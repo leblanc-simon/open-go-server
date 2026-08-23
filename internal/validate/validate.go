@@ -145,15 +145,18 @@ func Project(p *model.Project, homeRoot string) error {
 	primary := 0
 	for i, d := range p.Spec.Domains {
 		f := fmt.Sprintf("spec.domains[%d]", i)
-		h, err := naming.NormalizeHost(d.Name)
-		if err != nil {
+		if _, err := naming.NormalizeHost(d.Name); err != nil {
 			add(f+".name", "%v", err)
 			continue
 		}
-		if seenDomain[h] {
+		// La comparaison porte sur le nom littéral : « shop.fr » et
+		// « www.shop.fr » ont la même forme canonique mais sont bien deux domaines
+		// distincts à servir, cas de loin le plus courant.
+		literal := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(d.Name), "."))
+		if seenDomain[literal] {
 			add(f+".name", "domaine %q déclaré deux fois", d.Name)
 		}
-		seenDomain[h] = true
+		seenDomain[literal] = true
 		switch d.Role {
 		case "", "primary":
 			primary++
@@ -377,26 +380,29 @@ func cronField(f string, min, max int) error {
 // identifiants distincts peuvent réclamer le même répertoire (§3.3.6).
 func Uniqueness(projects []*model.Project, prepDomain string) error {
 	var errs Errors
+	// Le propriétaire d'une clé est repéré par sa position, et non par son nom :
+	// deux projets distincts peuvent porter le même identifiant, et c'est
+	// précisément la collision à détecter.
 	kinds := []struct {
 		label string
-		seen  map[string]string
+		seen  map[string]int
 		keys  func(*model.Project) []string
 	}{
-		{"identifiant", map[string]string{}, func(p *model.Project) []string { return []string{p.Metadata.Name} }},
-		{"host effectif", map[string]string{}, func(p *model.Project) []string {
+		{"identifiant", map[string]int{}, func(p *model.Project) []string { return []string{p.Metadata.Name} }},
+		{"host effectif", map[string]int{}, func(p *model.Project) []string {
 			h, err := naming.EffectiveHost(p.Metadata.Host, p.Env(), prepDomain)
 			if err != nil {
 				return nil
 			}
 			return []string{h}
 		}},
-		{"home", map[string]string{}, func(p *model.Project) []string {
+		{"home", map[string]int{}, func(p *model.Project) []string {
 			return []string{filepath.Clean(p.Spec.Layout.Root)}
 		}},
-		{"utilisateur système", map[string]string{}, func(p *model.Project) []string {
+		{"utilisateur système", map[string]int{}, func(p *model.Project) []string {
 			return []string{p.Spec.User.Name}
 		}},
-		{"domaine", map[string]string{}, func(p *model.Project) []string {
+		{"domaine", map[string]int{}, func(p *model.Project) []string {
 			out := make([]string, 0, len(p.Spec.Domains))
 			for _, d := range p.Spec.Domains {
 				if h, err := naming.NormalizeHost(d.Name); err == nil {
@@ -405,14 +411,14 @@ func Uniqueness(projects []*model.Project, prepDomain string) error {
 			}
 			return out
 		}},
-		{"base de données", map[string]string{}, func(p *model.Project) []string {
+		{"base de données", map[string]int{}, func(p *model.Project) []string {
 			out := make([]string, 0, len(p.Spec.Databases))
 			for _, db := range p.Spec.Databases {
 				out = append(out, db.Engine+":"+db.Name)
 			}
 			return out
 		}},
-		{"utilisateur de base", map[string]string{}, func(p *model.Project) []string {
+		{"utilisateur de base", map[string]int{}, func(p *model.Project) []string {
 			var out []string
 			for _, db := range p.Spec.Databases {
 				out = append(out, db.Engine+":"+db.User)
@@ -422,13 +428,13 @@ func Uniqueness(projects []*model.Project, prepDomain string) error {
 			}
 			return out
 		}},
-		{"vhost AMQP", map[string]string{}, func(p *model.Project) []string {
+		{"vhost AMQP", map[string]int{}, func(p *model.Project) []string {
 			if p.Spec.AMQP == nil {
 				return nil
 			}
 			return []string{p.Spec.AMQP.Vhost}
 		}},
-		{"pool PHP", map[string]string{}, func(p *model.Project) []string {
+		{"pool PHP", map[string]int{}, func(p *model.Project) []string {
 			out := make([]string, 0, len(p.Spec.PHP.Pools))
 			for _, pool := range p.Spec.PHP.Pools {
 				out = append(out, naming.RoleName(p.Metadata.Name, poolRole(pool.Name)))
@@ -436,20 +442,27 @@ func Uniqueness(projects []*model.Project, prepDomain string) error {
 			return out
 		}},
 	}
-	for _, p := range projects {
+	for index, p := range projects {
 		for _, k := range kinds {
 			for _, key := range k.keys(p) {
 				if key == "" {
 					continue
 				}
 				if owner, taken := k.seen[key]; taken {
+					// Un même projet peut légitimement produire deux fois la même
+					// clé : « shop.fr » et « www.shop.fr » partagent leur forme
+					// canonique. Seul un conflit entre projets distincts compte.
+					if owner == index {
+						continue
+					}
 					errs = append(errs, Error{
-						Field:   k.label,
-						Message: fmt.Sprintf("%q est déjà utilisé par le projet %q (demandé par %q)", key, owner, p.Metadata.Name),
+						Field: k.label,
+						Message: fmt.Sprintf("%q est déjà utilisé par le projet %q (demandé par %q)",
+							key, projects[owner].Metadata.Name, p.Metadata.Name),
 					})
 					continue
 				}
-				k.seen[key] = p.Metadata.Name
+				k.seen[key] = index
 			}
 		}
 	}

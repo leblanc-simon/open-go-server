@@ -44,6 +44,17 @@ func (h *harness) run(args ...string) (string, int) {
 	return out.String(), ExitCode(err)
 }
 
+// mustRunPartial accepte un succès partiel : sur cette machine, MySQL n'est pas
+// installé, donc la création d'une base produit un avertissement légitime.
+func (h *harness) mustRunPartial(args ...string) string {
+	h.t.Helper()
+	out, code := h.run(args...)
+	if code != CodeOK && code != CodePartial {
+		h.t.Fatalf("« ogs %s » a échoué (code %d) :\n%s", strings.Join(args, " "), code, out)
+	}
+	return out
+}
+
 // mustRun exige un succès.
 func (h *harness) mustRun(args ...string) string {
 	h.t.Helper()
@@ -1403,5 +1414,311 @@ func TestRuntimeDirectoriesAreDeclared(t *testing.T) {
 	}
 	if info.Mode().Perm() != 0o750 {
 		t.Errorf("mode %04o, attendu 0750", info.Mode().Perm())
+	}
+}
+
+// --- Lot L6 : composition, suppression, restauration ---
+
+func TestSiteCreateAssemblesEverything(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	state := newBrokerState()
+	h.fakeBroker(t, state)
+
+	out := h.mustRunPartial("site", "create", "shop.fr",
+		"--kind", "php-symfony", "--app-version", "6.4", "--php", "8.5",
+		"--alias", "www.shop.fr", "--redirect", "ancien-shop.fr",
+		"--db", "mysql", "--messenger", "async",
+		"--service", "symfony-messenger:async:2",
+		"--cron", "* * * * *:bin/console schedule:run",
+		"--yes")
+
+	// Le récapitulatif dit ce qui a été assemblé.
+	for _, want := range []string{"utilisateur  shopfr:shopfr", "php          8.5", "base         mysql shopfr",
+		"transport    vhost shopfr", "service      messenger-async", "tâche"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("récapitulatif incomplet, %q absent :\n%s", want, out)
+		}
+	}
+	// Toutes les ressources sont en place.
+	for _, rel := range []string{
+		filepath.Join("home", "shop.fr", "www", "public"),
+		filepath.Join("home", "shop.fr", "logs", "cron-schedule-run.log"),
+		filepath.Join("etc", "php", "8.5", "fpm", "pool.d", "shopfr.conf"),
+		filepath.Join("etc", "apache2", "sites-available", "shopfr.conf"),
+		filepath.Join("etc", "apache2", "sites-available", "shopfr_redirect.conf"),
+		filepath.Join("etc", "cron.d", "ogs-shopfr"),
+		filepath.Join("etc", "systemd", "system", "ogs-shopfr.target"),
+		filepath.Join("etc", "sudoers.d", "ogs-shopfr"),
+		filepath.Join("var", "lib", "ogs", "acme", "certificates", "shopfr", "fullchain.pem"),
+	} {
+		if _, err := os.Stat(h.path(rel)); err != nil {
+			t.Errorf("%s absent après site create : %v", rel, err)
+		}
+	}
+	// Le vhost sert le domaine principal et son alias.
+	vhost := h.read(t, filepath.Join("etc", "apache2", "sites-available", "shopfr.conf"))
+	if !strings.Contains(vhost, "ServerName shop.fr") || !strings.Contains(vhost, "ServerAlias www.shop.fr") {
+		t.Errorf("domaines mal servis :\n%s", vhost)
+	}
+	// Le vhost de redirection ne porte pas le site.
+	redirect := h.read(t, filepath.Join("etc", "apache2", "sites-available", "shopfr_redirect.conf"))
+	if !strings.Contains(redirect, "ancien-shop.fr") || !strings.Contains(redirect, "shop.fr$1") {
+		t.Errorf("redirection inattendue :\n%s", redirect)
+	}
+	// Le transport a bien été déclaré sur le broker.
+	if !state.vhosts["shopfr"] {
+		t.Errorf("vhost amqp non créé : %v", state.writes)
+	}
+}
+
+func TestSiteCreateRejectsExistingProject(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("site", "create", "shop.fr", "--kind", "static", "--yes")
+	if out, code := h.run("site", "create", "shop.fr", "--kind", "static", "--yes"); code != CodeConflict {
+		t.Errorf("code %d attendu %d :\n%s", code, CodeConflict, out)
+	}
+}
+
+func TestSiteCreateCronOptionSplitsOnFirstColon(t *testing.T) {
+	// Une commande contient souvent un deux-points (« schedule:run ») : la découpe
+	// doit se faire sur le premier, celui qui suit l'expression.
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("site", "create", "shop.fr", "--kind", "static",
+		"--cron", "*/5 * * * *:bin/console app:sync --force", "--yes")
+	cronFile := h.read(t, filepath.Join("etc", "cron.d", "ogs-shopfr"))
+	if !strings.Contains(cronFile, "*/5 * * * * shopfr") {
+		t.Errorf("expression mal découpée :\n%s", cronFile)
+	}
+	if !strings.Contains(cronFile, "app:sync --force") {
+		t.Errorf("commande tronquée :\n%s", cronFile)
+	}
+}
+
+func TestSiteCloneToPrep(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRunPartial("site", "create", "shop.fr", "--kind", "php-symfony", "--app-version", "6.4",
+		"--php", "8.5", "--db", "mysql", "--yes")
+	// Du contenu applicatif, pour vérifier la copie.
+	if err := os.WriteFile(h.path("home", "shop.fr", "www", "public", "index.php"),
+		[]byte("<?php echo 'production';"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	out, code := h.run("site", "clone", "shopfr", "--to", "prep", "--yes")
+	if code != CodeOK && code != CodePartial {
+		t.Fatalf("code %d :\n%s", code, out)
+	}
+	// La préproduction est un projet distinct, sur le domaine dédié.
+	shown := h.mustRun("project", "show", "shopfrprep")
+	for _, want := range []string{"shopfrprep", "shopfr.preprod-pp.net"} {
+		if !strings.Contains(shown, want) {
+			t.Errorf("le clone doit être en préproduction, %q absent :\n%s", want, shown)
+		}
+	}
+	// Aucune ressource partagée avec la production.
+	if strings.Contains(shown, "mysql shopfr\n") {
+		t.Error("la base de la préproduction doit être distincte")
+	}
+	if !strings.Contains(shown, "shopfrprep") {
+		t.Error("les ressources doivent porter l'identifiant de préproduction")
+	}
+	// Les deux homes existent.
+	for _, host := range []string{"shop.fr", "shopfr.preprod-pp.net"} {
+		if _, err := os.Stat(h.path("home", host)); err != nil {
+			t.Errorf("home %s absent : %v", host, err)
+		}
+	}
+}
+
+func TestDeleteArchivesThenRemoves(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("site", "create", "shop.fr", "--kind", "php-symfony", "--php", "8.5",
+		"--service", "symfony-messenger:async:1", "--yes")
+	if err := os.WriteFile(h.path("home", "shop.fr", "www", "public", "index.php"),
+		[]byte("<?php echo 'à archiver';"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	out := h.mustRun("project", "delete", "shopfr", "--yes")
+	if !strings.Contains(out, "archive créée") {
+		t.Errorf("une archive doit précéder la suppression :\n%s", out)
+	}
+	// Tout a disparu du système.
+	for _, rel := range []string{
+		filepath.Join("home", "shop.fr"),
+		filepath.Join("etc", "php", "8.5", "fpm", "pool.d", "shopfr.conf"),
+		filepath.Join("etc", "apache2", "sites-available", "shopfr.conf"),
+		filepath.Join("etc", "cron.d", "ogs-shopfr"),
+		filepath.Join("etc", "sudoers.d", "ogs-shopfr"),
+		filepath.Join("etc", "systemd", "system", "ogs-shopfr.target"),
+		filepath.Join("etc", "ogs", "projects", "shopfr.yaml"),
+	} {
+		if _, err := os.Stat(h.path(rel)); !os.IsNotExist(err) {
+			t.Errorf("%s devrait avoir été supprimé : %v", rel, err)
+		}
+	}
+	// La déclaration est conservée sous archived/ : la trace de ce qui a existé.
+	if _, err := os.Stat(h.path("etc", "ogs", "projects", "archived", "shopfr.yaml")); err != nil {
+		t.Errorf("la déclaration archivée devrait subsister : %v", err)
+	}
+	// L'archive est listable et son manifeste lisible.
+	list := h.mustRun("project", "archives")
+	if !strings.Contains(list, "shopfr") {
+		t.Errorf("l'archive doit être listée :\n%s", list)
+	}
+}
+
+func TestDeleteThenRestoreRoundTrip(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("site", "create", "shop.fr", "--kind", "php-symfony", "--app-version", "6.4",
+		"--php", "8.5", "--yes")
+	content := "<?php echo 'contenu à retrouver';"
+	if err := os.WriteFile(h.path("home", "shop.fr", "www", "public", "index.php"),
+		[]byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Un secret scellé, pour vérifier qu'il traverse l'archive.
+	st, err := store.Open(h.path("var", "lib", "ogs", "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ks, err := secret.Open(h.path("etc", "ogs", "master.key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	nonce, ciphertext, err := ks.Seal("shopfr", "mysql/shopfr", []byte("secret-a-retrouver"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.PutSecret("shopfr", "mysql/shopfr", nonce, ciphertext); err != nil {
+		t.Fatal(err)
+	}
+	st.Close()
+
+	out := h.mustRun("project", "delete", "shopfr", "--yes")
+	if !strings.Contains(out, "1 secret(s)") {
+		t.Errorf("le secret doit être inclus dans l'archive :\n%s", out)
+	}
+
+	// Restauration.
+	entries, err := os.ReadDir(h.path("var", "lib", "ogs", "archives"))
+	if err != nil || len(entries) == 0 {
+		t.Fatalf("aucune archive : %v", err)
+	}
+	archivePath := h.path("var", "lib", "ogs", "archives", entries[0].Name())
+	out, code := h.run("project", "restore", archivePath, "--yes")
+	if code != CodeOK && code != CodePartial {
+		t.Fatalf("code %d :\n%s", code, out)
+	}
+	// Le contenu est revenu à l'identique.
+	restored, err := os.ReadFile(h.path("home", "shop.fr", "www", "public", "index.php"))
+	if err != nil {
+		t.Fatalf("contenu non restauré : %v", err)
+	}
+	if string(restored) != content {
+		t.Errorf("contenu restauré : %q", restored)
+	}
+	// Le secret est relisible avec la même clé maître.
+	st, err = store.Open(h.path("var", "lib", "ogs", "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	nonce, ciphertext, err = st.GetSecret("shopfr", "mysql/shopfr")
+	if err != nil {
+		t.Fatalf("secret absent après restauration : %v", err)
+	}
+	plain, err := ks.Open("shopfr", "mysql/shopfr", nonce, ciphertext)
+	if err != nil {
+		t.Fatalf("secret illisible : %v", err)
+	}
+	if string(plain) != "secret-a-retrouver" {
+		t.Errorf("secret restitué : %q", plain)
+	}
+}
+
+func TestPurgeRequiresExactIdentifier(t *testing.T) {
+	// Une suppression sans recours ne doit pas pouvoir être confirmée par un
+	// simple --yes.
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("site", "create", "shop.fr", "--kind", "static", "--yes")
+	out, code := h.run("project", "delete", "shopfr", "--purge", "--yes")
+	if code != CodeCancelled {
+		t.Fatalf("code %d attendu %d :\n%s", code, CodeCancelled, out)
+	}
+	if !strings.Contains(out, "sans recours") {
+		t.Errorf("le motif doit être explicite :\n%s", out)
+	}
+	// Le projet est intact.
+	if _, err := os.Stat(h.path("etc", "ogs", "projects", "shopfr.yaml")); err != nil {
+		t.Errorf("le projet ne devait pas être supprimé : %v", err)
+	}
+}
+
+func TestDeleteKeepData(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("site", "create", "shop.fr", "--kind", "static", "--yes")
+	out := h.mustRun("project", "delete", "shopfr", "--keep-data", "--yes")
+	if !strings.Contains(out, "conservés") {
+		t.Errorf("la conservation doit être annoncée :\n%s", out)
+	}
+	// Le contenu subsiste, les configurations non.
+	if _, err := os.Stat(h.path("home", "shop.fr")); err != nil {
+		t.Errorf("le home devait être conservé : %v", err)
+	}
+	if _, err := os.Stat(h.path("etc", "apache2", "sites-available", "shopfr.conf")); !os.IsNotExist(err) {
+		t.Error("le vhost devait être retiré")
+	}
+}
+
+func TestRestoreRefusesExistingProject(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("site", "create", "shop.fr", "--kind", "static", "--yes")
+	h.mustRun("project", "delete", "shopfr", "--yes")
+	entries, _ := os.ReadDir(h.path("var", "lib", "ogs", "archives"))
+	archivePath := h.path("var", "lib", "ogs", "archives", entries[0].Name())
+	if _, code := h.run("project", "restore", archivePath, "--yes"); code != CodeOK && code != CodePartial {
+		t.Fatalf("première restauration : code %d", code)
+	}
+	out, code := h.run("project", "restore", archivePath, "--yes")
+	if code != CodeConflict {
+		t.Errorf("restaurer par-dessus un projet existant : code %d attendu %d\n%s",
+			code, CodeConflict, out)
+	}
+}
+
+func TestStatusReportsHealthAndExitCode(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("site", "create", "shop.fr", "--kind", "php-symfony", "--php", "8.5", "--yes")
+	h.simulateSystemEffects("shopfr", "shop.fr", 1004)
+
+	out, code := h.run("status")
+	if !strings.Contains(out, "shopfr") || !strings.Contains(out, "8.5") {
+		t.Errorf("le tableau doit décrire le projet :\n%s", out)
+	}
+	if code != CodeOK {
+		t.Errorf("un projet conforme doit donner le code 0, obtenu %d :\n%s", code, out)
+	}
+	// Une dérive doit être détectée et rendue par le code de retour : c'est ce
+	// qui rend la commande utilisable en supervision.
+	if err := os.Chmod(h.path("home", "shop.fr", "logs"), 0o777); err != nil {
+		t.Fatal(err)
+	}
+	out, code = h.run("status")
+	if code != CodePartial {
+		t.Errorf("une dérive doit donner le code %d, obtenu %d :\n%s", CodePartial, code, out)
+	}
+	if !strings.Contains(out, "dérive") {
+		t.Errorf("l'état doit être signalé :\n%s", out)
 	}
 }

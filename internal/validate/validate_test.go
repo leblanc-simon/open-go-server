@@ -179,3 +179,25 @@ func TestUniquenessDetectsDomainCollision(t *testing.T) {
 		t.Fatal("un domaine déjà servi doit être refusé")
 	}
 }
+
+func TestProjectAcceptsPrimaryAndWWWAlias(t *testing.T) {
+	// Le cas le plus courant : servir shop.fr et www.shop.fr. Les deux ont la
+	// même forme canonique, mais ce sont bien deux domaines à déclarer.
+	p := newProject(t, "shop.fr", naming.EnvProd, model.KindStatic)
+	p.Spec.Domains = append(p.Spec.Domains, model.Domain{Name: "www.shop.fr", Role: "alias"})
+	if err := Project(p, "/home"); err != nil {
+		t.Fatalf("principal et alias www refusés : %v", err)
+	}
+	if err := Uniqueness([]*model.Project{p}, "preprod-pp.net"); err != nil {
+		t.Fatalf("un projet ne peut pas entrer en conflit avec lui-même : %v", err)
+	}
+}
+
+func TestProjectStillDetectsRealDuplicate(t *testing.T) {
+	p := newProject(t, "shop.fr", naming.EnvProd, model.KindStatic)
+	p.Spec.Domains = append(p.Spec.Domains, model.Domain{Name: "shop.fr", Role: "alias"})
+	err := Project(p, "/home")
+	if err == nil || !strings.Contains(err.Error(), "deux fois") {
+		t.Fatalf("un vrai doublon doit être refusé : %v", err)
+	}
+}

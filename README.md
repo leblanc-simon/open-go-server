@@ -21,7 +21,7 @@ C'est la référence : toute contribution s'y adosse.
 | **L3** | TLS : ACME embarqué (lego), HTTP-01 et DNS-01 OVH, wildcard partagé pour les préproductions, timer de renouvellement, suspension après échecs répétés | **livré** |
 | **L4** | RabbitMQ : vhosts, utilisateurs, exchanges, files, bindings, policies, préréglage Messenger, arguments immuables détectés | **livré** |
 | **L5** | Tâches planifiées, services systemd templatisés avec instances multiples, délégation sudoers, répertoires d'exécution | **livré** |
-| L6 | Composition : `site create`, archivage, restauration, `status` | à venir |
+| **L6** | Composition : `site create` et `site clone`, suppression avec archivage, restauration, `status` | **livré** |
 | L7 | TUI (Bubble Tea) | à venir |
 | L8 | Import d'un serveur existant | à venir |
 | L9 | Applications Go, Node, Ruby, Python | à venir |
@@ -80,6 +80,11 @@ ogs amqp credentials set --user … --password …
 ogs cron add | remove | list | enable | disable | run
 ogs service add | remove | list | start | stop | restart | scale | logs
 ogs my start | stop | restart | status      (surface déléguée par sudo)
+ogs site create <host> [--db] [--messenger] [--service] [--cron] …
+ogs site clone <id> --to prep
+ogs project delete <id> [--purge] [--keep-data] [--no-dump]
+ogs project restore <archive> | archives
+ogs status [id...]
 ```
 
 ## Utilisation réelle
@@ -220,6 +225,50 @@ La commande `ogs my` ne prend aucun argument de projet — il est déduit de `SU
 que sudo positionne après avoir purgé l'environnement. `ogs doctor` vérifie que
 `env_reset` est bien active, sans quoi cette déduction ne serait plus fiable, et
 audite les fichiers de délégation à la recherche d'un élargissement manuel.
+
+### Créer un site complet
+
+```sh
+sudo ogs site create shop.fr \
+  --kind php-symfony --app-version 6.4 --php 8.5 \
+  --alias www.shop.fr --redirect ancien-shop.fr \
+  --db mysql --messenger async \
+  --service symfony-messenger:async:2 \
+  --cron "* * * * *:bin/console schedule:run"
+```
+
+Une seule saga assemble l'utilisateur, l'arborescence, la base, le transport, le
+pool PHP, les vhosts, le certificat, les tâches et les services. Une étape critique
+en échec défait les précédentes ; les étapes non critiques — base injoignable,
+certificat, démarrage de service — laissent le site en place avec un avertissement.
+
+### Supprimer et restaurer
+
+```sh
+sudo ogs project delete shopfr           # archive puis supprime
+sudo ogs project archives
+sudo ogs project restore /var/lib/ogs/archives/shopfr-20260823-143000.tar.zst
+```
+
+L'archive contient la déclaration, les configurations générées, les dumps de bases,
+l'arborescence, les secrets **restés chiffrés** et un manifeste décrivant tout ce qui
+a été retiré. L'espace disponible est vérifié avant de commencer : échouer au milieu
+d'une suppression laisserait le système à moitié démonté.
+
+`--purge` supprime sans archive et **exige la saisie de l'identifiant** : `--yes` ne
+suffit pas pour une opération sans recours. `--keep-data` ne retire que les
+configurations.
+
+### Superviser
+
+```sh
+sudo ogs status
+PROJET  ENV   HOST     PHP  ÉCARTS  SERVICES  TLS   ÉTAT
+shopfr  prod  shop.fr  8.5  0       2/2       89 j  sain
+```
+
+Le code de retour est non nul dès qu'un écart, un service manquant ou un certificat
+proche de l'échéance est détecté.
 
 ## Conventions structurantes
 

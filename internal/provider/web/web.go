@@ -189,6 +189,17 @@ func (p *Provider) vhostName(proj *model.Project, vh model.VHost) string {
 	return proj.ID() + "_" + vh.Name
 }
 
+// VHostNames énumère les noms de fichiers de vhost d'un projet, pour que la
+// suppression sache quoi retirer.
+func (p *Provider) VHostNames(proj *model.Project) []string {
+	vhosts := p.vhosts(proj)
+	out := make([]string, 0, len(vhosts))
+	for _, vh := range vhosts {
+		out = append(out, p.vhostName(proj, vh))
+	}
+	return out
+}
+
 // Build calcule le rendu attendu d'un vhost.
 func (p *Provider) Build(proj *model.Project, vh model.VHost) (*VHostPlan, error) {
 	at, err := proj.AppType()

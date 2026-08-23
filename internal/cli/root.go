@@ -68,6 +68,8 @@ func NewRootCommand() *cobra.Command {
 		newServiceCommand(app),
 		newMyCommand(app),
 		newCronCommand(app),
+		newSiteCommand(app),
+		newStatusCommand(app),
 	)
 	return root
 }

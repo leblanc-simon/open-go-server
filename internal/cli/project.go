@@ -25,6 +25,9 @@ func newProjectCommand(app *App) *cobra.Command {
 		newProjectListCommand(app),
 		newProjectShowCommand(app),
 		newProjectExportCommand(app),
+		newDeleteCommand(app),
+		newRestoreCommand(app),
+		newArchiveListCommand(app),
 	)
 	return cmd
 }

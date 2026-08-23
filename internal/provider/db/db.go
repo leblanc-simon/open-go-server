@@ -391,6 +391,12 @@ func (p *Provider) apply(ctx context.Context, proj *model.Project, decl model.Da
 	return nil
 }
 
+// Drop supprime une base et son utilisateur. Opération destructrice : l'appelant
+// doit avoir obtenu confirmation.
+func (p *Provider) Drop(ctx context.Context, decl model.Database, state DBState) error {
+	return p.drop(ctx, decl, state)
+}
+
 // drop supprime une base et son utilisateur.
 func (p *Provider) drop(ctx context.Context, decl model.Database, state DBState) error {
 	client, err := p.clientFor(decl)
