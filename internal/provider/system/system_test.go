@@ -1,0 +1,230 @@
+package system
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/leviathan/ogs/internal/engine"
+	"github.com/leviathan/ogs/internal/exec"
+	"github.com/leviathan/ogs/internal/model"
+	"github.com/leviathan/ogs/internal/naming"
+)
+
+// fixture prépare un projet dont la racine est dans un répertoire temporaire,
+// afin de pouvoir créer réellement l'arborescence sans être root.
+func fixture(t *testing.T) (*model.Project, *Provider, *exec.Recorder, *FakeIdentity) {
+	t.Helper()
+	homeRoot := t.TempDir()
+	p := model.New("shop.fr", naming.EnvProd, model.KindStatic)
+	if err := p.Normalize(homeRoot, "preprod-pp.net"); err != nil {
+		t.Fatal(err)
+	}
+	rec := exec.NewRecorder()
+	ident := NewFakeIdentity()
+	return p, &Provider{Exec: rec, Identity: ident, SkipWebUser: false}, rec, ident
+}
+
+func apply(t *testing.T, prov *Provider, p *model.Project) *engine.Report {
+	t.Helper()
+	ctx := context.Background()
+	obs, err := prov.Observe(ctx, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	steps, err := prov.Plan(ctx, p, obs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := &engine.Plan{Project: p.ID()}
+	for _, s := range steps {
+		plan.Add(s)
+	}
+	report, err := engine.Execute(ctx, plan, engine.Options{})
+	if err != nil {
+		t.Fatalf("apply : %v", err)
+	}
+	return report
+}
+
+func TestPlanCreatesGroupUserAndDirs(t *testing.T) {
+	p, prov, rec, _ := fixture(t)
+	report := apply(t, prov, p)
+	if report.RolledBack {
+		t.Fatal("aucun rollback attendu")
+	}
+	for _, want := range []string{"groupadd shopfr", "useradd", "gpasswd -a www-data shopfr"} {
+		if !rec.Contains(want) {
+			t.Errorf("commande manquante : %s\nappels : %v", want, rec.Calls())
+		}
+	}
+	// Le compte est marqué comme géré par ogs, ce qui permettra de le distinguer
+	// plus tard d'un compte adopté.
+	if !rec.Contains("--comment ogs=shopfr") {
+		t.Error("le compte doit porter la marque ogs dans son commentaire")
+	}
+	if !rec.Contains("--shell /usr/sbin/nologin") {
+		t.Error("le compte doit être créé sans shell interactif")
+	}
+	// L'arborescence est réellement créée.
+	for _, dir := range []string{"", "www", "var", "logs", ".bin", ".ssh"} {
+		path := filepath.Join(p.Spec.Layout.Root, dir)
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatalf("répertoire absent : %s (%v)", path, err)
+		}
+		if !info.IsDir() {
+			t.Errorf("%s n'est pas un répertoire", path)
+		}
+	}
+}
+
+func TestDirectoryModes(t *testing.T) {
+	p, prov, _, _ := fixture(t)
+	apply(t, prov, p)
+	cases := map[string]os.FileMode{
+		"":     0o750, // racine : rwx utilisateur, r-x groupe, rien pour les autres
+		"www":  0o750,
+		"var":  0o700, // hors de portée de www-data
+		"logs": 0o750,
+		".bin": 0o750,
+		".ssh": 0o700,
+	}
+	for dir, want := range cases {
+		path := filepath.Join(p.Spec.Layout.Root, dir)
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := info.Mode().Perm(); got != want {
+			t.Errorf("%s : mode %04o, attendu %04o", path, got, want)
+		}
+	}
+}
+
+func TestPlanIsIdempotent(t *testing.T) {
+	p, prov, rec, ident := fixture(t)
+	apply(t, prov, p)
+
+	// Le système reflète maintenant l'état désiré.
+	ident.Users["shopfr"] = &UserInfo{Name: "shopfr", UID: 1004, GID: 1004,
+		Home: p.Spec.Layout.Root, Shell: "/usr/sbin/nologin", Managed: true}
+	ident.Groups["shopfr"] = &GroupInfo{Name: "shopfr", GID: 1004, Members: []string{WebUser}}
+
+	before := len(rec.Calls())
+	ctx := context.Background()
+	obs, err := prov.Observe(ctx, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	steps, err := prov.Plan(ctx, p, obs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := &engine.Plan{Project: p.ID()}
+	for _, s := range steps {
+		plan.Add(s)
+	}
+	if !plan.Empty() {
+		t.Errorf("un second plan doit être vide, obtenu :\n%s", plan.String())
+	}
+	if len(rec.Calls()) != before {
+		t.Error("aucune commande ne doit être exécutée lors du calcul du plan")
+	}
+}
+
+func TestPlanCorrectsDriftedMode(t *testing.T) {
+	p, prov, _, ident := fixture(t)
+	apply(t, prov, p)
+	ident.Users["shopfr"] = &UserInfo{Name: "shopfr", UID: 1004, GID: 1004,
+		Home: p.Spec.Layout.Root, Managed: true}
+	ident.Groups["shopfr"] = &GroupInfo{Name: "shopfr", GID: 1004, Members: []string{WebUser}}
+
+	logs := filepath.Join(p.Spec.Layout.Root, "logs")
+	if err := os.Chmod(logs, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	obs, _ := prov.Observe(ctx, p)
+	steps, err := prov.Plan(ctx, p, obs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := &engine.Plan{Project: p.ID()}
+	for _, s := range steps {
+		plan.Add(s)
+	}
+	mutating := plan.Mutating()
+	if len(mutating) != 1 || !strings.Contains(mutating[0].Summary, "logs") {
+		t.Fatalf("la dérive de mode doit produire exactement une étape, obtenu :\n%s", plan.String())
+	}
+	if _, err := engine.Execute(ctx, plan, engine.Options{}); err != nil {
+		t.Fatal(err)
+	}
+	info, _ := os.Stat(logs)
+	if info.Mode().Perm() != 0o750 {
+		t.Errorf("mode non corrigé : %04o", info.Mode().Perm())
+	}
+}
+
+func TestPlanRefusesForeignUser(t *testing.T) {
+	p, prov, _, ident := fixture(t)
+	// Un compte homonyme non géré par ogs : refus explicite plutôt que
+	// modification silencieuse.
+	ident.Users["shopfr"] = &UserInfo{Name: "shopfr", UID: 1500, GID: 1500,
+		Home: "/home/ancien", Managed: false}
+	ctx := context.Background()
+	obs, _ := prov.Observe(ctx, p)
+	_, err := prov.Plan(ctx, p, obs)
+	if err == nil || !strings.Contains(err.Error(), "n'est pas géré par ogs") {
+		t.Fatalf("erreur attendue, obtenu : %v", err)
+	}
+}
+
+func TestRollbackRemovesCreatedUserAndGroup(t *testing.T) {
+	p, prov, rec, _ := fixture(t)
+	ctx := context.Background()
+	obs, _ := prov.Observe(ctx, p)
+	steps, err := prov.Plan(ctx, p, obs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := &engine.Plan{Project: p.ID()}
+	for _, s := range steps {
+		plan.Add(s)
+	}
+	// Une étape critique en échec est ajoutée à la fin, comme le ferait un
+	// provider ultérieur (base de données, vhost).
+	boom := engine.NewStep("test/boom", engine.Create, "étape en échec")
+	boom.Apply = func(context.Context) error { return os.ErrPermission }
+	plan.Add(boom)
+
+	report, err := engine.Execute(ctx, plan, engine.Options{})
+	if err == nil {
+		t.Fatal("erreur attendue")
+	}
+	if !report.RolledBack || report.RollbackErr != nil {
+		t.Fatalf("rollback : %+v", report)
+	}
+	for _, want := range []string{"gpasswd -d www-data shopfr", "userdel shopfr", "groupdel shopfr"} {
+		if !rec.Contains(want) {
+			t.Errorf("compensation manquante : %s", want)
+		}
+	}
+	// Les répertoires créés et restés vides sont retirés ; la racine contenant
+	// les sous-répertoires, elle peut subsister sans que ce soit une erreur.
+	if _, err := os.Stat(filepath.Join(p.Spec.Layout.Root, "logs")); !os.IsNotExist(err) {
+		t.Errorf("le répertoire logs devrait avoir été retiré : %v", err)
+	}
+}
+
+func TestWebAccessNoneSkipsGroupMembership(t *testing.T) {
+	p, prov, rec, _ := fixture(t)
+	p.Spec.User.WebAccess = "none"
+	apply(t, prov, p)
+	if rec.Contains("gpasswd") {
+		t.Error("webAccess none ne doit pas ajouter www-data au groupe")
+	}
+}

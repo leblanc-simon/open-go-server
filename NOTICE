@@ -1,0 +1,25 @@
+ogs — utilitaire d'administration de serveurs web
+Distribué sous licence WTFPL (voir le fichier LICENSE).
+
+AVERTISSEMENT — ABSENCE DE GARANTIE ET DE RESPONSABILITÉ
+
+La WTFPL ne comporte aucune clause d'exclusion de garantie. La présente notice la
+fournit explicitement, sans restreindre en rien les libertés accordées par la
+licence.
+
+Ce logiciel est fourni « en l'état », sans garantie d'aucune sorte, expresse ou
+implicite, y compris, sans s'y limiter, les garanties de qualité marchande,
+d'adéquation à un usage particulier et d'absence de contrefaçon.
+
+ogs s'exécute avec les privilèges du superutilisateur. Il crée et supprime des
+comptes système, des bases de données, des fichiers de configuration et des
+services, et peut détruire des données. En aucun cas les auteurs ou les
+détenteurs du droit d'auteur ne pourront être tenus responsables d'une
+réclamation, d'un dommage, d'une perte de données ou d'une interruption de
+service, qu'il s'agisse d'une action contractuelle, délictuelle ou autre,
+résultant du logiciel, de son utilisation ou de toute autre opération le
+concernant.
+
+L'exploitant est seul responsable de la sauvegarde de ses données, de la
+protection de la clé maître du keystore (/etc/ogs/master.key) et de la
+vérification des plans avant application.

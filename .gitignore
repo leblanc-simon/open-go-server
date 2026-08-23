@@ -1,0 +1,4 @@
+/ogs
+/dist/
+/coverage.out
+*.ogs-bak-*
