@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"text/tabwriter"
 
@@ -11,10 +12,12 @@ import (
 
 	"github.com/leviathan/ogs/internal/config"
 	"github.com/leviathan/ogs/internal/engine"
+	"github.com/leviathan/ogs/internal/exec"
 	"github.com/leviathan/ogs/internal/fs"
 	"github.com/leviathan/ogs/internal/model"
 	"github.com/leviathan/ogs/internal/spec"
 	"github.com/leviathan/ogs/internal/store"
+	"github.com/leviathan/ogs/internal/template"
 	"github.com/leviathan/ogs/internal/validate"
 )
 
@@ -87,6 +90,20 @@ func (a *App) buildPlan(ctx context.Context, provs *providers, p *model.Project)
 		for _, s := range webSteps {
 			plan.Add(s)
 		}
+
+		// Les certificats viennent après le vhost HTTP : le challenge HTTP-01
+		// exige que /.well-known/acme-challenge réponde déjà. Puis le vhost est
+		// basculé en TLS (§6.2, étapes 7 à 9).
+		certSteps, err := provs.TLS.Plan(ctx, p)
+		if err != nil {
+			return nil, wrap(CodeValidation, err)
+		}
+		for _, s := range certSteps {
+			plan.Add(s)
+		}
+		for _, s := range provs.Web.PlanTLS(ctx, p) {
+			plan.Add(s)
+		}
 	}
 	for _, s := range stale {
 		plan.Add(s)
@@ -102,6 +119,20 @@ func (a *App) buildGlobalPlan(provs *providers, projects []*model.Project) (*eng
 		return nil, wrap(CodeError, err)
 	}
 	plan.Add(step)
+
+	// Timer de renouvellement : ressource de portée serveur, installée dès qu'un
+	// certificat est en jeu.
+	binary, err := os.Executable()
+	if err != nil || a.Prefix != "" {
+		binary = "/usr/bin/ogs"
+	}
+	units, err := provs.TLS.RenewUnitPlan(template.New(a.Paths.TemplatesDir()), binary, "")
+	if err != nil {
+		return nil, wrap(CodeError, err)
+	}
+	for _, s := range units {
+		plan.Add(s)
+	}
 	return plan, nil
 }
 
@@ -118,6 +149,13 @@ func (a *App) reloadFunc(provs *providers) func(context.Context, string) error {
 		case strings.HasPrefix(target, "web:"):
 			a.printf("  ↻ rechargement de %s\n", provs.Engine.Unit())
 			return provs.Web.Reload(ctx)
+		case target == "systemd:daemon-reload":
+			a.printf("  ↻ systemctl daemon-reload\n")
+			return a.systemctl(ctx, "daemon-reload")
+		case strings.HasPrefix(target, "systemd:enable:"):
+			unit := strings.TrimPrefix(target, "systemd:enable:")
+			a.printf("  ↻ activation de %s\n", unit)
+			return a.systemctl(ctx, "enable", "--now", unit)
 		}
 		return fmt.Errorf("cible de rechargement inconnue : %s", target)
 	}
@@ -407,6 +445,15 @@ func newApplyCommand(app *App) *cobra.Command {
 	}
 	cmd.Flags().StringVarP(&file, "file", "f", "", "appliquer un fichier de projet précis")
 	return cmd
+}
+
+// systemctl pilote systemd. En mode simulé, aucune commande n'est exécutée.
+func (a *App) systemctl(ctx context.Context, args ...string) error {
+	if a.Exec.Simulated() {
+		return nil
+	}
+	_, err := a.Exec.Run(ctx, exec.Command{Name: "systemctl", Args: args})
+	return err
 }
 
 // recordState met à jour l'état observé après une application réussie.

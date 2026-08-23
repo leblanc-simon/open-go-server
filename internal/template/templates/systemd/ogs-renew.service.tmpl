@@ -1,0 +1,14 @@
+[Unit]
+Description=ogs — renouvellement des certificats TLS
+Documentation=man:ogs(8)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart={{ .Binary }} cert renew --all --yes --quiet
+# Le renouvellement recharge le serveur web : l'échec d'une émission ne doit pas
+# empêcher les autres certificats d'être traités, d'où le code de retour toléré
+# pour un succès partiel.
+SuccessExitStatus=0 6
+Nice=10

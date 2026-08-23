@@ -140,6 +140,20 @@ func (a *App) runChecks() []check {
 		return out
 	}
 	add("projets", "ok", fmt.Sprintf("%d déclaré(s)", len(projects)), "")
+
+	// Certificats : le seuil d'alerte d'un partagé est plus précoce, son
+	// expiration cassant toutes les préproductions à la fois.
+	if provs, err := a.buildProviders(); err == nil {
+		defer provs.close()
+		if warnings, err := provs.TLS.Warnings(); err == nil {
+			for _, w := range warnings {
+				add("tls", "avertissement", w, "ogs cert renew --all")
+			}
+		}
+		if list, err := provs.TLS.Store.List(); err == nil && len(list) > 0 {
+			add("certificats", "ok", fmt.Sprintf("%d présent(s)", len(list)), "")
+		}
+	}
 	for _, p := range projects {
 		for _, pool := range p.Spec.PHP.Pools {
 			if date, eol := validate.EOLDate(pool.Version); eol {

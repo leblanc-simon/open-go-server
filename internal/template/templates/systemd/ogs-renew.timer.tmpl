@@ -1,0 +1,14 @@
+[Unit]
+Description=ogs — renouvellement périodique des certificats TLS
+
+[Timer]
+# Deux passages par jour : un certificat est renouvelé 30 jours avant son
+# échéance, donc une fenêtre manquée n'a aucune conséquence.
+OnCalendar={{ .OnCalendar }}
+# Étalement aléatoire : cent serveurs installés le même jour ne doivent pas
+# solliciter l'autorité à la même seconde.
+RandomizedDelaySec=3600
+Persistent=true
+
+[Install]
+WantedBy=timers.target

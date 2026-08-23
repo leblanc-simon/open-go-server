@@ -18,6 +18,7 @@ import (
 	"github.com/leviathan/ogs/internal/provider/logrotate"
 	"github.com/leviathan/ogs/internal/provider/php"
 	"github.com/leviathan/ogs/internal/provider/system"
+	tlsprov "github.com/leviathan/ogs/internal/provider/tls"
 	"github.com/leviathan/ogs/internal/provider/web"
 	"github.com/leviathan/ogs/internal/secret"
 	"github.com/leviathan/ogs/internal/spec"
@@ -195,6 +196,7 @@ func (a *App) homeRoot() string {
 // providers assemble les providers actifs pour cette exécution.
 type providers struct {
 	System    *system.Provider
+	TLS       *tlsprov.Provider
 	DB        *db.Provider
 	PHP       *php.Provider
 	Web       *web.Provider
@@ -225,16 +227,58 @@ func (a *App) buildProviders() (*providers, error) {
 	if err != nil {
 		return nil, err
 	}
+	certStore := tlsprov.Store{Paths: a.Paths}
+	certs := &tlsprov.Provider{
+		Paths: a.Paths, Cfg: a.Cfg, Store: certStore, DB: a.Store,
+		Issuer: &tlsprov.ACME{
+			Paths: a.Paths, Store: certStore, Email: a.Cfg.ACME.Email,
+			Directory:      a.Cfg.ACME.Directory,
+			DNSCredentials: a.dnsCredentials,
+		},
+		// En mode simulé, l'émetteur de repli évite tout appel réseau : le mode
+		// d'essai doit produire un site complet, certificat compris.
+		Fallback: tlsprov.SelfSigned{},
+	}
+	if a.Exec.Simulated() {
+		certs.Issuer = tlsprov.SelfSigned{}
+	}
 	return &providers{
 		System: sys,
+		TLS:    certs,
 		DB:     &db.Provider{Paths: a.Paths, Exec: a.Exec, Store: a.Store, Keys: a.Keys},
 		PHP:    php,
 		Web: &web.Provider{
 			Paths: a.Paths, Exec: a.Exec, Templates: tmpl, Engine: eng, PHP: php,
+			CertRef: certs.CertificateFor,
+			CertDir: certStore.Dir,
 		},
 		Logrotate: &logrotate.Provider{Paths: a.Paths, Templates: tmpl, Config: a.Cfg},
 		Engine:    eng,
 	}, nil
+}
+
+// dnsCredentials lit les identifiants d'un provider DNS. Ils vivent hors de la
+// base d'état, dans un fichier à permissions restreintes : ils donnent un droit
+// d'écriture sur une zone DNS entière.
+func (a *App) dnsCredentials(provider string) (map[string]string, error) {
+	path := filepath.Join(a.Paths.DNSCredsDir(), provider+".yaml")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("identifiants %s absents : les enregistrer avec "+
+				"« ogs cert dns-provider set %s » (%s)", provider, provider, path)
+		}
+		return nil, err
+	}
+	if info, err := os.Stat(path); err == nil && info.Mode().Perm()&0o077 != 0 {
+		return nil, fmt.Errorf("%s est lisible au-delà de son propriétaire (mode %04o) : "+
+			"corriger avec chmod 0600", path, info.Mode().Perm())
+	}
+	creds := map[string]string{}
+	if err := yaml.Unmarshal(data, &creds); err != nil {
+		return nil, fmt.Errorf("%s : %w", path, err)
+	}
+	return creds, nil
 }
 
 // webEngine choisit le moteur web. En mode préfixé, l'arborescence du moteur est

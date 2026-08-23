@@ -24,6 +24,17 @@ type Config struct {
 	Sudo         Sudo                   `yaml:"sudo"`
 	Deployment   Deployment             `yaml:"deployment"`
 	Certificates map[string]SharedCert  `yaml:"certificates"`
+	ACME         ACME                   `yaml:"acme"`
+}
+
+// ACME paramètre le dialogue avec l'autorité de certification.
+type ACME struct {
+	// Email est le contact déclaré : l'autorité y notifie les expirations.
+	Email string `yaml:"email"`
+	// Directory permet de viser une autre autorité (test, ACME privé).
+	Directory string `yaml:"directory,omitempty"`
+	// Staging bascule sur l'environnement de test de Let's Encrypt.
+	Staging bool `yaml:"staging,omitempty"`
 }
 
 // Naming regroupe les réglages de nommage et d'emplacement des projets.
@@ -137,6 +148,7 @@ const (
 	sudoersDir   = "/etc/sudoers.d"
 	logrotateDir = "/etc/logrotate.d"
 	tmpfilesDir  = "/etc/tmpfiles.d"
+	systemdDir   = "/etc/systemd/system"
 )
 
 // NewPaths construit les chemins pour un préfixe donné.
@@ -171,6 +183,9 @@ func (p Paths) GlobalLock() string    { return p.join(runDir, "ogs.lock") }
 func (p Paths) SudoersDir() string    { return p.join(sudoersDir) }
 func (p Paths) LogrotateFile() string { return p.join(logrotateDir, "ogs") }
 func (p Paths) TmpfilesFile() string  { return p.join(tmpfilesDir, "ogs.conf") }
+
+// SystemdDir renvoie le répertoire des unités systemd générées.
+func (p Paths) SystemdDir() string { return p.join(systemdDir) }
 
 // ProjectFile renvoie le chemin du fichier d'état désiré d'un projet.
 func (p Paths) ProjectFile(id string) string { return filepath.Join(p.ProjectsDir(), id+".yaml") }

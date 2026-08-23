@@ -18,7 +18,7 @@ C'est la référence : toute contribution s'y adosse.
 | **L0** | Socle : nommage, modèle, validation, YAML, écriture atomique, base d'état, keystore, audit, moteur (plan/apply/diff/saga/verrou), provider système, CLI | **livré** |
 | **L1** | Web + PHP : templates surchargeables, pools multi-version 7.4→8.5 avec numérotation, vhosts Apache et Nginx, types Prestashop et Symfony 3.4→8, clé de déploiement, lien `.bin/php`, `php switch` avec garde-fou de compatibilité, rotation des logs | **livré** |
 | **L2** | Bases MySQL/MariaDB et PostgreSQL : privilèges nommés, échappement des motifs de `GRANT`, keystore, multi-cluster PostgreSQL, dump/restore, `secrets env` | **livré** |
-| L3 | TLS : ACME embarqué, HTTP-01 et DNS-01 (OVH), wildcard partagé | à venir |
+| **L3** | TLS : ACME embarqué (lego), HTTP-01 et DNS-01 OVH, wildcard partagé pour les préproductions, timer de renouvellement, suspension après échecs répétés | **livré** |
 | L4 | RabbitMQ : vhosts, queues, bindings, préréglage Messenger | à venir |
 | L5 | Crons, services systemd templatisés, délégation `ogs my` | à venir |
 | L6 | Composition : `site create`, archivage, restauration, `status` | à venir |
@@ -73,6 +73,8 @@ ogs template list | show | extract <nom>
 ogs db list | add | remove | dump | restore
 ogs db user add | rotate <id> <utilisateur>
 ogs secrets list | show | env <id>
+ogs cert list | issue | renew | revoke | delete
+ogs cert dns-provider set ovh --application-key … 
 ```
 
 ## Utilisation réelle
@@ -130,6 +132,32 @@ supprime une base : il est donc désactivé par défaut.
 ```sh
 OGS_TEST_POSTGRES=1 go test ./internal/provider/db/
 ```
+
+### Certificats TLS
+
+```sh
+sudo ogs apply shopfr          # vhost HTTP, puis certificat, puis bascule en TLS
+sudo ogs cert list
+sudo ogs cert renew --all      # ce que fait le timer ogs-renew deux fois par jour
+```
+
+L'ordre importe : le vhost HTTP doit répondre avant le challenge HTTP-01, et le
+`/.well-known/acme-challenge` est servi **avant** la redirection vers HTTPS — sans
+quoi aucun renouvellement n'aboutirait. L'émission est non bloquante : si elle
+échoue, le site reste en ligne en HTTP avec un avertissement et une commande de
+reprise.
+
+Les **préproductions partagent un wildcard** `*.preprod-pp.net` : créer une préprod
+ne déclenche donc aucun appel à l'autorité. Ce certificat exige le challenge DNS-01,
+donc des identifiants OVH :
+
+```sh
+sudo ogs cert dns-provider set ovh --client-id … --client-secret …
+sudo ogs cert issue @wildcard-prep
+```
+
+Après cinq échecs consécutifs sur un même jeu de domaines, les tentatives sont
+suspendues une heure : insister ferait perdre le droit d'émettre pour le domaine.
 
 ## Conventions structurantes
 

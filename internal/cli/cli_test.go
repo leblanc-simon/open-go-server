@@ -728,3 +728,208 @@ func TestPlanShowsSQLWithoutSecrets(t *testing.T) {
 		t.Errorf("le plan ne doit pas exposer de mot de passe :\n%s", out)
 	}
 }
+
+// --- Lot L3 : certificats TLS ---
+
+func TestCertificateIssuedThenVHostSwitchesToTLS(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("project", "create", "shop.fr", "--kind", "php-symfony", "--php", "8.5")
+
+	// L'ordre du plan est structurant : le vhost HTTP doit répondre avant le
+	// challenge, et la bascule TLS ne peut venir qu'après l'émission.
+	plan := h.mustRun("plan", "shopfr")
+	iVHost := strings.Index(plan, "vhost apache shopfr")
+	iCert := strings.Index(plan, "certificat shopfr")
+	iTLS := strings.Index(plan, "activation TLS")
+	if iVHost < 0 || iCert < 0 || iTLS < 0 {
+		t.Fatalf("plan incomplet :\n%s", plan)
+	}
+	if !(iVHost < iCert && iCert < iTLS) {
+		t.Errorf("ordre incorrect (vhost=%d cert=%d tls=%d) :\n%s", iVHost, iCert, iTLS, plan)
+	}
+	// L'émission est non bloquante : un site en HTTP vaut mieux qu'un site absent.
+	if !strings.Contains(plan, "certificat shopfr pour shop.fr (http-01)  (non bloquant)") {
+		t.Errorf("l'émission doit être annoncée non bloquante :\n%s", plan)
+	}
+
+	h.mustRun("apply", "shopfr", "--yes")
+	vhost := h.read(t, filepath.Join("etc", "apache2", "sites-available", "shopfr.conf"))
+	if !strings.Contains(vhost, "VirtualHost *:443") {
+		t.Errorf("le vhost doit avoir basculé en TLS :\n%s", vhost)
+	}
+	if !strings.Contains(vhost, "Strict-Transport-Security") {
+		t.Error("HSTS doit être posé sur le vhost chiffré")
+	}
+	// Le challenge reste servi avant la redirection, sinon aucun renouvellement
+	// ne pourrait aboutir.
+	iChallenge := strings.Index(vhost, "acme-challenge")
+	iRedirect := strings.Index(vhost, "RewriteRule")
+	if iChallenge < 0 || iRedirect < 0 || iChallenge > iRedirect {
+		t.Errorf("le challenge doit précéder la redirection :\n%s", vhost)
+	}
+	// Et le certificat existe réellement, avec une clé privée protégée.
+	key := h.path("var", "lib", "ogs", "acme", "certificates", "shopfr", "privkey.pem")
+	info, err := os.Stat(key)
+	if err != nil {
+		t.Fatalf("clé privée absente : %v", err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Errorf("clé privée en %04o, attendu 0600", info.Mode().Perm())
+	}
+}
+
+func TestPrepSharesWildcardCertificate(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("project", "create", "shop.fr", "--env", "prep", "--kind", "php-symfony", "--php", "8.5")
+	h.mustRun("apply", "--yes")
+
+	list := h.mustRun("cert", "list")
+	if !strings.Contains(list, "@wildcard-prep") {
+		t.Errorf("le wildcard partagé doit être émis :\n%s", list)
+	}
+	// Aucun certificat propre à la préproduction : c'est tout l'intérêt du
+	// partage, une création de préprod ne déclenche aucune émission.
+	if strings.Contains(list, "shopfrprep") {
+		t.Errorf("la préproduction ne doit pas avoir son propre certificat :\n%s", list)
+	}
+	vhost := h.read(t, filepath.Join("etc", "apache2", "sites-available", "shopfrprep.conf"))
+	if !strings.Contains(vhost, "_shared-wildcard-prep") {
+		t.Errorf("le vhost doit référencer le certificat partagé :\n%s", vhost)
+	}
+	// Et l'interdiction d'indexation reste en place.
+	if !strings.Contains(vhost, "noindex") {
+		t.Error("une préproduction ne doit pas être indexable")
+	}
+}
+
+func TestCertDeleteRefusesReferencedShared(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("project", "create", "shop.fr", "--env", "prep", "--kind", "static")
+	h.mustRun("apply", "--yes")
+	out, code := h.run("cert", "delete", "@wildcard-prep")
+	if code != CodeConflict {
+		t.Fatalf("code %d attendu %d :\n%s", code, CodeConflict, out)
+	}
+	if !strings.Contains(out, "shopfrprep") {
+		t.Errorf("le refus doit nommer les projets concernés :\n%s", out)
+	}
+}
+
+func TestCertRenewSaysNothingToDo(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("project", "create", "shop.fr", "--kind", "static")
+	h.mustRun("apply", "--yes")
+	out := h.mustRun("cert", "renew", "--all")
+	if !strings.Contains(out, "aucun certificat n'arrive à échéance") {
+		t.Errorf("un certificat frais ne doit pas être renouvelé :\n%s", out)
+	}
+	// --force renouvelle malgré tout.
+	out = h.mustRun("cert", "renew", "--all", "--force")
+	if !strings.Contains(out, "renouvelé") {
+		t.Errorf("--force doit renouveler :\n%s", out)
+	}
+}
+
+func TestCertIssueSelfSignedAndAudit(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("project", "create", "shop.fr", "--kind", "static")
+	out := h.mustRun("cert", "issue", "shopfr", "--self-signed")
+	if !strings.Contains(out, "valable jusqu'au") {
+		t.Errorf("sortie inattendue :\n%s", out)
+	}
+	audit := h.read(t, filepath.Join("var", "log", "ogs", "audit.log"))
+	if !strings.Contains(audit, "cert.issue") {
+		t.Errorf("l'émission doit être consignée :\n%s", audit)
+	}
+	// Un certificat auto-signé n'a rien à révoquer auprès d'une autorité.
+	if out, code := h.run("cert", "revoke", "shopfr"); code != CodeUsage {
+		t.Errorf("code %d attendu %d :\n%s", code, CodeUsage, out)
+	}
+}
+
+func TestCertIssueOnPrepRedirectsToSharedCertificate(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("project", "create", "shop.fr", "--env", "prep", "--kind", "static")
+	out, code := h.run("cert", "issue", "shopfrprep")
+	if code != CodeUsage {
+		t.Fatalf("code %d attendu %d :\n%s", code, CodeUsage, out)
+	}
+	if !strings.Contains(out, "@wildcard-prep") {
+		t.Errorf("le message doit orienter vers le certificat partagé :\n%s", out)
+	}
+}
+
+func TestCertDNSProviderSet(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	// Identifiants incomplets : refus explicite plutôt qu'un échec au premier
+	// renouvellement.
+	if out, code := h.run("cert", "dns-provider", "set", "ovh", "--application-key", "x"); code != CodeUsage {
+		t.Errorf("code %d attendu %d :\n%s", code, CodeUsage, out)
+	}
+	if out, code := h.run("cert", "dns-provider", "set", "cloudflare"); code != CodeUsage {
+		t.Errorf("provider non géré : code %d attendu %d :\n%s", code, CodeUsage, out)
+	}
+	h.mustRun("cert", "dns-provider", "set", "ovh",
+		"--application-key", "ak", "--application-secret", "as", "--consumer-key", "ck")
+	path := h.path("etc", "ogs", "credentials", "dns", "ovh.yaml")
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Ces identifiants donnent un droit d'écriture sur la zone entière.
+	if info.Mode().Perm() != 0o600 {
+		t.Errorf("mode %04o, attendu 0600", info.Mode().Perm())
+	}
+	content := h.read(t, filepath.Join("etc", "ogs", "credentials", "dns", "ovh.yaml"))
+	if !strings.Contains(content, "applicationKey: ak") || !strings.Contains(content, "endpoint: ovh-eu") {
+		t.Errorf("contenu inattendu :\n%s", content)
+	}
+}
+
+func TestRenewTimerIsInstalled(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("project", "create", "shop.fr", "--kind", "static")
+	h.mustRun("apply", "--yes")
+	timer := h.read(t, filepath.Join("etc", "systemd", "system", "ogs-renew.timer"))
+	if !strings.Contains(timer, "OnCalendar=*-*-* 03,15:00:00") {
+		t.Errorf("cadence inattendue :\n%s", timer)
+	}
+	// L'étalement évite que cent serveurs sollicitent l'autorité à la même seconde.
+	if !strings.Contains(timer, "RandomizedDelaySec=3600") {
+		t.Error("l'étalement aléatoire est nécessaire")
+	}
+	if !strings.Contains(timer, "Persistent=true") {
+		t.Error("une fenêtre manquée doit être rattrapée")
+	}
+	service := h.read(t, filepath.Join("etc", "systemd", "system", "ogs-renew.service"))
+	if !strings.Contains(service, "cert renew --all") {
+		t.Errorf("commande inattendue :\n%s", service)
+	}
+	// Le code 6 (succès partiel) ne doit pas marquer l'unité en échec.
+	if !strings.Contains(service, "SuccessExitStatus=0 6") {
+		t.Error("un renouvellement partiel ne doit pas faire échouer l'unité")
+	}
+}
+
+func TestDoctorWarnsOnExpiringCertificate(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("project", "create", "shop.fr", "--kind", "static")
+	h.mustRun("apply", "--yes")
+	// Un certificat frais ne doit pas produire d'avertissement TLS.
+	out, _ := h.run("doctor")
+	if strings.Contains(out, "expire dans") {
+		t.Errorf("aucun avertissement attendu pour un certificat neuf :\n%s", out)
+	}
+	if !strings.Contains(out, "certificats") {
+		t.Errorf("doctor doit rendre compte des certificats :\n%s", out)
+	}
+}

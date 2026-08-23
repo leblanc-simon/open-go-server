@@ -242,3 +242,49 @@ func TestAudit(t *testing.T) {
 		t.Errorf("filtre temporel : %d entrées, %v", len(recent), err)
 	}
 }
+
+func TestACMEFailureBackoff(t *testing.T) {
+	s := open(t)
+	key := "shop.fr"
+	// Sous le seuil, aucune suspension : un échec ponctuel (DNS non propagé) ne
+	// doit pas bloquer les tentatives suivantes.
+	for i := 1; i < ACMEFailureThreshold; i++ {
+		count, until, err := s.RecordACMEFailure(key, "challenge échoué")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if count != i {
+			t.Errorf("compteur %d, attendu %d", count, i)
+		}
+		if !until.IsZero() {
+			t.Errorf("suspension prématurée au %d-ème échec", i)
+		}
+	}
+	// Au seuil, les tentatives sont suspendues : insister ferait perdre le droit
+	// d'émettre pour le domaine.
+	count, until, err := s.RecordACMEFailure(key, "challenge échoué")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != ACMEFailureThreshold || until.IsZero() {
+		t.Fatalf("seuil non appliqué : compteur %d, jusqu'à %v", count, until)
+	}
+	got, paused, err := s.ACMEPause(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !paused || got.Before(time.Now()) {
+		t.Errorf("suspension non active : %v, %v", got, paused)
+	}
+	// Un autre domaine n'est pas affecté.
+	if _, paused, _ := s.ACMEPause("autre.fr"); paused {
+		t.Error("la suspension doit être propre à la cible")
+	}
+	// Un succès remet le compteur à zéro.
+	if err := s.ClearACMEFailures(key); err != nil {
+		t.Fatal(err)
+	}
+	if _, paused, _ := s.ACMEPause(key); paused {
+		t.Error("le succès doit lever la suspension")
+	}
+}

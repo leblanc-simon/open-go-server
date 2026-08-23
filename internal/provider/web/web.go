@@ -25,7 +25,13 @@ type Provider struct {
 	Templates *template.Set
 	Engine    Engine
 	PHP       *php.Provider
-	Now       func() time.Time
+	// CertRef résout le certificat d'un projet et indique si son matériel est
+	// présent. Le vhost n'est écrit en TLS que si le certificat existe : le
+	// contraire empêcherait le serveur web de démarrer.
+	CertRef func(*model.Project) (string, bool)
+	// CertDir localise le matériel d'un certificat.
+	CertDir func(ref string) string
+	Now     func() time.Time
 }
 
 // Name identifie le provider.
@@ -207,6 +213,19 @@ func (p *Provider) Build(proj *model.Project, vh model.VHost) (*VHostPlan, error
 		frontController = "index.php"
 	}
 
+	// Le TLS n'est activé dans le rendu que si le certificat est réellement
+	// disponible. Sinon le vhost est produit en HTTP seul : c'est aussi ce qui
+	// permet au challenge HTTP-01 d'aboutir avant la première émission.
+	wantTLS := vh.TLS == nil || vh.TLS.Enabled
+	certRef, certReady := "", false
+	if wantTLS && p.CertRef != nil {
+		certRef, certReady = p.CertRef(proj)
+	}
+	certDir := filepath.Join(p.Paths.ACMEDir(), "certificates", name)
+	if certRef != "" && p.CertDir != nil {
+		certDir = p.CertDir(certRef)
+	}
+
 	ctx := map[string]any{
 		"Project":           proj.ID(),
 		"Name":              name,
@@ -218,9 +237,9 @@ func (p *Provider) Build(proj *model.Project, vh model.VHost) (*VHostPlan, error
 		"FrontController":   frontController,
 		"AllowOverride":     at.AllowOverride,
 		"ACMEChallenge":     p.Paths.ACMEChallenge(),
-		"TLS":               vh.TLS != nil && vh.TLS.Enabled,
+		"TLS":               wantTLS && certReady,
 		"HSTS":              optionBool(vh.Options, "hsts", true),
-		"CertDir":           filepath.Join(p.Paths.ACMEDir(), "certificates", name),
+		"CertDir":           certDir,
 		"Noindex":           proj.IsPrep(),
 		"BasicAuthFile":     "",
 		"ClientMaxBodySize": optionString(vh.Options, "clientMaxBodySize", "32M"),
@@ -343,6 +362,49 @@ func (p *Provider) vhostStep(proj *model.Project, bp *VHostPlan) []*engine.Step 
 	} else {
 		steps = append(steps, engine.NewStep(resource+"/enabled", engine.NoOp,
 			fmt.Sprintf("vhost %s actif", bp.Name)))
+	}
+	return steps
+}
+
+// PlanTLS produit la bascule en TLS des vhosts dont le certificat n'était pas
+// encore disponible au moment du calcul. Ces étapes sont appliquées après
+// l'émission : le rendu est donc recalculé au moment de l'exécution, pas au plan.
+func (p *Provider) PlanTLS(_ context.Context, proj *model.Project) []*engine.Step {
+	if p.CertRef == nil {
+		return nil
+	}
+	if _, ready := p.CertRef(proj); ready {
+		// Le certificat était déjà là : le vhost a été écrit en TLS d'emblée.
+		return nil
+	}
+	var steps []*engine.Step
+	for _, vh := range p.vhosts(proj) {
+		if vh.TLS != nil && !vh.TLS.Enabled {
+			continue
+		}
+		vhCopy := vh
+		name := p.vhostName(proj, vh)
+		s := engine.NewStep("web/vhost/"+name+"/tls", engine.Update,
+			fmt.Sprintf("activation TLS du vhost %s", name))
+		// Non critique : si l'émission a échoué, le site reste servi en HTTP.
+		s.Critical = false
+		s.Apply = func(ctx context.Context) error {
+			ref, ready := p.CertRef(proj)
+			if !ready {
+				return fmt.Errorf("certificat %s indisponible : le vhost reste en HTTP "+
+					"(reprendre avec « ogs cert issue %s » puis « ogs apply %s »)", ref, proj.ID(), proj.ID())
+			}
+			bp, err := p.Build(proj, vhCopy)
+			if err != nil {
+				return err
+			}
+			if bp.State == fs.StateCurrent {
+				return nil
+			}
+			return p.writeVHost(ctx, bp)
+		}
+		s.Reload = []string{"web:" + p.Engine.Name()}
+		steps = append(steps, s)
 	}
 	return steps
 }

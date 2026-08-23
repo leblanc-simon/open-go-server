@@ -58,6 +58,7 @@ func NewRootCommand() *cobra.Command {
 		newTemplateCommand(app),
 		newDBCommand(app),
 		newSecretsCommand(app),
+		newCertCommand(app),
 	)
 	return root
 }

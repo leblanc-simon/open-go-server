@@ -125,6 +125,16 @@ var migrations = []string{
 		PRIMARY KEY (kind, name)
 	);
 	`,
+	// 2 — suivi des échecs ACME, pour ne pas épuiser les quotas de l'autorité
+	`
+	CREATE TABLE acme_failures (
+		key     TEXT PRIMARY KEY,
+		count   INTEGER NOT NULL DEFAULT 0,
+		last_at TEXT NOT NULL,
+		until   TEXT,
+		detail  TEXT NOT NULL DEFAULT ''
+	);
+	`,
 }
 
 func (s *Store) migrate() error {
@@ -394,6 +404,59 @@ func (s *Store) SecretNames(scope string) ([]string, error) {
 		out = append(out, n)
 	}
 	return out, rows.Err()
+}
+
+// ACMEFailureThreshold est le nombre d'échecs consécutifs au-delà duquel les
+// tentatives sont suspendues. Les autorités de certification limitent les échecs
+// de validation : insister ferait perdre le droit d'émettre pour le domaine.
+const ACMEFailureThreshold = 5
+
+// ACMEPauseDuration est la durée de la suspension.
+const ACMEPauseDuration = time.Hour
+
+// RecordACMEFailure enregistre un échec d'émission et renvoie le compteur ainsi
+// que la date de fin de suspension si le seuil est atteint.
+func (s *Store) RecordACMEFailure(key, detail string) (count int, until time.Time, err error) {
+	if err := s.db.QueryRow(`SELECT count FROM acme_failures WHERE key = ?`, key).Scan(&count); err != nil {
+		count = 0
+	}
+	count++
+	if count >= ACMEFailureThreshold {
+		until = time.Now().Add(ACMEPauseDuration)
+	}
+	var untilValue any
+	if !until.IsZero() {
+		untilValue = until.UTC().Format(time.RFC3339Nano)
+	}
+	_, err = s.db.Exec(`
+		INSERT INTO acme_failures (key, count, last_at, until, detail) VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT(key) DO UPDATE SET count = excluded.count, last_at = excluded.last_at,
+			until = excluded.until, detail = excluded.detail`,
+		key, count, now(), untilValue, detail)
+	return count, until, err
+}
+
+// ClearACMEFailures remet le compteur à zéro après un succès.
+func (s *Store) ClearACMEFailures(key string) error {
+	_, err := s.db.Exec(`DELETE FROM acme_failures WHERE key = ?`, key)
+	return err
+}
+
+// ACMEPause indique si les tentatives sont suspendues pour cette cible.
+func (s *Store) ACMEPause(key string) (until time.Time, paused bool, err error) {
+	var raw sql.NullString
+	err = s.db.QueryRow(`SELECT until FROM acme_failures WHERE key = ?`, key).Scan(&raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return time.Time{}, false, nil
+	}
+	if err != nil || !raw.Valid {
+		return time.Time{}, false, err
+	}
+	until, err = time.Parse(time.RFC3339Nano, raw.String)
+	if err != nil {
+		return time.Time{}, false, nil
+	}
+	return until, time.Now().Before(until), nil
 }
 
 // AuditEntry est une ligne du journal d'audit.
