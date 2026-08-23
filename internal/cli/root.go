@@ -1,7 +1,10 @@
 package cli
 
 import (
+	"os"
+
 	"github.com/spf13/cobra"
+	"golang.org/x/term"
 
 	"github.com/leviathan/ogs/internal/version"
 )
@@ -32,6 +35,10 @@ func NewRootCommand() *cobra.Command {
 		},
 		PersistentPostRun: func(*cobra.Command, []string) { app.close() },
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			// Sans argument sur un terminal, l'inspecteur est plus utile que l'aide.
+			if term.IsTerminal(int(os.Stdout.Fd())) {
+				return newTUICommand(app).RunE(cmd, nil)
+			}
 			return cmd.Help()
 		},
 	}
@@ -70,6 +77,7 @@ func NewRootCommand() *cobra.Command {
 		newCronCommand(app),
 		newSiteCommand(app),
 		newStatusCommand(app),
+		newTUICommand(app),
 	)
 	return root
 }

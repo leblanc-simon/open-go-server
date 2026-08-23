@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"time"
 
 	"github.com/goccy/go-yaml"
 
@@ -60,6 +61,9 @@ type App struct {
 	// allowNonRoot lève l'exigence de root pour la surface déléguée « ogs my ».
 	allowNonRoot bool
 }
+
+// nowFunc est isolé pour rester substituable en test.
+var nowFunc = time.Now
 
 // newApp construit le contexte, sans ouvrir la base : les commandes qui en ont
 // besoin appellent openStore.

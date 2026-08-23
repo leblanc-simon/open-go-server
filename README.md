@@ -22,7 +22,7 @@ C'est la référence : toute contribution s'y adosse.
 | **L4** | RabbitMQ : vhosts, utilisateurs, exchanges, files, bindings, policies, préréglage Messenger, arguments immuables détectés | **livré** |
 | **L5** | Tâches planifiées, services systemd templatisés avec instances multiples, délégation sudoers, répertoires d'exécution | **livré** |
 | **L6** | Composition : `site create` et `site clone`, suppression avec archivage, restauration, `status` | **livré** |
-| L7 | TUI (Bubble Tea) | à venir |
+| **L7** | Interface en mode texte : inspecteur, actions contextuelles, assistant de création | **livré** |
 | L8 | Import d'un serveur existant | à venir |
 | L9 | Applications Go, Node, Ruby, Python | à venir |
 | L10 | Industrialisation : hooks, paquet .deb, CI, documentation | à venir |
@@ -85,6 +85,7 @@ ogs site clone <id> --to prep
 ogs project delete <id> [--purge] [--keep-data] [--no-dump]
 ogs project restore <archive> | archives
 ogs status [id...]
+ogs tui                                    (ou « ogs » sans argument)
 ```
 
 ## Utilisation réelle
@@ -269,6 +270,22 @@ shopfr  prod  shop.fr  8.5  0       2/2       89 j  sain
 
 Le code de retour est non nul dès qu'un écart, un service manquant ou un certificat
 proche de l'échéance est détecté.
+
+### Interface en mode texte
+
+```sh
+sudo ogs          # ou « ogs tui »
+```
+
+Liste des projets à gauche, détail à droite, actions au clavier : `d` pour les
+écarts, `a` pour appliquer, `s` pour redémarrer, `c` pour renouveler le certificat,
+`n` pour l'assistant de création, `/` pour filtrer.
+
+Toute action mutante demande confirmation et passe par **le même moteur** que la
+ligne de commande : l'interface n'a pas de chemin privilégié, et la sortie affichée
+est celle qu'aurait produite `ogs apply`. `NO_COLOR` et `TERM=dumb` sont respectés —
+l'information reste portée par les symboles (`●` sain, `⚠` dérive, `✕` erreur), donc
+lisible sans couleur.
 
 ## Conventions structurantes
 
