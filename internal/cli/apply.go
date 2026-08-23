@@ -122,6 +122,38 @@ func (a *App) buildPlan(ctx context.Context, provs *providers, p *model.Project)
 	for _, s := range stale {
 		plan.Add(s)
 	}
+
+	// Tâches planifiées et services : ils viennent après le site, puisqu'ils
+	// s'appuient sur son arborescence et son interpréteur.
+	cronSteps, err := provs.Cron.Plan(ctx, p)
+	if err != nil {
+		return nil, wrap(CodeValidation, err)
+	}
+	for _, s := range cronSteps {
+		plan.Add(s)
+	}
+
+	unitObs, err := provs.Unit.Observe(ctx, p)
+	if err != nil {
+		return nil, wrap(CodeError, err)
+	}
+	unitSteps, err := provs.Unit.Plan(ctx, p, unitObs)
+	if err != nil {
+		return nil, wrap(CodeValidation, err)
+	}
+	for _, s := range unitSteps {
+		plan.Add(s)
+	}
+
+	// La délégation est écrite en dernier : en style systemctl, elle énumère les
+	// instances, dont le nombre vient d'être arrêté.
+	if len(p.Spec.Services) > 0 || p.Spec.Sudo != nil {
+		sudoStep, err := provs.Sudoers.Plan(ctx, p, unitObs.Instances)
+		if err != nil {
+			return nil, wrap(CodeValidation, err)
+		}
+		plan.Add(sudoStep)
+	}
 	return plan, nil
 }
 
@@ -133,6 +165,13 @@ func (a *App) buildGlobalPlan(provs *providers, projects []*model.Project) (*eng
 		return nil, wrap(CodeError, err)
 	}
 	plan.Add(step)
+
+	// Répertoires d'exécution : verrous de tâches et sockets applicatifs.
+	runtimeStep, err := provs.Runtime.Plan(projects)
+	if err != nil {
+		return nil, wrap(CodeError, err)
+	}
+	plan.Add(runtimeStep)
 
 	// Timer de renouvellement : ressource de portée serveur, installée dès qu'un
 	// certificat est en jeu.
@@ -166,6 +205,9 @@ func (a *App) reloadFunc(provs *providers) func(context.Context, string) error {
 		case target == "systemd:daemon-reload":
 			a.printf("  ↻ systemctl daemon-reload\n")
 			return a.systemctl(ctx, "daemon-reload")
+		case target == "systemd:tmpfiles":
+			a.printf("  ↻ systemd-tmpfiles --create\n")
+			return a.systemctlBin(ctx, "systemd-tmpfiles", "--create")
 		case strings.HasPrefix(target, "systemd:enable:"):
 			unit := strings.TrimPrefix(target, "systemd:enable:")
 			a.printf("  ↻ activation de %s\n", unit)
@@ -463,10 +505,15 @@ func newApplyCommand(app *App) *cobra.Command {
 
 // systemctl pilote systemd. En mode simulé, aucune commande n'est exécutée.
 func (a *App) systemctl(ctx context.Context, args ...string) error {
+	return a.systemctlBin(ctx, "systemctl", args...)
+}
+
+// systemctlBin exécute un binaire systemd.
+func (a *App) systemctlBin(ctx context.Context, bin string, args ...string) error {
 	if a.Exec.Simulated() {
 		return nil
 	}
-	_, err := a.Exec.Run(ctx, exec.Command{Name: "systemctl", Args: args})
+	_, err := a.Exec.Run(ctx, exec.Command{Name: bin, Args: args})
 	return err
 }
 

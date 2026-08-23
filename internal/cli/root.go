@@ -25,6 +25,9 @@ func NewRootCommand() *cobra.Command {
 			if cmd.Annotations["skip-setup"] == "true" {
 				return nil
 			}
+			if cmd.Annotations["skip-root"] == "true" || parentAllowsNonRoot(cmd) {
+				app.allowNonRoot = true
+			}
 			return app.setup()
 		},
 		PersistentPostRun: func(*cobra.Command, []string) { app.close() },
@@ -62,8 +65,21 @@ func NewRootCommand() *cobra.Command {
 		newSecretsCommand(app),
 		newCertCommand(app),
 		newAMQPCommand(app),
+		newServiceCommand(app),
+		newMyCommand(app),
+		newCronCommand(app),
 	)
 	return root
+}
+
+// parentAllowsNonRoot propage la dérogation aux sous-commandes de « my ».
+func parentAllowsNonRoot(cmd *cobra.Command) bool {
+	for c := cmd.Parent(); c != nil; c = c.Parent() {
+		if c.Annotations["skip-root"] == "true" {
+			return true
+		}
+	}
+	return false
 }
 
 func newVersionCommand(app *App) *cobra.Command {

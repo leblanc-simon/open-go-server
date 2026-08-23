@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 	"text/tabwriter"
 
 	"github.com/spf13/cobra"
@@ -140,6 +141,34 @@ func (a *App) runChecks() []check {
 		return out
 	}
 	add("projets", "ok", fmt.Sprintf("%d déclaré(s)", len(projects)), "")
+
+	// Délégation sudo : un fichier au préfixe ogs- non généré par l'outil, ou
+	// élargi à la main, mérite d'être signalé.
+	if provs, err := a.buildProviders(); err == nil {
+		if problems, err := provs.Sudoers.Audit(); err == nil {
+			for _, p := range problems {
+				add("sudoers", "échec", p, "vérifier ce fichier à la main")
+			}
+			if len(problems) == 0 {
+				add("sudoers", "ok", "fichiers de délégation conformes", "")
+			}
+		}
+		provs.close()
+	}
+	// « ogs my » identifie l'appelant par SUDO_UID, que sudo ne positionne de
+	// façon fiable que si env_reset est active.
+	if a.Prefix == "" {
+		if data, err := os.ReadFile("/etc/sudoers"); err == nil {
+			if strings.Contains(string(data), "!env_reset") {
+				add("sudo env_reset", "échec",
+					"env_reset est désactivée : l'appelant contrôle son environnement et « ogs my » "+
+						"ne peut plus l'identifier de façon sûre",
+					"réactiver Defaults env_reset dans /etc/sudoers")
+			} else {
+				add("sudo env_reset", "ok", "active", "")
+			}
+		}
+	}
 
 	// Certificats : le seuil d'alerte d'un partagé est plus précoce, son
 	// expiration cassant toutes les préproductions à la fois.

@@ -20,7 +20,7 @@ C'est la référence : toute contribution s'y adosse.
 | **L2** | Bases MySQL/MariaDB et PostgreSQL : privilèges nommés, échappement des motifs de `GRANT`, keystore, multi-cluster PostgreSQL, dump/restore, `secrets env` | **livré** |
 | **L3** | TLS : ACME embarqué (lego), HTTP-01 et DNS-01 OVH, wildcard partagé pour les préproductions, timer de renouvellement, suspension après échecs répétés | **livré** |
 | **L4** | RabbitMQ : vhosts, utilisateurs, exchanges, files, bindings, policies, préréglage Messenger, arguments immuables détectés | **livré** |
-| L5 | Crons, services systemd templatisés, délégation `ogs my` | à venir |
+| **L5** | Tâches planifiées, services systemd templatisés avec instances multiples, délégation sudoers, répertoires d'exécution | **livré** |
 | L6 | Composition : `site create`, archivage, restauration, `status` | à venir |
 | L7 | TUI (Bubble Tea) | à venir |
 | L8 | Import d'un serveur existant | à venir |
@@ -77,6 +77,9 @@ ogs cert list | issue | renew | revoke | delete
 ogs cert dns-provider set ovh --application-key … 
 ogs amqp status | messenger | queue add | queue purge
 ogs amqp credentials set --user … --password …
+ogs cron add | remove | list | enable | disable | run
+ogs service add | remove | list | start | stop | restart | scale | logs
+ogs my start | stop | restart | status      (surface déléguée par sudo)
 ```
 
 ## Utilisation réelle
@@ -184,6 +187,39 @@ concernés, et refuse d'agir sans `--recreate-queues` :
   ⚠ les arguments d'une queue sont immuables : recréer async détruirait 1240 message(s)
     en attente et 3 consumer(s) seraient déconnectés — relancer avec --recreate-queues
 ```
+
+### Tâches planifiées et services
+
+```sh
+sudo ogs cron add shopfr scheduler --schedule "* * * * *" --command "bin/console schedule:run"
+sudo ogs service add shopfr messenger-async --transport async --instances 3
+sudo ogs apply shopfr
+```
+
+Chaque tâche est enveloppée dans `flock` par défaut, s'exécute sous l'utilisateur du
+projet et journalise dans `logs/` — un fichier **pré-créé par ogs**, puisque `logs/`
+appartient à root et que la tâche ne pourrait pas le créer elle-même. Les occurrences
+à venir sont affichées à la déclaration, pour confirmer que l'expression dit bien ce
+qu'on croit.
+
+Les services sont des **unités templatisées** : mettre à l'échelle ne duplique aucun
+fichier, et `ogs service scale` agit immédiatement sans modifier la déclaration — le
+prochain `apply` rétablit le nombre déclaré.
+
+### Délégation à l'utilisateur du projet
+
+```sh
+# depuis le compte du projet
+sudo ogs my restart
+```
+
+Le fichier `/etc/sudoers.d/ogs-<id>` énumère les commandes autorisées, **sans le
+moindre métacaractère** : un `*` laisserait passer des arguments imprévus, et un
+`systemctl` sans unité ouvrirait `link`, `isolate`, `mask` ou l'arrêt de la machine.
+La commande `ogs my` ne prend aucun argument de projet — il est déduit de `SUDO_UID`,
+que sudo positionne après avoir purgé l'environnement. `ogs doctor` vérifie que
+`env_reset` est bien active, sans quoi cette déduction ne serait plus fiable, et
+audite les fichiers de délégation à la recherche d'un élargissement manuel.
 
 ## Conventions structurantes
 

@@ -279,7 +279,7 @@ func (p *Provider) dirSteps(proj *model.Project, obs Observed) ([]*engine.Step, 
 func (p *Provider) ensureDir(proj *model.Project, path string, mode os.FileMode, owner string) error {
 	target := fs.KeepOwner
 	if !p.Exec.Simulated() {
-		uid, gid, err := p.resolveOwner(proj, owner)
+		uid, gid, err := p.ResolveOwner(proj, owner)
 		if err != nil {
 			return err
 		}
@@ -288,8 +288,9 @@ func (p *Provider) ensureDir(proj *model.Project, path string, mode os.FileMode,
 	return fs.EnsureDir(path, mode, target)
 }
 
-// resolveOwner traduit le propriétaire attendu en identifiants numériques.
-func (p *Provider) resolveOwner(proj *model.Project, owner string) (uid, gid int, err error) {
+// ResolveOwner traduit le propriétaire attendu en identifiants numériques. Les
+// autres providers en ont besoin pour créer des fichiers appartenant au projet.
+func (p *Provider) ResolveOwner(proj *model.Project, owner string) (uid, gid int, err error) {
 	g, err := p.Identity.LookupGroup(proj.Spec.User.Group)
 	if err != nil {
 		return -1, -1, err

@@ -1,0 +1,33 @@
+[Unit]
+Description={{ .Description }} (instance %i)
+PartOf={{ .Target }}
+After=network.target
+
+[Service]
+Type=simple
+User={{ .User }}
+Group={{ .Group }}
+WorkingDirectory={{ .Workdir }}
+{{- range $key := sorted .Environment }}
+Environment={{ $key }}={{ index $.Environment $key }}
+{{- end }}
+ExecStart={{ .Command }}
+Restart=always
+RestartSec={{ .RestartSec }}
+StartLimitBurst=10
+StartLimitIntervalSec=600
+KillSignal=SIGTERM
+TimeoutStopSec={{ .StopTimeout }}
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier={{ .Identifier }}
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths={{ .Workdir }}/var {{ .RunDir }}
+UMask={{ .UMask }}
+
+[Install]
+WantedBy={{ .Target }}

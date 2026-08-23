@@ -48,7 +48,7 @@ func (p *Provider) keyStep(proj *model.Project) *engine.Step {
 		if p.Exec.Simulated() {
 			return nil
 		}
-		uid, gid, err := p.resolveOwner(proj, "")
+		uid, gid, err := p.ResolveOwner(proj, "")
 		if err != nil {
 			return err
 		}

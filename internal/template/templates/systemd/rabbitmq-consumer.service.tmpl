@@ -1,0 +1,36 @@
+[Unit]
+# Symfony 3.4 n'a pas le composant Messenger : le consumer passe par
+# oldsound/rabbitmq-bundle, avec les mêmes garde-fous.
+Description={{ .Description }} (instance %i)
+PartOf={{ .Target }}
+After=network.target{{ if .AfterBroker }} rabbitmq-server.service{{ end }}
+
+[Service]
+Type=simple
+User={{ .User }}
+Group={{ .Group }}
+WorkingDirectory={{ .Workdir }}
+{{- range $key := sorted .Environment }}
+Environment={{ $key }}={{ index $.Environment $key }}
+{{- end }}
+ExecStart={{ .Interpreter }} {{ .Console }} rabbitmq:consumer {{ .Transport }} \
+  --messages={{ .Limit }} --memory-limit={{ .MemoryLimitMiB }} -v
+Restart=always
+RestartSec={{ .RestartSec }}
+StartLimitBurst=10
+StartLimitIntervalSec=600
+KillSignal=SIGTERM
+TimeoutStopSec={{ .StopTimeout }}
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier={{ .Identifier }}
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths={{ .Workdir }}/var {{ .RunDir }}
+UMask={{ .UMask }}
+
+[Install]
+WantedBy={{ .Target }}

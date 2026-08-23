@@ -1,0 +1,7 @@
+[Unit]
+Description={{ .Description }}
+# Les unités du projet sont liées par PartOf : arrêter la cible les arrête toutes,
+# ce qui permet un redémarrage groupé et ordonné.
+
+[Install]
+WantedBy=multi-user.target

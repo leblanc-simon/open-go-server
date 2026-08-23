@@ -149,6 +149,7 @@ const (
 	logrotateDir = "/etc/logrotate.d"
 	tmpfilesDir  = "/etc/tmpfiles.d"
 	systemdDir   = "/etc/systemd/system"
+	cronDir      = "/etc/cron.d"
 )
 
 // NewPaths construit les chemins pour un préfixe donné.
@@ -186,6 +187,9 @@ func (p Paths) TmpfilesFile() string  { return p.join(tmpfilesDir, "ogs.conf") }
 
 // SystemdDir renvoie le répertoire des unités systemd générées.
 func (p Paths) SystemdDir() string { return p.join(systemdDir) }
+
+// CronDir renvoie le répertoire des fichiers cron générés.
+func (p Paths) CronDir() string { return p.join(cronDir) }
 
 // ProjectFile renvoie le chemin du fichier d'état désiré d'un projet.
 func (p Paths) ProjectFile(id string) string { return filepath.Join(p.ProjectsDir(), id+".yaml") }

@@ -1162,3 +1162,246 @@ func TestAMQPCredentialsPermissions(t *testing.T) {
 		t.Errorf("mode %04o, attendu 0600", info.Mode().Perm())
 	}
 }
+
+// --- Lot L5 : tâches planifiées, services et délégation ---
+
+func TestCronAndServiceLifecycle(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("project", "create", "shop.fr", "--kind", "php-symfony", "--app-version", "6.4", "--php", "8.5")
+	out := h.mustRun("cron", "add", "shopfr", "scheduler",
+		"--schedule", "0 3 * * *", "--command", "bin/console schedule:run")
+	// Les prochaines occurrences confirment que l'expression dit ce qu'on croit.
+	if !strings.Contains(out, "prochaines exécutions") || !strings.Contains(out, "03:00") {
+		t.Errorf("les occurrences doivent être affichées :\n%s", out)
+	}
+	h.mustRun("service", "add", "shopfr", "messenger-async", "--transport", "async", "--instances", "3")
+	h.mustRun("apply", "shopfr", "--yes")
+
+	// Le fichier cron : verrou, identité, interpréteur par le lien, journal.
+	cronFile := h.read(t, filepath.Join("etc", "cron.d", "ogs-shopfr"))
+	for _, want := range []string{
+		"0 3 * * * shopfr /usr/bin/flock -n",
+		filepath.Join("run", "ogs", "shopfr", "scheduler.lock"),
+		filepath.Join(".bin", "php"),
+		filepath.Join("www", "bin", "console"),
+		"cron-scheduler.log 2>&1",
+		`MAILTO=""`,
+	} {
+		if !strings.Contains(cronFile, want) {
+			t.Errorf("fichier cron incomplet, %q absent :\n%s", want, cronFile)
+		}
+	}
+	if strings.Contains(cronFile, "/usr/bin/php8") {
+		t.Error("aucune version de PHP ne doit être figée dans un cron")
+	}
+	// Le journal est pré-créé : logs/ appartient à root, la tâche ne pourrait pas
+	// le créer elle-même.
+	if _, err := os.Stat(h.path("home", "shop.fr", "logs", "cron-scheduler.log")); err != nil {
+		t.Errorf("journal de tâche absent : %v", err)
+	}
+
+	// Les unités : un modèle, une cible, trois instances activées.
+	if _, err := os.Stat(h.path("etc", "systemd", "system", "ogs-shopfr-messenger-async@.service")); err != nil {
+		t.Errorf("modèle d'unité absent : %v", err)
+	}
+	list := h.mustRun("service", "list", "shopfr")
+	if !strings.Contains(list, "messenger-async") || !strings.Contains(list, "3") {
+		t.Errorf("les instances doivent être comptées :\n%s", list)
+	}
+
+	// Idempotence de l'ensemble.
+	h.simulateSystemEffects("shopfr", "shop.fr", 1004)
+	out = h.mustRun("apply", "shopfr", "--yes")
+	if !strings.Contains(out, "aucun changement") {
+		t.Errorf("un apply rejoué doit être vide :\n%s", out)
+	}
+}
+
+func TestCronDisableKeepsTraceInFile(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("project", "create", "shop.fr", "--kind", "static")
+	h.mustRun("cron", "add", "shopfr", "nettoyage",
+		"--schedule", "0 4 * * *", "--command", "/usr/bin/find /tmp -delete")
+	h.mustRun("apply", "shopfr", "--yes")
+	h.mustRun("cron", "disable", "shopfr", "nettoyage")
+	h.mustRun("apply", "shopfr", "--yes")
+	cronFile := h.read(t, filepath.Join("etc", "cron.d", "ogs-shopfr"))
+	if !strings.Contains(cronFile, "# nettoyage (désactivée)") {
+		t.Errorf("la désactivation doit rester lisible :\n%s", cronFile)
+	}
+	if !strings.Contains(cronFile, "# 0 4 * * * shopfr") {
+		t.Errorf("la ligne doit être commentée, pas supprimée :\n%s", cronFile)
+	}
+	list := h.mustRun("cron", "list", "shopfr")
+	if !strings.Contains(list, "désactivée") {
+		t.Errorf("l'état doit apparaître dans la liste :\n%s", list)
+	}
+}
+
+func TestCronRejectsInvalidExpression(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("project", "create", "shop.fr", "--kind", "static")
+	for _, expr := range []string{"* * * *", "60 * * * *", "0 0 31 2 *"} {
+		out, code := h.run("cron", "add", "shopfr", "x", "--schedule", expr, "--command", "/bin/true")
+		if code != CodeValidation {
+			t.Errorf("expression %q : code %d attendu %d\n%s", expr, code, CodeValidation, out)
+		}
+	}
+}
+
+func TestServiceScaleActsWithoutTouchingDeclaration(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("project", "create", "shop.fr", "--kind", "php-symfony", "--app-version", "6.4", "--php", "8.5")
+	h.mustRun("service", "add", "shopfr", "messenger-async", "--transport", "async", "--instances", "2")
+	h.mustRun("apply", "shopfr", "--yes")
+
+	out := h.mustRun("service", "scale", "shopfr", "messenger-async", "5")
+	if !strings.Contains(out, "5 instance(s)") {
+		t.Errorf("sortie inattendue :\n%s", out)
+	}
+	if !strings.Contains(out, "la déclaration du projet reste inchangée") {
+		t.Error("la nature temporaire de l'opération doit être annoncée")
+	}
+	wants := h.path("etc", "systemd", "system", "ogs-shopfr.target.wants")
+	entries, err := os.ReadDir(wants)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 5 {
+		t.Errorf("%d instances actives, 5 attendues", len(entries))
+	}
+	// Le prochain apply rétablit le nombre déclaré : c'est le propre d'un moteur
+	// de réconciliation.
+	h.mustRun("apply", "shopfr", "--yes")
+	entries, _ = os.ReadDir(wants)
+	if len(entries) != 2 {
+		t.Errorf("%d instances après réconciliation, 2 déclarées", len(entries))
+	}
+}
+
+func TestServiceRefusesMessengerOnSymfony34(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("project", "create", "ancien.fr", "--kind", "php-symfony", "--app-version", "3.4", "--php", "7.4")
+	out, code := h.run("service", "add", "ancienfr", "worker", "--template", "symfony-messenger")
+	if code != CodeValidation {
+		t.Fatalf("code %d attendu %d :\n%s", code, CodeValidation, out)
+	}
+	if !strings.Contains(out, "rabbitmq-consumer") {
+		t.Errorf("le message doit indiquer le template de remplacement :\n%s", out)
+	}
+	// Le template de remplacement est accepté.
+	h.mustRun("service", "add", "ancienfr", "consumer", "--template", "rabbitmq-consumer", "--transport", "async")
+}
+
+func TestSudoersDelegationIsNarrow(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("project", "create", "shop.fr", "--kind", "php-symfony", "--app-version", "6.4", "--php", "8.5")
+	h.mustRun("service", "add", "shopfr", "messenger-async", "--transport", "async")
+	h.mustRun("apply", "shopfr", "--yes")
+
+	path := h.path("etc", "sudoers.d", "ogs-shopfr")
+	content := h.read(t, filepath.Join("etc", "sudoers.d", "ogs-shopfr"))
+	// Aucun métacaractère, aucun systemctl nu, chemin absolu.
+	if strings.ContainsAny(strings.Join(nonCommentLines(content), " "), "*?[]") {
+		t.Errorf("aucun métacaractère ne doit apparaître :\n%s", content)
+	}
+	for _, verb := range []string{"start", "stop", "restart", "status"} {
+		if !strings.Contains(content, "/usr/bin/ogs my "+verb) {
+			t.Errorf("verbe %s absent :\n%s", verb, content)
+		}
+	}
+	// sudo refuse un fichier de sudoers.d inscriptible.
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o440 {
+		t.Errorf("mode %04o, attendu 0440", info.Mode().Perm())
+	}
+}
+
+func nonCommentLines(content string) []string {
+	var out []string
+	for _, line := range strings.Split(content, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed != "" && !strings.HasPrefix(trimmed, "#") {
+			out = append(out, trimmed)
+		}
+	}
+	return out
+}
+
+func TestSudoersSystemctlStyleEnumerates(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("project", "create", "shop.fr", "--kind", "php-symfony", "--app-version", "6.4", "--php", "8.5")
+	h.mustRun("service", "add", "shopfr", "messenger-async", "--transport", "async", "--instances", "2")
+	// Basculer le style dans le fichier de projet.
+	path := h.path("etc", "ogs", "projects", "shopfr.yaml")
+	data := h.read(t, filepath.Join("etc", "ogs", "projects", "shopfr.yaml"))
+	data = strings.Replace(data, "spec:", "spec:\n  sudo:\n    style: systemctl\n    verbs: [restart]", 1)
+	if err := os.WriteFile(path, []byte(data), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h.mustRun("apply", "shopfr", "--yes")
+	content := h.read(t, filepath.Join("etc", "sudoers.d", "ogs-shopfr"))
+	if !strings.Contains(content, "/usr/bin/systemctl restart ogs-shopfr.target") {
+		t.Errorf("la cible doit être autorisée :\n%s", content)
+	}
+	for i := 1; i <= 2; i++ {
+		want := fmt.Sprintf("/usr/bin/systemctl restart ogs-shopfr-messenger-async@%d.service", i)
+		if !strings.Contains(content, want) {
+			t.Errorf("instance %d absente :\n%s", i, content)
+		}
+	}
+	// Aucun verbe non demandé.
+	if strings.Contains(content, "systemctl stop") {
+		t.Errorf("seul le verbe demandé doit être autorisé :\n%s", content)
+	}
+}
+
+func TestMyRequiresIdentifiableCaller(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("project", "create", "shop.fr", "--kind", "static")
+	// Sans SUDO_UID, l'appelant n'est pas identifiable : la commande doit renvoyer
+	// vers la forme explicite plutôt que de deviner.
+	t.Setenv("SUDO_UID", "")
+	out, code := h.run("my", "restart")
+	if code != CodePermission && code != CodeUsage {
+		t.Errorf("code %d :\n%s", code, out)
+	}
+	if !strings.Contains(out, "ogs service") && !strings.Contains(out, "aucun projet") {
+		t.Errorf("le message doit orienter l'appelant :\n%s", out)
+	}
+}
+
+func TestRuntimeDirectoriesAreDeclared(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("project", "create", "shop.fr", "--kind", "static")
+	h.mustRun("apply", "--yes")
+	tmpfiles := h.read(t, filepath.Join("etc", "tmpfiles.d", "ogs.conf"))
+	// Le répertoire du projet doit lui appartenir : il y écrit ses verrous et ses
+	// sockets, et www-data doit pouvoir traverser.
+	if !strings.Contains(tmpfiles, "0750 shopfr shopfr") {
+		t.Errorf("propriétaire attendu :\n%s", tmpfiles)
+	}
+	if !strings.Contains(tmpfiles, "0755 root root") {
+		t.Errorf("la racine doit rester traversable :\n%s", tmpfiles)
+	}
+	// Et le répertoire existe immédiatement, sans attendre un redémarrage.
+	info, err := os.Stat(h.path("run", "ogs", "shopfr"))
+	if err != nil {
+		t.Fatalf("répertoire d'exécution absent : %v", err)
+	}
+	if info.Mode().Perm() != 0o750 {
+		t.Errorf("mode %04o, attendu 0750", info.Mode().Perm())
+	}
+}

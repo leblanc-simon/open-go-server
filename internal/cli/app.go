@@ -15,11 +15,15 @@ import (
 	"github.com/leviathan/ogs/internal/model"
 	"github.com/leviathan/ogs/internal/naming"
 	"github.com/leviathan/ogs/internal/provider/amqp"
+	"github.com/leviathan/ogs/internal/provider/cron"
 	"github.com/leviathan/ogs/internal/provider/db"
 	"github.com/leviathan/ogs/internal/provider/logrotate"
 	"github.com/leviathan/ogs/internal/provider/php"
+	"github.com/leviathan/ogs/internal/provider/runtime"
+	"github.com/leviathan/ogs/internal/provider/sudoers"
 	"github.com/leviathan/ogs/internal/provider/system"
 	tlsprov "github.com/leviathan/ogs/internal/provider/tls"
+	"github.com/leviathan/ogs/internal/provider/unit"
 	"github.com/leviathan/ogs/internal/provider/web"
 	"github.com/leviathan/ogs/internal/secret"
 	"github.com/leviathan/ogs/internal/spec"
@@ -53,6 +57,8 @@ type App struct {
 	// RecreateQueues autorise la recréation d'une queue dont les arguments
 	// immuables ont changé. Cette opération détruit les messages en attente.
 	RecreateQueues bool
+	// allowNonRoot lève l'exigence de root pour la surface déléguée « ogs my ».
+	allowNonRoot bool
 }
 
 // newApp construit le contexte, sans ouvrir la base : les commandes qui en ont
@@ -75,9 +81,10 @@ func (a *App) setup() error {
 		return err
 	}
 	if a.Prefix == "" {
-		// Root strict (D21) : toute opération d'administration exige root. Le mode
-		// préfixé est la seule dérogation, réservée aux tests et au développement.
-		if os.Getuid() != 0 {
+		// Root strict (D21) : toute opération d'administration exige root. Deux
+		// dérogations seulement : le mode préfixé, réservé aux tests, et la surface
+		// déléguée « ogs my », dont la portée est bornée à un projet (D28).
+		if os.Getuid() != 0 && !a.allowNonRoot {
 			return exitf(CodePermission,
 				"ogs doit être exécuté en tant que root ; pour un essai sans privilèges, "+
 					"utiliser --prefix <répertoire>")
@@ -203,6 +210,10 @@ type providers struct {
 	TLS       *tlsprov.Provider
 	DB        *db.Provider
 	AMQP      *amqp.Provider
+	Cron      *cron.Provider
+	Unit      *unit.Provider
+	Sudoers   *sudoers.Provider
+	Runtime   *runtime.Provider
 	PHP       *php.Provider
 	Web       *web.Provider
 	Logrotate *logrotate.Provider
@@ -254,7 +265,12 @@ func (a *App) buildProviders() (*providers, error) {
 		TLS:    certs,
 		DB:     &db.Provider{Paths: a.Paths, Exec: a.Exec, Store: a.Store, Keys: a.Keys, AMQPPort: amqpPort},
 		AMQP:   amqpProv,
-		PHP:    php,
+		Cron: &cron.Provider{Paths: a.Paths, Templates: tmpl,
+			Owner: func(proj *model.Project) (int, int, error) { return sys.ResolveOwner(proj, "") }},
+		Unit:    &unit.Provider{Paths: a.Paths, Exec: a.Exec, Templates: tmpl},
+		Sudoers: &sudoers.Provider{Paths: a.Paths, Exec: a.Exec},
+		Runtime: &runtime.Provider{Paths: a.Paths},
+		PHP:     php,
 		Web: &web.Provider{
 			Paths: a.Paths, Exec: a.Exec, Templates: tmpl, Engine: eng, PHP: php,
 			CertRef: certs.CertificateFor,

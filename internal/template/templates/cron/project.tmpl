@@ -1,0 +1,8 @@
+SHELL=/bin/sh
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# Aucune notification par courriel : les sorties sont journalisées dans logs/.
+MAILTO=""
+{{ range .Jobs }}
+# {{ .Name }}{{ if not .Enabled }} (désactivée){{ end }}
+{{ if not .Enabled }}# {{ end }}{{ .Schedule }} {{ $.User }} {{ .Command }} >> {{ .Log }} 2>&1
+{{- end }}

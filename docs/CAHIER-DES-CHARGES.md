@@ -96,7 +96,7 @@ Décisions arbitrées et figées pour la v1. Toute remise en cause est une évol
 | D25 | Accès du serveur web | **Groupe privé par projet**, `www-data` ajouté comme **membre secondaire** de chaque groupe | Isolation inter-sites préservée ; `.env` et `var/` restent hors de portée de `www-data` |
 | D26 | Certificats partagés | Un certificat peut être de **portée serveur** et référencé par `@<nom>` ; la préproduction utilise un wildcard `*.preprod-pp.net` unique | Impose DNS-01 et des credentials en écriture sur la zone ; supprime tout appel ACME à la création d'une préproduction |
 | D27 | DNS | **Hors périmètre** : un wildcard `*.preprod-pp.net` est créé manuellement une fois ; `doctor` vérifie seulement la résolution | Un seul serveur de préproduction par domaine |
-| D28 | Délégation | L'utilisateur du projet pilote ses services par **sudoers énuméré, sans métacaractère** ; `ogs my <verbe>` déduit le projet de l'**UID réel** | Aucune cible à détourner ; fichier sudoers validé par `visudo -cf` avant activation |
+| D28 | Délégation | L'utilisateur du projet pilote ses services par **sudoers énuméré, sans métacaractère** ; `ogs my <verbe>` déduit le projet de **`SUDO_UID`** | Aucune cible à détourner ; fichier sudoers validé par `visudo -cf` avant activation ; dépend de `env_reset`, vérifié par `doctor` |
 | D29 | Logs | Logs d'infrastructure dans **`/home/<host>/logs/`**, répertoire **root** avec fichiers pré-créés ; rotation par un `/etc/logrotate.d/ogs` unique | Bloque l'escalade root par substitution de lien symbolique ; un seul reload par rotation |
 | D30 | Interpréteur | Crons et unités invoquent **`/home/<host>/.bin/php`**, lien géré | Une bascule de version ne réécrit ni cron ni unité |
 | D31 | Transport FPM | **Socket Unix par défaut**, numéroté selon la norme `1<version><incrément>` ; TCP possible mais explicite | Le numéro est un identifiant logique, pas un port ouvert |
@@ -1462,11 +1462,18 @@ shopfr ALL=(root) NOPASSWD: /usr/bin/ogs my status
 shopfr ALL=(root) NOPASSWD: /usr/bin/ogs my reload-php
 ```
 
-La sous-commande `ogs my <verbe>` **ne prend aucun argument de projet** : `ogs` détermine le projet à partir
-de l'**UID réel** de l'appelant (`getuid()`, et non `SUDO_USER` qui est déclaratif), puis restreint l'action
-à ce seul projet. Il devient structurellement impossible de cibler un autre projet : il n'y a pas de
-paramètre à détourner, donc pas de wildcard sudoers à contourner. Cette surface est la seule exception à la
-règle root-strict (D21, amendée en D28) ; toute autre commande refuse de s'exécuter hors root.
+La sous-commande `ogs my <verbe>` **ne prend aucun argument de projet** : `ogs` détermine le projet à
+partir de l'identité de l'appelant, puis restreint l'action à ce seul projet. Il devient structurellement
+impossible de cibler un autre projet : il n'y a pas de paramètre à détourner, donc pas de wildcard sudoers à
+contourner. Cette surface est la seule exception à la règle root-strict (D21, amendée en D28) ; toute autre
+commande refuse de s'exécuter hors root.
+
+**Comment l'appelant est identifié.** `getuid()` ne convient pas : `sudo` appelle `setresuid(0, 0, 0)`, donc
+l'UID réel vaut 0 dans le processus délégué. La source retenue est **`SUDO_UID`**, que `sudo` positionne
+lui-même après avoir purgé l'environnement — comportement de la directive `env_reset`, active par défaut sur
+Debian et Ubuntu. `ogs doctor` vérifie que `env_reset` est bien en vigueur : sans elle, l'appelant contrôle
+son environnement et pourrait se présenter comme un autre projet. En l'absence de `SUDO_UID` (invocation
+directe en root), `ogs my` refuse et renvoie vers `ogs service <verbe> <id>`, qui est explicite.
 
 ```
 $ sudo ogs my restart              # sous l'utilisateur shopfr
@@ -1508,7 +1515,7 @@ moteur de réconciliation s'en charge comme de n'importe quel autre fichier gén
 échec annule l'apply et le fichier précédent reste en place. `ogs doctor` revalide l'ensemble de
 `/etc/sudoers.d/ogs-*` et signale tout fichier étranger portant ce préfixe.
 
-**Traçabilité** : chaque invocation de `ogs my` est écrite au journal d'audit avec l'UID réel, le projet
+**Traçabilité** : chaque invocation de `ogs my` est écrite au journal d'audit avec l'UID appelant, le projet
 déduit et le verbe, au même titre qu'une opération d'administration.
 
 ### 7.10 Types d'application et docroot
@@ -2264,7 +2271,7 @@ Points de conception :
 | Privilège MySQL trop large | Échappement systématique de `_` en `\_` dans tout motif de `GRANT`, verrouillé par un test unitaire dédié (§3.3.5). |
 | Collision prod / préproduction | Suffixe `prep` préservé lors de toute troncature ; unicité vérifiée sur l'identifiant, le host effectif **et** le home. |
 | Escalade root par lien symbolique de log | `logs/` appartient à root et n'est pas inscriptible par l'utilisateur ; les fichiers sont pré-créés. Aucun processus root n'ouvre en écriture un chemin dont un non-root contrôle le répertoire (§7.1.2). |
-| Élargissement de la délégation sudo | Commandes énumérées sans métacaractère, jamais de `systemctl` nu ; `ogs my` ne prend aucun argument et déduit le projet de l'UID réel ; validation `visudo -cf` avant activation, revalidation par `doctor` (§7.9.1). |
+| Élargissement de la délégation sudo | Commandes énumérées sans métacaractère, jamais de `systemctl` nu ; `ogs my` ne prend aucun argument et déduit le projet de `SUDO_UID`, que sudo positionne sous `env_reset` ; validation `visudo -cf` avant activation, revalidation par `doctor` (§7.9.1). |
 | Exécution croisée via un pool FPM | Socket Unix `0660 www-data:<id>` par défaut : seuls le serveur web et l'utilisateur du projet peuvent s'y connecter. Le mode TCP, dépourvu d'authentification, exige `--allow-tcp` et un avertissement explicite (§7.5). |
 | Détournement de l'interpréteur | `.bin/` appartient à root : l'utilisateur ne peut pas substituer le lien `php` et faire diverger la version effective de celle que déclare l'inventaire. |
 

@@ -1,0 +1,41 @@
+[Unit]
+Description={{ .Description }} (instance %i)
+PartOf={{ .Target }}
+After=network.target{{ if .AfterBroker }} rabbitmq-server.service{{ end }}
+
+[Service]
+Type=simple
+User={{ .User }}
+Group={{ .Group }}
+WorkingDirectory={{ .Workdir }}
+{{- range $key := sorted .Environment }}
+Environment={{ $key }}={{ index $.Environment $key }}
+{{- end }}
+# L'interpréteur passe par le lien géré : une bascule de version PHP ne réécrit
+# aucune unité (D30).
+ExecStart={{ .Interpreter }} {{ .Console }} messenger:consume {{ .Transport }} \
+  --time-limit={{ .TimeLimit }} --memory-limit={{ .MemoryLimit }} --limit={{ .Limit }} -v
+Restart=always
+RestartSec={{ .RestartSec }}
+# Un worker qui échoue en boucle ne doit pas saturer la machine : au-delà du
+# seuil, systemd cesse de le relancer et l'unité reste en échec, visible.
+StartLimitBurst=10
+StartLimitIntervalSec=600
+# Messenger termine le message en cours sur SIGTERM : lui laisser le temps évite
+# de perdre un traitement à chaque redémarrage.
+KillSignal=SIGTERM
+TimeoutStopSec={{ .StopTimeout }}
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier={{ .Identifier }}
+
+# Durcissement
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths={{ .Workdir }}/var {{ .RunDir }}
+UMask={{ .UMask }}
+
+[Install]
+WantedBy={{ .Target }}
