@@ -14,6 +14,7 @@ import (
 	"github.com/leviathan/ogs/internal/exec"
 	"github.com/leviathan/ogs/internal/model"
 	"github.com/leviathan/ogs/internal/naming"
+	"github.com/leviathan/ogs/internal/provider/amqp"
 	"github.com/leviathan/ogs/internal/provider/db"
 	"github.com/leviathan/ogs/internal/provider/logrotate"
 	"github.com/leviathan/ogs/internal/provider/php"
@@ -49,6 +50,9 @@ type App struct {
 	Quiet          bool
 	Verbose        int
 	NoHooks        bool
+	// RecreateQueues autorise la recréation d'une queue dont les arguments
+	// immuables ont changé. Cette opération détruit les messages en attente.
+	RecreateQueues bool
 }
 
 // newApp construit le contexte, sans ouvrir la base : les commandes qui en ont
@@ -198,6 +202,7 @@ type providers struct {
 	System    *system.Provider
 	TLS       *tlsprov.Provider
 	DB        *db.Provider
+	AMQP      *amqp.Provider
 	PHP       *php.Provider
 	Web       *web.Provider
 	Logrotate *logrotate.Provider
@@ -227,6 +232,8 @@ func (a *App) buildProviders() (*providers, error) {
 	if err != nil {
 		return nil, err
 	}
+	amqpProv := a.amqpProvider()
+	amqpPort := amqpProv.Port
 	certStore := tlsprov.Store{Paths: a.Paths}
 	certs := &tlsprov.Provider{
 		Paths: a.Paths, Cfg: a.Cfg, Store: certStore, DB: a.Store,
@@ -245,7 +252,8 @@ func (a *App) buildProviders() (*providers, error) {
 	return &providers{
 		System: sys,
 		TLS:    certs,
-		DB:     &db.Provider{Paths: a.Paths, Exec: a.Exec, Store: a.Store, Keys: a.Keys},
+		DB:     &db.Provider{Paths: a.Paths, Exec: a.Exec, Store: a.Store, Keys: a.Keys, AMQPPort: amqpPort},
+		AMQP:   amqpProv,
 		PHP:    php,
 		Web: &web.Provider{
 			Paths: a.Paths, Exec: a.Exec, Templates: tmpl, Engine: eng, PHP: php,
@@ -255,6 +263,46 @@ func (a *App) buildProviders() (*providers, error) {
 		Logrotate: &logrotate.Provider{Paths: a.Paths, Templates: tmpl, Config: a.Cfg},
 		Engine:    eng,
 	}, nil
+}
+
+// amqpProvider construit le provider RabbitMQ. Le client n'est branché que si
+// des identifiants d'administration existent : sans eux, l'indisponibilité est
+// rapportée par le plan plutôt qu'en erreur d'initialisation.
+func (a *App) amqpProvider() *amqp.Provider {
+	prov := &amqp.Provider{Paths: a.Paths, Store: a.Store, Keys: a.Keys,
+		RecreateQueues: a.RecreateQueues}
+	creds, err := a.amqpCredentials()
+	if err != nil {
+		return prov
+	}
+	if client, err := amqp.NewHTTPClient(creds); err == nil {
+		prov.Client = client
+		prov.Host = "127.0.0.1"
+		prov.Port = creds.AMQPPort
+	}
+	return prov
+}
+
+// amqpCredentials lit les identifiants d'administration du broker.
+func (a *App) amqpCredentials() (amqp.Credentials, error) {
+	path := filepath.Join(a.Paths.Etc(), "credentials", "amqp.yaml")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return amqp.Credentials{}, fmt.Errorf("identifiants RabbitMQ absents : "+
+				"les enregistrer avec « ogs amqp credentials set » (%s)", path)
+		}
+		return amqp.Credentials{}, err
+	}
+	if info, err := os.Stat(path); err == nil && info.Mode().Perm()&0o077 != 0 {
+		return amqp.Credentials{}, fmt.Errorf("%s est lisible au-delà de son propriétaire (mode %04o) : "+
+			"corriger avec chmod 0600", path, info.Mode().Perm())
+	}
+	var creds amqp.Credentials
+	if err := yaml.Unmarshal(data, &creds); err != nil {
+		return amqp.Credentials{}, fmt.Errorf("%s : %w", path, err)
+	}
+	return creds, nil
 }
 
 // dnsCredentials lit les identifiants d'un provider DNS. Ils vivent hors de la

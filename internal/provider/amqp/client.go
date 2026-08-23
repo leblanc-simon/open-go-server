@@ -1,0 +1,364 @@
+// Package amqp porte le provider RabbitMQ : vhosts, utilisateurs, permissions,
+// exchanges, queues, bindings et policies.
+package amqp
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"sort"
+	"strings"
+	"time"
+)
+
+// DefaultManagementURL est l'adresse du plugin management sur une installation
+// standard. Le plugin n'écoute que sur la boucle locale par défaut.
+const DefaultManagementURL = "http://127.0.0.1:15672"
+
+// ErrUnavailable indique que le broker n'est pas joignable.
+var ErrUnavailable = errors.New("broker RabbitMQ indisponible")
+
+// ErrPluginMissing indique que l'API management n'est pas activée.
+var ErrPluginMissing = errors.New("plugin rabbitmq_management non activé")
+
+// Credentials porte les identifiants d'administration.
+type Credentials struct {
+	URL      string `yaml:"url"`
+	User     string `yaml:"user"`
+	Password string `yaml:"password"`
+	// AMQPPort est le port du protocole AMQP, pour construire les DSN applicatifs.
+	AMQPPort int `yaml:"amqpPort,omitempty"`
+}
+
+// Vhost décrit un vhost observé.
+type Vhost struct {
+	Name string `json:"name"`
+}
+
+// User décrit un compte observé.
+type User struct {
+	Name string `json:"name"`
+	Tags any    `json:"tags"`
+}
+
+// Permission décrit les droits d'un compte sur un vhost.
+type Permission struct {
+	Vhost     string `json:"vhost"`
+	User      string `json:"user"`
+	Configure string `json:"configure"`
+	Write     string `json:"write"`
+	Read      string `json:"read"`
+}
+
+// Exchange décrit un exchange observé.
+type Exchange struct {
+	Name       string         `json:"name"`
+	Vhost      string         `json:"vhost"`
+	Type       string         `json:"type"`
+	Durable    bool           `json:"durable"`
+	AutoDelete bool           `json:"auto_delete"`
+	Arguments  map[string]any `json:"arguments"`
+}
+
+// Queue décrit une queue observée. Les compteurs servent à prévenir avant toute
+// opération destructrice.
+type Queue struct {
+	Name      string         `json:"name"`
+	Vhost     string         `json:"vhost"`
+	Durable   bool           `json:"durable"`
+	Type      string         `json:"type"`
+	Arguments map[string]any `json:"arguments"`
+	Messages  int            `json:"messages"`
+	Consumers int            `json:"consumers"`
+}
+
+// EffectiveType renvoie le type de la queue, en tenant compte de l'argument
+// x-queue-type qui prime sur le champ dédié selon les versions du broker.
+func (q Queue) EffectiveType() string {
+	if v, ok := q.Arguments["x-queue-type"]; ok {
+		if s, ok := v.(string); ok && s != "" {
+			return s
+		}
+	}
+	if q.Type != "" {
+		return q.Type
+	}
+	return "classic"
+}
+
+// Binding décrit un lien entre un exchange et une queue.
+type Binding struct {
+	Vhost           string         `json:"vhost"`
+	Source          string         `json:"source"`
+	Destination     string         `json:"destination"`
+	DestinationType string         `json:"destination_type"`
+	RoutingKey      string         `json:"routing_key"`
+	Arguments       map[string]any `json:"arguments"`
+}
+
+// Policy décrit une policy observée.
+type Policy struct {
+	Vhost      string         `json:"vhost"`
+	Name       string         `json:"name"`
+	Pattern    string         `json:"pattern"`
+	ApplyTo    string         `json:"apply-to"`
+	Definition map[string]any `json:"definition"`
+	Priority   int            `json:"priority"`
+}
+
+// Client est l'accès d'administration au broker.
+type Client interface {
+	// Overview vérifie la disponibilité et renvoie la version du broker.
+	Overview(ctx context.Context) (string, error)
+	Vhosts(ctx context.Context) ([]Vhost, error)
+	EnsureVhost(ctx context.Context, name string) error
+	DeleteVhost(ctx context.Context, name string) error
+	Users(ctx context.Context) ([]User, error)
+	EnsureUser(ctx context.Context, name, password string, tags []string) error
+	DeleteUser(ctx context.Context, name string) error
+	Permissions(ctx context.Context) ([]Permission, error)
+	EnsurePermission(ctx context.Context, p Permission) error
+	Exchanges(ctx context.Context, vhost string) ([]Exchange, error)
+	EnsureExchange(ctx context.Context, e Exchange) error
+	Queues(ctx context.Context, vhost string) ([]Queue, error)
+	EnsureQueue(ctx context.Context, q Queue) error
+	DeleteQueue(ctx context.Context, vhost, name string) error
+	PurgeQueue(ctx context.Context, vhost, name string) error
+	Bindings(ctx context.Context, vhost string) ([]Binding, error)
+	EnsureBinding(ctx context.Context, b Binding) error
+	Policies(ctx context.Context, vhost string) ([]Policy, error)
+	EnsurePolicy(ctx context.Context, p Policy) error
+	DeletePolicy(ctx context.Context, vhost, name string) error
+}
+
+// httpClient parle à l'API management.
+type httpClient struct {
+	base  string
+	creds Credentials
+	http  *http.Client
+}
+
+// NewHTTPClient construit un client de l'API management. Celle-ci est privilégiée
+// sur rabbitmqctl : elle est idempotente par construction (les créations sont des
+// PUT) et permet de déclarer les arguments de queue, ce que la CLI ne fait pas.
+func NewHTTPClient(creds Credentials) (Client, error) {
+	if creds.URL == "" {
+		creds.URL = DefaultManagementURL
+	}
+	if creds.User == "" {
+		return nil, fmt.Errorf("identifiants d'administration RabbitMQ absents : " +
+			"les enregistrer avec « ogs amqp credentials set »")
+	}
+	if _, err := url.Parse(creds.URL); err != nil {
+		return nil, fmt.Errorf("URL de management %q invalide : %w", creds.URL, err)
+	}
+	return &httpClient{
+		base:  strings.TrimRight(creds.URL, "/"),
+		creds: creds,
+		http:  &http.Client{Timeout: 15 * time.Second},
+	}, nil
+}
+
+// do exécute une requête et décode la réponse éventuelle.
+func (c *httpClient) do(ctx context.Context, method, path string, body, out any) error {
+	var reader io.Reader
+	if body != nil {
+		data, err := json.Marshal(body)
+		if err != nil {
+			return err
+		}
+		reader = bytes.NewReader(data)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, c.base+path, reader)
+	if err != nil {
+		return err
+	}
+	req.SetBasicAuth(c.creds.User, c.creds.Password)
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	res, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("%w : %v", ErrUnavailable, err)
+	}
+	defer res.Body.Close()
+	switch {
+	case res.StatusCode == http.StatusNotFound && method == http.MethodGet:
+		// Une ressource absente n'est pas une erreur pour une lecture.
+		return nil
+	case res.StatusCode == http.StatusUnauthorized:
+		return fmt.Errorf("identifiants d'administration RabbitMQ refusés (%s)", res.Status)
+	case res.StatusCode == http.StatusNotFound:
+		return fmt.Errorf("%w : %s %s introuvable — vérifier « rabbitmq-plugins enable rabbitmq_management »",
+			ErrPluginMissing, method, path)
+	case res.StatusCode >= 300:
+		data, _ := io.ReadAll(io.LimitReader(res.Body, 2048))
+		return fmt.Errorf("%s %s : %s %s", method, path, res.Status, strings.TrimSpace(string(data)))
+	}
+	if out == nil {
+		return nil
+	}
+	return json.NewDecoder(res.Body).Decode(out)
+}
+
+// escape encode un segment de chemin. Le vhost est déclaré sans barre oblique
+// (D9), mais l'encodage reste nécessaire pour les autres caractères.
+func escape(s string) string { return url.PathEscape(s) }
+
+func (c *httpClient) Overview(ctx context.Context) (string, error) {
+	var out struct {
+		Version string `json:"rabbitmq_version"`
+	}
+	if err := c.do(ctx, http.MethodGet, "/api/overview", nil, &out); err != nil {
+		return "", err
+	}
+	return out.Version, nil
+}
+
+func (c *httpClient) Vhosts(ctx context.Context) ([]Vhost, error) {
+	var out []Vhost
+	err := c.do(ctx, http.MethodGet, "/api/vhosts", nil, &out)
+	return out, err
+}
+
+func (c *httpClient) EnsureVhost(ctx context.Context, name string) error {
+	return c.do(ctx, http.MethodPut, "/api/vhosts/"+escape(name), map[string]any{}, nil)
+}
+
+func (c *httpClient) DeleteVhost(ctx context.Context, name string) error {
+	return c.do(ctx, http.MethodDelete, "/api/vhosts/"+escape(name), nil, nil)
+}
+
+func (c *httpClient) Users(ctx context.Context) ([]User, error) {
+	var out []User
+	err := c.do(ctx, http.MethodGet, "/api/users", nil, &out)
+	return out, err
+}
+
+func (c *httpClient) EnsureUser(ctx context.Context, name, password string, tags []string) error {
+	body := map[string]any{"tags": strings.Join(tags, ",")}
+	if password != "" {
+		body["password"] = password
+	}
+	return c.do(ctx, http.MethodPut, "/api/users/"+escape(name), body, nil)
+}
+
+func (c *httpClient) DeleteUser(ctx context.Context, name string) error {
+	return c.do(ctx, http.MethodDelete, "/api/users/"+escape(name), nil, nil)
+}
+
+func (c *httpClient) Permissions(ctx context.Context) ([]Permission, error) {
+	var out []Permission
+	err := c.do(ctx, http.MethodGet, "/api/permissions", nil, &out)
+	return out, err
+}
+
+func (c *httpClient) EnsurePermission(ctx context.Context, p Permission) error {
+	return c.do(ctx, http.MethodPut,
+		"/api/permissions/"+escape(p.Vhost)+"/"+escape(p.User),
+		map[string]any{"configure": p.Configure, "write": p.Write, "read": p.Read}, nil)
+}
+
+func (c *httpClient) Exchanges(ctx context.Context, vhost string) ([]Exchange, error) {
+	var out []Exchange
+	err := c.do(ctx, http.MethodGet, "/api/exchanges/"+escape(vhost), nil, &out)
+	return out, err
+}
+
+func (c *httpClient) EnsureExchange(ctx context.Context, e Exchange) error {
+	return c.do(ctx, http.MethodPut,
+		"/api/exchanges/"+escape(e.Vhost)+"/"+escape(e.Name),
+		map[string]any{
+			"type": e.Type, "durable": e.Durable,
+			"auto_delete": e.AutoDelete, "arguments": orEmptyArgs(e.Arguments),
+		}, nil)
+}
+
+func (c *httpClient) Queues(ctx context.Context, vhost string) ([]Queue, error) {
+	var out []Queue
+	err := c.do(ctx, http.MethodGet, "/api/queues/"+escape(vhost), nil, &out)
+	return out, err
+}
+
+func (c *httpClient) EnsureQueue(ctx context.Context, q Queue) error {
+	args := orEmptyArgs(q.Arguments)
+	// Le type de queue se déclare par un argument : le champ « type » de l'API
+	// n'est pas accepté à la création sur toutes les versions.
+	if t := q.Type; t != "" && t != "classic" {
+		args["x-queue-type"] = t
+	}
+	return c.do(ctx, http.MethodPut,
+		"/api/queues/"+escape(q.Vhost)+"/"+escape(q.Name),
+		map[string]any{"durable": q.Durable, "auto_delete": false, "arguments": args}, nil)
+}
+
+func (c *httpClient) DeleteQueue(ctx context.Context, vhost, name string) error {
+	return c.do(ctx, http.MethodDelete, "/api/queues/"+escape(vhost)+"/"+escape(name), nil, nil)
+}
+
+func (c *httpClient) PurgeQueue(ctx context.Context, vhost, name string) error {
+	return c.do(ctx, http.MethodDelete,
+		"/api/queues/"+escape(vhost)+"/"+escape(name)+"/contents", nil, nil)
+}
+
+func (c *httpClient) Bindings(ctx context.Context, vhost string) ([]Binding, error) {
+	var out []Binding
+	err := c.do(ctx, http.MethodGet, "/api/bindings/"+escape(vhost), nil, &out)
+	return out, err
+}
+
+func (c *httpClient) EnsureBinding(ctx context.Context, b Binding) error {
+	return c.do(ctx, http.MethodPost,
+		"/api/bindings/"+escape(b.Vhost)+"/e/"+escape(b.Source)+"/q/"+escape(b.Destination),
+		map[string]any{"routing_key": b.RoutingKey, "arguments": orEmptyArgs(b.Arguments)}, nil)
+}
+
+func (c *httpClient) Policies(ctx context.Context, vhost string) ([]Policy, error) {
+	var out []Policy
+	err := c.do(ctx, http.MethodGet, "/api/policies/"+escape(vhost), nil, &out)
+	return out, err
+}
+
+func (c *httpClient) EnsurePolicy(ctx context.Context, p Policy) error {
+	applyTo := p.ApplyTo
+	if applyTo == "" {
+		applyTo = "queues"
+	}
+	return c.do(ctx, http.MethodPut,
+		"/api/policies/"+escape(p.Vhost)+"/"+escape(p.Name),
+		map[string]any{
+			"pattern": p.Pattern, "definition": orEmptyArgs(p.Definition),
+			"priority": p.Priority, "apply-to": applyTo,
+		}, nil)
+}
+
+func (c *httpClient) DeletePolicy(ctx context.Context, vhost, name string) error {
+	return c.do(ctx, http.MethodDelete, "/api/policies/"+escape(vhost)+"/"+escape(name), nil, nil)
+}
+
+func orEmptyArgs(m map[string]any) map[string]any {
+	if m == nil {
+		return map[string]any{}
+	}
+	out := make(map[string]any, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
+}
+
+// SortedKeys renvoie les clés triées d'une table d'arguments, pour un affichage
+// et des comparaisons déterministes.
+func SortedKeys(m map[string]any) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}

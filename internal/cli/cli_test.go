@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -931,5 +933,232 @@ func TestDoctorWarnsOnExpiringCertificate(t *testing.T) {
 	}
 	if !strings.Contains(out, "certificats") {
 		t.Errorf("doctor doit rendre compte des certificats :\n%s", out)
+	}
+}
+
+// --- Lot L4 : RabbitMQ ---
+
+// fakeBroker démarre un serveur imitant l'API management et enregistre les
+// identifiants sous le préfixe. Cela permet d'éprouver le câblage complet, de la
+// commande jusqu'aux requêtes HTTP réellement émises.
+func (h *harness) fakeBroker(t *testing.T, state *brokerState) {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(state.serve))
+	t.Cleanup(srv.Close)
+	dir := h.path("etc", "ogs", "credentials")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	creds := fmt.Sprintf("url: %s\nuser: admin\npassword: s3cr3t\namqpPort: 5672\n", srv.URL)
+	if err := os.WriteFile(filepath.Join(dir, "amqp.yaml"), []byte(creds), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// brokerState porte l'état du faux broker.
+type brokerState struct {
+	vhosts    map[string]bool
+	users     map[string]bool
+	queues    map[string]map[string]any
+	writes    []string
+	queueList []map[string]any
+}
+
+func newBrokerState() *brokerState {
+	return &brokerState{vhosts: map[string]bool{}, users: map[string]bool{},
+		queues: map[string]map[string]any{}}
+}
+
+func (b *brokerState) serve(w http.ResponseWriter, r *http.Request) {
+	path := r.URL.Path
+	if r.Method != http.MethodGet {
+		b.writes = append(b.writes, r.Method+" "+path)
+	}
+	switch {
+	case path == "/api/overview":
+		_ = json.NewEncoder(w).Encode(map[string]any{"rabbitmq_version": "3.13.7"})
+	case path == "/api/vhosts" && r.Method == http.MethodGet:
+		var out []map[string]any
+		for name := range b.vhosts {
+			out = append(out, map[string]any{"name": name})
+		}
+		_ = json.NewEncoder(w).Encode(out)
+	case strings.HasPrefix(path, "/api/vhosts/") && r.Method == http.MethodPut:
+		b.vhosts[strings.TrimPrefix(path, "/api/vhosts/")] = true
+		w.WriteHeader(http.StatusNoContent)
+	case path == "/api/users" && r.Method == http.MethodGet:
+		var out []map[string]any
+		for name := range b.users {
+			out = append(out, map[string]any{"name": name})
+		}
+		_ = json.NewEncoder(w).Encode(out)
+	case strings.HasPrefix(path, "/api/users/") && r.Method == http.MethodPut:
+		b.users[strings.TrimPrefix(path, "/api/users/")] = true
+		w.WriteHeader(http.StatusNoContent)
+	case path == "/api/permissions":
+		_ = json.NewEncoder(w).Encode([]map[string]any{})
+	case strings.HasPrefix(path, "/api/queues/") && r.Method == http.MethodGet:
+		_ = json.NewEncoder(w).Encode(b.queueList)
+	case strings.HasPrefix(path, "/api/queues/") && r.Method == http.MethodPut:
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		name := path[strings.LastIndex(path, "/")+1:]
+		b.queues[name] = body
+		w.WriteHeader(http.StatusNoContent)
+	case strings.HasPrefix(path, "/api/exchanges/") && r.Method == http.MethodGet,
+		strings.HasPrefix(path, "/api/bindings/") && r.Method == http.MethodGet,
+		strings.HasPrefix(path, "/api/policies/") && r.Method == http.MethodGet:
+		_ = json.NewEncoder(w).Encode([]map[string]any{})
+	default:
+		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
+func TestAMQPMessengerPresetAndApply(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	state := newBrokerState()
+	h.fakeBroker(t, state)
+	h.mustRun("project", "create", "shop.fr", "--kind", "php-symfony", "--app-version", "6.4", "--php", "8.5")
+	out := h.mustRun("amqp", "messenger", "shopfr", "--transport", "async")
+	if !strings.Contains(out, "async_failed") {
+		t.Errorf("la file d'échec doit être déclarée :\n%s", out)
+	}
+
+	h.mustRun("apply", "shopfr", "--yes")
+	if !state.vhosts["shopfr"] {
+		t.Errorf("vhost non créé, requêtes émises : %v", state.writes)
+	}
+	if !state.users["shopfr"] {
+		t.Error("utilisateur non créé")
+	}
+	// Le type quorum se déclare par argument : c'est la seule forme acceptée par
+	// toutes les versions du broker.
+	async, ok := state.queues["async"]
+	if !ok {
+		t.Fatalf("file async non déclarée : %v", state.writes)
+	}
+	args, _ := async["arguments"].(map[string]any)
+	if args["x-queue-type"] != "quorum" {
+		t.Errorf("type de file : %+v", args)
+	}
+	if args["x-dead-letter-exchange"] != "dlx" {
+		t.Errorf("exchange de rejet absent : %+v", args)
+	}
+}
+
+func TestAMQPRefusesMessengerOnSymfony34(t *testing.T) {
+	// Le composant Messenger n'existe qu'à partir de Symfony 4.1 : le proposer
+	// sur un projet en 3.4 produirait une configuration inutilisable.
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("project", "create", "ancien.fr", "--kind", "php-symfony", "--app-version", "3.4", "--php", "7.4")
+	out, code := h.run("amqp", "messenger", "ancienfr")
+	if code != CodeUsage {
+		t.Fatalf("code %d attendu %d :\n%s", code, CodeUsage, out)
+	}
+	if !strings.Contains(out, "rabbitmq-consumer") {
+		t.Errorf("le message doit indiquer la solution de remplacement :\n%s", out)
+	}
+}
+
+func TestAMQPImmutableArgumentsRequireExplicitRecreation(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	state := newBrokerState()
+	h.fakeBroker(t, state)
+	h.mustRun("project", "create", "shop.fr", "--kind", "php-symfony", "--app-version", "6.4", "--php", "8.5")
+	h.mustRun("amqp", "messenger", "shopfr")
+	h.mustRun("apply", "shopfr", "--yes")
+
+	// Le broker rapporte désormais une file existante, avec des messages en
+	// attente et un TTL différent de celui déclaré.
+	state.vhosts["shopfr"] = true
+	state.users["shopfr"] = true
+	state.queueList = []map[string]any{{
+		"name": "async", "vhost": "shopfr", "durable": true, "messages": 1240, "consumers": 3,
+		"arguments": map[string]any{
+			"x-queue-type": "quorum", "x-dead-letter-exchange": "dlx",
+			"x-dead-letter-routing-key": "async_failed", "x-message-ttl": 3600000,
+		},
+	}, {
+		"name": "async_failed", "vhost": "shopfr", "durable": true,
+		"arguments": map[string]any{},
+	}}
+	// La déclaration ne porte pas de TTL : l'écart doit être signalé, jamais
+	// appliqué en silence.
+	out, code := h.run("apply", "shopfr", "--yes")
+	if code != CodePartial {
+		t.Fatalf("code %d attendu %d :\n%s", code, CodePartial, out)
+	}
+	for _, want := range []string{"recréation requise", "1240 message", "--recreate-queues"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("la sortie doit contenir %q :\n%s", want, out)
+		}
+	}
+	// Aucune suppression n'a été tentée.
+	for _, w := range state.writes {
+		if strings.HasPrefix(w, "DELETE /api/queues") {
+			t.Errorf("aucune file ne devait être supprimée : %v", state.writes)
+		}
+	}
+}
+
+func TestAMQPStatusShowsCounters(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	state := newBrokerState()
+	state.vhosts["shopfr"] = true
+	state.users["shopfr"] = true
+	state.queueList = []map[string]any{{
+		"name": "async", "vhost": "shopfr", "durable": true, "type": "quorum",
+		"messages": 42, "consumers": 2, "arguments": map[string]any{},
+	}}
+	h.fakeBroker(t, state)
+	h.mustRun("project", "create", "shop.fr", "--kind", "php-symfony", "--app-version", "6.4", "--php", "8.5")
+	h.mustRun("amqp", "messenger", "shopfr")
+	out := h.mustRun("amqp", "status", "shopfr")
+	if !strings.Contains(out, "async") || !strings.Contains(out, "42") {
+		t.Errorf("les compteurs doivent être affichés :\n%s", out)
+	}
+}
+
+func TestAMQPUnavailableBrokerDoesNotBlockSite(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	// Aucun identifiant enregistré : le broker est injoignable.
+	h.mustRun("project", "create", "shop.fr", "--kind", "php-symfony", "--app-version", "6.4", "--php", "8.5")
+	h.mustRun("amqp", "messenger", "shopfr")
+	out, code := h.run("apply", "shopfr", "--yes")
+	if code != CodePartial {
+		t.Fatalf("code %d attendu %d :\n%s", code, CodePartial, out)
+	}
+	// Le site est déployé malgré tout.
+	for _, rel := range []string{
+		filepath.Join("etc", "php", "8.5", "fpm", "pool.d", "shopfr.conf"),
+		filepath.Join("etc", "apache2", "sites-available", "shopfr.conf"),
+	} {
+		if _, err := os.Stat(h.path(rel)); err != nil {
+			t.Errorf("%s devrait exister malgré l'indisponibilité du broker : %v", rel, err)
+		}
+	}
+}
+
+func TestAMQPCredentialsPermissions(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	if out, code := h.run("amqp", "credentials", "set", "--user", "admin"); code != CodeUsage {
+		t.Errorf("le mot de passe est requis : code %d\n%s", code, out)
+	}
+	out := h.mustRun("amqp", "credentials", "set", "--user", "guest", "--password", "guest")
+	if !strings.Contains(out, "compte par défaut connu") {
+		t.Errorf("l'emploi de guest doit être signalé :\n%s", out)
+	}
+	info, err := os.Stat(h.path("etc", "ogs", "credentials", "amqp.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Errorf("mode %04o, attendu 0600", info.Mode().Perm())
 	}
 }

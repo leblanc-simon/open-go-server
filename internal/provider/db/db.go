@@ -23,6 +23,10 @@ type Provider struct {
 	Store *store.Store
 	Keys  *secret.Keystore
 
+	// AMQPHost et AMQPPort servent à composer le transport applicatif.
+	AMQPHost string
+	AMQPPort int
+
 	// Clients est le cache des connexions ouvertes, par moteur ou cluster.
 	clients map[string]Client
 }
@@ -544,7 +548,7 @@ func (p *Provider) Env(ctx context.Context, proj *model.Project) ([]EnvEntry, er
 		if err == nil {
 			out = append(out, EnvEntry{
 				Name:  "MESSENGER_TRANSPORT_DSN",
-				Value: AMQPDSN("", 0, proj.Spec.AMQP.User, password, proj.Spec.AMQP.Vhost),
+				Value: AMQPDSN(p.AMQPHost, p.AMQPPort, proj.Spec.AMQP.User, password, proj.Spec.AMQP.Vhost),
 			})
 		}
 	}

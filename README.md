@@ -19,7 +19,7 @@ C'est la référence : toute contribution s'y adosse.
 | **L1** | Web + PHP : templates surchargeables, pools multi-version 7.4→8.5 avec numérotation, vhosts Apache et Nginx, types Prestashop et Symfony 3.4→8, clé de déploiement, lien `.bin/php`, `php switch` avec garde-fou de compatibilité, rotation des logs | **livré** |
 | **L2** | Bases MySQL/MariaDB et PostgreSQL : privilèges nommés, échappement des motifs de `GRANT`, keystore, multi-cluster PostgreSQL, dump/restore, `secrets env` | **livré** |
 | **L3** | TLS : ACME embarqué (lego), HTTP-01 et DNS-01 OVH, wildcard partagé pour les préproductions, timer de renouvellement, suspension après échecs répétés | **livré** |
-| L4 | RabbitMQ : vhosts, queues, bindings, préréglage Messenger | à venir |
+| **L4** | RabbitMQ : vhosts, utilisateurs, exchanges, files, bindings, policies, préréglage Messenger, arguments immuables détectés | **livré** |
 | L5 | Crons, services systemd templatisés, délégation `ogs my` | à venir |
 | L6 | Composition : `site create`, archivage, restauration, `status` | à venir |
 | L7 | TUI (Bubble Tea) | à venir |
@@ -75,6 +75,8 @@ ogs db user add | rotate <id> <utilisateur>
 ogs secrets list | show | env <id>
 ogs cert list | issue | renew | revoke | delete
 ogs cert dns-provider set ovh --application-key … 
+ogs amqp status | messenger | queue add | queue purge
+ogs amqp credentials set --user … --password …
 ```
 
 ## Utilisation réelle
@@ -158,6 +160,30 @@ sudo ogs cert issue @wildcard-prep
 
 Après cinq échecs consécutifs sur un même jeu de domaines, les tentatives sont
 suspendues une heure : insister ferait perdre le droit d'émettre pour le domaine.
+
+### Files RabbitMQ
+
+```sh
+sudo ogs amqp credentials set --user ogs-admin --password …
+sudo ogs amqp messenger shopfr --transport async,priority
+sudo ogs apply shopfr
+sudo ogs secrets env shopfr        # MESSENGER_TRANSPORT_DSN incluse
+```
+
+Le préréglage produit ce qu'attend le transport AMQP de Symfony Messenger : un
+exchange direct, une file par transport, un binding par clé de routage et une file
+d'échec pour rejouer les messages rejetés.
+
+**Les arguments d'une file sont immuables.** Modifier un TTL, un exchange de rejet
+ou le type d'une file existante exige de la recréer, ce qui détruit les messages en
+attente. `ogs` détecte l'écart, l'affiche avec le nombre de messages et de consumers
+concernés, et refuse d'agir sans `--recreate-queues` :
+
+```
+~ queue async : x-message-ttl 3600000 → absent — recréation requise (1240 message(s) en attente)
+  ⚠ les arguments d'une queue sont immuables : recréer async détruirait 1240 message(s)
+    en attente et 3 consumer(s) seraient déconnectés — relancer avec --recreate-queues
+```
 
 ## Conventions structurantes
 

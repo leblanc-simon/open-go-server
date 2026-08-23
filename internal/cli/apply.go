@@ -57,6 +57,20 @@ func (a *App) buildPlan(ctx context.Context, provs *providers, p *model.Project)
 		}
 	}
 
+	if p.Spec.AMQP != nil {
+		amqpObs, err := provs.AMQP.Observe(ctx, p)
+		if err != nil {
+			return nil, wrap(CodeError, err)
+		}
+		amqpSteps, err := provs.AMQP.Plan(ctx, p, amqpObs)
+		if err != nil {
+			return nil, wrap(CodeValidation, err)
+		}
+		for _, s := range amqpSteps {
+			plan.Add(s)
+		}
+	}
+
 	at, err := p.AppType()
 	if err != nil {
 		return nil, exitf(CodeValidation, "%s", err)

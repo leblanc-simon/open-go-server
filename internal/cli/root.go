@@ -43,6 +43,8 @@ func NewRootCommand() *cobra.Command {
 	f.BoolVarP(&app.Quiet, "quiet", "q", false, "limiter la sortie à l'essentiel")
 	f.CountVarP(&app.Verbose, "verbose", "v", "augmenter le niveau de détail (répétable)")
 	f.BoolVar(&app.NoHooks, "no-hooks", false, "ne pas exécuter les hooks utilisateur")
+	f.BoolVar(&app.RecreateQueues, "recreate-queues", false,
+		"autoriser la recréation des queues dont les arguments ont changé (détruit les messages en attente)")
 
 	root.AddCommand(
 		newVersionCommand(app),
@@ -59,6 +61,7 @@ func NewRootCommand() *cobra.Command {
 		newDBCommand(app),
 		newSecretsCommand(app),
 		newCertCommand(app),
+		newAMQPCommand(app),
 	)
 	return root
 }
