@@ -91,14 +91,23 @@ func Project(p *model.Project, homeRoot string) error {
 		add("spec.app.kind", "%v", err)
 	}
 
-	// Utilisateur et groupe portent l'identifiant du projet (D23).
-	if p.Spec.User.Name != p.Metadata.Name {
-		add("spec.user.name", "doit valoir l'identifiant du projet (%q), obtenu %q",
-			p.Metadata.Name, p.Spec.User.Name)
-	}
-	if p.Spec.User.Group != p.Metadata.Name {
-		add("spec.user.group", "doit valoir l'identifiant du projet (%q), obtenu %q",
-			p.Metadata.Name, p.Spec.User.Group)
+	// Utilisateur et groupe portent l'identifiant du projet (D23). Un projet
+	// adopté en est dispensé : renommer un compte existant exigerait de le
+	// recréer, ce qui n'est pas une opération d'import.
+	adopted := p.Metadata.Labels["adopted"] == "true"
+	if !adopted {
+		if p.Spec.User.Name != p.Metadata.Name {
+			add("spec.user.name", "doit valoir l'identifiant du projet (%q), obtenu %q",
+				p.Metadata.Name, p.Spec.User.Name)
+		}
+		if p.Spec.User.Group != p.Metadata.Name {
+			add("spec.user.group", "doit valoir l'identifiant du projet (%q), obtenu %q",
+				p.Metadata.Name, p.Spec.User.Group)
+		}
+	} else {
+		if err := naming.ValidateIdentifier(p.Spec.User.Name); err != nil {
+			add("spec.user.name", "%v", err)
+		}
 	}
 	if p.Spec.User.UID != "" && p.Spec.User.UID != "auto" {
 		if _, err := strconv.Atoi(p.Spec.User.UID); err != nil {
@@ -116,7 +125,15 @@ func Project(p *model.Project, homeRoot string) error {
 	if !filepath.IsAbs(root) {
 		add("spec.layout.root", "chemin absolu attendu, obtenu %q", root)
 	} else if !isUnder(root, homeRoot) {
-		add("spec.layout.root", "doit être sous %s, obtenu %q", homeRoot, root)
+		// Un projet adopté décrit l'existant : son arborescence peut vivre hors de
+		// la racine conventionnelle, et la refuser rendrait l'import inutilisable.
+		// Les emplacements manifestement dangereux restent interdits.
+		if !adopted {
+			add("spec.layout.root", "doit être sous %s, obtenu %q "+
+				"(un projet adopté peut y échapper : voir « ogs import »)", homeRoot, root)
+		} else if forbiddenRoot(root) {
+			add("spec.layout.root", "emplacement interdit pour une racine de projet : %q", root)
+		}
 	}
 	if p.Spec.User.Home != root {
 		add("spec.user.home", "doit valoir spec.layout.root (%q), obtenu %q", root, p.Spec.User.Home)
@@ -476,6 +493,20 @@ func poolRole(name string) string {
 		return ""
 	}
 	return name
+}
+
+// forbiddenRoot refuse les emplacements qu'aucune racine de projet ne devrait
+// occuper : les toucher mettrait le système en péril.
+func forbiddenRoot(root string) bool {
+	forbidden := []string{"/", "/etc", "/usr", "/bin", "/sbin", "/lib", "/boot",
+		"/dev", "/proc", "/sys", "/run", "/var", "/var/lib", "/var/log", "/root", "/tmp"}
+	clean := filepath.Clean(root)
+	for _, f := range forbidden {
+		if clean == f {
+			return true
+		}
+	}
+	return false
 }
 
 func contains(list []string, v string) bool {

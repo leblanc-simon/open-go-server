@@ -78,6 +78,7 @@ func NewRootCommand() *cobra.Command {
 		newSiteCommand(app),
 		newStatusCommand(app),
 		newTUICommand(app),
+		newImportCommand(app),
 	)
 	return root
 }

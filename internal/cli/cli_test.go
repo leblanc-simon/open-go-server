@@ -1722,3 +1722,129 @@ func TestStatusReportsHealthAndExitCode(t *testing.T) {
 		t.Errorf("l'état doit être signalé :\n%s", out)
 	}
 }
+
+// --- Lot L8 : import d'un serveur existant ---
+
+// legacyServer installe une configuration « faite à la main » sous le préfixe.
+func (h *harness) legacyServer(t *testing.T) {
+	t.Helper()
+	mk := func(dir string) {
+		if err := os.MkdirAll(h.path(dir), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write := func(rel, content string) {
+		mk(filepath.Dir(rel))
+		if err := os.WriteFile(h.path(rel), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mk(filepath.Join("etc", "apache2", "sites-available"))
+	mk(filepath.Join("etc", "apache2", "sites-enabled"))
+	mk(filepath.Join("var", "www", "boutique", "public"))
+	write(filepath.Join("etc", "apache2", "sites-available", "boutique.conf"), `
+<VirtualHost *:80>
+    ServerName boutique.fr
+    ServerAlias www.boutique.fr
+    DocumentRoot /var/www/boutique/public
+    <FilesMatch \.php$>
+        SetHandler "proxy:unix:/run/php/php8.1-fpm-boutique.sock|fcgi://localhost"
+    </FilesMatch>
+</VirtualHost>
+`)
+	if err := os.Symlink("../sites-available/boutique.conf",
+		h.path("etc", "apache2", "sites-enabled", "boutique.conf")); err != nil {
+		t.Fatal(err)
+	}
+	mk(filepath.Join("etc", "php", "8.1", "fpm", "pool.d"))
+	write(filepath.Join("etc", "php", "8.1", "fpm", "pool.d", "boutique.conf"),
+		"[boutique]\nuser = boutique\nlisten = /run/php/php8.1-fpm-boutique.sock\n")
+	write(filepath.Join("usr", "bin", "php8.1"), "#!/bin/sh\n")
+	write(filepath.Join("usr", "sbin", "php-fpm8.1"), "#!/bin/sh\n")
+	write(filepath.Join("etc", "passwd"),
+		"boutique:x:1001:1001::/var/www/boutique:/bin/bash\n"+
+			"humain:x:1002:1002:Un humain:/home/humain:/bin/bash\n")
+}
+
+func TestImportScanIsReadOnlyAndProposes(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	h.legacyServer(t)
+
+	out := h.mustRun("import", "scan")
+	for _, want := range []string{"boutiquefr", "confiance élevée", "boutique.fr",
+		"/var/www/boutique", "php-symfony", "Non géré", "humain"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("le rapport doit contenir %q :\n%s", want, out)
+		}
+	}
+	// Le scan ne déclare rien : c'est une inspection.
+	if _, err := os.Stat(h.path("etc", "ogs", "projects", "boutiquefr.yaml")); !os.IsNotExist(err) {
+		t.Error("« import scan » ne doit rien écrire")
+	}
+}
+
+func TestImportAdoptKeepsExistingNamesAndAnnouncesDrift(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	h.legacyServer(t)
+
+	out := h.mustRun("import", "adopt", "boutiquefr", "--yes")
+	// Les écarts à la convention sont annoncés avant, pas découverts après.
+	for _, want := range []string{"écarts à la convention", "utilisateur : boutique", "convention : boutiquefr"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("l'écart doit être annoncé, %q absent :\n%s", want, out)
+		}
+	}
+	declaration := h.read(t, filepath.Join("etc", "ogs", "projects", "boutiquefr.yaml"))
+	// L'adoption décrit l'existant : les noms réels sont conservés.
+	for _, want := range []string{"name: boutique", "/var/www/boutique", "adopted: \"true\""} {
+		if !strings.Contains(declaration, want) {
+			t.Errorf("la déclaration doit conserver l'existant, %q absent :\n%s", want, declaration)
+		}
+	}
+	// Et le projet est exploitable : le diff fonctionne, sans conflit avec
+	// lui-même sur ses propres domaines.
+	out, code := h.run("diff", "boutiquefr")
+	if code != CodePartial && code != CodeOK {
+		t.Fatalf("le diff d'un projet adopté doit fonctionner (code %d) :\n%s", code, out)
+	}
+	if strings.Contains(out, "déjà servi par") {
+		t.Errorf("un projet adopté ne doit pas entrer en conflit avec ses propres vhosts :\n%s", out)
+	}
+}
+
+func TestImportAdoptRecordsUnmanaged(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	h.legacyServer(t)
+	h.mustRun("import", "adopt", "boutiquefr", "--yes")
+	out := h.mustRun("import", "unmanaged")
+	if !strings.Contains(out, "humain") {
+		t.Errorf("les ressources hors gestion doivent être mémorisées :\n%s", out)
+	}
+}
+
+func TestImportAdoptRejectsUnknownCandidate(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	h.legacyServer(t)
+	out, code := h.run("import", "adopt", "inexistant")
+	if code != CodeUsage {
+		t.Errorf("code %d attendu %d :\n%s", code, CodeUsage, out)
+	}
+	if !strings.Contains(out, "boutiquefr") {
+		t.Errorf("les candidats disponibles doivent être énumérés :\n%s", out)
+	}
+}
+
+func TestImportIgnoresAlreadyManaged(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("site", "create", "shop.fr", "--kind", "static", "--yes")
+	out := h.mustRun("import", "scan")
+	// Un site déjà géré ne doit pas être reproposé à l'adoption.
+	if strings.Contains(out, "Projet candidat : shopfr") {
+		t.Errorf("un projet déjà géré ne doit pas être proposé :\n%s", out)
+	}
+}

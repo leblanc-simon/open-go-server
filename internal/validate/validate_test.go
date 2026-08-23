@@ -201,3 +201,34 @@ func TestProjectStillDetectsRealDuplicate(t *testing.T) {
 		t.Fatalf("un vrai doublon doit être refusé : %v", err)
 	}
 }
+
+func TestAdoptedProjectMayLiveOutsideHomeRoot(t *testing.T) {
+	// Un projet adopté décrit l'existant : refuser son emplacement rendrait
+	// l'import inutilisable sur un serveur où les sites sont sous /var/www.
+	p := newProject(t, "boutique.fr", naming.EnvProd, model.KindStatic)
+	p.Spec.Layout.Root = "/var/www/boutique"
+	p.Spec.User.Home = "/var/www/boutique"
+	p.Spec.Layout.Docroot = "/var/www/boutique/public"
+	p.Spec.Layout.LogDir = "/var/www/boutique/logs"
+	if err := Project(p, "/home"); err == nil {
+		t.Fatal("sans marque d'adoption, un home hors racine doit être refusé")
+	}
+	p.Metadata.Labels = map[string]string{"adopted": "true"}
+	if err := Project(p, "/home"); err != nil {
+		t.Fatalf("un projet adopté doit être accepté : %v", err)
+	}
+}
+
+func TestAdoptedProjectStillRefusesDangerousRoots(t *testing.T) {
+	p := newProject(t, "boutique.fr", naming.EnvProd, model.KindStatic)
+	p.Metadata.Labels = map[string]string{"adopted": "true"}
+	for _, root := range []string{"/", "/etc", "/usr", "/var", "/root"} {
+		p.Spec.Layout.Root = root
+		p.Spec.User.Home = root
+		p.Spec.Layout.Docroot = root
+		p.Spec.Layout.LogDir = root
+		if err := Project(p, "/home"); err == nil {
+			t.Errorf("racine %q acceptée à tort", root)
+		}
+	}
+}

@@ -149,9 +149,10 @@ func (p *Provider) Plan(_ context.Context, proj *model.Project, obs Observed) ([
 			return err
 		}
 		steps = append(steps, s)
-	case !obs.User.Managed:
+	case !obs.User.Managed && proj.Metadata.Labels["adopted"] != "true":
 		// Le compte existe mais n'a pas été créé par ogs : on ne le modifie pas
-		// en silence. L'adoption est une opération explicite (import).
+		// en silence. L'adoption est une opération explicite (import), et un projet
+		// qui en est issu reprend légitimement un compte non marqué.
 		return nil, fmt.Errorf("l'utilisateur %s existe déjà et n'est pas géré par ogs "+
 			"(champ commentaire sans marque %q) : l'adopter avec « ogs import » ou choisir un autre identifiant",
 			spec.Name, managedMarker)

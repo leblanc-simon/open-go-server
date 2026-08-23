@@ -132,6 +132,13 @@ func serverNames(content string) []string {
 
 func (p *Provider) belongsTo(proj *model.Project, filename string) bool {
 	base := strings.TrimSuffix(filename, filepath.Ext(filename))
+	// Un projet adopté conserve le nom réel de ses fichiers : la reconnaissance
+	// s'appuie donc sur les noms attendus, et non sur le seul préfixe canonique.
+	for _, name := range p.VHostNames(proj) {
+		if base == name {
+			return true
+		}
+	}
 	id := proj.ID()
 	return base == id || strings.HasPrefix(base, id+"_")
 }
@@ -181,10 +188,16 @@ func (p *Provider) vhosts(proj *model.Project) []model.VHost {
 }
 
 // vhostName traduit le nom logique d'un vhost en nom de fichier : le vhost
-// principal porte le nom nu du projet.
+// principal porte le nom nu du projet, les autres un suffixe de rôle. Un projet
+// adopté conserve en revanche le nom réel de ses fichiers : les renommer
+// reviendrait à recréer le vhost, et son domaine apparaîtrait en conflit avec
+// lui-même.
 func (p *Provider) vhostName(proj *model.Project, vh model.VHost) string {
 	if vh.Name == "" || vh.Name == model.MainPoolName {
 		return proj.ID()
+	}
+	if proj.Metadata.Labels["adopted"] == "true" {
+		return vh.Name
 	}
 	return proj.ID() + "_" + vh.Name
 }

@@ -23,7 +23,7 @@ C'est la référence : toute contribution s'y adosse.
 | **L5** | Tâches planifiées, services systemd templatisés avec instances multiples, délégation sudoers, répertoires d'exécution | **livré** |
 | **L6** | Composition : `site create` et `site clone`, suppression avec archivage, restauration, `status` | **livré** |
 | **L7** | Interface en mode texte : inspecteur, actions contextuelles, assistant de création | **livré** |
-| L8 | Import d'un serveur existant | à venir |
+| **L8** | Import d'un serveur existant : scan en lecture seule, corrélation, adoption sans renommage | **livré** |
 | L9 | Applications Go, Node, Ruby, Python | à venir |
 | L10 | Industrialisation : hooks, paquet .deb, CI, documentation | à venir |
 
@@ -86,6 +86,7 @@ ogs project delete <id> [--purge] [--keep-data] [--no-dump]
 ogs project restore <archive> | archives
 ogs status [id...]
 ogs tui                                    (ou « ogs » sans argument)
+ogs import scan | adopt <id> | unmanaged
 ```
 
 ## Utilisation réelle
@@ -286,6 +287,28 @@ ligne de commande : l'interface n'a pas de chemin privilégié, et la sortie aff
 est celle qu'aurait produite `ogs apply`. `NO_COLOR` et `TERM=dumb` sont respectés —
 l'information reste portée par les symboles (`●` sain, `⚠` dérive, `✕` erreur), donc
 lisible sans couleur.
+
+### Reprendre un serveur existant
+
+```sh
+sudo ogs import scan       # lecture seule : rien n'est modifié
+sudo ogs import adopt boutiquefr
+sudo ogs diff boutiquefr   # ce qu'un premier apply changerait
+```
+
+Le scan rapproche les ressources par ce qui est **vérifiable** — le socket FPM
+référencé par un vhost, l'utilisateur du pool, le docroot sous un home — et énonce
+ce qui ne l'est pas : la propriété d'une base n'est pas déductible, elle est donc
+signalée à confirmer.
+
+**L'adoption ne renomme jamais.** Un site servi depuis `/var/www/boutique` par
+l'utilisateur `boutique` garde ces noms : les changer exigerait de recréer le compte
+et de migrer la base. Les écarts à la convention sont affichés à l'adoption, et
+`ogs diff` montre ce qu'un premier apply normaliserait — avant de le faire.
+
+Les mots de passe existants sont inconnus d'ogs : ils ne sont **ni devinés ni
+réinitialisés**. `ogs db user rotate` permet d'en reprendre la main quand on le
+décide. Tout ce qui n'a pas été rattaché reste hors gestion et ne sera jamais touché.
 
 ## Conventions structurantes
 
