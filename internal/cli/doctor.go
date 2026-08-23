@@ -1,14 +1,17 @@
 package cli
 
 import (
+	"context"
 	"fmt"
 	"os"
-	"os/exec"
+	osexec "os/exec"
 	"strings"
 	"text/tabwriter"
 
 	"github.com/spf13/cobra"
 
+	"github.com/leviathan/ogs/internal/exec"
+	appprov "github.com/leviathan/ogs/internal/provider/app"
 	"github.com/leviathan/ogs/internal/validate"
 )
 
@@ -61,6 +64,25 @@ func newDoctorCommand(app *App) *cobra.Command {
 			return nil
 		},
 	}
+}
+
+// listeners énumère les points d'écoute TCP de la machine.
+func (a *App) listeners() ([]string, error) {
+	res, err := a.Exec.Run(context.Background(), exec.Command{
+		Name: "ss", Args: []string{"-tlnH"},
+	})
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, line := range strings.Split(res.Stdout, "\n") {
+		fields := strings.Fields(line)
+		// ss -tlnH : State Recv-Q Send-Q Local:Port Peer:Port
+		if len(fields) >= 4 {
+			out = append(out, fields[3])
+		}
+	}
+	return out, nil
 }
 
 func symbolFor(status string) string {
@@ -127,7 +149,7 @@ func (a *App) runChecks() []check {
 
 	// Binaires attendus par le provider système.
 	for _, bin := range []string{"useradd", "groupadd", "gpasswd", "usermod"} {
-		if path, err := exec.LookPath(bin); err != nil {
+		if path, err := osexec.LookPath(bin); err != nil {
 			add("binaire "+bin, "échec", "introuvable dans le PATH", "apt install passwd")
 		} else {
 			add("binaire "+bin, "ok", path, "")
@@ -166,6 +188,20 @@ func (a *App) runChecks() []check {
 					"réactiver Defaults env_reset dans /etc/sudoers")
 			} else {
 				add("sudo env_reset", "ok", "active", "")
+			}
+		}
+	}
+
+	// Applications : une écoute au-delà de la boucle locale contourne le vhost,
+	// donc le TLS, les en-têtes de sécurité et l'authentification.
+	if a.Prefix == "" && !a.Exec.Simulated() {
+		if listeners, err := a.listeners(); err == nil {
+			if exposed := appprov.ExposedPorts(listeners); len(exposed) > 0 {
+				add("écoute applicative", "échec",
+					"port(s) applicatif(s) exposé(s) hors de la boucle locale : "+strings.Join(exposed, ", "),
+					"faire écouter l'application sur 127.0.0.1, ou employer un socket Unix")
+			} else {
+				add("écoute applicative", "ok", "aucun port exposé", "")
 			}
 		}
 	}

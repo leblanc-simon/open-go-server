@@ -15,6 +15,7 @@ import (
 	"github.com/leviathan/ogs/internal/exec"
 	"github.com/leviathan/ogs/internal/fs"
 	"github.com/leviathan/ogs/internal/model"
+	appprov "github.com/leviathan/ogs/internal/provider/app"
 	"github.com/leviathan/ogs/internal/spec"
 	"github.com/leviathan/ogs/internal/store"
 	"github.com/leviathan/ogs/internal/template"
@@ -90,6 +91,22 @@ func (a *App) buildPlan(ctx context.Context, provs *providers, p *model.Project)
 		}
 		// Les suppressions de pools sont différées après la réécriture des vhosts.
 		stale = provs.PHP.PlanStale(ctx, p, phpObs)
+	}
+
+	// Application non-PHP : runtime, unité et attente de disponibilité. Elle
+	// précède le vhost de proxy, qui exposerait sinon une erreur 502.
+	if appprov.Applies(p) {
+		appObs, err := provs.App.Observe(ctx, p)
+		if err != nil {
+			return nil, wrap(CodeError, err)
+		}
+		appSteps, err := provs.App.Plan(ctx, p, appObs)
+		if err != nil {
+			return nil, wrap(CodeValidation, err)
+		}
+		for _, s := range appSteps {
+			plan.Add(s)
+		}
 	}
 
 	if len(p.Spec.Domains) > 0 {

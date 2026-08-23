@@ -16,6 +16,7 @@ import (
 	"github.com/leviathan/ogs/internal/model"
 	"github.com/leviathan/ogs/internal/naming"
 	"github.com/leviathan/ogs/internal/provider/amqp"
+	appprov "github.com/leviathan/ogs/internal/provider/app"
 	"github.com/leviathan/ogs/internal/provider/cron"
 	"github.com/leviathan/ogs/internal/provider/db"
 	"github.com/leviathan/ogs/internal/provider/logrotate"
@@ -214,6 +215,7 @@ type providers struct {
 	TLS       *tlsprov.Provider
 	DB        *db.Provider
 	AMQP      *amqp.Provider
+	App       *appprov.Provider
 	Cron      *cron.Provider
 	Unit      *unit.Provider
 	Sudoers   *sudoers.Provider
@@ -247,6 +249,8 @@ func (a *App) buildProviders() (*providers, error) {
 	if err != nil {
 		return nil, err
 	}
+	appProv := &appprov.Provider{Paths: a.Paths, Exec: a.Exec, Templates: tmpl, Store: a.Store,
+		Installer: &appprov.Installer{Exec: a.Exec}}
 	amqpProv := a.amqpProvider()
 	amqpPort := amqpProv.Port
 	certStore := tlsprov.Store{Paths: a.Paths}
@@ -269,6 +273,7 @@ func (a *App) buildProviders() (*providers, error) {
 		TLS:    certs,
 		DB:     &db.Provider{Paths: a.Paths, Exec: a.Exec, Store: a.Store, Keys: a.Keys, AMQPPort: amqpPort},
 		AMQP:   amqpProv,
+		App:    appProv,
 		Cron: &cron.Provider{Paths: a.Paths, Templates: tmpl,
 			Owner: func(proj *model.Project) (int, int, error) { return sys.ResolveOwner(proj, "") }},
 		Unit:    &unit.Provider{Paths: a.Paths, Exec: a.Exec, Templates: tmpl},
@@ -277,8 +282,9 @@ func (a *App) buildProviders() (*providers, error) {
 		PHP:     php,
 		Web: &web.Provider{
 			Paths: a.Paths, Exec: a.Exec, Templates: tmpl, Engine: eng, PHP: php,
-			CertRef: certs.CertificateFor,
-			CertDir: certStore.Dir,
+			CertRef:     certs.CertificateFor,
+			CertDir:     certStore.Dir,
+			ProxyTarget: appProv.ProxyTarget,
 		},
 		Logrotate: &logrotate.Provider{Paths: a.Paths, Templates: tmpl, Config: a.Cfg},
 		Engine:    eng,

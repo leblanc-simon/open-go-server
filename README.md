@@ -24,7 +24,7 @@ C'est la référence : toute contribution s'y adosse.
 | **L6** | Composition : `site create` et `site clone`, suppression avec archivage, restauration, `status` | **livré** |
 | **L7** | Interface en mode texte : inspecteur, actions contextuelles, assistant de création | **livré** |
 | **L8** | Import d'un serveur existant : scan en lecture seule, corrélation, adoption sans renommage | **livré** |
-| L9 | Applications Go, Node, Ruby, Python | à venir |
+| **L9** | Applications Go, Node, Ruby et Python : runtimes par projet, service supervisé, écoute sur socket, proxy | **livré** |
 | L10 | Industrialisation : hooks, paquet .deb, CI, documentation | à venir |
 
 ## Compilation
@@ -87,6 +87,8 @@ ogs project restore <archive> | archives
 ogs status [id...]
 ogs tui                                    (ou « ogs » sans argument)
 ogs import scan | adopt <id> | unmanaged
+ogs app types | set <id> --kind <type>
+ogs runtime list | install <id> <version>
 ```
 
 ## Utilisation réelle
@@ -309,6 +311,28 @@ et de migrer la base. Les écarts à la convention sont affichés à l'adoption,
 Les mots de passe existants sont inconnus d'ogs : ils ne sont **ni devinés ni
 réinitialisés**. `ogs db user rotate` permet d'en reprendre la main quand on le
 décide. Tout ce qui n'a pas été rattaché reste hors gestion et ne sera jamais touché.
+
+### Applications Go, Node, Ruby et Python
+
+```sh
+sudo ogs site create app.fr --kind node
+sudo ogs runtime install appfr 22.11.0
+sudo ogs apply appfr
+```
+
+Le processus est supervisé par systemd, le vhost devient un reverse-proxy, et
+l'ordre compte : le service démarre et **doit répondre** avant que le vhost ne soit
+écrit — sinon le premier rechargement exposerait un 502.
+
+L'écoute passe par un **socket Unix** dès que le runtime le permet : ses permissions
+(`0770`, groupe du projet) restreignent l'accès au serveur web, alors qu'un port
+local est joignable par tout utilisateur de la machine. Un binaire Go, qui n'a pas de
+convention de socket, écoute sur un port `2<runtime><incrément>` borné à `127.0.0.1`.
+`ogs doctor` signale toute application qui écouterait au-delà.
+
+`ogs` ne peut pas **forcer** une application Node à écouter sur un socket : le chemin
+est transmis par `SOCKET_PATH`, et si le code l'ignore, l'attente de disponibilité
+échoue avec un message qui nomme la cause.
 
 ## Conventions structurantes
 

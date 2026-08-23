@@ -1,0 +1,37 @@
+[Unit]
+Description={{ .Description }} (instance %i)
+PartOf={{ .Target }}
+After=network.target
+
+[Service]
+Type=simple
+User={{ .User }}
+Group={{ .Group }}
+WorkingDirectory={{ .Workdir }}
+{{- range $key := sorted .Environment }}
+Environment={{ $key }}={{ index $.Environment $key }}
+{{- end }}
+ExecStart={{ .Command }}
+Restart=always
+RestartSec={{ .RestartSec }}
+StartLimitBurst=10
+StartLimitIntervalSec=600
+KillSignal=SIGTERM
+TimeoutStopSec={{ .StopTimeout }}
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier={{ .Identifier }}
+
+# Un socket Unix est créé en 0777 & ~umask : sans ce réglage il sortirait en 0755,
+# dépourvu du bit d'écriture pour le groupe, et le serveur web ne pourrait pas s'y
+# connecter.
+UMask=0007
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths={{ .Workdir }}/var {{ .RunDir }}
+
+[Install]
+WantedBy={{ .Target }}

@@ -79,6 +79,8 @@ func NewRootCommand() *cobra.Command {
 		newStatusCommand(app),
 		newTUICommand(app),
 		newImportCommand(app),
+		newRuntimeCommand(app),
+		newAppCommand(app),
 	)
 	return root
 }

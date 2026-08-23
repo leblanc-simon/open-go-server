@@ -35,6 +35,8 @@ type Engine interface {
 	FPMReference(listen string, unix bool) string
 	// Installed indique si le moteur est présent sur la machine.
 	Installed() bool
+	// ProxyReference traduit une cible applicative en référence de proxy.
+	ProxyReference(target string, unix bool) string
 }
 
 // apacheEngine implémente Engine pour Apache 2.4 sur Debian et Ubuntu.
@@ -65,6 +67,15 @@ func (a apacheEngine) FPMReference(listen string, unix bool) string {
 	return "fcgi://" + listen
 }
 
+// ProxyReference produit la cible de mod_proxy_http. La syntaxe unix: est
+// supportée depuis Apache 2.4.7.
+func (a apacheEngine) ProxyReference(target string, unix bool) string {
+	if unix {
+		return fmt.Sprintf("unix:%s|http://localhost/", target)
+	}
+	return "http://" + target + "/"
+}
+
 func (a apacheEngine) Installed() bool {
 	_, err := os.Stat(a.AvailableDir())
 	return err == nil
@@ -93,6 +104,14 @@ func (n nginxEngine) FPMReference(listen string, unix bool) string {
 		return "unix:" + listen
 	}
 	return listen
+}
+
+// ProxyReference produit la cible de proxy_pass.
+func (n nginxEngine) ProxyReference(target string, unix bool) string {
+	if unix {
+		return "unix:" + target
+	}
+	return target
 }
 
 func (n nginxEngine) Installed() bool {

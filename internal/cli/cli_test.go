@@ -1848,3 +1848,117 @@ func TestImportIgnoresAlreadyManaged(t *testing.T) {
 		t.Errorf("un projet déjà géré ne doit pas être proposé :\n%s", out)
 	}
 }
+
+// --- Lot L9 : applications Go, Node, Ruby, Python ---
+
+func TestNodeApplicationFullCycle(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("project", "create", "app.fr", "--kind", "node")
+	// La version de runtime se déclare dans le fichier de projet.
+	path := h.path("etc", "ogs", "projects", "appfr.yaml")
+	data := h.read(t, filepath.Join("etc", "ogs", "projects", "appfr.yaml"))
+	data = strings.Replace(data, "kind: node",
+		"kind: node\n    runtime: 22.11.0\n    entrypoint: server.js", 1)
+	if err := os.WriteFile(path, []byte(data), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	plan := h.mustRun("plan", "appfr")
+	// L'application précède le vhost de proxy : l'inverse exposerait un 502.
+	iApp := strings.Index(plan, "unité applicative")
+	iWait := strings.Index(plan, "attente de disponibilité")
+	iVHost := strings.Index(plan, "vhost apache appfr")
+	if iApp < 0 || iWait < 0 || iVHost < 0 {
+		t.Fatalf("plan incomplet :\n%s", plan)
+	}
+	if !(iApp < iWait && iWait < iVHost) {
+		t.Errorf("ordre incorrect (unité=%d attente=%d vhost=%d) :\n%s", iApp, iWait, iVHost, plan)
+	}
+
+	h.mustRun("apply", "appfr", "--yes")
+	unit := h.read(t, filepath.Join("etc", "systemd", "system", "ogs-appfr-app@.service"))
+	for _, want := range []string{
+		"ExecStart=", filepath.Join(".bin", "node"), "server.js",
+		"SOCKET_PATH=", "UMask=0007", "NoNewPrivileges=true",
+	} {
+		if !strings.Contains(unit, want) {
+			t.Errorf("unité incomplète, %q absent :\n%s", want, unit)
+		}
+	}
+	// Le vhost proxifie vers le socket, et le challenge ACME reste servi.
+	vhost := h.read(t, filepath.Join("etc", "apache2", "sites-available", "appfr.conf"))
+	if !strings.Contains(vhost, "ProxyPass        / unix:") {
+		t.Errorf("le proxy doit viser le socket :\n%s", vhost)
+	}
+	if !strings.Contains(vhost, "ProxyPass        /.well-known/acme-challenge !") {
+		t.Errorf("le challenge ACME doit échapper au proxy :\n%s", vhost)
+	}
+	// Le lien est en place et le runtime listé.
+	target, err := os.Readlink(h.path("home", "app.fr", ".bin", "node"))
+	if err != nil {
+		t.Fatalf("lien absent : %v", err)
+	}
+	if !strings.Contains(target, "v22.11.0") {
+		t.Errorf("cible du lien : %q", target)
+	}
+	list := h.mustRun("runtime", "list")
+	if !strings.Contains(list, "node") || !strings.Contains(list, "22.11.0") {
+		t.Errorf("le runtime doit être listé :\n%s", list)
+	}
+}
+
+func TestGoApplicationUsesPort(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("project", "create", "api.fr", "--kind", "go")
+	h.mustRun("apply", "apifr", "--yes")
+	unit := h.read(t, filepath.Join("etc", "systemd", "system", "ogs-apifr-app@.service"))
+	// Un binaire Go n'a pas de convention de socket : il écoute sur un port, borné
+	// à la boucle locale.
+	if !strings.Contains(unit, "PORT=21001") || !strings.Contains(unit, "HOST=127.0.0.1") {
+		t.Errorf("le port doit être transmis :\n%s", unit)
+	}
+	if strings.Contains(unit, "0.0.0.0") {
+		t.Error("aucune écoute sur toutes les interfaces ne doit être suggérée")
+	}
+	if !strings.Contains(unit, filepath.Join(".bin", "app")) {
+		t.Errorf("le binaire doit passer par .bin/app :\n%s", unit)
+	}
+}
+
+func TestAppTypesAndSet(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	types := h.mustRun("app", "types")
+	for _, want := range []string{"php-symfony", "php-prestashop", "node", "proxy"} {
+		if !strings.Contains(types, want) {
+			t.Errorf("le type %q doit être listé :\n%s", want, types)
+		}
+	}
+	// Basculer de type déplace le docroot : le laisser figé servirait le mauvais
+	// répertoire.
+	h.mustRun("project", "create", "shop.fr", "--kind", "php-prestashop", "--php", "8.5")
+	before := h.mustRun("project", "show", "shopfr")
+	if strings.Contains(before, filepath.Join("www", "public")) {
+		t.Errorf("Prestashop sert www :\n%s", before)
+	}
+	h.mustRun("app", "set", "shopfr", "--kind", "php-symfony")
+	after := h.mustRun("project", "show", "shopfr")
+	if !strings.Contains(after, filepath.Join("www", "public")) {
+		t.Errorf("Symfony sert www/public :\n%s", after)
+	}
+}
+
+func TestRuntimeInstallRequiresRuntimeKind(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("project", "create", "shop.fr", "--kind", "php-symfony", "--php", "8.5")
+	out, code := h.run("runtime", "install", "shopfr", "22.11.0")
+	if code != CodeUsage {
+		t.Errorf("code %d attendu %d :\n%s", code, CodeUsage, out)
+	}
+	if !strings.Contains(out, "go, node, python, ruby") {
+		t.Errorf("les types concernés doivent être énumérés :\n%s", out)
+	}
+}

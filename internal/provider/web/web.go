@@ -31,7 +31,9 @@ type Provider struct {
 	CertRef func(*model.Project) (string, bool)
 	// CertDir localise le matériel d'un certificat.
 	CertDir func(ref string) string
-	Now     func() time.Time
+	// ProxyTarget résout la cible d'un vhost de proxy : socket ou adresse locale.
+	ProxyTarget func(*model.Project) (string, bool)
+	Now         func() time.Time
 }
 
 // Name identifie le provider.
@@ -282,6 +284,20 @@ func (p *Provider) Build(proj *model.Project, vh model.VHost) (*VHostPlan, error
 		ref := p.Engine.FPMReference(pool.Listen, pool.Unix)
 		ctx["FPMHandler"] = ref
 		ctx["FPMPass"] = ref
+	}
+	if tmpl == "proxy" {
+		target := optionString(vh.Options, "proxyTarget", "")
+		if target == "" && p.ProxyTarget != nil {
+			resolved, unix := p.ProxyTarget(proj)
+			if resolved == "" {
+				return nil, fmt.Errorf("vhost %s : aucune cible de proxy résolue", name)
+			}
+			target = p.Engine.ProxyReference(resolved, unix)
+		}
+		if target == "" {
+			return nil, fmt.Errorf("vhost %s : préciser la cible de proxy (options.proxyTarget)", name)
+		}
+		ctx["ProxyTarget"] = target
 	}
 
 	body, err := p.Templates.Render(p.Engine.TemplateName(tmpl), ctx)
