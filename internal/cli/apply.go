@@ -37,6 +37,23 @@ func (a *App) buildPlan(ctx context.Context, provs *providers, p *model.Project)
 		plan.Add(s)
 	}
 
+	// Les bases viennent après l'utilisateur et avant les pools : une application
+	// n'a pas besoin de sa base pour que son pool existe, mais l'ordre du cahier
+	// des charges place les données avant l'exécution.
+	if len(p.Spec.Databases) > 0 {
+		dbObs, err := provs.DB.Observe(ctx, p)
+		if err != nil {
+			return nil, wrap(CodeError, err)
+		}
+		dbSteps, err := provs.DB.Plan(ctx, p, dbObs)
+		if err != nil {
+			return nil, wrap(CodeValidation, err)
+		}
+		for _, s := range dbSteps {
+			plan.Add(s)
+		}
+	}
+
 	at, err := p.AppType()
 	if err != nil {
 		return nil, exitf(CodeValidation, "%s", err)
@@ -154,10 +171,14 @@ func newPlanCommand(app *App) *cobra.Command {
 			if err := validate.Uniqueness(projects, app.Cfg.PrepDomain()); err != nil {
 				return exitf(CodeConflict, "%v", err)
 			}
+			if err := app.openStore(); err != nil {
+				return err
+			}
 			provs, err := app.buildProviders()
 			if err != nil {
 				return err
 			}
+			defer provs.close()
 			var items []planStep
 			total := 0
 			for _, p := range projects {
@@ -213,10 +234,14 @@ func newDiffCommand(app *App) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			if err := app.openStore(); err != nil {
+				return err
+			}
 			provs, err := app.buildProviders()
 			if err != nil {
 				return err
 			}
+			defer provs.close()
 			drifted := 0
 			for _, p := range projects {
 				plan, err := app.buildPlan(cmd.Context(), provs, p)
@@ -289,11 +314,11 @@ func newApplyCommand(app *App) *cobra.Command {
 			if err := app.openStore(); err != nil {
 				return err
 			}
-
 			provs, err := app.buildProviders()
 			if err != nil {
 				return err
 			}
+			defer provs.close()
 			reload := app.reloadFunc(provs)
 			warnings := 0
 			for _, p := range projects {

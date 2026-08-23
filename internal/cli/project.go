@@ -9,6 +9,7 @@ import (
 
 	"github.com/leviathan/ogs/internal/model"
 	"github.com/leviathan/ogs/internal/naming"
+	"github.com/leviathan/ogs/internal/provider/db"
 	"github.com/leviathan/ogs/internal/spec"
 	"github.com/leviathan/ogs/internal/validate"
 )
@@ -36,6 +37,7 @@ func newProjectCreateCommand(app *App) *cobra.Command {
 		hostOpt string
 		appVer  string
 		phpVer  string
+		withDB  string
 	)
 	cmd := &cobra.Command{
 		Use:   "create <host>",
@@ -71,6 +73,19 @@ func newProjectCreateCommand(app *App) *cobra.Command {
 			}
 			if err := app.prepare(p); err != nil {
 				return err
+			}
+			// La base est déclarée après la normalisation : son nom dérive de
+			// l'identifiant du projet, qui n'est connu qu'à ce moment.
+			if withDB != "" {
+				switch withDB {
+				case "mysql", "mariadb", "postgres":
+					p.Spec.Databases = []model.Database{db.DefaultDatabase(p, withDB)}
+				default:
+					return exitf(CodeUsage, "moteur %q inconnu (mysql, mariadb ou postgres)", withDB)
+				}
+				if err := app.prepare(p); err != nil {
+					return err
+				}
 			}
 
 			path := app.Paths.ProjectFile(p.ID())
@@ -117,6 +132,7 @@ func newProjectCreateCommand(app *App) *cobra.Command {
 	f.StringVar(&id, "id", "", "forcer l'identifiant au lieu de le dériver du host")
 	f.StringVar(&hostOpt, "host", "", "host servi, s'il diffère du host canonique")
 	f.StringVar(&phpVer, "php", "", "version PHP du pool principal (défaut "+model.DefaultPHPVersion+")")
+	f.StringVar(&withDB, "db", "", "déclarer une base : mysql, mariadb ou postgres")
 	return cmd
 }
 

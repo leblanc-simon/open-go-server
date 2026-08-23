@@ -14,6 +14,7 @@ import (
 	"github.com/leviathan/ogs/internal/exec"
 	"github.com/leviathan/ogs/internal/model"
 	"github.com/leviathan/ogs/internal/naming"
+	"github.com/leviathan/ogs/internal/provider/db"
 	"github.com/leviathan/ogs/internal/provider/logrotate"
 	"github.com/leviathan/ogs/internal/provider/php"
 	"github.com/leviathan/ogs/internal/provider/system"
@@ -194,10 +195,18 @@ func (a *App) homeRoot() string {
 // providers assemble les providers actifs pour cette exécution.
 type providers struct {
 	System    *system.Provider
+	DB        *db.Provider
 	PHP       *php.Provider
 	Web       *web.Provider
 	Logrotate *logrotate.Provider
 	Engine    web.Engine
+}
+
+// close libère les connexions ouvertes par les providers.
+func (p *providers) close() {
+	if p != nil && p.DB != nil {
+		p.DB.Close()
+	}
 }
 
 // buildProviders construit les providers une fois par exécution : la détection
@@ -218,6 +227,7 @@ func (a *App) buildProviders() (*providers, error) {
 	}
 	return &providers{
 		System: sys,
+		DB:     &db.Provider{Paths: a.Paths, Exec: a.Exec, Store: a.Store, Keys: a.Keys},
 		PHP:    php,
 		Web: &web.Provider{
 			Paths: a.Paths, Exec: a.Exec, Templates: tmpl, Engine: eng, PHP: php,

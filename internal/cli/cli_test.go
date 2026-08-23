@@ -8,6 +8,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/leviathan/ogs/internal/secret"
+	"github.com/leviathan/ogs/internal/store"
 )
 
 // harness exécute la CLI en mode préfixé, ce qui permet d'éprouver le flux
@@ -563,5 +566,165 @@ func TestUserKeyShowRequiresGeneratedKey(t *testing.T) {
 	}
 	if strings.Contains(out, "PRIVATE") {
 		t.Error("la clé privée ne doit jamais être exposée")
+	}
+}
+
+// --- Lot L2 : bases de données et secrets ---
+
+func TestDatabaseDeclarationAndUnavailableEngine(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("project", "create", "shop.fr", "--kind", "php-symfony", "--php", "8.5", "--db", "mysql")
+
+	// La déclaration porte le nom du projet (D23).
+	shown := h.mustRun("project", "show", "shopfr")
+	if !strings.Contains(shown, "mysql shopfr") {
+		t.Errorf("la base doit porter le nom du projet :\n%s", shown)
+	}
+
+	// Aucun serveur sous le préfixe : l'état doit le dire sans faire échouer la
+	// commande de consultation.
+	list := h.mustRun("db", "list")
+	if !strings.Contains(list, "moteur indisponible") {
+		t.Errorf("l'indisponibilité doit être rapportée :\n%s", list)
+	}
+
+	// Et surtout : un moteur injoignable ne doit pas empêcher la création du site.
+	out, code := h.run("apply", "shopfr", "--yes")
+	if code != CodePartial {
+		t.Fatalf("code %d attendu %d (succès partiel) :\n%s", code, CodePartial, out)
+	}
+	if !strings.Contains(out, "⚠") {
+		t.Errorf("l'échec non critique doit être signalé :\n%s", out)
+	}
+	// Le reste du site est bien en place.
+	for _, rel := range []string{
+		filepath.Join("home", "shop.fr", "www", "public"),
+		filepath.Join("etc", "php", "8.5", "fpm", "pool.d", "shopfr.conf"),
+		filepath.Join("etc", "apache2", "sites-available", "shopfr.conf"),
+	} {
+		if _, err := os.Stat(h.path(rel)); err != nil {
+			t.Errorf("%s devrait exister malgré l'indisponibilité de la base : %v", rel, err)
+		}
+	}
+}
+
+func TestDatabaseAddRejectsDuplicateAndUnknownEngine(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("project", "create", "shop.fr", "--kind", "static")
+	h.mustRun("db", "add", "shopfr", "--engine", "postgres")
+	if out, code := h.run("db", "add", "shopfr", "--engine", "postgres"); code != CodeConflict {
+		t.Errorf("une base déjà déclarée doit donner le code %d, obtenu %d :\n%s", CodeConflict, code, out)
+	}
+	if out, code := h.run("db", "add", "shopfr", "--engine", "oracle"); code != CodeUsage {
+		t.Errorf("moteur inconnu : code %d attendu %d :\n%s", code, CodeUsage, out)
+	}
+	// Une base additionnelle porte un suffixe de rôle.
+	h.mustRun("db", "add", "shopfr", "--engine", "postgres", "--role", "analytics")
+	shown := h.mustRun("project", "show", "shopfr")
+	if !strings.Contains(shown, "shopfr_analytics") {
+		t.Errorf("la base additionnelle doit être suffixée :\n%s", shown)
+	}
+}
+
+func TestDatabaseRemoveKeepsData(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("project", "create", "shop.fr", "--kind", "static", "--db", "mysql")
+	out := h.mustRun("db", "remove", "shopfr", "shopfr")
+	if !strings.Contains(out, "subsistent") {
+		t.Errorf("le retrait d'une déclaration ne détruit rien, et doit le dire :\n%s", out)
+	}
+	if out, code := h.run("db", "remove", "shopfr", "shopfr"); code != CodeUsage {
+		t.Errorf("retirer une base absente : code %d attendu %d :\n%s", code, CodeUsage, out)
+	}
+}
+
+func TestSecretsListShowAndAudit(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("project", "create", "shop.fr", "--kind", "static", "--db", "mysql")
+
+	// Aucun secret avant application.
+	out := h.mustRun("secrets", "list", "shopfr")
+	if !strings.Contains(out, "aucun secret") {
+		t.Errorf("liste initiale :\n%s", out)
+	}
+
+	// Un secret scellé à la main, comme le ferait l'application d'une base.
+	st, err := store.Open(h.path("var", "lib", "ogs", "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ks, err := secret.Open(h.path("etc", "ogs", "master.key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	nonce, ciphertext, err := ks.Seal("shopfr", "mysql/shopfr", []byte("mot-de-passe-scelle"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.PutSecret("shopfr", "mysql/shopfr", nonce, ciphertext); err != nil {
+		t.Fatal(err)
+	}
+	st.Close()
+
+	// La liste n'expose que les noms.
+	out = h.mustRun("secrets", "list", "shopfr")
+	if !strings.Contains(out, "mysql/shopfr") {
+		t.Errorf("le nom du secret doit apparaître :\n%s", out)
+	}
+	if strings.Contains(out, "mot-de-passe-scelle") {
+		t.Error("la liste ne doit jamais exposer une valeur")
+	}
+
+	// show est la seule voie de divulgation, et elle est journalisée.
+	out = h.mustRun("secrets", "show", "shopfr", "mysql/shopfr")
+	if !strings.Contains(out, "mot-de-passe-scelle") {
+		t.Errorf("la valeur doit être restituée :\n%s", out)
+	}
+	audit := h.read(t, filepath.Join("var", "log", "ogs", "audit.log"))
+	if !strings.Contains(audit, "secrets.show") {
+		t.Errorf("la consultation doit être consignée :\n%s", audit)
+	}
+	if strings.Contains(audit, "mot-de-passe-scelle") {
+		t.Error("l'audit ne doit jamais contenir la valeur du secret")
+	}
+	// Un secret inconnu produit une erreur d'usage, pas une trace de pile.
+	if _, code := h.run("secrets", "show", "shopfr", "mysql/absent"); code != CodeUsage {
+		t.Errorf("secret inconnu : code %d attendu %d", code, CodeUsage)
+	}
+}
+
+func TestSecretsEnvNeedsAppliedDatabase(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("project", "create", "shop.fr", "--kind", "static")
+	// Sans base ni transport déclarés, il n'y a rien à émettre.
+	out := h.mustRun("secrets", "env", "shopfr")
+	if !strings.Contains(out, "ni base ni transport") {
+		t.Errorf("sortie inattendue :\n%s", out)
+	}
+	// Avec une base déclarée mais un moteur injoignable, le motif doit être clair.
+	h.mustRun("db", "add", "shopfr", "--engine", "mysql")
+	out, code := h.run("secrets", "env", "shopfr")
+	if code != CodeDependency {
+		t.Errorf("code %d attendu %d :\n%s", code, CodeDependency, out)
+	}
+}
+
+func TestPlanShowsSQLWithoutSecrets(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("project", "create", "shop.fr", "--kind", "static", "--db", "mysql")
+	// Un écart existe (la base n'est pas créée), donc le code 6 est attendu : c'est
+	// le contrat de « diff », utilisable en supervision.
+	out, code := h.run("diff", "shopfr")
+	if code != CodePartial {
+		t.Fatalf("code %d attendu %d :\n%s", code, CodePartial, out)
+	}
+	if strings.Contains(out, "IDENTIFIED BY '") && !strings.Contains(out, "mot de passe généré") {
+		t.Errorf("le plan ne doit pas exposer de mot de passe :\n%s", out)
 	}
 }

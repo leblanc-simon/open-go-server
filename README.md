@@ -17,7 +17,7 @@ C'est la référence : toute contribution s'y adosse.
 |---|---|---|
 | **L0** | Socle : nommage, modèle, validation, YAML, écriture atomique, base d'état, keystore, audit, moteur (plan/apply/diff/saga/verrou), provider système, CLI | **livré** |
 | **L1** | Web + PHP : templates surchargeables, pools multi-version 7.4→8.5 avec numérotation, vhosts Apache et Nginx, types Prestashop et Symfony 3.4→8, clé de déploiement, lien `.bin/php`, `php switch` avec garde-fou de compatibilité, rotation des logs | **livré** |
-| L2 | Bases MySQL/MariaDB et PostgreSQL | à venir |
+| **L2** | Bases MySQL/MariaDB et PostgreSQL : privilèges nommés, échappement des motifs de `GRANT`, keystore, multi-cluster PostgreSQL, dump/restore, `secrets env` | **livré** |
 | L3 | TLS : ACME embarqué, HTTP-01 et DNS-01 (OVH), wildcard partagé | à venir |
 | L4 | RabbitMQ : vhosts, queues, bindings, préréglage Messenger | à venir |
 | L5 | Crons, services systemd templatisés, délégation `ogs my` | à venir |
@@ -70,6 +70,9 @@ ogs php list | ports | switch <id> <version> [--pool] [--force]
 ogs web engine | test | reload
 ogs user key show | rotate <id>
 ogs template list | show | extract <nom>
+ogs db list | add | remove | dump | restore
+ogs db user add | rotate <id> <utilisateur>
+ogs secrets list | show | env <id>
 ```
 
 ## Utilisation réelle
@@ -104,6 +107,30 @@ structurant : nouveau pool, puis réécriture du vhost sur le nouveau socket, pu
 seulement retrait de l'ancien pool. Les fichiers cron et les unités systemd ne sont
 jamais réécrits, puisqu'ils invoquent `.bin/php`.
 
+### Bases de données et secrets
+
+```sh
+sudo ogs project create shop.fr --kind php-symfony --db mysql
+sudo ogs apply shopfr
+sudo ogs secrets env shopfr        # DATABASE_URL prête à coller dans le .env
+```
+
+Le mot de passe est généré à la première application, scellé dans le keystore et
+**jamais régénéré** ensuite : le régénérer invaliderait la configuration applicative
+en place. `ogs db user rotate` le fait explicitement quand c'est voulu.
+
+Un moteur injoignable ne bloque pas la création du site : l'étape est non critique,
+le site est déployé, et l'échec est rapporté avec son motif (code de retour 6).
+
+### Tests d'intégration des bases
+
+Le test qui valide la syntaxe SQL contre un vrai serveur PostgreSQL crée puis
+supprime une base : il est donc désactivé par défaut.
+
+```sh
+OGS_TEST_POSTGRES=1 go test ./internal/provider/db/
+```
+
 ## Conventions structurantes
 
 - **Un identifiant unique par projet**, dérivé du host (`shop.fr` → `shopfr`), qui nomme l'utilisateur
@@ -116,6 +143,8 @@ jamais réécrits, puisqu'ils invoquent `.bin/php`.
   jamais l'inverse, qui rendrait chaque site lisible par tous les autres.
 - **Préproduction** : `--env prep` produit un projet distinct sur un domaine dédié
   (`<identifiant>.preprod-pp.net`), sans partager la moindre ressource avec la production.
+- **Privilèges MySQL** : le nom de base côté `ON` est un motif où `_` fait joker — il est donc
+  systématiquement échappé. Le nom d'utilisateur, lui, est un littéral exact et ne l'est pas.
 
 ## Codes de retour
 
