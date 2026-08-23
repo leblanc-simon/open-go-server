@@ -1,0 +1,34 @@
+upstream ogs_{{ snake .Project }} {
+    server {{ .ProxyTarget }};
+}
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name {{ .ServerName }}{{ range .Aliases }} {{ . }}{{ end }};
+
+    location ^~ /.well-known/acme-challenge/ {
+        root {{ .ACMEChallenge }}/..;
+        default_type "text/plain";
+    }
+
+    access_log {{ .LogDir }}/nginx-access.log;
+    error_log  {{ .LogDir }}/nginx-error.log;
+    client_max_body_size {{ .ClientMaxBodySize }};
+
+    location / {
+        proxy_pass http://ogs_{{ snake .Project }};
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto {{ if .TLS }}https{{ else }}$scheme{{ end }};
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+    }
+{{- range .Blocks }}
+
+    # bloc {{ .Name }}
+{{ indent 4 .Content }}
+{{- end }}
+}

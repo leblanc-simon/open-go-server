@@ -49,15 +49,26 @@ func (h *harness) mustRun(args ...string) string {
 	return out
 }
 
+// read lit un fichier produit sous le préfixe.
+func (h *harness) read(t *testing.T, rel string) string {
+	t.Helper()
+	data, err := os.ReadFile(h.path(rel))
+	if err != nil {
+		t.Fatalf("lecture de %s : %v", rel, err)
+	}
+	return string(data)
+}
+
 func (h *harness) path(elem ...string) string {
 	return filepath.Join(append([]string{h.prefix}, elem...)...)
 }
 
-// declareAccounts simule ce que useradd et groupadd auraient écrit, afin
-// d'éprouver l'idempotence complète sans créer de comptes réels.
-func (h *harness) declareAccounts(id string, uid int) {
+// simulateSystemEffects reproduit les effets que le mode préfixé n'exécute pas :
+// création des comptes par useradd et de la paire de clés par ssh-keygen. Sans
+// cela, l'idempotence ne pourrait pas être éprouvée sans privilèges.
+func (h *harness) simulateSystemEffects(id, host string, uid int) {
 	h.t.Helper()
-	home := h.path("home", "shop.fr")
+	home := h.path("home", host)
 	if err := os.MkdirAll(h.path("etc"), 0o755); err != nil {
 		h.t.Fatal(err)
 	}
@@ -68,6 +79,12 @@ func (h *harness) declareAccounts(id string, uid int) {
 	group := fmt.Sprintf("%s:x:%d:www-data\n", id, uid)
 	if err := os.WriteFile(h.path("etc", "group"), []byte(group), 0o644); err != nil {
 		h.t.Fatal(err)
+	}
+	key := filepath.Join(home, ".ssh", "id_ed25519")
+	for _, f := range []string{key, key + ".pub"} {
+		if err := os.WriteFile(f, []byte("clé simulée\n"), 0o600); err != nil {
+			h.t.Fatal(err)
+		}
 	}
 }
 
@@ -153,7 +170,7 @@ func TestFullLifecycle(t *testing.T) {
 	}
 
 	// 5. Idempotence, une fois les comptes réputés créés.
-	h.declareAccounts("shopfr", 1004)
+	h.simulateSystemEffects("shopfr", "shop.fr", 1004)
 	out = h.mustRun("apply", "shopfr", "--yes")
 	if !strings.Contains(out, "aucun changement") {
 		t.Errorf("un apply rejoué doit être vide :\n%s", out)
@@ -316,5 +333,235 @@ func TestVersionAndLicence(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Errorf("la licence doit mentionner %q :\n%s", want, out)
 		}
+	}
+}
+
+// --- Lot L1 : PHP, serveur web, rotation ---
+
+func TestPrestashopAndSymfonyCoexist(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("project", "create", "boutique.fr", "--kind", "php-prestashop", "--php", "7.4")
+	h.mustRun("project", "create", "shop.fr", "--kind", "php-symfony", "--app-version", "8.0", "--php", "8.5")
+	h.mustRun("apply", "--yes")
+
+	// Deux pools, deux versions, deux numéros suivant la norme.
+	boutique := h.read(t, filepath.Join("etc", "php", "7.4", "fpm", "pool.d", "boutiquefr.conf"))
+	shop := h.read(t, filepath.Join("etc", "php", "8.5", "fpm", "pool.d", "shopfr.conf"))
+	if !strings.Contains(boutique, "php7.4-fpm-17401-boutiquefr.sock") {
+		t.Errorf("numéro attendu 17401 pour le premier pool en 7.4 :\n%s", boutique)
+	}
+	if !strings.Contains(shop, "php8.5-fpm-18501-shopfr.sock") {
+		t.Errorf("numéro attendu 18501 pour le premier pool en 8.5 :\n%s", shop)
+	}
+	// Chaque pool tourne sous son propre utilisateur : c'est l'isolation.
+	if !strings.Contains(boutique, "user = boutiquefr") || !strings.Contains(shop, "user = shopfr") {
+		t.Error("chaque pool doit tourner sous l'utilisateur de son projet")
+	}
+	// Réglages propres à Prestashop, absents du projet Symfony.
+	if !strings.Contains(boutique, "max_input_vars] = 5000") {
+		t.Error("les réglages Prestashop doivent être appliqués")
+	}
+	if strings.Contains(shop, "max_input_vars] = 5000") {
+		t.Error("les réglages Prestashop ne doivent pas fuir vers Symfony")
+	}
+	// Docroots distincts selon le type d'application.
+	vhBoutique := h.read(t, filepath.Join("etc", "apache2", "sites-available", "boutiquefr.conf"))
+	vhShop := h.read(t, filepath.Join("etc", "apache2", "sites-available", "shopfr.conf"))
+	if !strings.Contains(vhBoutique, filepath.Join("boutique.fr", "www")+"\n") {
+		t.Errorf("Prestashop sert www :\n%s", vhBoutique)
+	}
+	if !strings.Contains(vhShop, filepath.Join("shop.fr", "www", "public")) {
+		t.Errorf("Symfony sert www/public :\n%s", vhShop)
+	}
+	if !strings.Contains(vhBoutique, "AllowOverride All") || !strings.Contains(vhShop, "AllowOverride None") {
+		t.Error("AllowOverride doit suivre le type d'application")
+	}
+}
+
+func TestLogrotateGathersProjectsInOneBlock(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("project", "create", "boutique.fr", "--kind", "php-prestashop", "--php", "7.4")
+	h.mustRun("project", "create", "shop.fr", "--kind", "php-symfony", "--php", "8.5")
+	h.mustRun("apply", "--yes")
+
+	rot := h.read(t, filepath.Join("etc", "logrotate.d", "ogs"))
+	// Un seul rechargement pour tout le parc : sans sharedscripts, cent projets
+	// provoqueraient cent rechargements.
+	if n := strings.Count(rot, "postrotate"); n != 1 {
+		t.Errorf("%d blocs postrotate, 1 attendu :\n%s", n, rot)
+	}
+	if !strings.Contains(rot, "sharedscripts") {
+		t.Error("sharedscripts est indispensable")
+	}
+	// « create » sans propriétaire : chaque fichier est recréé avec le sien, ce qui
+	// permet à un bloc unique de couvrir des projets appartenant à des
+	// utilisateurs différents.
+	for _, line := range strings.Split(rot, "\n") {
+		if strings.TrimSpace(line) != "" && strings.HasPrefix(strings.TrimSpace(line), "create ") {
+			t.Errorf("« create » ne doit pas fixer de propriétaire : %q", line)
+		}
+	}
+	// L'unité rechargée est bien apache2, pas « apache ».
+	if !strings.Contains(rot, "systemctl reload apache2 php7.4-fpm php8.5-fpm") {
+		t.Errorf("unités de rechargement inattendues :\n%s", rot)
+	}
+	// Aucun glob sur /home : il embarquerait les répertoires d'utilisateurs humains.
+	if strings.Contains(rot, "/home/*/") {
+		t.Error("les chemins doivent être énumérés, pas globalisés")
+	}
+	for _, want := range []string{"boutique.fr/logs/php-error.log", "shop.fr/logs/apache-access.log"} {
+		if !strings.Contains(rot, want) {
+			t.Errorf("chemin absent de la rotation : %s", want)
+		}
+	}
+}
+
+func TestPHPSwitchRefusesIncompatibleVersion(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("project", "create", "ancien.fr", "--kind", "php-symfony", "--app-version", "3.4", "--php", "7.4")
+	h.mustRun("apply", "ancienfr", "--yes")
+
+	// Contrainte réelle d'un Symfony 3.4 : il ne fonctionne pas sur PHP 8.
+	composer := filepath.Join(h.path("home", "ancien.fr", "www"), "composer.json")
+	if err := os.WriteFile(composer, []byte(`{"require":{"php":"^5.5.9|>=7.0.8 <8.0"}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, code := h.run("php", "switch", "ancienfr", "8.3")
+	if code != CodeValidation {
+		t.Fatalf("la bascule incompatible doit être refusée (code %d attendu %d) :\n%s", code, CodeValidation, out)
+	}
+	if !strings.Contains(out, "composer.json") {
+		t.Errorf("le refus doit citer la source de la contrainte :\n%s", out)
+	}
+	// La version déclarée n'a pas changé.
+	shown := h.mustRun("project", "show", "ancienfr")
+	if !strings.Contains(shown, "7.4") {
+		t.Errorf("le projet ne doit pas avoir été modifié :\n%s", shown)
+	}
+	// --force passe outre, en le consignant.
+	out = h.mustRun("php", "switch", "ancienfr", "8.3", "--force")
+	if !strings.Contains(out, "forcée") {
+		t.Errorf("le forçage doit être signalé :\n%s", out)
+	}
+}
+
+func TestPHPSwitchRewritesVHostAndRemovesOldPoolLast(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("project", "create", "shop.fr", "--kind", "php-symfony", "--app-version", "6.4", "--php", "8.5")
+	h.mustRun("apply", "shopfr", "--yes")
+
+	h.mustRun("php", "switch", "shopfr", "8.3")
+	// L'ordre du plan est structurant : le nouveau pool, puis le vhost, puis la
+	// suppression de l'ancien pool. Supprimer d'abord exposerait un 502.
+	plan := h.mustRun("plan", "shopfr")
+	iNew := strings.Index(plan, "pool php 8.3")
+	iVHost := strings.Index(plan, "vhost apache shopfr")
+	iOld := strings.Index(plan, "pool php obsolète")
+	if iNew < 0 || iVHost < 0 || iOld < 0 {
+		t.Fatalf("plan de bascule incomplet :\n%s", plan)
+	}
+	if !(iNew < iVHost && iVHost < iOld) {
+		t.Errorf("ordre incorrect (nouveau=%d vhost=%d ancien=%d) :\n%s", iNew, iVHost, iOld, plan)
+	}
+
+	h.mustRun("apply", "shopfr", "--yes")
+	vhost := h.read(t, filepath.Join("etc", "apache2", "sites-available", "shopfr.conf"))
+	if !strings.Contains(vhost, "php8.3-fpm-18301-shopfr.sock") {
+		t.Errorf("le vhost doit pointer sur le nouveau socket :\n%s", vhost)
+	}
+	if strings.Contains(vhost, "php8.5") {
+		t.Error("aucune référence à l'ancienne version ne doit subsister")
+	}
+	if _, err := os.Stat(h.path("etc", "php", "8.5", "fpm", "pool.d", "shopfr.conf")); !os.IsNotExist(err) {
+		t.Error("l'ancien pool doit avoir été supprimé")
+	}
+	// Le lien d'interpréteur suit la version.
+	target, err := os.Readlink(h.path("home", "shop.fr", ".bin", "php"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasSuffix(target, "php8.3") {
+		t.Errorf("lien .bin/php : %s", target)
+	}
+}
+
+func TestPHPListAndPorts(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("project", "create", "shop.fr", "--kind", "php-symfony", "--php", "8.5")
+	h.mustRun("apply", "shopfr", "--yes")
+
+	ports := h.mustRun("php", "ports")
+	if !strings.Contains(ports, "18501") || !strings.Contains(ports, "shopfr") {
+		t.Errorf("les numéros attribués doivent être listés :\n%s", ports)
+	}
+	list := h.mustRun("php", "list")
+	if !strings.Contains(list, "8.5") {
+		t.Errorf("la version utilisée doit être détectée :\n%s", list)
+	}
+}
+
+func TestTemplateExtractChangesRendering(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	out := h.mustRun("template", "extract", "php/pool.conf")
+	if !strings.Contains(out, "templates") {
+		t.Errorf("l'extraction doit indiquer le chemin :\n%s", out)
+	}
+	// La surcharge remplace la version embarquée.
+	override := h.path("etc", "ogs", "templates", "php", "pool.conf.tmpl")
+	if err := os.WriteFile(override, []byte("[{{ .Name }}]\n; surcharge locale\nuser = {{ .User }}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h.mustRun("project", "create", "shop.fr", "--kind", "php-symfony", "--php", "8.5")
+	h.mustRun("apply", "shopfr", "--yes")
+	pool := h.read(t, filepath.Join("etc", "php", "8.5", "fpm", "pool.d", "shopfr.conf"))
+	if !strings.Contains(pool, "surcharge locale") {
+		t.Errorf("la surcharge doit être employée :\n%s", pool)
+	}
+	// L'en-tête doit désigner le fichier à éditer.
+	if !strings.Contains(pool, override) {
+		t.Errorf("l'en-tête doit renvoyer vers la surcharge :\n%s", pool)
+	}
+}
+
+func TestWebEngineReportsChoice(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	out := h.mustRun("web", "engine")
+	if !strings.Contains(out, "apache") {
+		t.Errorf("le moteur retenu doit être indiqué :\n%s", out)
+	}
+}
+
+func TestUserKeyShowRequiresGeneratedKey(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("project", "create", "shop.fr", "--kind", "static")
+	// En mode préfixé, ssh-keygen n'est pas exécuté : la commande doit le dire
+	// clairement plutôt que d'échouer sur une erreur de fichier.
+	out, code := h.run("user", "key", "show", "shopfr")
+	if code != CodeUsage {
+		t.Errorf("code %d attendu %d :\n%s", code, CodeUsage, out)
+	}
+	if !strings.Contains(out, "ogs apply") {
+		t.Errorf("le message doit indiquer comment obtenir la clé :\n%s", out)
+	}
+	// Une fois la clé présente, elle est restituée.
+	h.mustRun("apply", "shopfr", "--yes")
+	key := h.path("home", "shop.fr", ".ssh", "id_ed25519.pub")
+	if err := os.WriteFile(key, []byte("ssh-ed25519 AAAAC3Nza ogs=shopfr@test\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out = h.mustRun("user", "key", "show", "shopfr")
+	if !strings.Contains(out, "ssh-ed25519") {
+		t.Errorf("la clé publique doit être affichée :\n%s", out)
+	}
+	if strings.Contains(out, "PRIVATE") {
+		t.Error("la clé privée ne doit jamais être exposée")
 	}
 }

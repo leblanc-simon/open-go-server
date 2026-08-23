@@ -37,18 +37,35 @@ type AppType struct {
 	Runtime string
 	// EnvVar est la variable d'environnement pilotant l'environnement applicatif.
 	EnvVar string
+	// PHPSettings porte les réglages caractéristiques du type, appliqués par
+	// défaut et surchargeables. Prestashop, par exemple, ne fonctionne pas avec
+	// les valeurs par défaut de PHP.
+	PHPSettings map[string]string
+	// AllowOverride vaut vrai pour les applications s'appuyant sur .htaccess.
+	AllowOverride bool
 }
 
 // appTypes est la table par défaut, surchargeable par /etc/ogs/apptypes.yaml.
 var appTypes = map[AppKind]AppType{
-	KindStatic:     {Kind: KindStatic, Docroot: "www", VHostTemplate: "static"},
-	KindPHPPlain:   {Kind: KindPHPPlain, Docroot: "www", VHostTemplate: "php-fpm", NeedsPHP: true},
-	KindPrestashop: {Kind: KindPrestashop, Docroot: "www", FrontController: "index.php", VHostTemplate: "php-fpm", NeedsPHP: true},
-	KindSymfony:    {Kind: KindSymfony, Docroot: "www/public", FrontController: "index.php", VHostTemplate: "php-fpm", NeedsPHP: true, EnvVar: "APP_ENV"},
-	KindGo:         {Kind: KindGo, VHostTemplate: "proxy", Runtime: "go"},
-	KindNode:       {Kind: KindNode, VHostTemplate: "proxy", Runtime: "node"},
-	KindPython:     {Kind: KindPython, VHostTemplate: "proxy", Runtime: "python"},
-	KindRuby:       {Kind: KindRuby, VHostTemplate: "proxy", Runtime: "ruby"},
+	KindStatic:   {Kind: KindStatic, Docroot: "www", VHostTemplate: "static"},
+	KindPHPPlain: {Kind: KindPHPPlain, Docroot: "www", VHostTemplate: "php-fpm", NeedsPHP: true},
+	KindPrestashop: {
+		Kind: KindPrestashop, Docroot: "www", FrontController: "index.php",
+		VHostTemplate: "php-fpm", NeedsPHP: true, AllowOverride: true,
+		// Prérequis Prestashop : les valeurs par défaut de PHP ne suffisent pas.
+		PHPSettings: map[string]string{
+			"php_admin_value[memory_limit]":        "512M",
+			"php_admin_value[max_input_vars]":      "5000",
+			"php_admin_value[upload_max_filesize]": "64M",
+			"php_admin_value[post_max_size]":       "64M",
+			"php_admin_value[max_execution_time]":  "300",
+		},
+	},
+	KindSymfony: {Kind: KindSymfony, Docroot: "www/public", FrontController: "index.php", VHostTemplate: "php-fpm", NeedsPHP: true, EnvVar: "APP_ENV"},
+	KindGo:      {Kind: KindGo, VHostTemplate: "proxy", Runtime: "go"},
+	KindNode:    {Kind: KindNode, VHostTemplate: "proxy", Runtime: "node"},
+	KindPython:  {Kind: KindPython, VHostTemplate: "proxy", Runtime: "python"},
+	KindRuby:    {Kind: KindRuby, VHostTemplate: "proxy", Runtime: "ruby"},
 }
 
 // Kinds énumère les types connus, triés pour un affichage stable.

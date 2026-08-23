@@ -14,10 +14,14 @@ import (
 	"github.com/leviathan/ogs/internal/exec"
 	"github.com/leviathan/ogs/internal/model"
 	"github.com/leviathan/ogs/internal/naming"
+	"github.com/leviathan/ogs/internal/provider/logrotate"
+	"github.com/leviathan/ogs/internal/provider/php"
 	"github.com/leviathan/ogs/internal/provider/system"
+	"github.com/leviathan/ogs/internal/provider/web"
 	"github.com/leviathan/ogs/internal/secret"
 	"github.com/leviathan/ogs/internal/spec"
 	"github.com/leviathan/ogs/internal/store"
+	"github.com/leviathan/ogs/internal/template"
 	"github.com/leviathan/ogs/internal/validate"
 )
 
@@ -185,6 +189,69 @@ func (a *App) homeRoot() string {
 		return a.Cfg.Naming.HomeRoot
 	}
 	return a.Paths.Home(a.Cfg, "")
+}
+
+// providers assemble les providers actifs pour cette exécution.
+type providers struct {
+	System    *system.Provider
+	PHP       *php.Provider
+	Web       *web.Provider
+	Logrotate *logrotate.Provider
+	Engine    web.Engine
+}
+
+// buildProviders construit les providers une fois par exécution : la détection
+// des versions PHP et du moteur web ne doit pas être refaite à chaque projet.
+func (a *App) buildProviders() (*providers, error) {
+	tmpl := template.New(a.Paths.TemplatesDir())
+	sys := a.systemProvider()
+	sys.Paths = a.Paths
+	php := &php.Provider{
+		Paths:     a.Paths,
+		Exec:      a.Exec,
+		Templates: tmpl,
+		Store:     a.Store,
+	}
+	eng, err := a.webEngine()
+	if err != nil {
+		return nil, err
+	}
+	return &providers{
+		System: sys,
+		PHP:    php,
+		Web: &web.Provider{
+			Paths: a.Paths, Exec: a.Exec, Templates: tmpl, Engine: eng, PHP: php,
+		},
+		Logrotate: &logrotate.Provider{Paths: a.Paths, Templates: tmpl, Config: a.Cfg},
+		Engine:    eng,
+	}, nil
+}
+
+// webEngine choisit le moteur web. En mode préfixé, l'arborescence du moteur est
+// créée à la demande : le mode d'essai doit fonctionner sur une machine où aucun
+// serveur web n'est installé.
+func (a *App) webEngine() (web.Engine, error) {
+	requested := a.Cfg.Web.Engine
+	eng, err := web.DetectEngine(requested, a.Prefix)
+	if err == nil {
+		return eng, nil
+	}
+	if a.Prefix == "" {
+		return nil, exitf(CodeDependency, "%s", err)
+	}
+	if requested == "" {
+		requested = "apache"
+	}
+	eng, nerr := web.NewEngine(requested, a.Prefix)
+	if nerr != nil {
+		return nil, exitf(CodeUsage, "%s", nerr)
+	}
+	for _, d := range []string{eng.AvailableDir(), eng.EnabledDir()} {
+		if mkErr := os.MkdirAll(d, 0o755); mkErr != nil {
+			return nil, wrap(CodeError, mkErr)
+		}
+	}
+	return eng, nil
 }
 
 // systemProvider construit le provider système.

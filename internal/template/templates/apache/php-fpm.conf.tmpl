@@ -1,0 +1,80 @@
+<VirtualHost *:80>
+    ServerName {{ .ServerName }}
+{{- range .Aliases }}
+    ServerAlias {{ . }}
+{{- end }}
+    DocumentRoot {{ .Docroot }}
+
+    # Le challenge ACME doit répondre avant toute redirection, sinon aucun
+    # certificat ne peut être émis ni renouvelé.
+    Alias /.well-known/acme-challenge {{ .ACMEChallenge }}
+    <Directory {{ .ACMEChallenge }}>
+        Require all granted
+        Options -Indexes
+    </Directory>
+{{ if .TLS }}
+    RewriteEngine On
+    RewriteCond %{REQUEST_URI} !^/\.well-known/acme-challenge/
+    RewriteRule ^(.*)$ https://{{ .ServerName }}$1 [R=301,L]
+{{- else }}
+{{ template "apache-body" . }}
+{{- end }}
+    ErrorLog {{ .LogDir }}/apache-error.log
+    CustomLog {{ .LogDir }}/apache-access.log combined
+</VirtualHost>
+{{ if .TLS }}
+<VirtualHost *:443>
+    ServerName {{ .ServerName }}
+{{- range .Aliases }}
+    ServerAlias {{ . }}
+{{- end }}
+    DocumentRoot {{ .Docroot }}
+
+    SSLEngine on
+    SSLCertificateFile {{ .CertDir }}/fullchain.pem
+    SSLCertificateKeyFile {{ .CertDir }}/privkey.pem
+{{- if .HSTS }}
+    Header always set Strict-Transport-Security "max-age=31536000; includeSubDomains"
+{{- end }}
+{{ template "apache-body" . }}
+    ErrorLog {{ .LogDir }}/apache-error.log
+    CustomLog {{ .LogDir }}/apache-access.log combined
+</VirtualHost>
+{{- end }}
+
+{{- define "apache-body" }}
+    <Directory {{ .Docroot }}>
+        AllowOverride {{ if .AllowOverride }}All{{ else }}None{{ end }}
+        Require all granted
+        Options -Indexes +FollowSymLinks
+{{- if not .AllowOverride }}
+        FallbackResource /{{ .FrontController }}
+{{- end }}
+    </Directory>
+
+    # Le PHP est traité par FPM sous l'identité du projet : le serveur web ne
+    # sert que le statique et n'exécute aucun code applicatif.
+    <FilesMatch \.php$>
+        SetHandler "proxy:{{ .FPMHandler }}"
+    </FilesMatch>
+{{- if .Noindex }}
+
+    # Préproduction : interdiction d'indexation.
+    Header always set X-Robots-Tag "noindex, nofollow"
+    Alias /robots.txt {{ .ACMEChallenge }}/../robots-noindex.txt
+{{- end }}
+{{- if .BasicAuthFile }}
+
+    <Location />
+        AuthType Basic
+        AuthName "Préproduction"
+        AuthUserFile {{ .BasicAuthFile }}
+        Require valid-user
+    </Location>
+{{- end }}
+{{- range .Blocks }}
+
+    # bloc {{ .Name }}
+{{ indent 4 .Content }}
+{{- end }}
+{{- end }}

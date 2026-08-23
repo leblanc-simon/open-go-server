@@ -1,0 +1,24 @@
+server {
+    listen 80;
+    listen [::]:80;
+    server_name {{ .ServerName }}{{ range .Aliases }} {{ . }}{{ end }};
+
+    location ^~ /.well-known/acme-challenge/ {
+        root {{ .ACMEChallenge }}/..;
+        default_type "text/plain";
+    }
+
+    root {{ .Docroot }};
+    index index.html;
+    access_log {{ .LogDir }}/nginx-access.log;
+    error_log  {{ .LogDir }}/nginx-error.log;
+
+    location / {
+        try_files $uri $uri/ =404;
+    }
+{{- range .Blocks }}
+
+    # bloc {{ .Name }}
+{{ indent 4 .Content }}
+{{- end }}
+}

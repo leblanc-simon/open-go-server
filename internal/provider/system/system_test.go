@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/leviathan/ogs/internal/config"
 	"github.com/leviathan/ogs/internal/engine"
 	"github.com/leviathan/ogs/internal/exec"
 	"github.com/leviathan/ogs/internal/model"
@@ -24,7 +25,24 @@ func fixture(t *testing.T) (*model.Project, *Provider, *exec.Recorder, *FakeIden
 	}
 	rec := exec.NewRecorder()
 	ident := NewFakeIdentity()
-	return p, &Provider{Exec: rec, Identity: ident, SkipWebUser: false}, rec, ident
+	prov := &Provider{
+		Paths:    config.NewPaths(t.TempDir()),
+		Exec:     rec,
+		Identity: ident,
+	}
+	return p, prov, rec, ident
+}
+
+// declareKey simule le fichier que ssh-keygen aurait produit : l'enregistreur
+// n'exécute pas la commande, mais l'idempotence se juge sur la présence du fichier.
+func declareKey(t *testing.T, p *model.Project) {
+	t.Helper()
+	path := KeyPath(p.Spec.Layout.Root)
+	for _, f := range []string{path, path + ".pub"} {
+		if err := os.WriteFile(f, []byte("clé simulée\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
 }
 
 func apply(t *testing.T, prov *Provider, p *model.Project) *engine.Report {
@@ -109,6 +127,7 @@ func TestPlanIsIdempotent(t *testing.T) {
 	apply(t, prov, p)
 
 	// Le système reflète maintenant l'état désiré.
+	declareKey(t, p)
 	ident.Users["shopfr"] = &UserInfo{Name: "shopfr", UID: 1004, GID: 1004,
 		Home: p.Spec.Layout.Root, Shell: "/usr/sbin/nologin", Managed: true}
 	ident.Groups["shopfr"] = &GroupInfo{Name: "shopfr", GID: 1004, Members: []string{WebUser}}
@@ -138,6 +157,7 @@ func TestPlanIsIdempotent(t *testing.T) {
 func TestPlanCorrectsDriftedMode(t *testing.T) {
 	p, prov, _, ident := fixture(t)
 	apply(t, prov, p)
+	declareKey(t, p)
 	ident.Users["shopfr"] = &UserInfo{Name: "shopfr", UID: 1004, GID: 1004,
 		Home: p.Spec.Layout.Root, Managed: true}
 	ident.Groups["shopfr"] = &GroupInfo{Name: "shopfr", GID: 1004, Members: []string{WebUser}}
@@ -226,5 +246,61 @@ func TestWebAccessNoneSkipsGroupMembership(t *testing.T) {
 	apply(t, prov, p)
 	if rec.Contains("gpasswd") {
 		t.Error("webAccess none ne doit pas ajouter www-data au groupe")
+	}
+}
+
+func TestDeployKeyIsGeneratedOnceAndNonCritical(t *testing.T) {
+	p, prov, rec, _ := fixture(t)
+	apply(t, prov, p)
+	if !rec.Contains("ssh-keygen -t ed25519 -N  -C ogs=shopfr@") {
+		t.Errorf("la clé de déploiement doit être générée sans passphrase : %v", rec.Calls())
+	}
+	// L'étape est non bloquante : une image sans ssh-keygen ne doit pas empêcher
+	// la création du site.
+	obs, _ := prov.Observe(context.Background(), p)
+	steps, _ := prov.Plan(context.Background(), p, obs)
+	for _, s := range steps {
+		if s.Resource == "system/deploy-key/shopfr" && s.Critical {
+			t.Error("la génération de clé doit être non critique")
+		}
+	}
+	// Une fois la clé présente, l'étape disparaît du plan.
+	declareKey(t, p)
+	obs, _ = prov.Observe(context.Background(), p)
+	steps, _ = prov.Plan(context.Background(), p, obs)
+	for _, s := range steps {
+		if s.Resource == "system/deploy-key/shopfr" && s.Mutates() {
+			t.Error("la clé existante ne doit pas être régénérée")
+		}
+	}
+}
+
+func TestBinPHPLink(t *testing.T) {
+	homeRoot := t.TempDir()
+	p := model.New("shop.fr", naming.EnvProd, model.KindSymfony)
+	p.Spec.App.Version = "6.4"
+	if err := p.Normalize(homeRoot, "preprod-pp.net"); err != nil {
+		t.Fatal(err)
+	}
+	p.Spec.PHP.Pools[0].Version = "8.3"
+	prefix := t.TempDir()
+	prov := &Provider{Paths: config.NewPaths(prefix), Exec: exec.NewRecorder(), Identity: NewFakeIdentity()}
+	apply(t, prov, p)
+
+	link := filepath.Join(p.Spec.Layout.Root, ".bin", "php")
+	target, err := os.Readlink(link)
+	if err != nil {
+		t.Fatalf("lien .bin/php absent : %v", err)
+	}
+	if want := filepath.Join(prefix, "usr", "bin", "php8.3"); target != want {
+		t.Errorf("cible du lien %q, attendue %q", target, want)
+	}
+
+	// Bascule de version : seul le lien change.
+	p.Spec.PHP.Pools[0].Version = "8.5"
+	apply(t, prov, p)
+	target, _ = os.Readlink(link)
+	if !strings.HasSuffix(target, "php8.5") {
+		t.Errorf("le lien doit suivre la version : %q", target)
 	}
 }

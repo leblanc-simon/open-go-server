@@ -1,0 +1,18 @@
+<VirtualHost *:80>
+    ServerName {{ .ServerName }}
+{{- range .Aliases }}
+    ServerAlias {{ . }}
+{{- end }}
+
+    Alias /.well-known/acme-challenge {{ .ACMEChallenge }}
+    <Directory {{ .ACMEChallenge }}>
+        Require all granted
+    </Directory>
+
+    RewriteEngine On
+    RewriteCond %{REQUEST_URI} !^/\.well-known/acme-challenge/
+    RewriteRule ^(.*)$ {{ if .TLS }}https{{ else }}http{{ end }}://{{ .RedirectTarget }}$1 [R=301,L]
+
+    ErrorLog {{ .LogDir }}/apache-error.log
+    CustomLog {{ .LogDir }}/apache-access.log combined
+</VirtualHost>

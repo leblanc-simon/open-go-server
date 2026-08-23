@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"text/tabwriter"
 
 	"github.com/spf13/cobra"
 
+	"github.com/leviathan/ogs/internal/config"
 	"github.com/leviathan/ogs/internal/engine"
 	"github.com/leviathan/ogs/internal/fs"
 	"github.com/leviathan/ogs/internal/model"
@@ -16,22 +18,92 @@ import (
 	"github.com/leviathan/ogs/internal/validate"
 )
 
-// buildPlan observe le système et calcule le plan d'un projet.
-func (a *App) buildPlan(ctx context.Context, p *model.Project) (*engine.Plan, error) {
+// buildPlan observe le système et calcule le plan d'un projet. L'ordre des
+// providers suit celui des dépendances : utilisateur et arborescence, puis pools
+// PHP, puis vhosts — un vhost référence un socket, qui référence un pool, qui
+// tourne sous un utilisateur.
+func (a *App) buildPlan(ctx context.Context, provs *providers, p *model.Project) (*engine.Plan, error) {
 	plan := &engine.Plan{Project: p.ID()}
-	prov := a.systemProvider()
-	obs, err := prov.Observe(ctx, p)
+
+	sysObs, err := provs.System.Observe(ctx, p)
 	if err != nil {
 		return nil, wrap(CodeError, err)
 	}
-	steps, err := prov.Plan(ctx, p, obs)
+	sysSteps, err := provs.System.Plan(ctx, p, sysObs)
 	if err != nil {
 		return nil, wrap(CodeConflict, err)
 	}
-	for _, s := range steps {
+	for _, s := range sysSteps {
+		plan.Add(s)
+	}
+
+	at, err := p.AppType()
+	if err != nil {
+		return nil, exitf(CodeValidation, "%s", err)
+	}
+	var stale []*engine.Step
+	if at.NeedsPHP {
+		phpObs, err := provs.PHP.Observe(ctx, p)
+		if err != nil {
+			return nil, wrap(CodeError, err)
+		}
+		phpSteps, err := provs.PHP.Plan(ctx, p, phpObs)
+		if err != nil {
+			return nil, wrap(CodeDependency, err)
+		}
+		for _, s := range phpSteps {
+			plan.Add(s)
+		}
+		// Les suppressions de pools sont différées après la réécriture des vhosts.
+		stale = provs.PHP.PlanStale(ctx, p, phpObs)
+	}
+
+	if len(p.Spec.Domains) > 0 {
+		webObs, err := provs.Web.Observe(ctx, p)
+		if err != nil {
+			return nil, wrap(CodeError, err)
+		}
+		webSteps, err := provs.Web.Plan(ctx, p, webObs)
+		if err != nil {
+			return nil, wrap(CodeConflict, err)
+		}
+		for _, s := range webSteps {
+			plan.Add(s)
+		}
+	}
+	for _, s := range stale {
 		plan.Add(s)
 	}
 	return plan, nil
+}
+
+// buildGlobalPlan calcule les étapes qui portent sur l'ensemble du parc.
+func (a *App) buildGlobalPlan(provs *providers, projects []*model.Project) (*engine.Plan, error) {
+	plan := &engine.Plan{Project: "*"}
+	step, err := provs.Logrotate.Plan(projects, provs.Engine.Name(), provs.Engine.Unit())
+	if err != nil {
+		return nil, wrap(CodeError, err)
+	}
+	plan.Add(step)
+	return plan, nil
+}
+
+// reloadFunc route les intentions de rechargement vers le bon provider. Elles
+// sont dédupliquées par le moteur : un seul rechargement par cible, en fin
+// d'application.
+func (a *App) reloadFunc(provs *providers) func(context.Context, string) error {
+	return func(ctx context.Context, target string) error {
+		switch {
+		case strings.HasPrefix(target, "php:"):
+			version := strings.TrimPrefix(target, "php:")
+			a.printf("  ↻ rechargement de %s\n", config.PHPUnit(version))
+			return provs.PHP.Reload(ctx, version)
+		case strings.HasPrefix(target, "web:"):
+			a.printf("  ↻ rechargement de %s\n", provs.Engine.Unit())
+			return provs.Web.Reload(ctx)
+		}
+		return fmt.Errorf("cible de rechargement inconnue : %s", target)
+	}
 }
 
 // targets résout les projets visés : ceux nommés, ou tous à défaut.
@@ -82,10 +154,14 @@ func newPlanCommand(app *App) *cobra.Command {
 			if err := validate.Uniqueness(projects, app.Cfg.PrepDomain()); err != nil {
 				return exitf(CodeConflict, "%v", err)
 			}
+			provs, err := app.buildProviders()
+			if err != nil {
+				return err
+			}
 			var items []planStep
 			total := 0
 			for _, p := range projects {
-				plan, err := app.buildPlan(cmd.Context(), p)
+				plan, err := app.buildPlan(cmd.Context(), provs, p)
 				if err != nil {
 					return err
 				}
@@ -98,6 +174,22 @@ func newPlanCommand(app *App) *cobra.Command {
 				total += len(plan.Mutating())
 				if app.Format == "table" {
 					app.printf("projet %s\n%s", p.ID(), plan.String())
+				}
+			}
+			global, err := app.buildGlobalPlan(provs, projects)
+			if err != nil {
+				return err
+			}
+			for _, s := range global.Mutating() {
+				items = append(items, planStep{
+					Project: "*", Action: s.Action.String(), Resource: s.Resource,
+					Summary: s.Summary, Critical: s.Critical,
+				})
+			}
+			if len(global.Mutating()) > 0 {
+				total += len(global.Mutating())
+				if app.Format == "table" {
+					app.printf("parc\n%s", global.String())
 				}
 			}
 			if app.Format != "table" {
@@ -121,9 +213,13 @@ func newDiffCommand(app *App) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			provs, err := app.buildProviders()
+			if err != nil {
+				return err
+			}
 			drifted := 0
 			for _, p := range projects {
-				plan, err := app.buildPlan(cmd.Context(), p)
+				plan, err := app.buildPlan(cmd.Context(), provs, p)
 				if err != nil {
 					return err
 				}
@@ -194,9 +290,14 @@ func newApplyCommand(app *App) *cobra.Command {
 				return err
 			}
 
+			provs, err := app.buildProviders()
+			if err != nil {
+				return err
+			}
+			reload := app.reloadFunc(provs)
 			warnings := 0
 			for _, p := range projects {
-				plan, err := app.buildPlan(cmd.Context(), p)
+				plan, err := app.buildPlan(cmd.Context(), provs, p)
 				if err != nil {
 					return err
 				}
@@ -227,6 +328,7 @@ func newApplyCommand(app *App) *cobra.Command {
 					Audit: func(s *engine.Step, outcome, detail string) {
 						_ = app.Audit.Record(p.ID(), s.Resource, "apply."+s.Action.String(), outcome, detail)
 					},
+					Reload: reload,
 				})
 				warnings += len(report.Warnings)
 				if err != nil {
@@ -247,6 +349,30 @@ func newApplyCommand(app *App) *cobra.Command {
 					app.printf(", %d avertissement(s)", len(report.Warnings))
 				}
 				app.printf(" (audit %s)\n", app.Audit.RunID())
+			}
+			// Rotation des journaux : elle porte sur tout le parc, donc après les
+			// projets et une seule fois.
+			if !app.DryRun {
+				global, err := app.buildGlobalPlan(provs, projects)
+				if err != nil {
+					return err
+				}
+				if !global.Empty() {
+					report, err := engine.Execute(cmd.Context(), global, engine.Options{
+						OnStep: func(s *engine.Step, stepErr error) {
+							if stepErr == nil {
+								app.printf("  ✓ %s\n", s.Summary)
+							}
+						},
+						Audit: func(s *engine.Step, outcome, detail string) {
+							_ = app.Audit.Record("", s.Resource, "apply."+s.Action.String(), outcome, detail)
+						},
+					})
+					if err != nil {
+						return wrap(CodeError, err)
+					}
+					warnings += len(report.Warnings)
+				}
 			}
 			if warnings > 0 {
 				return exitf(CodePartial, "terminé avec %d avertissement(s)", warnings)

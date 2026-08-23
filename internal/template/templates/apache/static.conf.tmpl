@@ -1,0 +1,27 @@
+<VirtualHost *:80>
+    ServerName {{ .ServerName }}
+{{- range .Aliases }}
+    ServerAlias {{ . }}
+{{- end }}
+    DocumentRoot {{ .Docroot }}
+
+    Alias /.well-known/acme-challenge {{ .ACMEChallenge }}
+    <Directory {{ .ACMEChallenge }}>
+        Require all granted
+        Options -Indexes
+    </Directory>
+
+    <Directory {{ .Docroot }}>
+        AllowOverride {{ if .AllowOverride }}All{{ else }}None{{ end }}
+        Require all granted
+        Options -Indexes +FollowSymLinks
+    </Directory>
+{{- range .Blocks }}
+
+    # bloc {{ .Name }}
+{{ indent 4 .Content }}
+{{- end }}
+
+    ErrorLog {{ .LogDir }}/apache-error.log
+    CustomLog {{ .LogDir }}/apache-access.log combined
+</VirtualHost>

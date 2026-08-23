@@ -1,0 +1,41 @@
+{{- /* Fichier unique pour tout le parc : « create » sans propriétaire reprend
+celui du fichier d'origine, ce qui permet à un seul bloc de couvrir des projets
+appartenant à des utilisateurs différents. « sharedscripts » garantit un seul
+rechargement par rotation, quel que soit le nombre de projets. */ -}}
+{{- if .ServerLogs }}
+{{ range .ServerLogs }}{{ . }}
+{{ end }}{
+    daily
+    rotate {{ .Rotate }}
+    maxsize {{ .MaxSize }}
+    missingok
+    notifempty
+{{- if .Compress }}
+    compress
+    delaycompress
+{{- end }}
+    create
+    sharedscripts
+    postrotate
+{{- if .ReloadUnits }}
+        systemctl reload {{ join " " .ReloadUnits }} > /dev/null 2>&1 || true
+{{- else }}
+        true
+{{- end }}
+    endscript
+}
+{{- end }}
+{{- if .AppLogs }}
+
+{{ range .AppLogs }}{{ . }}
+{{ end }}{
+    weekly
+    rotate 8
+    missingok
+    notifempty
+{{- if .Compress }}
+    compress
+{{- end }}
+    create
+}
+{{- end }}

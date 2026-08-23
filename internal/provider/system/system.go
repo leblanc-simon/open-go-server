@@ -6,6 +6,9 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"time"
+
+	"github.com/leviathan/ogs/internal/config"
 
 	"github.com/leviathan/ogs/internal/engine"
 	"github.com/leviathan/ogs/internal/exec"
@@ -18,8 +21,10 @@ import (
 // rendrait chaque site lisible par tous les autres.
 const WebUser = "www-data"
 
-// Provider réconcilie l'utilisateur, le groupe et l'arborescence d'un projet.
+// Provider réconcilie l'utilisateur, le groupe, l'arborescence, la clé de
+// déploiement et le lien d'interpréteur d'un projet.
 type Provider struct {
+	Paths    config.Paths
 	Exec     exec.Executor
 	Identity Identity
 	// SkipWebUser désactive l'ajout de www-data au groupe, lorsque le compte
@@ -202,7 +207,14 @@ func (p *Provider) Plan(_ context.Context, proj *model.Project, obs Observed) ([
 	if err != nil {
 		return nil, err
 	}
-	return append(steps, dirSteps...), nil
+	steps = append(steps, dirSteps...)
+
+	// 5. Clé de déploiement et lien d'interpréteur, une fois l'arborescence en place.
+	steps = append(steps, p.keyStep(proj))
+	if s := p.binStep(proj); s != nil {
+		steps = append(steps, s)
+	}
+	return steps, nil
 }
 
 func (p *Provider) dirSteps(proj *model.Project, obs Observed) ([]*engine.Step, error) {
@@ -297,6 +309,9 @@ func (p *Provider) resolveOwner(proj *model.Project, owner string) (uid, gid int
 	}
 	return u.UID, g.GID, nil
 }
+
+// nowFunc est isolé pour rester substituable en test.
+var nowFunc = time.Now
 
 // UID renvoie l'identifiant numérique d'un utilisateur, sous forme de chaîne.
 func UID(u *UserInfo) string {

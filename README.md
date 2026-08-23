@@ -16,7 +16,7 @@ C'est la référence : toute contribution s'y adosse.
 | Lot | Contenu | État |
 |---|---|---|
 | **L0** | Socle : nommage, modèle, validation, YAML, écriture atomique, base d'état, keystore, audit, moteur (plan/apply/diff/saga/verrou), provider système, CLI | **livré** |
-| L1 | Web + PHP : pools multi-version 7.4→8.5, vhosts Apache et Nginx, types Prestashop et Symfony, rotation des logs | à venir |
+| **L1** | Web + PHP : templates surchargeables, pools multi-version 7.4→8.5 avec numérotation, vhosts Apache et Nginx, types Prestashop et Symfony 3.4→8, clé de déploiement, lien `.bin/php`, `php switch` avec garde-fou de compatibilité, rotation des logs | **livré** |
 | L2 | Bases MySQL/MariaDB et PostgreSQL | à venir |
 | L3 | TLS : ACME embarqué, HTTP-01 et DNS-01 (OVH), wildcard partagé | à venir |
 | L4 | RabbitMQ : vhosts, queues, bindings, préréglage Messenger | à venir |
@@ -59,6 +59,19 @@ ou pas à pas :
 ./ogs --prefix ./dev project list
 ```
 
+## Commandes principales
+
+```
+ogs init | doctor | version [--license]
+ogs project create <host> [--kind] [--app-version] [--php] [--env prep] [--id] [--host]
+ogs project list | show | export
+ogs plan | apply | diff  [id...] [-f fichier]
+ogs php list | ports | switch <id> <version> [--pool] [--force]
+ogs web engine | test | reload
+ogs user key show | rotate <id>
+ogs template list | show | extract <nom>
+```
+
 ## Utilisation réelle
 
 ```sh
@@ -77,6 +90,19 @@ main et versionnable dans git. `ogs diff` montre l'écart entre ce fichier et le
 `ogs init` génère `/etc/ogs/master.key` (mode 0400). Elle chiffre tous les secrets de la base d'état. **Sans
 elle, ils sont définitivement irrécupérables** ; avec elle, ils sont tous lisibles. À sauvegarder hors de la
 machine, et à protéger comme un secret de premier rang.
+
+### Bascule de version PHP
+
+```sh
+sudo ogs php switch shopfr 8.4
+```
+
+La compatibilité est lue dans la contrainte `require.php` du `composer.json` de
+l'application — pas dans une table figée. Une bascule incompatible est refusée avec
+le motif et sa source ; `--force` l'impose et le consigne. L'ordre d'application est
+structurant : nouveau pool, puis réécriture du vhost sur le nouveau socket, puis
+seulement retrait de l'ancien pool. Les fichiers cron et les unités systemd ne sont
+jamais réécrits, puisqu'ils invoquent `.bin/php`.
 
 ## Conventions structurantes
 

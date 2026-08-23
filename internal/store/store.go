@@ -324,6 +324,39 @@ func (s *Store) Release(scope, projectID, name string) error {
 	return err
 }
 
+// Allocation est un numéro attribué à une ressource.
+type Allocation struct {
+	Scope   string
+	Number  int
+	Project string
+	Name    string
+}
+
+// Allocations liste les numéros attribués, triés par plage puis par numéro.
+func (s *Store) Allocations(scope string) ([]Allocation, error) {
+	query := `SELECT scope, number, project_id, name FROM allocations`
+	args := []any{}
+	if scope != "" {
+		query += ` WHERE scope = ?`
+		args = append(args, scope)
+	}
+	query += ` ORDER BY scope, number`
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Allocation
+	for rows.Next() {
+		var a Allocation
+		if err := rows.Scan(&a.Scope, &a.Number, &a.Project, &a.Name); err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
 // PutSecret enregistre un secret scellé.
 func (s *Store) PutSecret(scope, name string, nonce, ciphertext []byte) error {
 	_, err := s.db.Exec(`

@@ -1,0 +1,19 @@
+[{{ .Name }}]
+; Pool du projet {{ .Project }} — version PHP {{ .Version }}, numéro {{ .Number }}
+user = {{ .User }}
+group = {{ .Group }}
+listen = {{ .Listen }}
+{{- if .UnixSocket }}
+listen.owner = {{ .WebUser }}
+listen.group = {{ .Group }}
+listen.mode = 0660
+{{- else }}
+; Écoute TCP : aucune authentification n'est possible sur un pool FPM. Tout
+; utilisateur local peut donc faire exécuter du code sous cette identité.
+listen.allowed_clients = 127.0.0.1
+{{- end }}
+{{ range $key := sorted .Settings }}{{ $key }} = {{ index $.Settings $key }}
+{{ end }}
+{{- range $key := sorted .Env }}
+env[{{ $key }}] = {{ index $.Env $key }}
+{{- end }}

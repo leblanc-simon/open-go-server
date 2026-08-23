@@ -1,0 +1,91 @@
+server {
+    listen 80;
+    listen [::]:80;
+    server_name {{ .ServerName }}{{ range .Aliases }} {{ . }}{{ end }};
+
+    # Le challenge ACME doit répondre avant toute redirection.
+    location ^~ /.well-known/acme-challenge/ {
+        root {{ .ACMEChallenge }}/..;
+        default_type "text/plain";
+    }
+{{ if .TLS }}
+    location / {
+        return 301 https://{{ .ServerName }}$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
+    server_name {{ .ServerName }}{{ range .Aliases }} {{ . }}{{ end }};
+
+    ssl_certificate     {{ .CertDir }}/fullchain.pem;
+    ssl_certificate_key {{ .CertDir }}/privkey.pem;
+{{- if .HSTS }}
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+{{- end }}
+{{- end }}
+    root {{ .Docroot }};
+    index {{ .FrontController }} index.html;
+    access_log {{ .LogDir }}/nginx-access.log;
+    error_log  {{ .LogDir }}/nginx-error.log;
+    client_max_body_size {{ .ClientMaxBodySize }};
+{{- if .Noindex }}
+
+    # Préproduction : interdiction d'indexation.
+    add_header X-Robots-Tag "noindex, nofollow" always;
+    location = /robots.txt {
+        return 200 "User-agent: *\nDisallow: /\n";
+    }
+{{- end }}
+{{- if .BasicAuthFile }}
+
+    auth_basic "Préproduction";
+    auth_basic_user_file {{ .BasicAuthFile }};
+{{- end }}
+{{ if eq .AppKind "php-prestashop" }}
+    # Prestashop s'appuie sur .htaccess, que nginx ne lit pas : les règles de
+    # réécriture doivent être fournies ici, sans quoi le site n'est qu'à moitié
+    # fonctionnel (images, pages de catégorie, API).
+    location / {
+        try_files $uri $uri/ /{{ .FrontController }}$is_args$args;
+    }
+    rewrite ^/api/?(.*)$ /webservice/dispatcher.php?url=$1 last;
+    rewrite ^/([0-9])(-[\w-]+)?/(.+)\.(jpg|webp|png|avif)$ /img/p/$1/$1$2.$4 last;
+    rewrite ^/([0-9])([0-9])(-[\w-]+)?/(.+)\.(jpg|webp|png|avif)$ /img/p/$1/$2/$1$2$3.$5 last;
+    rewrite ^/c/([0-9]+)(-[\w-]+)?/(.+)\.(jpg|webp|png|avif)$ /img/c/$1$2.$4 last;
+    rewrite ^/c/([\w-]+)/(.+)\.(jpg|webp|png|avif)$ /img/c/$1.$3 last;
+
+    # Répertoires qui ne doivent jamais être servis.
+    location ~ ^/(app|bin|cache|classes|config|controllers|docs|localization|override|src|tests|tools|translations|travis-scripts|vendor|var)/ {
+        deny all;
+    }
+{{- else }}
+    # Front controller unique : tout passe par {{ .FrontController }}.
+    location / {
+        try_files $uri /{{ .FrontController }}$is_args$args;
+    }
+{{- end }}
+
+    location ~ ^/{{ .FrontController }}(/|$) {
+        fastcgi_pass {{ .FPMPass }};
+        fastcgi_split_path_info ^(.+\.php)(/.*)$;
+        include fastcgi_params;
+        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+        fastcgi_param DOCUMENT_ROOT $document_root;
+        fastcgi_param HTTPS {{ if .TLS }}on{{ else }}off{{ end }};
+        internal;
+    }
+
+    # Aucun autre script PHP ne doit être exécutable : un fichier déposé dans un
+    # répertoire d'upload ne devient pas un point d'entrée.
+    location ~ \.php$ {
+        return 404;
+    }
+{{- range .Blocks }}
+
+    # bloc {{ .Name }}
+{{ indent 4 .Content }}
+{{- end }}
+}

@@ -1,0 +1,15 @@
+server {
+    listen 80;
+    listen [::]:80;
+    server_name {{ .ServerName }}{{ range .Aliases }} {{ . }}{{ end }};
+
+    location ^~ /.well-known/acme-challenge/ {
+        root {{ .ACMEChallenge }}/..;
+        default_type "text/plain";
+    }
+
+    access_log {{ .LogDir }}/nginx-access.log;
+    location / {
+        return 301 {{ if .TLS }}https{{ else }}http{{ end }}://{{ .RedirectTarget }}$request_uri;
+    }
+}

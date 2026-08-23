@@ -1987,6 +1987,12 @@ confirmation, applique en saga, puis affiche le récapitulatif avec les chaînes
 Options transverses de toutes les commandes mutantes : `--dry-run`, `--yes`, `--non-interactive`, `--force`,
 `--output`, `--verbose`, `--quiet`, `--no-hooks`, `--config`.
 
+**`--prefix <répertoire>`** décale l'ensemble des chemins système sous un répertoire et simule les commandes
+système. C'est la seule dérogation au root-strict (D21) : sans elle, aucun test automatisé ne serait
+possible, puisque toute opération exigerait les privilèges du superutilisateur et modifierait la machine de
+développement. Ce mode est réservé aux essais et au développement ; il l'annonce sur la sortie d'erreur et
+n'exécute aucune commande réelle.
+
 ### 10.3 Codes de retour
 
 | Code | Signification |

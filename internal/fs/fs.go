@@ -253,3 +253,44 @@ func syncDir(dir string) error {
 	}
 	return nil
 }
+
+// UnifiedDiff produit un diff ligne à ligne, suffisant pour qu'un administrateur
+// juge un changement de configuration avant de l'appliquer. Ce n'est pas un
+// algorithme de plus longue sous-séquence commune : les fichiers comparés étant
+// tous deux générés depuis le même template, les écarts sont locaux et un
+// alignement séquentiel les rend correctement.
+func UnifiedDiff(before, after, label string) string {
+	if before == after {
+		return ""
+	}
+	b := strings.Split(strings.TrimRight(before, "\n"), "\n")
+	a := strings.Split(strings.TrimRight(after, "\n"), "\n")
+	var out strings.Builder
+	fmt.Fprintf(&out, "--- %s (présent)\n+++ %s (attendu)\n", label, label)
+	i, j := 0, 0
+	for i < len(b) || j < len(a) {
+		switch {
+		case i < len(b) && j < len(a) && b[i] == a[j]:
+			i++
+			j++
+		case j < len(a) && (i >= len(b) || !contains(b[i:], a[j])):
+			fmt.Fprintf(&out, "+%s\n", a[j])
+			j++
+		case i < len(b):
+			fmt.Fprintf(&out, "-%s\n", b[i])
+			i++
+		default:
+			j++
+		}
+	}
+	return out.String()
+}
+
+func contains(lines []string, want string) bool {
+	for _, l := range lines {
+		if l == want {
+			return true
+		}
+	}
+	return false
+}

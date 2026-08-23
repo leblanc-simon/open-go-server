@@ -186,6 +186,46 @@ func (p Paths) Home(cfg *Config, effectiveHost string) string {
 	return filepath.Join(p.prefix, cfg.Naming.HomeRoot, effectiveHost)
 }
 
+// Chemins PHP. Ils suivent le découpage Debian/Ubuntu (dépôt Sury pour le
+// multi-version), seule famille gérée en v1.
+const (
+	phpEtc = "/etc/php"
+	phpRun = "/run/php"
+	phpCLI = "/usr/bin/php"
+	phpFPM = "/usr/sbin/php-fpm"
+)
+
+// PHPRoot renvoie la racine des configurations PHP.
+func (p Paths) PHPRoot() string { return p.join(phpEtc) }
+
+// PHPPoolDir renvoie le répertoire des pools d'une version.
+func (p Paths) PHPPoolDir(version string) string {
+	return p.join(phpEtc, version, "fpm", "pool.d")
+}
+
+// PHPPoolFile renvoie le chemin du fichier de pool.
+func (p Paths) PHPPoolFile(version, pool string) string {
+	return filepath.Join(p.PHPPoolDir(version), pool+".conf")
+}
+
+// PHPBin renvoie l'interpréteur en ligne de commande d'une version.
+func (p Paths) PHPBin(version string) string { return p.join(phpCLI + version) }
+
+// PHPFpmBin renvoie le binaire FPM d'une version.
+func (p Paths) PHPFpmBin(version string) string { return p.join(phpFPM + version) }
+
+// PHPRunDir renvoie le répertoire des sockets FPM.
+func (p Paths) PHPRunDir() string { return p.join(phpRun) }
+
+// PHPSocket renvoie le chemin du socket d'un pool. Le numéro y figure, ce qui
+// rend l'appartenance lisible dans un « ss -x » ou un « ls /run/php ».
+func (p Paths) PHPSocket(version string, number int, pool string) string {
+	return filepath.Join(p.PHPRunDir(), fmt.Sprintf("php%s-fpm-%d-%s.sock", version, number, pool))
+}
+
+// PHPUnit renvoie le nom de l'unité systemd du gestionnaire de processus.
+func PHPUnit(version string) string { return "php" + version + "-fpm" }
+
 // Dirs énumère les répertoires à créer par `ogs init`, avec leur mode.
 func (p Paths) Dirs() []struct {
 	Path string

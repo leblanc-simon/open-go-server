@@ -52,6 +52,10 @@ func NewRootCommand() *cobra.Command {
 		newPlanCommand(app),
 		newApplyCommand(app),
 		newDiffCommand(app),
+		newPHPCommand(app),
+		newWebCommand(app),
+		newUserCommand(app),
+		newTemplateCommand(app),
 	)
 	return root
 }

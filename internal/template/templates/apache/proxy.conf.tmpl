@@ -1,0 +1,25 @@
+<VirtualHost *:80>
+    ServerName {{ .ServerName }}
+{{- range .Aliases }}
+    ServerAlias {{ . }}
+{{- end }}
+
+    Alias /.well-known/acme-challenge {{ .ACMEChallenge }}
+    <Directory {{ .ACMEChallenge }}>
+        Require all granted
+    </Directory>
+
+    ProxyPreserveHost On
+    ProxyPass        /.well-known/acme-challenge !
+    ProxyPass        / {{ .ProxyTarget }}
+    ProxyPassReverse / {{ .ProxyTarget }}
+    RequestHeader set X-Forwarded-Proto "{{ if .TLS }}https{{ else }}http{{ end }}"
+{{- range .Blocks }}
+
+    # bloc {{ .Name }}
+{{ indent 4 .Content }}
+{{- end }}
+
+    ErrorLog {{ .LogDir }}/apache-error.log
+    CustomLog {{ .LogDir }}/apache-access.log combined
+</VirtualHost>
