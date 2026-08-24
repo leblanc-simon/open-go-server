@@ -7,20 +7,45 @@ server {
     listen [::]:80;
     server_name {{ .ServerName }}{{ range .Aliases }} {{ . }}{{ end }};
 
+    # Le challenge ACME doit répondre avant toute redirection, et ne jamais
+    # partir vers l'applicatif.
     location ^~ /.well-known/acme-challenge/ {
-        root {{ .ACMEChallenge }}/..;
+        root {{ .ACMEChallenge }};
         default_type "text/plain";
     }
+{{ if .TLS }}
+    location / {
+        return 301 https://{{ .ServerName }}$request_uri;
+    }
+}
 
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
+    server_name {{ .ServerName }}{{ range .Aliases }} {{ . }}{{ end }};
+
+    ssl_certificate     {{ .CertDir }}/fullchain.pem;
+    ssl_certificate_key {{ .CertDir }}/privkey.pem;
+{{- if .HSTS }}
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+{{- end }}
+{{- end }}
     access_log {{ .LogDir }}/nginx-access.log;
     error_log  {{ .LogDir }}/nginx-error.log;
     client_max_body_size {{ .ClientMaxBodySize }};
+{{- if .BasicAuthFile }}
+
+    auth_basic "Préproduction";
+    auth_basic_user_file {{ .BasicAuthFile }};
+{{- end }}
 
     location / {
         proxy_pass http://ogs_{{ snake .Project }};
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        # L'applicatif doit savoir sous quel schéma il est réellement exposé.
         proxy_set_header X-Forwarded-Proto {{ if .TLS }}https{{ else }}$scheme{{ end }};
         proxy_http_version 1.1;
         proxy_set_header Upgrade $http_upgrade;

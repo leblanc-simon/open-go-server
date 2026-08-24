@@ -69,10 +69,12 @@ contents:
     type: dir
     file_info:
       mode: 0700
+  # 0751 : le serveur web doit pouvoir traverser jusqu'au répertoire du
+  # challenge ACME, sans pouvoir énumérer le reste.
   - dst: /var/lib/ogs
     type: dir
     file_info:
-      mode: 0700
+      mode: 0751
   - dst: /var/log/ogs
     type: dir
     file_info:

@@ -201,3 +201,18 @@ func TestParseEnv(t *testing.T) {
 		t.Error("environnement inconnu accepté")
 	}
 }
+
+func TestUnescapeMySQLPatternIsTheInverseOfEscape(t *testing.T) {
+	// La relecture des privilèges rend le motif tel qu'il est stocké. Sans cette
+	// conversion, une base dont le nom contient un souligné — le cas de toute base
+	// additionnelle, « shopfr_stats » — ne serait jamais vue comme conforme, et le
+	// GRANT serait rejoué à chaque apply.
+	for _, nom := range []string{"shopfr", "shopfr_stats", "a_b_c", "cent%pour_cent"} {
+		if got := UnescapeMySQLPattern(EscapeMySQLPattern(nom)); got != nom {
+			t.Errorf("aller-retour de %q = %q", nom, got)
+		}
+	}
+	if got := UnescapeMySQLPattern(`shopfr\_stats`); got != "shopfr_stats" {
+		t.Errorf("motif stocké mal interprété : %q", got)
+	}
+}

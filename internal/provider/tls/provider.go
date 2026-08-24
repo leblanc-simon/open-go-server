@@ -175,6 +175,9 @@ func (p *Provider) CertificateFor(proj *model.Project) (ref string, available bo
 // déclaration explicite, le TLS est souhaité par défaut : un site public sans
 // certificat n'est plus acceptable.
 func wantsTLS(proj *model.Project) bool {
+	if proj.Spec.Web.TLSDisabled() {
+		return false
+	}
 	if len(proj.Spec.Web.VHosts) == 0 {
 		return true
 	}
@@ -241,6 +244,7 @@ func (p *Provider) certificateStep(req Request) (*engine.Step, error) {
 				req.Name, strings.Join(req.Domains, ", ")))
 		s.Critical = false
 		s.Apply = func(ctx context.Context) error { return p.issue(ctx, req) }
+		s.FlushReloads = req.Challenge == "http-01"
 		return s, nil
 	case present:
 		s := engine.NewStep(resource, engine.Update,
@@ -248,12 +252,17 @@ func (p *Provider) certificateStep(req Request) (*engine.Step, error) {
 				req.Name, info.DaysLeft(now)))
 		s.Critical = false
 		s.Apply = func(ctx context.Context) error { return p.issue(ctx, req) }
+		s.FlushReloads = req.Challenge == "http-01"
 		return s, nil
 	}
 	s := engine.NewStep(resource, engine.Create,
 		fmt.Sprintf("certificat %s pour %s (%s)", req.Name, strings.Join(req.Domains, ", "), req.Challenge))
 	s.Critical = false
 	s.Apply = func(ctx context.Context) error { return p.issue(ctx, req) }
+	// Le challenge HTTP-01 se fait servir par le vhost : il doit être chargé, non
+	// seulement écrit. Sans ce vidage, la première émission d'un site neuf échoue
+	// en 404, le serveur n'ayant pas encore relu sa configuration.
+	s.FlushReloads = req.Challenge == "http-01"
 	// La compensation ne retire que ce que cette exécution a créé.
 	s.Compensate = func(context.Context) error { return p.Store.Remove(req.Name) }
 	return s, nil

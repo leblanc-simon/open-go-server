@@ -108,6 +108,14 @@ func Inspect(path string, expected []byte) (State, error) {
 	if announced == "" || announced != Fingerprint(body) {
 		return StateHandEdited, nil
 	}
+	// Le corps est intact et c'est bien celui qu'ogs a écrit. Reste à savoir si le
+	// rendu attendu porte le même corps : l'en-tête contient un horodatage, qui
+	// diffère à chaque calcul. Sans cette comparaison d'empreintes, tout fichier
+	// serait déclaré en écart une seconde après avoir été écrit, et chaque apply
+	// le réécrirait — en rechargeant le serveur web au passage.
+	if expectedFP, _ := splitHeader(expected); expectedFP != "" && expectedFP == announced {
+		return StateCurrent, nil
+	}
 	return StateOutdated, nil
 }
 

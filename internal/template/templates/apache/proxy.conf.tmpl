@@ -4,22 +4,61 @@
     ServerAlias {{ . }}
 {{- end }}
 
-    Alias /.well-known/acme-challenge {{ .ACMEChallenge }}
-    <Directory {{ .ACMEChallenge }}>
+    # Le challenge ACME doit répondre avant toute redirection, et ne jamais
+    # partir vers l'applicatif.
+    Alias /.well-known/acme-challenge {{ .ACMEChallengeDir }}
+    <Directory {{ .ACMEChallengeDir }}>
         Require all granted
     </Directory>
+{{ if .TLS }}
+    RewriteEngine On
+    RewriteCond %{REQUEST_URI} !^/\.well-known/acme-challenge/
+    RewriteRule ^(.*)$ https://{{ .ServerName }}$1 [R=301,L]
+{{- else }}
+{{ template "apache-body" . }}
+{{- end }}
+    ErrorLog {{ .LogDir }}/apache-error.log
+    CustomLog {{ .LogDir }}/apache-access.log combined
+</VirtualHost>
+{{ if .TLS }}
+<VirtualHost *:443>
+    ServerName {{ .ServerName }}
+{{- range .Aliases }}
+    ServerAlias {{ . }}
+{{- end }}
 
+    SSLEngine on
+    SSLCertificateFile {{ .CertDir }}/fullchain.pem
+    SSLCertificateKeyFile {{ .CertDir }}/privkey.pem
+{{- if .HSTS }}
+    Header always set Strict-Transport-Security "max-age=31536000; includeSubDomains"
+{{- end }}
+{{ template "apache-body" . }}
+    ErrorLog {{ .LogDir }}/apache-error.log
+    CustomLog {{ .LogDir }}/apache-access.log combined
+</VirtualHost>
+{{- end }}
+
+{{- define "apache-body" }}
     ProxyPreserveHost On
     ProxyPass        /.well-known/acme-challenge !
     ProxyPass        / {{ .ProxyTarget }}
     ProxyPassReverse / {{ .ProxyTarget }}
+    # L'applicatif doit savoir sous quel schéma il est réellement exposé, sans
+    # quoi il produit des URL en http derrière un site en https.
     RequestHeader set X-Forwarded-Proto "{{ if .TLS }}https{{ else }}http{{ end }}"
+{{- if .BasicAuthFile }}
+
+    <Location />
+        AuthType Basic
+        AuthName "Préproduction"
+        AuthUserFile {{ .BasicAuthFile }}
+        Require valid-user
+    </Location>
+{{- end }}
 {{- range .Blocks }}
 
     # bloc {{ .Name }}
 {{ indent 4 .Content }}
 {{- end }}
-
-    ErrorLog {{ .LogDir }}/apache-error.log
-    CustomLog {{ .LogDir }}/apache-access.log combined
-</VirtualHost>
+{{- end }}

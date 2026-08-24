@@ -108,6 +108,9 @@ Décisions arbitrées et figées pour la v1. Toute remise en cause est une évol
 | D37 | Types livrés | **Prestashop** et **Symfony 3.4 → 8** (+ `static`, `php-plain` et les 4 runtimes) ; les autres frameworks s'ajoutent par `apptypes.yaml` sans code | Symfony 3.4 impose une variante distincte : docroot `web`, `app.php`, pas de Messenger |
 | D38 | Compatibilité PHP | La contrainte `require.php` du **`composer.json` de l'application** fait autorité ; table indicative en secours seulement | Aucune matrice figée à maintenir ; `php switch` refuse une bascule incompatible sans `--force` |
 | D39 | Versions PHP | **7.4 à 8.5**, y compris des versions en fin de support | `doctor` les signale sans jamais bloquer : un Prestashop ancien peut exiger 7.4 |
+| D41 | Droits de `/var/lib/ogs` | **0751** et non 0750 | Le serveur web doit traverser jusqu'à `acme-challenge` : en 0750 tout challenge HTTP-01 se voit refuser par un 403. Le bit d'exécution seul n'autorise pas l'énumération, et les contenus sensibles gardent leurs propres droits |
+| D42 | Webroot du challenge | Le client ACME écrit dans `<webroot>/.well-known/acme-challenge/` : **Apache aliase ce répertoire, nginx prend le webroot** et y accole l'URI | Les deux directives n'ont pas la même sémantique ; une seule valeur de template menait fatalement l'un des deux moteurs à un 404 |
+| D43 | TLS dans les templates | **Tous** les templates de vhost servent le HTTPS, non seulement ceux des sites PHP | Un site statique, une application derrière un proxy — donc tous les runtimes non-PHP — et un domaine redirigé ont autant besoin d'être chiffrés |
 | D40 | Hooks | **Deux portées** : un fichier de `/etc/ogs/hooks` nommé d'après l'événement s'applique à tout le parc, `spec.hooks` le remplace pour un projet. Criticité déduite du préfixe : `pre` interrompt, `post` avertit | Un hook s'exécute en root : le script doit vivre sous `/etc/ogs/hooks`, appartenir à root et n'être inscriptible par personne d'autre, sans quoi il est refusé — c'est une escalade de privilèges autrement. Aucun hook en `--dry-run` |
 
 ---
@@ -2418,7 +2421,23 @@ build multi-architecture. Les tests d'intégration sont obligatoires avant fusio
 | **L7 — TUI** | inspecteur, panneau de détail, actions contextuelles, suivi de logs, wizard de création | Création complète d'un projet depuis la TUI, parité avec la CLI |
 | **L8 — Import** | scan multi-sources, corrélation, adoption interactive, ressources non gérées | Adoption d'un serveur préconfiguré sans régression |
 | **L9 — Applications non-PHP** | types d'application, providers `runtime` (nvm, rbenv, pyenv, venv), templates de service Go/Node/Python/Ruby, vhosts de proxy, attente de disponibilité | Scénarios d'intégration 22 à 25 validés |
-| **L10 — Industrialisation** | hooks de parc et de projet, complétions dynamiques bash/zsh/fish, 96 pages de manuel engendrées, paquet `.deb` (nfpm), CI GitHub Actions, scénarios d'intégration conteneurisés, documentation d'exploitation | Paquet installable, documentation publiée |
+| **L10 — Industrialisation** | hooks de parc et de projet, complétions dynamiques bash/zsh/fish, 96 pages de manuel engendrées, paquet `.deb` (nfpm), CI GitHub Actions, sept scénarios d'intégration conteneurisés (serveur web, PHP, hooks, MariaDB, RabbitMQ, ACME, paquet), documentation d'exploitation | Paquet installable, documentation publiée |
+
+### Ce que les essais sur système réel ont corrigé
+
+Les scénarios conteneurisés du lot L10 ont mis au jour sept défauts qu'aucun test unitaire ne pouvait
+voir, parce que tous supposaient un interlocuteur simulé :
+
+| Défaut | Conséquence en exploitation |
+|---|---|
+| `/var/lib/ogs` en 0750 | le serveur web ne pouvait pas traverser : **tout challenge HTTP-01 échouait en 403** (D41) |
+| Webroot du challenge mal aliasé | le jeton était écrit là où aucun des deux moteurs ne le cherchait : **404** (D42) |
+| Rechargement du serveur web groupé en fin d'apply | le vhost n'était pas encore chargé quand l'autorité venait valider : **la première émission d'un site neuf échouait toujours**. Une étape peut désormais exiger que les rechargements en attente soient exécutés avant elle |
+| TLS absent des templates `static`, `proxy` et `redirect` | un certificat était émis puis **jamais présenté** — sites statiques et toutes les applications non-PHP restaient en clair (D43) |
+| Comparaison octet à octet incluant l'horodatage de l'en-tête | **tout fichier était déclaré en écart la seconde suivant son écriture**, et chaque apply le réécrivait en rechargeant le serveur |
+| Motif de `GRANT` non déséchappé à la relecture | une base dont le nom contient un souligné — donc **toute base additionnelle** — n'était jamais reconnue conforme |
+| `robots.txt` de préproduction aliasé vers un fichier jamais créé | 404 sur `/robots.txt`, donc **aucune protection contre l'indexation** |
+| `--tls=false` sans effet, et dump dans le répertoire courant | un site voulu en HTTP consommait un quota ACME ; un dump de production pouvait atterrir à la racine du système |
 
 Les lots L0 à L2 constituent le socle minimal utilisable ; L3 à L6 apportent la valeur cible ; L7 à L10
 finalisent le produit. L9 (applications non-PHP) est le seul lot réellement détachable : le produit est

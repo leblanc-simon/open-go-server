@@ -3,15 +3,46 @@ server {
     listen [::]:80;
     server_name {{ .ServerName }}{{ range .Aliases }} {{ . }}{{ end }};
 
+    # Le challenge ACME doit répondre avant toute redirection.
     location ^~ /.well-known/acme-challenge/ {
-        root {{ .ACMEChallenge }}/..;
+        root {{ .ACMEChallenge }};
         default_type "text/plain";
     }
+{{ if .TLS }}
+    location / {
+        return 301 https://{{ .ServerName }}$request_uri;
+    }
+}
 
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
+    server_name {{ .ServerName }}{{ range .Aliases }} {{ . }}{{ end }};
+
+    ssl_certificate     {{ .CertDir }}/fullchain.pem;
+    ssl_certificate_key {{ .CertDir }}/privkey.pem;
+{{- if .HSTS }}
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+{{- end }}
+{{- end }}
     root {{ .Docroot }};
     index index.html;
     access_log {{ .LogDir }}/nginx-access.log;
     error_log  {{ .LogDir }}/nginx-error.log;
+{{- if .Noindex }}
+
+    # Préproduction : interdiction d'indexation.
+    add_header X-Robots-Tag "noindex, nofollow" always;
+    location = /robots.txt {
+        return 200 "User-agent: *\nDisallow: /\n";
+    }
+{{- end }}
+{{- if .BasicAuthFile }}
+
+    auth_basic "Préproduction";
+    auth_basic_user_file {{ .BasicAuthFile }};
+{{- end }}
 
     location / {
         try_files $uri $uri/ =404;

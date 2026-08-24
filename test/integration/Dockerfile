@@ -19,13 +19,24 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         sudo \
         man-db \
         less \
-    && a2enmod proxy proxy_fcgi rewrite headers setenvif \
+        mariadb-server \
+        mariadb-client \
+        procps \
+        openssl \
+        openssh-client \
+        python3-minimal \
+        python3-pika \
+    && a2enmod proxy proxy_fcgi rewrite headers setenvif ssl \
     && rm -rf /var/lib/apt/lists/*
+
+# Sans init dans le conteneur, systemctl n'existe pas : un substitut dispatche
+# les actions sur les services réellement installés.
+COPY test/integration/systemctl-shim.sh /usr/local/bin/systemctl
 
 # Le binaire est compilé à l'extérieur : statique, il n'a besoin de rien ici.
 COPY ogs /usr/bin/ogs
 COPY test/integration/scenarios /scenarios
 
-RUN chmod +x /usr/bin/ogs /scenarios/*.sh
+RUN chmod +x /usr/bin/ogs /scenarios/*.sh /usr/local/bin/systemctl
 
 ENTRYPOINT ["/bin/bash"]

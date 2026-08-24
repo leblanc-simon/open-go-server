@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -218,5 +219,41 @@ func TestLockIsExclusive(t *testing.T) {
 	}
 	if err := second.Release(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestFlushReloadsRunsPendingReloadsBeforeTheStep(t *testing.T) {
+	// Le challenge HTTP-01 a besoin que le serveur web ait relu son vhost : un
+	// fichier écrit ne suffit pas. Une étape peut donc exiger que les
+	// rechargements en attente soient exécutés avant elle — et ils ne doivent pas
+	// l'être deux fois.
+	var journal []string
+
+	plan := &Plan{Project: "shopfr"}
+	ecriture := NewStep("web/vhost/shopfr", Create, "vhost")
+	ecriture.Apply = func(context.Context) error { journal = append(journal, "écriture"); return nil }
+	ecriture.Reload = []string{"web:apache"}
+	plan.Add(ecriture)
+
+	emission := NewStep("tls/certificate/shopfr", Create, "certificat")
+	emission.FlushReloads = true
+	emission.Apply = func(context.Context) error { journal = append(journal, "émission"); return nil }
+	plan.Add(emission)
+
+	report, err := Execute(context.Background(), plan, Options{
+		Reload: func(_ context.Context, target string) error {
+			journal = append(journal, "rechargement "+target)
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	attendu := "écriture, rechargement web:apache, émission"
+	if got := strings.Join(journal, ", "); got != attendu {
+		t.Errorf("ordre d'exécution = %q, attendu %q", got, attendu)
+	}
+	if len(report.Reloaded) != 1 {
+		t.Errorf("le rechargement doit être exécuté une seule fois : %v", report.Reloaded)
 	}
 }

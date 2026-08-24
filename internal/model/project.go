@@ -185,7 +185,15 @@ type Pool struct {
 type Web struct {
 	Engine string  `yaml:"engine,omitempty"`
 	VHosts []VHost `yaml:"vhosts,omitempty"`
+	// TLS porte le réglage de portée projet. Il est nécessaire parce que le vhost
+	// est le plus souvent implicite — déduit des domaines : sans lui, un projet
+	// sans section « vhosts » n'aurait aucun endroit où dire qu'il reste en HTTP.
+	TLS *TLS `yaml:"tls,omitempty"`
 }
+
+// TLSDisabled indique que le projet renonce explicitement au chiffrement. Le
+// défaut reste l'inverse : un site public sans certificat n'est plus acceptable.
+func (w Web) TLSDisabled() bool { return w.TLS != nil && !w.TLS.Enabled }
 
 // VHost est un hôte virtuel.
 type VHost struct {

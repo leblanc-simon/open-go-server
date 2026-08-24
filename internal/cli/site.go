@@ -195,6 +195,13 @@ func (a *App) buildSite(host string, opts siteOptions) (*model.Project, error) {
 		p.Spec.AMQP = amqp.Preset(p, opts.messenger, true)
 	}
 	if !opts.tls {
+		// Le certificat doit disparaître avec le TLS : le laisser déclaré ferait
+		// solliciter l'autorité — et consommer un quota — pour un site qui reste
+		// délibérément en HTTP.
+		p.Spec.Certificates = nil
+		// Le réglage est porté par le projet, non par les vhosts : ceux-ci sont le
+		// plus souvent implicites, et la liste est vide à ce stade.
+		p.Spec.Web.TLS = &model.TLS{Enabled: false}
 		for i := range p.Spec.Web.VHosts {
 			p.Spec.Web.VHosts[i].TLS = &model.TLS{Enabled: false}
 		}

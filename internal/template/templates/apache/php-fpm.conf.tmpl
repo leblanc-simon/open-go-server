@@ -7,8 +7,8 @@
 
     # Le challenge ACME doit répondre avant toute redirection, sinon aucun
     # certificat ne peut être émis ni renouvelé.
-    Alias /.well-known/acme-challenge {{ .ACMEChallenge }}
-    <Directory {{ .ACMEChallenge }}>
+    Alias /.well-known/acme-challenge {{ .ACMEChallengeDir }}
+    <Directory {{ .ACMEChallengeDir }}>
         Require all granted
         Options -Indexes
     </Directory>
@@ -61,7 +61,7 @@
 
     # Préproduction : interdiction d'indexation.
     Header always set X-Robots-Tag "noindex, nofollow"
-    Alias /robots.txt {{ .ACMEChallenge }}/../robots-noindex.txt
+    Alias /robots.txt {{ .RobotsNoindexFile }}
 {{- end }}
 {{- if .BasicAuthFile }}
 

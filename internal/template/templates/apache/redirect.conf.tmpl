@@ -4,8 +4,8 @@
     ServerAlias {{ . }}
 {{- end }}
 
-    Alias /.well-known/acme-challenge {{ .ACMEChallenge }}
-    <Directory {{ .ACMEChallenge }}>
+    Alias /.well-known/acme-challenge {{ .ACMEChallengeDir }}
+    <Directory {{ .ACMEChallengeDir }}>
         Require all granted
     </Directory>
 
@@ -16,3 +16,23 @@
     ErrorLog {{ .LogDir }}/apache-error.log
     CustomLog {{ .LogDir }}/apache-access.log combined
 </VirtualHost>
+{{ if .TLS }}
+<VirtualHost *:443>
+    ServerName {{ .ServerName }}
+{{- range .Aliases }}
+    ServerAlias {{ . }}
+{{- end }}
+
+    SSLEngine on
+    SSLCertificateFile {{ .CertDir }}/fullchain.pem
+    SSLCertificateKeyFile {{ .CertDir }}/privkey.pem
+
+    # Un domaine redirigé doit l'être aussi en HTTPS : le certificat le couvre,
+    # et un visiteur qui arrive en https ne doit pas voir une erreur de nom.
+    RewriteEngine On
+    RewriteRule ^(.*)$ https://{{ .RedirectTarget }}$1 [R=301,L]
+
+    ErrorLog {{ .LogDir }}/apache-error.log
+    CustomLog {{ .LogDir }}/apache-access.log combined
+</VirtualHost>
+{{- end }}

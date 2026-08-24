@@ -5,7 +5,7 @@ server {
 
     # Le challenge ACME doit répondre avant toute redirection.
     location ^~ /.well-known/acme-challenge/ {
-        root {{ .ACMEChallenge }}/..;
+        root {{ .ACMEChallenge }};
         default_type "text/plain";
     }
 {{ if .TLS }}

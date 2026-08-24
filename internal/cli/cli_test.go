@@ -1497,6 +1497,46 @@ func TestSiteCreateCronOptionSplitsOnFirstColon(t *testing.T) {
 	}
 }
 
+func TestSiteCreateWithoutTLSDeclaresNoCertificate(t *testing.T) {
+	// Un site explicitement laissé en HTTP ne doit pas déclarer de certificat :
+	// autrement chaque apply solliciterait l'autorité — et son quota — pour un
+	// certificat que le vhost n'emploiera jamais.
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("site", "create", "shop.fr", "--kind", "static", "--tls=false", "--yes")
+	decl := h.read(t, filepath.Join("etc", "ogs", "projects", "shopfr.yaml"))
+	if strings.Contains(decl, "certificates:") {
+		t.Errorf("aucun certificat ne doit être déclaré sans TLS :\n%s", decl)
+	}
+	// Le refus doit être inscrit dans la déclaration : le vhost étant implicite,
+	// c'est le seul endroit où il peut survivre à une relecture.
+	if !strings.Contains(decl, "tls:") {
+		t.Errorf("le renoncement au TLS n'est pas déclaré :\n%s", decl)
+	}
+	// Et le vhost écrit doit être en HTTP seul.
+	vhost := h.read(t, filepath.Join("etc", "apache2", "sites-available", "shopfr.conf"))
+	for _, interdit := range []string{"SSLEngine", "443"} {
+		if strings.Contains(vhost, interdit) {
+			t.Errorf("le vhost contient %q alors que le TLS est refusé :\n%s", interdit, vhost)
+		}
+	}
+	// Le mode préfixé ne crée pas les comptes système, l'écart les concernant est
+	// normal ; ce qui ne doit plus apparaître, c'est le certificat — sans quoi
+	// chaque apply le redemanderait.
+	out, _ := h.run("diff", "shopfr")
+	if strings.Contains(out, "certificat") {
+		t.Errorf("le certificat est encore planifié :\n%s", out)
+	}
+
+	// Avec --self-signed, en revanche, le certificat est voulu.
+	h.mustRun("site", "create", "boutique.fr", "--kind", "static", "--tls=false",
+		"--self-signed", "--yes")
+	decl = h.read(t, filepath.Join("etc", "ogs", "projects", "boutiquefr.yaml"))
+	if !strings.Contains(decl, "selfsigned") {
+		t.Errorf("le certificat auto-signé doit rester déclaré :\n%s", decl)
+	}
+}
+
 func TestSiteCloneToPrep(t *testing.T) {
 	h := newHarness(t)
 	h.mustRun("init")

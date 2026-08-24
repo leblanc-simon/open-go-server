@@ -18,7 +18,8 @@ ARCH    := $(shell go env GOARCH)
 DEBVER  := $(shell git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//' || echo 0.0.0)
 
 .PHONY: all build test vet fmt cover clean install dev-init dev-demo \
-	doc completion man package integration integration-php integration-package integration-hooks tidy check
+	doc completion man package integration integration-php integration-package integration-hooks \
+	integration-all integration-mysql integration-rabbitmq integration-acme tidy check
 
 all: fmt vet test build
 
@@ -65,6 +66,15 @@ package: doc
 # --- Essais d'intégration ----------------------------------------------------
 # Ils exigent un système complet — serveur web, PHP, comptes — et s'exécutent
 # donc dans un conteneur. Ils ne font pas partie de « make test ».
+# Tous les scénarios, l'un après l'autre.
+SCENARIOS := reload-group site-complet hooks mysql rabbitmq pebble paquet
+
+integration-all:
+	@for s in $(SCENARIOS); do \
+		echo "########## $$s"; \
+		./test/integration/run.sh $$s || exit 1; \
+	done
+
 integration:
 	./test/integration/run.sh reload-group
 
@@ -76,6 +86,15 @@ integration-package:
 
 integration-hooks:
 	./test/integration/run.sh hooks
+
+integration-mysql:
+	./test/integration/run.sh mysql
+
+integration-rabbitmq:
+	./test/integration/run.sh rabbitmq
+
+integration-acme:
+	./test/integration/run.sh pebble
 
 tidy:
 	go mod tidy

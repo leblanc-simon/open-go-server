@@ -4,7 +4,7 @@ server {
     server_name {{ .ServerName }}{{ range .Aliases }} {{ . }}{{ end }};
 
     location ^~ /.well-known/acme-challenge/ {
-        root {{ .ACMEChallenge }}/..;
+        root {{ .ACMEChallenge }};
         default_type "text/plain";
     }
 
@@ -13,3 +13,21 @@ server {
         return 301 {{ if .TLS }}https{{ else }}http{{ end }}://{{ .RedirectTarget }}$request_uri;
     }
 }
+{{ if .TLS }}
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
+    server_name {{ .ServerName }}{{ range .Aliases }} {{ . }}{{ end }};
+
+    ssl_certificate     {{ .CertDir }}/fullchain.pem;
+    ssl_certificate_key {{ .CertDir }}/privkey.pem;
+
+    # Un domaine redirigé doit l'être aussi en HTTPS : le certificat le couvre,
+    # et un visiteur qui arrive en https ne doit pas voir une erreur de nom.
+    access_log {{ .LogDir }}/nginx-access.log;
+    location / {
+        return 301 https://{{ .RedirectTarget }}$request_uri;
+    }
+}
+{{- end }}

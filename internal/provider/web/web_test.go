@@ -357,3 +357,73 @@ func TestFPMReferencePerEngine(t *testing.T) {
 		t.Errorf("Nginx TCP : %q", got)
 	}
 }
+
+func TestEveryTemplateServesHTTPSWhenTLSIsEnabled(t *testing.T) {
+	// Le TLS n'est pas l'affaire des seuls sites PHP : un site statique, une
+	// application derrière un proxy — donc tous les runtimes non-PHP — et un
+	// domaine redirigé doivent tous être servis en HTTPS dès qu'un certificat
+	// existe. Sans ce contrôle, le certificat est émis puis jamais présenté.
+	cas := []struct {
+		kind    model.AppKind
+		version string
+		role    string // « redirect » pour éprouver le vhost de redirection
+	}{
+		{kind: model.KindStatic},
+		{kind: model.KindPHPPlain},
+		{kind: model.KindSymfony, version: "6.4"},
+		{kind: model.KindPrestashop, version: "8.1"},
+		{kind: model.KindGo},
+		{kind: model.KindNode},
+		{kind: model.KindStatic, role: "redirect"},
+	}
+	for _, moteur := range []string{"apache", "nginx"} {
+		for _, c := range cas {
+			nom := moteur + "/" + string(c.kind) + c.role
+			t.Run(nom, func(t *testing.T) {
+				prov, _ := fixture(t, moteur)
+				prov.CertRef = func(*model.Project) (string, bool) { return "shopfr", true }
+				p := project(t, "shop.fr", c.kind, c.version, "8.5")
+
+				// Une application derrière un proxy déclare sa cible : c'est le
+				// provider applicatif qui la fournit en exploitation.
+				if c.kind == model.KindGo || c.kind == model.KindNode {
+					p.Spec.Web.VHosts = prov.vhosts(p)
+					p.Spec.Web.VHosts[0].Options = map[string]any{
+						"proxyTarget": "unix:/run/ogs/shopfr/app.sock|http://localhost/",
+					}
+				}
+				vhosts := prov.vhosts(p)
+				if c.role == "redirect" {
+					p.Spec.Domains = append(p.Spec.Domains,
+						model.Domain{Name: "ancien.fr", Role: "redirect"})
+					vhosts = prov.vhosts(p)
+					if len(vhosts) < 2 {
+						t.Fatal("aucun vhost de redirection déduit")
+					}
+					vhosts = vhosts[1:]
+				}
+				bp, err := prov.Build(p, vhosts[0])
+				if err != nil {
+					t.Fatal(err)
+				}
+				c := string(bp.Content)
+				attendus := []string{"443"}
+				if moteur == "apache" {
+					attendus = append(attendus, "SSLEngine on", "SSLCertificateFile", "SSLCertificateKeyFile")
+				} else {
+					attendus = append(attendus, "listen 443 ssl", "ssl_certificate", "ssl_certificate_key")
+				}
+				for _, want := range attendus {
+					if !strings.Contains(c, want) {
+						t.Errorf("le TLS est activé mais %q est absent :\n%s", want, c)
+					}
+				}
+				// Et le challenge doit rester servi en clair, sans quoi le
+				// renouvellement échouerait.
+				if !strings.Contains(c, "acme-challenge") {
+					t.Errorf("le challenge ACME n'est plus servi :\n%s", c)
+				}
+			})
+		}
+	}
+}

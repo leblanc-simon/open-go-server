@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	osexec "os/exec"
+	"path/filepath"
 	"strings"
 	"text/tabwriter"
 
@@ -153,6 +154,20 @@ func (a *App) runChecks() []check {
 			add("binaire "+bin, "échec", "introuvable dans le PATH", "apt install passwd")
 		} else {
 			add("binaire "+bin, "ok", path, "")
+		}
+	}
+
+	// Capacité TLS du serveur web. Sans mod_ssl, Apache refuse un vhost portant
+	// SSLEngine : le premier site à demander un certificat échouerait à
+	// l'activation, avec un message d'Apache peu parlant.
+	if eng, err := a.webEngine(); err == nil && eng.Name() == "apache" {
+		mods := filepath.Join(a.Paths.Prefix(), "/etc/apache2/mods-enabled")
+		if _, err := os.Stat(filepath.Join(mods, "ssl.load")); err != nil {
+			add("mod_ssl", "avertissement",
+				"le module ssl d'Apache n'est pas activé : aucun site ne peut être servi en HTTPS",
+				"a2enmod ssl && systemctl reload apache2")
+		} else {
+			add("mod_ssl", "ok", "activé", "")
 		}
 	}
 

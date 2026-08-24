@@ -62,6 +62,11 @@ type Step struct {
 	// Reload énumère les intentions de rechargement, dédupliquées puis exécutées
 	// une seule fois en fin d'application.
 	Reload []string
+	// FlushReloads exige que les rechargements en attente soient exécutés avant
+	// cette étape. Certaines étapes ne se contentent pas d'un fichier écrit : le
+	// challenge HTTP-01 a besoin que le serveur web ait relu son vhost, faute de
+	// quoi l'autorité reçoit un 404.
+	FlushReloads bool
 }
 
 // NewStep construit une étape critique par défaut : le cas dangereux est celui

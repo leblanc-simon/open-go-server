@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
+
+	"github.com/leviathan/ogs/internal/naming"
 )
 
 // NewMySQLClient ouvre une connexion administrateur par socket Unix. L'absence de
@@ -69,7 +71,9 @@ func (c *mysqlClient) Grants(ctx context.Context, user, host string) (map[string
 		if err := rows.Scan(&schema, &privs); err != nil {
 			return nil, err
 		}
-		out[schema] = privs
+		// Le motif est rendu tel qu'il est stocké, échappement compris : il faut le
+		// ramener au nom réel pour pouvoir le comparer à l'état désiré.
+		out[naming.UnescapeMySQLPattern(schema)] = privs
 	}
 	return out, rows.Err()
 }

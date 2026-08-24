@@ -175,15 +175,28 @@ func (p Paths) Lib() string           { return p.join(libDir) }
 func (p Paths) StateDB() string       { return p.join(libDir, "state.db") }
 func (p Paths) ACMEDir() string       { return p.join(libDir, "acme") }
 func (p Paths) ACMEChallenge() string { return p.join(libDir, "acme-challenge") }
-func (p Paths) ArchivesDir() string   { return p.join(libDir, "archives") }
-func (p Paths) LogDir() string        { return p.join(logDir) }
-func (p Paths) AppLog() string        { return p.join(logDir, "ogs.log") }
-func (p Paths) AuditLog() string      { return p.join(logDir, "audit.log") }
-func (p Paths) RunDir() string        { return p.join(runDir) }
-func (p Paths) GlobalLock() string    { return p.join(runDir, "ogs.lock") }
-func (p Paths) SudoersDir() string    { return p.join(sudoersDir) }
-func (p Paths) LogrotateFile() string { return p.join(logrotateDir, "ogs") }
-func (p Paths) TmpfilesFile() string  { return p.join(tmpfilesDir, "ogs.conf") }
+
+// ACMEChallengeTokens est le répertoire où les jetons sont réellement déposés :
+// le client ACME ajoute « .well-known/acme-challenge » au webroot qu'on lui
+// confie. C'est donc là que l'alias d'Apache doit pointer, tandis que le « root »
+// de nginx veut le webroot, puisqu'il y accole l'URI demandée.
+func (p Paths) ACMEChallengeTokens() string {
+	return filepath.Join(p.ACMEChallenge(), ".well-known", "acme-challenge")
+}
+
+// RobotsNoindexFile est le robots.txt servi aux préproductions. Il est hors de
+// portée des projets : un site ne doit pas pouvoir se désindexer lui-même.
+func (p Paths) RobotsNoindexFile() string { return p.join(libDir, "robots-noindex.txt") }
+func (p Paths) ArchivesDir() string       { return p.join(libDir, "archives") }
+func (p Paths) DumpsDir() string          { return p.join(libDir, "dumps") }
+func (p Paths) LogDir() string            { return p.join(logDir) }
+func (p Paths) AppLog() string            { return p.join(logDir, "ogs.log") }
+func (p Paths) AuditLog() string          { return p.join(logDir, "audit.log") }
+func (p Paths) RunDir() string            { return p.join(runDir) }
+func (p Paths) GlobalLock() string        { return p.join(runDir, "ogs.lock") }
+func (p Paths) SudoersDir() string        { return p.join(sudoersDir) }
+func (p Paths) LogrotateFile() string     { return p.join(logrotateDir, "ogs") }
+func (p Paths) TmpfilesFile() string      { return p.join(tmpfilesDir, "ogs.conf") }
 
 // SystemdDir renvoie le répertoire des unités systemd générées.
 func (p Paths) SystemdDir() string { return p.join(systemdDir) }
@@ -261,10 +274,17 @@ func (p Paths) Dirs() []struct {
 		{p.HooksDir(), 0o750},
 		{p.HtpasswdDir(), 0o750},
 		{p.DNSCredsDir(), 0o700},
-		{p.Lib(), 0o750},
+		// 0751 et non 0750 : le serveur web doit pouvoir traverser ce répertoire
+		// pour atteindre /var/lib/ogs/acme-challenge, sans quoi tout challenge
+		// HTTP-01 se voit refuser par un 403. Le bit d'exécution seul n'autorise
+		// pas l'énumération, et les contenus sensibles gardent leurs propres
+		// droits — la base d'état en 0600, les certificats en 0700.
+		{p.Lib(), 0o751},
 		{p.ACMEDir(), 0o700},
 		{p.ACMEChallenge(), 0o755},
+		{p.ACMEChallengeTokens(), 0o755},
 		{p.ArchivesDir(), 0o700},
+		{p.DumpsDir(), 0o700},
 		{p.LogDir(), 0o750},
 		{p.RunDir(), 0o755},
 	}

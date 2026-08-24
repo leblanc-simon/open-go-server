@@ -1,0 +1,49 @@
+# Composition pour les scénarios qui exigent un service tiers joignable par le
+# réseau : un vrai broker RabbitMQ, une vraie autorité ACME.
+#
+# MariaDB, lui, n'est pas ici : ogs administre le serveur par socket Unix local,
+# et son scénario démarre donc le serveur dans le conteneur même.
+
+services:
+  rabbitmq:
+    image: rabbitmq:4-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: admin
+      RABBITMQ_DEFAULT_PASS: motdepasse-essai
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_running"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+
+  pebble:
+    image: ghcr.io/letsencrypt/pebble:latest
+    command: -config /pebble/config.json
+    volumes:
+      - ./pebble-config.json:/pebble/config.json:ro
+    environment:
+      # Sans cela pebble attend un délai aléatoire avant chaque validation, ce qui
+      # rend la durée du scénario imprévisible sans rien éprouver de plus.
+      PEBBLE_VA_NOSLEEP: "1"
+
+  runner:
+    image: ogs-integration
+    # Le lanceur n'est pas un service : « compose up » ne doit pas l'attendre,
+    # il est invoqué à la demande par « compose run ».
+    profiles: ["manual"]
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      pebble:
+        condition: service_started
+    volumes:
+      - ./scenarios:/scenarios:ro
+      - ./certs:/certs:ro
+    networks:
+      default:
+        # Le domaine du certificat doit résoudre vers ce conteneur : c'est là que
+        # pebble viendra chercher le jeton du challenge HTTP-01.
+        aliases:
+          - acme.test
+          - www.acme.test
+    entrypoint: ["/bin/bash"]

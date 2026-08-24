@@ -242,7 +242,7 @@ func (p *Provider) Build(proj *model.Project, vh model.VHost) (*VHostPlan, error
 	// Le TLS n'est activé dans le rendu que si le certificat est réellement
 	// disponible. Sinon le vhost est produit en HTTP seul : c'est aussi ce qui
 	// permet au challenge HTTP-01 d'aboutir avant la première émission.
-	wantTLS := vh.TLS == nil || vh.TLS.Enabled
+	wantTLS := !proj.Spec.Web.TLSDisabled() && (vh.TLS == nil || vh.TLS.Enabled)
 	certRef, certReady := "", false
 	if wantTLS && p.CertRef != nil {
 		certRef, certReady = p.CertRef(proj)
@@ -253,16 +253,20 @@ func (p *Provider) Build(proj *model.Project, vh model.VHost) (*VHostPlan, error
 	}
 
 	ctx := map[string]any{
-		"Project":           proj.ID(),
-		"Name":              name,
-		"AppKind":           string(proj.Spec.App.Kind),
-		"ServerName":        vh.Domains[0],
-		"Aliases":           vh.Domains[1:],
-		"Docroot":           docroot,
-		"LogDir":            proj.Spec.Layout.LogDir,
-		"FrontController":   frontController,
-		"AllowOverride":     at.AllowOverride,
+		"Project":         proj.ID(),
+		"Name":            name,
+		"AppKind":         string(proj.Spec.App.Kind),
+		"ServerName":      vh.Domains[0],
+		"Aliases":         vh.Domains[1:],
+		"Docroot":         docroot,
+		"LogDir":          proj.Spec.Layout.LogDir,
+		"FrontController": frontController,
+		"AllowOverride":   at.AllowOverride,
+		// Deux valeurs distinctes : Apache aliase le répertoire des jetons, nginx
+		// prend le webroot et y accole l'URI.
 		"ACMEChallenge":     p.Paths.ACMEChallenge(),
+		"ACMEChallengeDir":  p.Paths.ACMEChallengeTokens(),
+		"RobotsNoindexFile": p.Paths.RobotsNoindexFile(),
 		"TLS":               wantTLS && certReady,
 		"HSTS":              optionBool(vh.Options, "hsts", true),
 		"CertDir":           certDir,
@@ -419,7 +423,7 @@ func (p *Provider) PlanTLS(_ context.Context, proj *model.Project) []*engine.Ste
 	}
 	var steps []*engine.Step
 	for _, vh := range p.vhosts(proj) {
-		if vh.TLS != nil && !vh.TLS.Enabled {
+		if proj.Spec.Web.TLSDisabled() || (vh.TLS != nil && !vh.TLS.Enabled) {
 			continue
 		}
 		vhCopy := vh

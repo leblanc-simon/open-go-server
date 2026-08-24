@@ -33,6 +33,15 @@ func newInitCommand(app *App) *cobra.Command {
 				}
 			}
 
+			// Le robots.txt servi aux préproductions. Il est écrit ici, hors de
+			// portée des projets : un site ne doit pas pouvoir se réindexer en
+			// remplaçant le fichier que son vhost aliase.
+			robots := app.Paths.RobotsNoindexFile()
+			if err := fs.WriteAtomic(robots, []byte("User-agent: *\nDisallow: /\n"), 0o644, fs.KeepOwner); err != nil {
+				return wrap(CodeError, err)
+			}
+			app.printf("✓ robots.txt de préproduction : %s\n", robots)
+
 			// Configuration : écrite seulement si absente, pour ne jamais écraser
 			// les réglages de l'administrateur.
 			cfgPath := app.Paths.ConfigFile()

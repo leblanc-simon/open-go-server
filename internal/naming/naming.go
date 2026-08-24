@@ -185,6 +185,15 @@ func EscapeMySQLPattern(name string) string {
 	return r.Replace(name)
 }
 
+// UnescapeMySQLPattern est l'inverse d'EscapeMySQLPattern. Il est nécessaire à la
+// relecture : information_schema.SCHEMA_PRIVILEGES rend le motif tel qu'il est
+// stocké — « shopfr\_stats » — et sans cette conversion une base dont le nom
+// contient un souligné ne serait jamais reconnue comme conforme.
+func UnescapeMySQLPattern(pattern string) string {
+	r := strings.NewReplacer(`\_`, `_`, `\%`, `%`, `\\`, `\`)
+	return r.Replace(pattern)
+}
+
 // PoolNumber calcule le numéro d'un pool PHP-FPM selon la norme
 // 1<version sans point><incrément sur 2 chiffres> : php 8.5, 1er pool → 18501.
 func PoolNumber(phpVersion string, increment int) (int, error) {

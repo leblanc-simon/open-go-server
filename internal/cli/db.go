@@ -219,7 +219,15 @@ func newDBDumpCommand(app *App) *cobra.Command {
 				return err
 			}
 			if output == "" {
-				output = filepath.Join(".", fmt.Sprintf("%s-%s.sql", decl.Name, decl.Engine))
+				// Un emplacement défini, à côté des archives, plutôt que le répertoire
+				// courant : un dump contient les données des clients, et il n'a rien à
+				// faire à la racine du système parce que la commande a été lancée de là.
+				dir := app.Paths.DumpsDir()
+				if err := os.MkdirAll(dir, 0o700); err != nil {
+					return wrap(CodeError, err)
+				}
+				output = filepath.Join(dir, fmt.Sprintf("%s-%s-%s.sql",
+					p.ID(), decl.Name, nowFunc().UTC().Format("20060102-150405")))
 			}
 			if err := app.openStore(); err != nil {
 				return err

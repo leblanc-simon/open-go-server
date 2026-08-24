@@ -145,8 +145,30 @@ func Execute(ctx context.Context, plan *Plan, opts Options) (*Report, error) {
 		return report, nil
 	}
 
+	// Les rechargements sont groupés en fin d'exécution, sauf lorsqu'une étape
+	// déclare en avoir besoin plus tôt : ceux déjà effectués sont alors retenus
+	// pour ne pas être rejoués.
+	pending := plan.Reloads()
+	flush := func(ctx context.Context) {
+		if opts.Reload == nil || len(pending) == 0 {
+			return
+		}
+		reste := pending[:0:0]
+		for _, r := range pending {
+			if err := opts.Reload(ctx, r); err != nil {
+				report.Warnings = append(report.Warnings, fmt.Sprintf("rechargement %s : %v", r, err))
+				continue
+			}
+			report.Reloaded = append(report.Reloaded, r)
+		}
+		pending = reste
+	}
+
 	var applied []*Step
 	for _, s := range plan.Mutating() {
+		if s.FlushReloads {
+			flush(ctx)
+		}
 		if err := ctx.Err(); err != nil {
 			report.Warnings = append(report.Warnings, "exécution interrompue : "+err.Error())
 			rollback(context.WithoutCancel(ctx), applied, report, opts)
@@ -186,15 +208,7 @@ func Execute(ctx context.Context, plan *Plan, opts Options) (*Report, error) {
 	}
 
 	// Rechargements groupés, une fois chacun, après toutes les écritures.
-	if opts.Reload != nil {
-		for _, r := range plan.Reloads() {
-			if err := opts.Reload(ctx, r); err != nil {
-				report.Warnings = append(report.Warnings, fmt.Sprintf("rechargement %s : %v", r, err))
-				continue
-			}
-			report.Reloaded = append(report.Reloaded, r)
-		}
-	}
+	flush(ctx)
 	return report, nil
 }
 

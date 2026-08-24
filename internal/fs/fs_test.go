@@ -136,3 +136,39 @@ func TestParseMode(t *testing.T) {
 		t.Error("mode illisible accepté")
 	}
 }
+
+func TestInspectIgnoresTheHeaderTimestamp(t *testing.T) {
+	// L'en-tête porte l'instant du rendu : comparer les octets ferait apparaître
+	// un écart dès la seconde suivante, et chaque apply réécrirait tous les
+	// fichiers — avec un rechargement du serveur web à la clé.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "vhost.conf")
+	corps := []byte("<VirtualHost *:80>\n  ServerName shop.fr\n</VirtualHost>\n")
+	h := Header{Project: "shopfr", Resource: "web/vhost/shopfr",
+		Generated: time.Date(2026, 8, 24, 10, 0, 0, 0, time.UTC)}
+
+	if err := os.WriteFile(path, Render(h, corps, "#"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Même corps, rendu une minute plus tard.
+	plusTard := h
+	plusTard.Generated = h.Generated.Add(time.Minute)
+	state, err := Inspect(path, Render(plusTard, corps, "#"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state != StateCurrent {
+		t.Errorf("état = %s, attendu conforme : seul l'horodatage diffère", state)
+	}
+
+	// En revanche, un corps réellement différent doit être vu comme à mettre à jour.
+	autre := []byte("<VirtualHost *:80>\n  ServerName boutique.fr\n</VirtualHost>\n")
+	state, err = Inspect(path, Render(plusTard, autre, "#"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state != StateOutdated {
+		t.Errorf("état = %s, attendu à mettre à jour", state)
+	}
+}

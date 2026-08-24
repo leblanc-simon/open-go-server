@@ -5,23 +5,67 @@
 {{- end }}
     DocumentRoot {{ .Docroot }}
 
-    Alias /.well-known/acme-challenge {{ .ACMEChallenge }}
-    <Directory {{ .ACMEChallenge }}>
+    # Le challenge ACME doit répondre avant toute redirection, sinon aucun
+    # certificat ne peut être émis ni renouvelé.
+    Alias /.well-known/acme-challenge {{ .ACMEChallengeDir }}
+    <Directory {{ .ACMEChallengeDir }}>
         Require all granted
         Options -Indexes
     </Directory>
+{{ if .TLS }}
+    RewriteEngine On
+    RewriteCond %{REQUEST_URI} !^/\.well-known/acme-challenge/
+    RewriteRule ^(.*)$ https://{{ .ServerName }}$1 [R=301,L]
+{{- else }}
+{{ template "apache-body" . }}
+{{- end }}
+    ErrorLog {{ .LogDir }}/apache-error.log
+    CustomLog {{ .LogDir }}/apache-access.log combined
+</VirtualHost>
+{{ if .TLS }}
+<VirtualHost *:443>
+    ServerName {{ .ServerName }}
+{{- range .Aliases }}
+    ServerAlias {{ . }}
+{{- end }}
+    DocumentRoot {{ .Docroot }}
 
+    SSLEngine on
+    SSLCertificateFile {{ .CertDir }}/fullchain.pem
+    SSLCertificateKeyFile {{ .CertDir }}/privkey.pem
+{{- if .HSTS }}
+    Header always set Strict-Transport-Security "max-age=31536000; includeSubDomains"
+{{- end }}
+{{ template "apache-body" . }}
+    ErrorLog {{ .LogDir }}/apache-error.log
+    CustomLog {{ .LogDir }}/apache-access.log combined
+</VirtualHost>
+{{- end }}
+
+{{- define "apache-body" }}
     <Directory {{ .Docroot }}>
         AllowOverride {{ if .AllowOverride }}All{{ else }}None{{ end }}
         Require all granted
         Options -Indexes +FollowSymLinks
     </Directory>
+{{- if .Noindex }}
+
+    # Préproduction : interdiction d'indexation.
+    Header always set X-Robots-Tag "noindex, nofollow"
+    Alias /robots.txt {{ .RobotsNoindexFile }}
+{{- end }}
+{{- if .BasicAuthFile }}
+
+    <Location />
+        AuthType Basic
+        AuthName "Préproduction"
+        AuthUserFile {{ .BasicAuthFile }}
+        Require valid-user
+    </Location>
+{{- end }}
 {{- range .Blocks }}
 
     # bloc {{ .Name }}
 {{ indent 4 .Content }}
 {{- end }}
-
-    ErrorLog {{ .LogDir }}/apache-error.log
-    CustomLog {{ .LogDir }}/apache-access.log combined
-</VirtualHost>
+{{- end }}
