@@ -67,6 +67,22 @@ ogs amqp credentials set
 ogs cert dns-provider set ovh
 ```
 
+### PostgreSQL : un rôle d'administration à créer une fois
+
+`ogs` administre un cluster par socket Unix, où PostgreSQL emploie l'authentification `peer` : le rôle
+demandé doit porter le nom de l'utilisateur système. `ogs` s'exécutant en root, il lui faut donc un rôle
+`root`, qu'une installation neuve ne comporte pas :
+
+```sh
+su - postgres -c 'createuser --superuser root'
+```
+
+À faire une fois par cluster. `ogs doctor` le signale, avec cette commande, tant que ce n'est pas fait.
+Pour employer un autre rôle, renseigner `OGS_PG_ADMIN` — il devra alors être accepté par le `pg_hba.conf`.
+
+Chaque base créée est fermée aux autres : `CONNECT` est révoqué à `PUBLIC` et accordé au seul rôle du
+projet. C'est nécessaire — PostgreSQL ouvre par défaut toute base nouvelle à tous les rôles du cluster.
+
 ## Mise à jour
 
 ```sh

@@ -116,6 +116,25 @@ fi
 echo "l'ancien mot de passe est révoqué, le nouveau fonctionne"
 
 echo
+echo "--- compte additionnel, et son sort à la suppression ---"
+ogs db user add shopfr lecture --privileges readonly >/dev/null
+ogs apply shopfr --yes >/dev/null 2>&1
+lecturepass=$(ogs secrets show shopfr mysql/lecture 2>/dev/null | tail -1)
+if [ -z "$lecturepass" ]; then
+    echo "ÉCHEC : le compte additionnel n'a pas de mot de passe au keystore"
+    exit 1
+fi
+if ! mariadb -h 127.0.0.1 -u lecture -p"$lecturepass" shopfr -e "SELECT count(*) FROM essai" >/dev/null 2>&1; then
+    echo "ÉCHEC : le compte de lecture ne peut pas lire"
+    exit 1
+fi
+if mariadb -h 127.0.0.1 -u lecture -p"$lecturepass" shopfr -e "INSERT INTO essai VALUES (2)" >/dev/null 2>&1; then
+    echo "ÉCHEC : un compte « readonly » a pu écrire"
+    exit 1
+fi
+echo "le compte lecture lit mais n'écrit pas"
+
+echo
 echo "--- dump ---"
 ogs db dump shopfr shopfr 2>&1 | tail -2
 # Le dump doit atterrir dans un emplacement défini, non dans le répertoire
@@ -144,8 +163,11 @@ if [ -n "$restantes" ]; then
     echo "ÉCHEC : bases subsistantes après suppression : $restantes"
     exit 1
 fi
-if mariadb -N -e "SELECT user FROM mysql.user WHERE user='shopfr'" | grep -q shopfr; then
-    echo "ÉCHEC : l'utilisateur MySQL subsiste"
+# Le compte additionnel doit partir aussi : laissé derrière, il garderait la
+# faculté de s'authentifier avec un mot de passe que le keystore ne conserve plus.
+comptes=$(mariadb -N -e "SELECT user FROM mysql.user WHERE user IN ('shopfr','shopfr_stats','lecture')")
+if [ -n "$comptes" ]; then
+    echo "ÉCHEC : comptes subsistants : $(echo "$comptes" | tr '\n' ' ')"
     exit 1
 fi
 echo "bases et utilisateur supprimés ; le leurre, qui n'appartenait pas au projet, est intact :"

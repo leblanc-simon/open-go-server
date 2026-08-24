@@ -136,7 +136,7 @@ func TestMySQLUserLengthLimit(t *testing.T) {
 }
 
 func TestDropMySQL(t *testing.T) {
-	stmts, err := DropMySQL("shopfr", "shopfr", "localhost")
+	stmts, err := DropMySQL("shopfr", "shopfr", "localhost", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -159,22 +159,41 @@ func TestCreatePostgresSkipsExistingObjects(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(full.Cluster) != 2 {
+	// Deux créations, plus le durcissement de la base — celui-ci étant idempotent,
+	// il est rejoué dans tous les cas de figure.
+	creations := func(stmts []string) []string {
+		var out []string
+		for _, s := range stmts {
+			if strings.HasPrefix(s, "CREATE ") {
+				out = append(out, s)
+			}
+		}
+		return out
+	}
+	if len(creations(full.Cluster)) != 2 {
 		t.Fatalf("rôle et base attendus : %v", full.Cluster)
 	}
 	partial, err := CreatePostgres(spec, true, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(partial.Cluster) != 1 || !strings.Contains(partial.Cluster[0], "CREATE DATABASE") {
+	if c := creations(partial.Cluster); len(c) != 1 || !strings.Contains(c[0], "CREATE DATABASE") {
 		t.Errorf("le rôle existant ne doit pas être recréé : %v", partial.Cluster)
 	}
 	none, err := CreatePostgres(spec, true, true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(none.Cluster) != 0 {
+	if len(creations(none.Cluster)) != 0 {
 		t.Errorf("rien à créer : %v", none.Cluster)
+	}
+	// Le durcissement de la base, lui, doit être présent même quand tout existe :
+	// c'est ainsi qu'une base créée avant cette règle finit par s'y conformer.
+	joined := strings.Join(none.Cluster, "\n")
+	for _, want := range []string{"REVOKE CONNECT ON DATABASE", "GRANT CONNECT ON DATABASE"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("%q absent :\n%s", want, joined)
+		}
 	}
 	// Le durcissement du schéma public s'applique dans tous les cas.
 	if len(none.InDatabase) < 3 {
@@ -240,14 +259,14 @@ func TestCreatePostgresCollationRequiresTemplate0(t *testing.T) {
 }
 
 func TestDropPostgresForceOnlyWhenSupported(t *testing.T) {
-	with, err := DropPostgres("shopfr", "shopfr", true)
+	with, err := DropPostgres("shopfr", "shopfr", nil, true)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(with[0], "WITH (FORCE)") {
 		t.Errorf("PostgreSQL 13+ accepte WITH (FORCE) : %q", with[0])
 	}
-	without, err := DropPostgres("shopfr", "shopfr", false)
+	without, err := DropPostgres("shopfr", "shopfr", nil, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -265,5 +284,102 @@ func TestParsePrivilege(t *testing.T) {
 	}
 	if _, err := ParsePrivilege("superuser"); err == nil {
 		t.Error("jeu inconnu accepté")
+	}
+}
+
+func TestPostgresExtraUserGrantsPresentAndFutureObjects(t *testing.T) {
+	// Un compte additionnel doit voir les tables déjà créées et celles à venir :
+	// sans privilèges par défaut, il devient aveugle à la première migration.
+	for _, cas := range []struct {
+		priv     Privilege
+		attendu  string
+		interdit string
+	}{
+		{PrivReadOnly, "GRANT SELECT ON ALL TABLES", "INSERT"},
+		{PrivCRUD, "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES", "ALL PRIVILEGES ON ALL TABLES"},
+		{PrivAll, "GRANT ALL PRIVILEGES ON ALL TABLES", ""},
+	} {
+		t.Run(string(cas.priv), func(t *testing.T) {
+			stmts, err := PostgresExtraUser("shopfr", "shopfr", "lecture", "secret", cas.priv)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cluster := strings.Join(stmts.Cluster, "\n")
+			if !strings.Contains(cluster, `CREATE ROLE "lecture" LOGIN PASSWORD 'secret'`) {
+				t.Errorf("rôle non créé :\n%s", cluster)
+			}
+			// Sans CONNECT explicite, le compte ne peut pas ouvrir la base : elle a
+			// été fermée à PUBLIC.
+			if !strings.Contains(cluster, `GRANT CONNECT ON DATABASE "shopfr" TO "lecture"`) {
+				t.Errorf("CONNECT non accordé :\n%s", cluster)
+			}
+			inDB := strings.Join(stmts.InDatabase, "\n")
+			for _, want := range []string{cas.attendu, "GRANT USAGE ON SCHEMA public",
+				"ALTER DEFAULT PRIVILEGES FOR ROLE \"shopfr\" IN SCHEMA public"} {
+				if !strings.Contains(inDB, want) {
+					t.Errorf("%q absent :\n%s", want, inDB)
+				}
+			}
+			if cas.interdit != "" && strings.Contains(inDB, cas.interdit) {
+				t.Errorf("%q ne devrait pas apparaître :\n%s", cas.interdit, inDB)
+			}
+		})
+	}
+	if _, err := PostgresExtraUser("shopfr", "shopfr", "lecture", "x", "inconnu"); err == nil {
+		t.Error("un jeu de privilèges inconnu doit être refusé")
+	}
+}
+
+func TestCreatePostgresAlwaysUsesTemplate0(t *testing.T) {
+	// L'encodage est toujours explicite : créer depuis template1 échoue dès que
+	// celui-ci a un autre encodage, ce qui est le cas de tout cluster initialisé
+	// sans locale.
+	stmts, err := CreatePostgres(PostgresSpec{Database: "shopfr", Role: "shopfr"}, false, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var creation string
+	for _, s := range stmts.Cluster {
+		if strings.HasPrefix(s, "CREATE DATABASE") {
+			creation = s
+		}
+	}
+	if !strings.Contains(creation, "TEMPLATE template0") {
+		t.Errorf("création sans template0 : %q", creation)
+	}
+	if !strings.Contains(creation, "ENCODING 'UTF8'") {
+		t.Errorf("encodage absent : %q", creation)
+	}
+}
+
+func TestDropRemovesExtraAccounts(t *testing.T) {
+	// Un compte additionnel laissé derrière garderait la faculté de
+	// s'authentifier, alors que le keystore ne conserve plus son mot de passe.
+	mysql, err := DropMySQL("shopfr", "shopfr", "localhost", []string{"lecture", "integration"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(mysql, "\n")
+	for _, want := range []string{"DROP USER IF EXISTS 'shopfr'@'localhost'",
+		"DROP USER IF EXISTS 'lecture'@'localhost'",
+		"DROP USER IF EXISTS 'integration'@'localhost'"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("%q absent :\n%s", want, joined)
+		}
+	}
+
+	pg, err := DropPostgres("shopfr", "shopfr", []string{"lecture"}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined = strings.Join(pg, "\n")
+	// La base d'abord : les privilèges des rôles y vivent.
+	if !strings.HasPrefix(pg[0], "DROP DATABASE") {
+		t.Errorf("la base doit être supprimée en premier : %v", pg)
+	}
+	for _, want := range []string{`DROP ROLE IF EXISTS "shopfr"`, `DROP ROLE IF EXISTS "lecture"`} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("%q absent :\n%s", want, joined)
+		}
 	}
 }

@@ -387,6 +387,35 @@ func (p *Provider) apply(ctx context.Context, proj *model.Project, decl model.Da
 				return err
 			}
 		}
+		// Les comptes additionnels : ils étaient observés sans jamais être créés,
+		// de sorte que le plan les redemandait indéfiniment.
+		for _, u := range decl.ExtraUsers {
+			if state.ExtraUsers[u.User] {
+				continue
+			}
+			extraPriv, err := ParsePrivilege(u.Privileges)
+			if err != nil {
+				return err
+			}
+			extraPassword, err := p.ensurePassword(proj.ID(), decl.Engine, u.User)
+			if err != nil {
+				return err
+			}
+			extra, err := PostgresExtraUser(decl.Name, decl.User, u.User, extraPassword, extraPriv)
+			if err != nil {
+				return err
+			}
+			for _, stmt := range extra.Cluster {
+				if err := client.Exec(ctx, stmt); err != nil {
+					return err
+				}
+			}
+			for _, stmt := range extra.InDatabase {
+				if err := client.ExecIn(ctx, decl.Name, stmt); err != nil {
+					return err
+				}
+			}
+		}
 	}
 	return nil
 }
@@ -407,16 +436,20 @@ func (p *Provider) drop(ctx context.Context, decl model.Database, state DBState)
 	if host == "" {
 		host = "localhost"
 	}
+	extra := make([]string, 0, len(decl.ExtraUsers))
+	for _, u := range decl.ExtraUsers {
+		extra = append(extra, u.User)
+	}
 	var stmts []string
 	switch decl.Engine {
 	case "mysql", "mariadb":
-		stmts, err = DropMySQL(decl.Name, decl.User, host)
+		stmts, err = DropMySQL(decl.Name, decl.User, host, extra)
 	case "postgres":
 		force := false
 		if pg, ok := client.(*pgClient); ok {
 			force = pg.SupportsForceDrop()
 		}
-		stmts, err = DropPostgres(decl.Name, decl.User, force)
+		stmts, err = DropPostgres(decl.Name, decl.User, extra, force)
 	}
 	if err != nil {
 		return err

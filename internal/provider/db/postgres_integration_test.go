@@ -44,7 +44,7 @@ func TestPostgresIntegration(t *testing.T) {
 
 	name := fmt.Sprintf("ogs_it_%d", os.Getpid())
 	t.Cleanup(func() {
-		stmts, _ := DropPostgres(name, "", true)
+		stmts, _ := DropPostgres(name, "", nil, true)
 		for _, stmt := range stmts {
 			_ = client.Exec(ctx, stmt)
 		}
@@ -93,7 +93,7 @@ func TestPostgresIntegration(t *testing.T) {
 	if !ok {
 		t.Fatal("client PostgreSQL attendu")
 	}
-	drops, err := DropPostgres(name, "", pg.SupportsForceDrop())
+	drops, err := DropPostgres(name, "", nil, pg.SupportsForceDrop())
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -13,6 +13,7 @@ import (
 
 	"github.com/leviathan/ogs/internal/exec"
 	appprov "github.com/leviathan/ogs/internal/provider/app"
+	"github.com/leviathan/ogs/internal/provider/db"
 	"github.com/leviathan/ogs/internal/validate"
 )
 
@@ -32,7 +33,7 @@ func newDoctorCommand(app *App) *cobra.Command {
 			"Chaque anomalie est accompagnée de la commande qui la corrige. Aucun paquet\n" +
 			"n'est installé : ogs diagnostique, il n'administre pas la distribution.",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			checks := app.runChecks()
+			checks := app.runChecks(cmd.Context())
 			failed, warned := 0, 0
 			for _, c := range checks {
 				switch c.Status {
@@ -96,7 +97,7 @@ func symbolFor(status string) string {
 	return "✗"
 }
 
-func (a *App) runChecks() []check {
+func (a *App) runChecks(ctx context.Context) []check {
 	var out []check
 	add := func(name, status, detail, fix string) {
 		out = append(out, check{Name: name, Status: status, Detail: detail, Fix: fix})
@@ -154,6 +155,30 @@ func (a *App) runChecks() []check {
 			add("binaire "+bin, "échec", "introuvable dans le PATH", "apt install passwd")
 		} else {
 			add("binaire "+bin, "ok", path, "")
+		}
+	}
+
+	// Clusters PostgreSQL : l'accès d'administration passe par l'authentification
+	// « peer », qui exige un rôle au nom de l'utilisateur système. Une installation
+	// neuve n'en comporte pas, et le défaut ne se découvrirait qu'à la création
+	// d'une base.
+	if a.Prefix == "" && !a.Exec.Simulated() {
+		clusters := db.DetectClusters("")
+		role := db.PostgresAdminRole(os.Getenv("OGS_PG_ADMIN"))
+		for _, cl := range clusters {
+			client, err := db.NewPostgresClient(cl, role)
+			if err != nil {
+				add("cluster postgres "+cl.ID(), "échec", err.Error(), "")
+				continue
+			}
+			if _, err := client.Endpoint(ctx); err != nil {
+				add("cluster postgres "+cl.ID(), "échec", err.Error(),
+					fmt.Sprintf("su - postgres -c 'createuser --superuser %s'", role))
+			} else {
+				add("cluster postgres "+cl.ID(), "ok",
+					fmt.Sprintf("joignable en tant que %s", role), "")
+			}
+			client.Close()
 		}
 	}
 

@@ -21,6 +21,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         less \
         mariadb-server \
         mariadb-client \
+        postgresql \
+        postgresql-contrib \
         procps \
         openssl \
         openssh-client \

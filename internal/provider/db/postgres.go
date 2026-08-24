@@ -4,17 +4,30 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"os/user"
 	"strconv"
 	"strings"
 )
+
+// PostgresAdminRole renvoie le rôle d'administration à employer. L'authentification
+// « peer » reconnaît l'utilisateur du système : le rôle doit donc porter le nom de
+// l'utilisateur qui exécute ogs — root en exploitation — et non « postgres », qui
+// serait systématiquement refusé. OGS_PG_ADMIN permet d'en désigner un autre.
+func PostgresAdminRole(override string) string {
+	if override != "" {
+		return override
+	}
+	if u, err := user.Current(); err == nil && u.Username != "" {
+		return u.Username
+	}
+	return "postgres"
+}
 
 // NewPostgresClient ouvre une connexion administrateur sur un cluster, par socket
 // Unix : l'authentification « peer » reconnaît l'utilisateur du système, ce qui
 // évite tout mot de passe pour l'accès d'administration.
 func NewPostgresClient(cluster Cluster, adminUser string) (Client, error) {
-	if adminUser == "" {
-		adminUser = "postgres"
-	}
+	adminUser = PostgresAdminRole(adminUser)
 	socketDir := cluster.Socket
 	if socketDir == "" {
 		socketDir = "/var/run/postgresql"
@@ -31,19 +44,35 @@ func NewPostgresClient(cluster Cluster, adminUser string) (Client, error) {
 		return nil, err
 	}
 	db.SetMaxOpenConns(2)
-	return &pgClient{sqlClient{engine: "postgres", db: db, dsn: dsn, port: cluster.Port}, cluster}, nil
+	return &pgClient{sqlClient{engine: "postgres", db: db, dsn: dsn, port: cluster.Port}, cluster, adminUser}, nil
 }
 
 type pgClient struct {
 	sqlClient
-	cluster Cluster
+	cluster   Cluster
+	adminRole string
+}
+
+// explainPostgresRefusal traduit un refus d'authentification en consigne. Le cas
+// est le plus courant à l'installation : ogs s'exécute en root, l'authentification
+// « peer » exige donc un rôle « root », qu'une installation neuve ne comporte pas.
+func explainPostgresRefusal(role string, err error) error {
+	msg := err.Error()
+	if !strings.Contains(msg, "Peer authentication failed") &&
+		!strings.Contains(msg, "role \""+role+"\" does not exist") {
+		return fmt.Errorf("%w : %v", ErrUnavailable, err)
+	}
+	return fmt.Errorf("%w : le cluster refuse le rôle d'administration %q — "+
+		"l'authentification « peer » exige un rôle portant le nom de l'utilisateur système. "+
+		"Le créer une fois : su - postgres -c 'createuser --superuser %s' ; "+
+		"ou en désigner un autre par OGS_PG_ADMIN (%v)", ErrUnavailable, role, role, err)
 }
 
 // Endpoint renvoie le point de connexion applicatif.
 func (c *pgClient) Endpoint(ctx context.Context) (Endpoint, error) {
 	var setting string
 	if err := c.db.QueryRowContext(ctx, "SHOW server_version").Scan(&setting); err != nil {
-		return Endpoint{}, fmt.Errorf("%w : %v", ErrUnavailable, err)
+		return Endpoint{}, explainPostgresRefusal(c.adminRole, err)
 	}
 	major := setting
 	if i := strings.IndexAny(setting, ". "); i > 0 {
