@@ -257,3 +257,40 @@ func TestFlushReloadsRunsPendingReloadsBeforeTheStep(t *testing.T) {
 		t.Errorf("le rechargement doit être exécuté une seule fois : %v", report.Reloaded)
 	}
 }
+
+func TestReloadIntentDeclaredAfterAFlushIsStillHonoured(t *testing.T) {
+	// Une étape qui vide la file ne doit pas consommer l'intention d'une étape qui
+	// n'a pas encore eu lieu. Le cas réel : le démarrage d'une instance systemd
+	// exige un rechargement préalable, puis crée un lien d'activation qui en exige
+	// un second — sans quoi la cible ne réclame pas l'instance au démarrage.
+	var journal []string
+	plan := &Plan{Project: "shopfr"}
+
+	unite := NewStep("unit/service/veille", Create, "unité")
+	unite.Apply = func(context.Context) error { journal = append(journal, "écriture"); return nil }
+	unite.Reload = []string{"systemd:daemon-reload"}
+	plan.Add(unite)
+
+	instance := NewStep("unit/instance/veille@1", Create, "instance")
+	instance.FlushReloads = true
+	instance.Apply = func(context.Context) error { journal = append(journal, "démarrage"); return nil }
+	instance.Reload = []string{"systemd:daemon-reload"}
+	plan.Add(instance)
+
+	report, err := Execute(context.Background(), plan, Options{
+		Reload: func(_ context.Context, target string) error {
+			journal = append(journal, "rechargement")
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	attendu := "écriture, rechargement, démarrage, rechargement"
+	if got := strings.Join(journal, ", "); got != attendu {
+		t.Errorf("séquence = %q, attendu %q", got, attendu)
+	}
+	if len(report.Reloaded) != 2 {
+		t.Errorf("deux rechargements attendus : %v", report.Reloaded)
+	}
+}

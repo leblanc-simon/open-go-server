@@ -295,8 +295,10 @@ func TestRemovingServicesCleansUp(t *testing.T) {
 	apply(t, prov, proj)
 	proj.Spec.Services = nil
 	plan := apply(t, prov, proj)
-	if len(plan.Mutating()) != 2 {
-		t.Errorf("les deux instances doivent être désactivées :\n%s", plan.String())
+	// Les deux instances, plus le détachement de la cible : un projet sans service
+	// ne doit plus être réclamé au démarrage.
+	if len(plan.Mutating()) != 3 {
+		t.Errorf("deux instances et la cible doivent être désactivées :\n%s", plan.String())
 	}
 }
 
@@ -331,5 +333,123 @@ func TestPlanIsDeterministic(t *testing.T) {
 func TestTemplateOf(t *testing.T) {
 	if got := templateOf("ogs-shopfr-messenger-async@3.service"); got != "ogs-shopfr-messenger-async@.service" {
 		t.Errorf("templateOf : %q", got)
+	}
+}
+
+func TestStartLimitDirectivesLiveInUnitSection(t *testing.T) {
+	// StartLimitBurst et StartLimitIntervalSec appartiennent à [Unit] depuis
+	// systemd 229. Placés dans [Service], systemd les ignore avec un simple
+	// avertissement au chargement : la protection contre un service qui échoue en
+	// boucle n'existe alors pas, sans que rien ne le signale.
+	set := template.New(t.TempDir())
+	for _, nom := range []string{"symfony-messenger", "worker", "rabbitmq-consumer", "app"} {
+		t.Run(nom, func(t *testing.T) {
+			src, err := set.Read("systemd/" + nom + ".service")
+			if err != nil {
+				t.Fatal(err)
+			}
+			contenu := string(src)
+			if !strings.Contains(contenu, "StartLimitBurst") {
+				t.Skip("ce template ne borne pas les redémarrages")
+			}
+			// L'en-tête est cherché en début de ligne : le mot figure aussi dans un
+			// commentaire, plus haut.
+			unit := contenu[:strings.Index(contenu, "\n[Service]")]
+			for _, directive := range []string{"StartLimitBurst", "StartLimitIntervalSec"} {
+				if !strings.Contains(unit, directive) {
+					t.Errorf("%s doit figurer dans [Unit] :\n%s", directive, contenu)
+				}
+			}
+		})
+	}
+}
+
+func TestPlanOrdersUnitFilesBeforeInstances(t *testing.T) {
+	// L'ordre suit le cycle de vie, non l'alphabet : « unit/instance » précède
+	// « unit/service » par ordre lexical, de sorte qu'un tri par nom faisait
+	// démarrer chaque instance avant l'écriture de son modèle — systemd répondait
+	// « Unit not found » et aucun service ne démarrait au premier apply.
+	prov, proj := fixture(t)
+	proj.Spec.Services = []model.Service{{
+		Name: "veille", Template: "worker", Instances: 2,
+		Params: map[string]string{"command": "/usr/bin/true"},
+	}}
+	steps, err := prov.Plan(context.Background(), proj, Observed{Enabled: map[string]bool{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ordre []string
+	for _, s := range steps {
+		ordre = append(ordre, s.Resource)
+	}
+	position := func(prefixe string) int {
+		for i, r := range ordre {
+			if strings.HasPrefix(r, prefixe) {
+				return i
+			}
+		}
+		return -1
+	}
+	cible, modele, instance := position("unit/target/"), position("unit/service/"), position("unit/instance/")
+	if cible < 0 || modele < 0 || instance < 0 {
+		t.Fatalf("étapes attendues absentes : %v", ordre)
+	}
+	if !(cible < modele && modele < instance) {
+		t.Errorf("ordre incorrect (cible %d, modèle %d, instance %d) : %v",
+			cible, modele, instance, ordre)
+	}
+}
+
+func TestCleanupStopsInstancesBeforeRemovingFiles(t *testing.T) {
+	// Dans l'autre sens : retirer le fichier d'unité avant d'arrêter ses instances
+	// laisserait des processus sans unité pour les piloter.
+	prov, proj := fixture(t)
+	proj.Spec.Services = nil
+	obs := Observed{Enabled: map[string]bool{
+		InstanceName(proj.ID(), "veille", 1): true,
+	}}
+	steps := prov.cleanupSteps(proj, obs)
+	var arret, detachement = -1, -1
+	for i, s := range steps {
+		if strings.HasPrefix(s.Resource, "unit/instance/") && arret < 0 {
+			arret = i
+		}
+		if strings.HasPrefix(s.Resource, "unit/target-enable/") && detachement < 0 {
+			detachement = i
+		}
+	}
+	if arret < 0 {
+		t.Fatalf("aucun arrêt d'instance planifié : %v", steps)
+	}
+	if detachement >= 0 && arret > detachement {
+		t.Errorf("les instances doivent être arrêtées avant le détachement de la cible : %v", steps)
+	}
+}
+
+func TestReadWritePathsAreOptional(t *testing.T) {
+	// « var » est créé par l'application, pas par ogs : sans le tiret qui rend le
+	// chemin facultatif, systemd refuse d'installer l'espace de noms et le service
+	// échoue en 226/NAMESPACE — avant même d'exécuter la commande.
+	// Le contrôle porte sur l'unité rendue : c'est elle que systemd lit.
+	prov, proj := fixture(t)
+	for _, svc := range []model.Service{
+		{Name: "async", Template: "symfony-messenger", Params: map[string]string{"transport": "async"}},
+		{Name: "veille", Template: "worker", Params: map[string]string{"command": "/usr/bin/true"}},
+		{Name: "conso", Template: "rabbitmq-consumer", Params: map[string]string{"queue": "async"}},
+	} {
+		contenu, err := prov.Build(proj, svc)
+		if err != nil {
+			t.Fatalf("%s : %v", svc.Name, err)
+		}
+		for _, ligne := range strings.Split(string(contenu), "\n") {
+			if !strings.HasPrefix(ligne, "ReadWritePaths=") {
+				continue
+			}
+			for _, chemin := range strings.Fields(strings.TrimPrefix(ligne, "ReadWritePaths=")) {
+				if !strings.HasPrefix(chemin, "-") {
+					t.Errorf("%s : %q doit être facultatif (préfixe « - »)", svc.Name, chemin)
+				}
+			}
+		}
 	}
 }

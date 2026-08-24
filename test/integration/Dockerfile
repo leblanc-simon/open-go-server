@@ -26,13 +26,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         procps \
         openssl \
         openssh-client \
+        systemd \
+        systemd-sysv \
+        cron \
         python3-minimal \
         python3-pika \
     && a2enmod proxy proxy_fcgi rewrite headers setenvif ssl \
     && rm -rf /var/lib/apt/lists/*
 
-# Sans init dans le conteneur, systemctl n'existe pas : un substitut dispatche
-# les actions sur les services réellement installés.
+# Sans init dans le conteneur, systemctl est inopérant : un substitut dispatche
+# les actions sur les services réellement installés. Il s'efface de lui-même
+# lorsque le scénario démarre un vrai systemd en PID 1.
 COPY test/integration/systemctl-shim.sh /usr/local/bin/systemctl
 
 # Le binaire est compilé à l'extérieur : statique, il n'a besoin de rien ici.

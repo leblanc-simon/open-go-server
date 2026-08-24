@@ -67,7 +67,7 @@ package: doc
 # Ils exigent un système complet — serveur web, PHP, comptes — et s'exécutent
 # donc dans un conteneur. Ils ne font pas partie de « make test ».
 # Tous les scénarios, l'un après l'autre.
-SCENARIOS := reload-group site-complet hooks mysql postgres rabbitmq pebble paquet
+SCENARIOS := reload-group site-complet hooks mysql postgres rabbitmq pebble systemd paquet
 
 integration-all:
 	@for s in $(SCENARIOS); do \
@@ -89,6 +89,9 @@ integration-hooks:
 
 integration-mysql:
 	./test/integration/run.sh mysql
+
+integration-systemd:
+	./test/integration/run.sh systemd
 
 integration-postgres:
 	./test/integration/run.sh postgres

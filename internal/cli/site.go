@@ -575,6 +575,13 @@ func (a *App) applyProjects(cmd *cobra.Command, projects []*model.Project) error
 					a.printf("  ✓ %s\n", s.Summary)
 				}
 			},
+			OnWarning: func(s *engine.Step, stepErr error) {
+				a.printf("  ⚠ %s : %v\n", s.Summary, stepErr)
+			},
+			// Les rechargements du plan global comptent autant que ceux d'un projet :
+			// c'est là que les répertoires d'exécution sont créés et que le timer de
+			// renouvellement est activé.
+			Reload: a.reloadFunc(provs),
 		}); err != nil {
 			return wrap(CodeError, err)
 		}

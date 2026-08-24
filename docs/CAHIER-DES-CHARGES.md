@@ -108,6 +108,9 @@ Décisions arbitrées et figées pour la v1. Toute remise en cause est une évol
 | D37 | Types livrés | **Prestashop** et **Symfony 3.4 → 8** (+ `static`, `php-plain` et les 4 runtimes) ; les autres frameworks s'ajoutent par `apptypes.yaml` sans code | Symfony 3.4 impose une variante distincte : docroot `web`, `app.php`, pas de Messenger |
 | D38 | Compatibilité PHP | La contrainte `require.php` du **`composer.json` de l'application** fait autorité ; table indicative en secours seulement | Aucune matrice figée à maintenir ; `php switch` refuse une bascule incompatible sans `--force` |
 | D39 | Versions PHP | **7.4 à 8.5**, y compris des versions en fin de support | `doctor` les signale sans jamais bloquer : un Prestashop ancien peut exiger 7.4 |
+| D47 | Ordre des étapes d'unité | L'ordre suit le **cycle de vie**, non l'alphabet : cible, modèles d'unité, activation des instances ; en sens inverse pour un retrait | Trier par nom faisait démarrer chaque instance avant l'écriture de son modèle — systemd répondait « Unit not found » et aucun service ne démarrait au premier apply |
+| D48 | Activation de la cible | La cible du projet est **liée à `multi-user.target`** | Sans ce lien, rien ne la réclame au démarrage de la machine : les services ne repartent pas après un redémarrage, alors que tout paraît en ordre tant qu'elle reste allumée |
+| D49 | Chemins inscriptibles d'une unité | `ReadWritePaths` est **facultatif** (préfixe `-`) | `var/` est créé par l'application, non par ogs : un service déclaré avant le déploiement du code échouait en 226/NAMESPACE, avant même d'exécuter sa commande |
 | D44 | Accès d'administration PostgreSQL | Le rôle d'administration porte **le nom de l'utilisateur système** (root en exploitation), non « postgres » ; `OGS_PG_ADMIN` permet d'en désigner un autre | L'authentification « peer » compare l'utilisateur du système : le rôle « postgres » est systématiquement refusé à root. Prérequis d'installation : `su - postgres -c 'createuser --superuser root'`, contrôlé par `ogs doctor` |
 | D45 | Isolation des bases PostgreSQL | **`REVOKE CONNECT ... FROM PUBLIC`** sur chaque base, `GRANT CONNECT` au seul rôle du projet et à ses comptes additionnels | PostgreSQL accorde CONNECT à PUBLIC sur toute base nouvelle : sans révocation, le rôle d'un projet se connecte à la base d'un autre et y lit du catalogue. Les requêtes étant idempotentes, elles durcissent aussi les bases créées avant cette règle |
 | D46 | Création de base PostgreSQL | **`TEMPLATE template0`** systématiquement | L'encodage étant toujours explicite, créer depuis `template1` échoue dès que celui-ci a un autre encodage — le cas de tout cluster initialisé sans locale |
@@ -2424,11 +2427,11 @@ build multi-architecture. Les tests d'intégration sont obligatoires avant fusio
 | **L7 — TUI** | inspecteur, panneau de détail, actions contextuelles, suivi de logs, wizard de création | Création complète d'un projet depuis la TUI, parité avec la CLI |
 | **L8 — Import** | scan multi-sources, corrélation, adoption interactive, ressources non gérées | Adoption d'un serveur préconfiguré sans régression |
 | **L9 — Applications non-PHP** | types d'application, providers `runtime` (nvm, rbenv, pyenv, venv), templates de service Go/Node/Python/Ruby, vhosts de proxy, attente de disponibilité | Scénarios d'intégration 22 à 25 validés |
-| **L10 — Industrialisation** | hooks de parc et de projet, complétions dynamiques bash/zsh/fish, 96 pages de manuel engendrées, paquet `.deb` (nfpm), CI GitHub Actions, huit scénarios d'intégration conteneurisés (serveur web, PHP, hooks, MariaDB, PostgreSQL, RabbitMQ, ACME, paquet), documentation d'exploitation | Paquet installable, documentation publiée |
+| **L10 — Industrialisation** | hooks de parc et de projet, complétions dynamiques bash/zsh/fish, 96 pages de manuel engendrées, paquet `.deb` (nfpm), CI GitHub Actions, neuf scénarios d'intégration conteneurisés (serveur web, PHP, hooks, MariaDB, PostgreSQL, RabbitMQ, ACME, systemd et cron, paquet), documentation d'exploitation | Paquet installable, documentation publiée |
 
 ### Ce que les essais sur système réel ont corrigé
 
-Les scénarios conteneurisés du lot L10 ont mis au jour treize défauts qu'aucun test unitaire ne pouvait
+Les scénarios conteneurisés du lot L10 ont mis au jour vingt défauts qu'aucun test unitaire ne pouvait
 voir, parce que tous supposaient un interlocuteur simulé :
 
 | Défaut | Conséquence en exploitation |
@@ -2446,6 +2449,15 @@ voir, parce que tous supposaient un interlocuteur simulé :
 | `CREATE DATABASE` depuis `template1` | échec sur tout cluster dont la base modèle n'est pas en UTF8 (D46) |
 | Comptes additionnels PostgreSQL observés mais jamais créés | le plan les redemandait indéfiniment ; `ogs db user add` restait sans effet sur une base PostgreSQL |
 | Comptes additionnels non supprimés avec le projet, sur les deux moteurs | un compte **gardait la faculté de s'authentifier**, avec un mot de passe que le keystore ne conservait plus |
+| Étapes d'unité triées par nom | les instances démarraient avant l'écriture de leur modèle : **aucun service ne démarrait au premier apply** (D47) |
+| Cible du projet non liée à `multi-user.target` | **les services ne repartaient pas après un redémarrage** de la machine (D48) |
+| `StartLimitBurst` et `StartLimitIntervalSec` placés dans `[Service]` | systemd les ignorait : la protection contre un service qui échoue en boucle **n'existait pas** |
+| `ReadWritePaths` sur un `var/` inexistant | tout service déclaré avant le déploiement du code échouait en 226/NAMESPACE (D49) |
+| Rechargements du plan global jamais exécutés | `systemd-tmpfiles` ne créait pas les répertoires d'exécution — **le verrou de toute tâche planifiée échouait** — et **le timer de renouvellement des certificats n'était jamais activé** |
+| Intentions de rechargement calculées d'avance | un vidage anticipé consommait celle d'une étape à venir : la cible ne réclamait pas ses instances |
+| `AsUser` recollait l'argv sans citation | tout argument contenant une espace était redécoupé par le shell : `ogs cron run` était inutilisable |
+| `ogs cron run` sans répertoire de travail | la commande d'essai ne reproduisait pas ce que cron exécute, dans un sens comme dans l'autre |
+| Suppression d'un projet sans rechargement des serveurs | le maître PHP-FPM gardait le pool en mémoire : **ses workers continuaient de tourner et le site restait servi** |
 
 Les lots L0 à L2 constituent le socle minimal utilisable ; L3 à L6 apportent la valeur cible ; L7 à L10
 finalisent le produit. L9 (applications non-PHP) est le seul lot réellement détachable : le produit est

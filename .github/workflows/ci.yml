@@ -99,7 +99,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        scenario: [reload-group, site-complet, hooks, mysql, postgres, rabbitmq, pebble, paquet]
+        scenario: [reload-group, site-complet, hooks, mysql, postgres, rabbitmq, pebble, systemd, paquet]
     steps:
       - uses: actions/checkout@v4
         with:

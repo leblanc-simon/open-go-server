@@ -37,6 +37,17 @@ func (c Command) String() string {
 	return s
 }
 
+// shellQuote assemble un argv en script shell sûr. Les guillemets simples
+// protègent tout, y compris les métacaractères ; un guillemet simple présent dans
+// la valeur est fermé, échappé, puis réouvert.
+func shellQuote(argv []string) string {
+	parts := make([]string, len(argv))
+	for i, a := range argv {
+		parts[i] = "'" + strings.ReplaceAll(a, "'", `'\''`) + "'"
+	}
+	return strings.Join(parts, " ")
+}
+
 // Result porte la sortie d'une commande.
 type Result struct {
 	Stdout   string
@@ -66,7 +77,12 @@ func (l *Local) Run(ctx context.Context, cmd Command) (Result, error) {
 	if cmd.AsUser != "" {
 		// -s force le shell : l'utilisateur du projet a nologin, ce qui ferait
 		// échouer un su ordinaire.
-		script := strings.Join(append([]string{cmd.Name}, cmd.Args...), " ")
+		//
+		// Chaque élément est cité : su attend un script, non un argv, et recoller
+		// les arguments avec des espaces ferait redécouper par le shell tout
+		// argument qui en contient — « sh -c "flock … sh -c 'date …'" » perdrait
+		// ses imbrications et flock recevrait une commande vide.
+		script := shellQuote(append([]string{cmd.Name}, cmd.Args...))
 		name, args = "su", []string{"-s", "/bin/bash", "-c", script, cmd.AsUser}
 	}
 	c := osexec.CommandContext(ctx, name, args...)

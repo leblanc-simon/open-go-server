@@ -151,6 +151,22 @@ func newDeleteCommand(app *App) *cobra.Command {
 				}
 			}
 
+			// Les serveurs doivent oublier ce qui vient de disparaître : sans
+			// rechargement, le maître PHP-FPM garde le pool du projet en mémoire —
+			// ses workers continuent de tourner et le site reste servi — et le
+			// serveur web conserve un vhost dont les fichiers n'existent plus.
+			for _, pool := range p.Spec.PHP.Pools {
+				if err := provs.PHP.Reload(cmd.Context(), pool.Version); err != nil {
+					app.printf("⚠ rechargement de PHP %s : %v\n", pool.Version, err)
+				}
+			}
+			if err := provs.Web.Reload(cmd.Context()); err != nil {
+				app.printf("⚠ rechargement du serveur web : %v\n", err)
+			}
+			if err := app.systemctl(cmd.Context(), "daemon-reload"); err != nil {
+				app.printf("⚠ daemon-reload : %v\n", err)
+			}
+
 			_, _ = app.runHook(cmd.Context(), provs.Hooks, p, hook.PostDelete,
 				hook.Context{Resources: removed, Extra: map[string]string{"archive": archived}})
 			_ = app.Audit.Record(p.ID(), "project", "project.delete", "ok", archived)
@@ -177,6 +193,9 @@ func (a *App) generatedFiles(provs *providers, p *model.Project) []string {
 	files := []string{
 		a.Paths.SudoersFile(p.ID()),
 		filepath.Join(a.Paths.CronDir(), cron.FileName(p.ID())),
+		// Le lien d'activation d'abord : laissé derrière, il fait subsister dans
+		// systemd une référence à une unité introuvable.
+		filepath.Join(a.Paths.SystemdDir(), "multi-user.target.wants", unit.TargetName(p.ID())),
 		filepath.Join(a.Paths.SystemdDir(), unit.TargetName(p.ID())),
 	}
 	for _, svc := range p.Spec.Services {

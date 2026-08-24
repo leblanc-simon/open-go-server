@@ -103,3 +103,45 @@ func TestLocalRunKillsChildProcesses(t *testing.T) {
 		t.Error("le processus petit-fils a survécu à l'annulation")
 	}
 }
+
+func TestAsUserPreservesQuotedArguments(t *testing.T) {
+	// su attend un script, non un argv : recoller les arguments avec de simples
+	// espaces ferait redécouper par le shell tout argument qui en contient. Le cas
+	// réel est « ogs cron run », qui exécute « sh -c "flock … sh -c 'date …'" ».
+	if os.Getuid() != 0 {
+		t.Skip("su exige root")
+	}
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	cible := filepath.Join(dir, "trace")
+	l := &Local{}
+	_, err := l.Run(context.Background(), Command{
+		Name:   "/bin/sh",
+		Args:   []string{"-c", "/bin/sh -c 'echo imbriqué > " + cible + "'"},
+		AsUser: "nobody",
+	})
+	if err != nil {
+		t.Fatalf("exécution : %v", err)
+	}
+	data, err := os.ReadFile(cible)
+	if err != nil {
+		t.Fatalf("la commande imbriquée n'a rien écrit : %v", err)
+	}
+	if strings.TrimSpace(string(data)) != "imbriqué" {
+		t.Errorf("contenu = %q", data)
+	}
+}
+
+func TestShellQuoteProtectsMetacharacters(t *testing.T) {
+	got := shellQuote([]string{"/bin/sh", "-c", "echo a > b && rm -rf /"})
+	want := `'/bin/sh' '-c' 'echo a > b && rm -rf /'`
+	if got != want {
+		t.Errorf("shellQuote = %s, attendu %s", got, want)
+	}
+	// Un guillemet simple dans la valeur ne doit pas rompre la citation.
+	if got := shellQuote([]string{"date 'x'"}); got != `'date '\''x'\'''` {
+		t.Errorf("citation d'un guillemet simple : %s", got)
+	}
+}

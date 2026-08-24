@@ -240,6 +240,7 @@ func (p *Provider) Plan(_ context.Context, proj *model.Project, obs Observed) ([
 		"cible "+TargetName(proj.ID())); s != nil {
 		steps = append(steps, s)
 	}
+	steps = append(steps, p.enableTargetStep(proj))
 
 	// 2. Les modèles d'unité.
 	wanted := map[string]bool{}
@@ -292,6 +293,9 @@ func (p *Provider) cleanupSteps(proj *model.Project, obs Observed) []*engine.Ste
 	for name := range obs.Enabled {
 		steps = append(steps, p.disableStep(proj, name))
 	}
+	if s := p.disableTargetStep(proj); s != nil {
+		steps = append(steps, s)
+	}
 	sortSteps(steps)
 	return steps
 }
@@ -336,6 +340,53 @@ func (p *Provider) fileStep(resource, path string, content []byte, summary strin
 	return s
 }
 
+// enableTargetStep rattache la cible du projet à multi-user.target. Sans ce lien,
+// rien ne réclame la cible au démarrage de la machine : les services du projet
+// ne repartent pas après un redémarrage, alors que tout paraît en ordre tant que
+// la machine reste allumée.
+func (p *Provider) enableTargetStep(proj *model.Project) *engine.Step {
+	name := TargetName(proj.ID())
+	link := filepath.Join(p.Paths.SystemdDir(), "multi-user.target.wants", name)
+	if _, err := os.Lstat(link); err == nil {
+		return engine.NewStep("unit/target-enable/"+proj.ID(), engine.NoOp,
+			fmt.Sprintf("cible %s activée au démarrage", name))
+	}
+	s := engine.NewStep("unit/target-enable/"+proj.ID(), engine.Create,
+		fmt.Sprintf("activation de %s au démarrage", name))
+	s.Critical = false
+	s.Apply = func(context.Context) error {
+		if err := fs.EnsureDir(filepath.Dir(link), 0o755, fs.KeepOwner); err != nil {
+			return err
+		}
+		target := filepath.Join(p.Paths.SystemdDir(), name)
+		if err := os.Symlink(target, link); err != nil && !os.IsExist(err) {
+			return err
+		}
+		return nil
+	}
+	s.Compensate = func(context.Context) error { return os.Remove(link) }
+	return s
+}
+
+// disableTargetStep détache la cible : un projet sans service, ou supprimé, ne
+// doit plus être réclamé au démarrage.
+func (p *Provider) disableTargetStep(proj *model.Project) *engine.Step {
+	name := TargetName(proj.ID())
+	link := filepath.Join(p.Paths.SystemdDir(), "multi-user.target.wants", name)
+	if _, err := os.Lstat(link); err != nil {
+		return nil
+	}
+	s := engine.NewStep("unit/target-enable/"+proj.ID(), engine.Delete,
+		fmt.Sprintf("désactivation de %s au démarrage", name))
+	s.Apply = func(context.Context) error {
+		if err := os.Remove(link); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		return nil
+	}
+	return s
+}
+
 // enableStep active une instance : le lien dans le répertoire .wants de la cible
 // est exactement ce que crée « systemctl enable ».
 func (p *Provider) enableStep(proj *model.Project, name string) *engine.Step {
@@ -345,6 +396,10 @@ func (p *Provider) enableStep(proj *model.Project, name string) *engine.Step {
 	// Non critique : un service qui refuse de démarrer ne doit pas annuler le
 	// déploiement du site.
 	s.Critical = false
+	// Le gestionnaire doit avoir relu ses unités avant qu'on démarre une instance :
+	// autrement systemd répond « Unit not found » sur une unité qu'ogs vient
+	// pourtant d'écrire. Le daemon-reload est groupé, il est donc vidé ici.
+	s.FlushReloads = true
 	s.Apply = func(ctx context.Context) error {
 		if err := fs.EnsureDir(filepath.Dir(link), 0o755, fs.KeepOwner); err != nil {
 			return err
@@ -359,6 +414,9 @@ func (p *Provider) enableStep(proj *model.Project, name string) *engine.Step {
 		_ = p.systemctl(ctx, "stop", name)
 		return os.Remove(link)
 	}
+	// Le lien vient d'être créé : sans un nouveau rechargement, la cible ne le
+	// connaît pas et n'entraînerait pas l'instance au démarrage de la machine.
+	s.Reload = []string{"systemd:daemon-reload"}
 	return s
 }
 
@@ -464,6 +522,40 @@ func (p *Provider) Logs(ctx context.Context, proj *model.Project, service string
 
 // sortSteps rend l'ordre des étapes déterministe : sans cela, l'itération sur une
 // table produirait un plan différent à chaque appel.
+// sortSteps ordonne les étapes selon le cycle de vie, non par nom : une instance
+// ne peut pas démarrer avant que son modèle d'unité existe, et un fichier
+// d'unité ne peut pas être retiré avant que ses instances soient arrêtées. Le
+// nom ne sert qu'à départager, pour que le plan reste reproductible.
 func sortSteps(steps []*engine.Step) {
-	sort.SliceStable(steps, func(i, j int) bool { return steps[i].Resource < steps[j].Resource })
+	rang := func(s *engine.Step) int {
+		suppression := s.Action == engine.Delete
+		switch {
+		case strings.HasPrefix(s.Resource, "unit/target-enable/"):
+			if suppression {
+				return 5
+			}
+			return 1 // après l'écriture de la cible, avant les instances
+		case strings.HasPrefix(s.Resource, "unit/target/"):
+			if suppression {
+				return 5 // la cible part en dernier
+			}
+			return 0 // et arrive en premier
+		case strings.HasPrefix(s.Resource, "unit/service/"):
+			if suppression {
+				return 4
+			}
+			return 1
+		default: // unit/instance/
+			if suppression {
+				return 3 // arrêter avant de retirer les fichiers
+			}
+			return 2 // démarrer après les avoir écrits
+		}
+	}
+	sort.SliceStable(steps, func(i, j int) bool {
+		if ri, rj := rang(steps[i]), rang(steps[j]); ri != rj {
+			return ri < rj
+		}
+		return steps[i].Resource < steps[j].Resource
+	})
 }

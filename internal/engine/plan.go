@@ -146,22 +146,41 @@ func Execute(ctx context.Context, plan *Plan, opts Options) (*Report, error) {
 	}
 
 	// Les rechargements sont groupés en fin d'exécution, sauf lorsqu'une étape
-	// déclare en avoir besoin plus tôt : ceux déjà effectués sont alors retenus
-	// pour ne pas être rejoués.
-	pending := plan.Reloads()
+	// déclare en avoir besoin plus tôt.
+	//
+	// Les intentions s'accumulent au fil des étapes appliquées, et non d'avance :
+	// une étape qui vide la file ne doit pas consommer l'intention d'une étape qui
+	// n'a pas encore eu lieu. C'est le cas du lien d'activation d'une instance
+	// systemd, créé après le rechargement dont le démarrage avait besoin, et qui
+	// exige donc un second rechargement pour être vu.
+	var pending []string
+	attendre := func(intents []string) {
+		for _, r := range intents {
+			deja := false
+			for _, p := range pending {
+				if p == r {
+					deja = true
+					break
+				}
+			}
+			if !deja {
+				pending = append(pending, r)
+			}
+		}
+	}
 	flush := func(ctx context.Context) {
 		if opts.Reload == nil || len(pending) == 0 {
 			return
 		}
-		reste := pending[:0:0]
-		for _, r := range pending {
+		aFaire := pending
+		pending = nil
+		for _, r := range aFaire {
 			if err := opts.Reload(ctx, r); err != nil {
 				report.Warnings = append(report.Warnings, fmt.Sprintf("rechargement %s : %v", r, err))
 				continue
 			}
 			report.Reloaded = append(report.Reloaded, r)
 		}
-		pending = reste
 	}
 
 	var applied []*Step
@@ -185,6 +204,7 @@ func Execute(ctx context.Context, plan *Plan, opts Options) (*Report, error) {
 		switch {
 		case err == nil:
 			applied = append(applied, s)
+			attendre(s.Reload)
 			if opts.Audit != nil {
 				opts.Audit(s, "ok", "")
 			}

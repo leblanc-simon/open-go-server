@@ -3,6 +3,13 @@ Description={{ .Description }} (instance %i)
 PartOf={{ .Target }}
 After=network.target
 
+# Un service qui échoue en boucle ne doit pas saturer la machine : au-delà du
+# seuil, systemd cesse de le relancer et l'unité reste en échec, visible. Ces
+# deux réglages appartiennent à [Unit] : placés dans [Service], systemd les
+# ignore et la protection n'existe pas.
+StartLimitBurst=10
+StartLimitIntervalSec=600
+
 [Service]
 Type=simple
 User={{ .User }}
@@ -14,8 +21,6 @@ Environment={{ $key }}={{ index $.Environment $key }}
 ExecStart={{ .Command }}
 Restart=always
 RestartSec={{ .RestartSec }}
-StartLimitBurst=10
-StartLimitIntervalSec=600
 KillSignal=SIGTERM
 TimeoutStopSec={{ .StopTimeout }}
 StandardOutput=journal
@@ -31,7 +36,10 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
 ProtectHome=read-only
-ReadWritePaths={{ .Workdir }}/var {{ .RunDir }}
+# Le tiret rend le chemin facultatif : « var » est créé par l'application, non
+# par ogs, et un service déclaré avant le déploiement du code ne doit pas
+# refuser de démarrer sur un espace de noms impossible à installer (226).
+ReadWritePaths=-{{ .Workdir }}/var -{{ .RunDir }}
 
 [Install]
 WantedBy={{ .Target }}

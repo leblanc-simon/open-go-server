@@ -6,6 +6,12 @@
 # explicitement — un substitut complaisant rendrait les scénarios vides de sens.
 set -u
 
+# Quand systemd tourne réellement — le scénario dédié le démarre en PID 1 —, ce
+# substitut n'a rien à faire : il s'efface devant le vrai.
+if [ -d /run/systemd/system ]; then
+    exec /usr/bin/systemctl "$@"
+fi
+
 verbe=""
 unites=""
 maintenant=0

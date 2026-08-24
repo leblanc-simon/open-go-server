@@ -514,9 +514,17 @@ func newApplyCommand(app *App) *cobra.Command {
 								app.printf("  ✓ %s\n", s.Summary)
 							}
 						},
+						OnWarning: func(s *engine.Step, stepErr error) {
+							app.printf("  ⚠ %s : %v\n", s.Summary, stepErr)
+						},
 						Audit: func(s *engine.Step, outcome, detail string) {
 							_ = app.Audit.Record("", s.Resource, "apply."+s.Action.String(), outcome, detail)
 						},
+						// Sans cette fonction, les rechargements du plan global n'étaient
+						// jamais exécutés : systemd-tmpfiles ne créait pas les répertoires
+						// d'exécution — les verrous de tâches échouaient donc tous — et le
+						// timer de renouvellement des certificats n'était jamais activé.
+						Reload: reload,
 					})
 					if err != nil {
 						return wrap(CodeError, err)

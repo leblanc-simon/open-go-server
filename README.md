@@ -7,7 +7,7 @@ PostgreSQL, vhost et files RabbitMQ, pool PHP-FPM, vhost Apache ou Nginx, certif
 et services systemd. Un projet est décrit par un fichier YAML ; un moteur de réconciliation idempotent amène
 le serveur dans l'état décrit.
 
-Le cahier des charges technique complet — 46 décisions d'architecture arbitrées, spécification par module,
+Le cahier des charges technique complet — 49 décisions d'architecture arbitrées, spécification par module,
 plan de tests, découpage en lots — est dans [`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md).
 C'est la référence : toute contribution s'y adosse.
 
@@ -54,14 +54,16 @@ make integration-mysql     # MariaDB réel : privilèges, échappement des motif
 make integration-postgres  # cluster réel : schéma public durci, extensions, multi-cluster
 make integration-rabbitmq  # broker réel : isolation par vhost, bindings, arguments immuables
 make integration-acme      # autorité ACME réelle (pebble) : émission, HTTPS, renouvellement
+make integration-systemd   # systemd en PID 1 : instances, durcissement, délégation, cron réel
 make integration-package   # installation, usage et désinstallation du .deb
-make integration-all       # les huit, à la suite
+make integration-all       # les neuf, à la suite
 ```
 
-Ces scénarios ne sont pas décoratifs : ils ont mis au jour treize défauts que les tests unitaires ne
+Ces scénarios ne sont pas décoratifs : ils ont mis au jour vingt défauts que les tests unitaires ne
 pouvaient pas voir — dont l'impossibilité de servir un site statique ou une application non-PHP en
-HTTPS, un challenge HTTP-01 qui ne pouvait aboutir sur aucun serveur, et un accès PostgreSQL
-d'administration qui ne pouvait jamais s'authentifier.
+HTTPS, un challenge HTTP-01 qui ne pouvait aboutir sur aucun serveur, un accès PostgreSQL
+d'administration qui ne pouvait jamais s'authentifier, des services qui ne démarraient jamais au
+premier apply, et des tâches planifiées dont le verrou échouait systématiquement.
 
 ## Prise en main sans privilèges
 
@@ -390,7 +392,7 @@ est transmis par `SOCKET_PATH`, et si le code l'ignore, l'attente de disponibili
 
 ## Documentation
 
-- [`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md) — la référence : 46 décisions d'architecture
+- [`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md) — la référence : 49 décisions d'architecture
   arbitrées, spécification par module, plan de tests, découpage en lots.
 - [`docs/INSTALLATION.md`](docs/INSTALLATION.md) — installation, premier démarrage, sauvegarde, mise à jour.
 - [`docs/HOOKS.md`](docs/HOOKS.md) — raccorder l'outil au reste de l'exploitation.

@@ -267,8 +267,11 @@ func newCronRunCommand(app *App) *cobra.Command {
 				app.printf("= mode simulé : la commande n'est pas exécutée\n")
 				return nil
 			}
+			// Cron place la tâche dans le home de l'utilisateur : s'exécuter ailleurs
+			// donnerait un faux résultat, dans un sens comme dans l'autre.
 			res, err := app.Exec.Run(cmd.Context(), exec.Command{
 				Name: "/bin/sh", Args: []string{"-c", command}, AsUser: p.Spec.User.Name,
+				Dir: p.Spec.Layout.Root,
 			})
 			if res.Stdout != "" {
 				fmt.Fprint(app.Out, res.Stdout)
