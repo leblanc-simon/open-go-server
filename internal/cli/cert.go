@@ -12,6 +12,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/leviathan/ogs/internal/fs"
+	"github.com/leviathan/ogs/internal/hook"
 	"github.com/leviathan/ogs/internal/model"
 	tlsprov "github.com/leviathan/ogs/internal/provider/tls"
 )
@@ -231,6 +232,12 @@ func newCertRenewCommand(app *App) *cobra.Command {
 			for _, e := range errs {
 				app.printf("⚠ %v\n", e)
 				_ = app.Audit.Record("", "tls/certificate", "cert.renew", "échec", e.Error())
+			}
+			// Le hook est déclenché même en cas d'échec partiel : les certificats
+			// renouvelés le sont bel et bien, et une supervision doit l'apprendre.
+			if len(done) > 0 {
+				_, _ = app.runHook(cmd.Context(), provs.Hooks, nil, hook.PostCertRenew,
+					hook.Context{Resources: done, Extra: map[string]string{"cert": strings.Join(done, ",")}})
 			}
 			if len(done) == 0 && len(errs) == 0 {
 				app.printf("= aucun certificat n'arrive à échéance (%d examiné(s))\n", len(requests))

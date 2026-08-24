@@ -7,6 +7,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/leviathan/ogs/internal/hook"
 	"github.com/leviathan/ogs/internal/model"
 	"github.com/leviathan/ogs/internal/naming"
 	"github.com/leviathan/ogs/internal/provider/db"
@@ -110,6 +111,11 @@ func newProjectCreateCommand(app *App) *cobra.Command {
 				app.printf("--dry-run : %s serait écrit avec le contenu suivant.\n\n", path)
 				fmt.Fprint(app.Out, string(data))
 				return nil
+			}
+			// Le hook « preCreate » garde la porte : il peut refuser la création
+			// avant que rien n'ait été écrit.
+			if _, err := app.runHook(cmd.Context(), app.hookRunner(), p, hook.PreCreate, hook.Context{}); err != nil {
+				return err
 			}
 			if err := spec.Save(path, p); err != nil {
 				return wrap(CodeError, err)

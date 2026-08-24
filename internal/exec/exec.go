@@ -10,6 +10,8 @@ import (
 	osexec "os/exec"
 	"strings"
 	"sync"
+	"syscall"
+	"time"
 )
 
 // Command décrit une commande à exécuter. Les arguments sont toujours séparés :
@@ -68,6 +70,19 @@ func (l *Local) Run(ctx context.Context, cmd Command) (Result, error) {
 		name, args = "su", []string{"-s", "/bin/bash", "-c", script, cmd.AsUser}
 	}
 	c := osexec.CommandContext(ctx, name, args...)
+	// Le processus est placé dans son propre groupe, et l'annulation tue tout le
+	// groupe : sans cela, tuer un shell laisserait ses enfants en vie, et Wait
+	// resterait bloqué sur les tuyaux qu'ils ont hérités.
+	c.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	c.Cancel = func() error {
+		if c.Process == nil {
+			return nil
+		}
+		return syscall.Kill(-c.Process.Pid, syscall.SIGKILL)
+	}
+	// Filet de sécurité : si un enfant survit malgré tout, les tuyaux sont fermés
+	// après ce délai plutôt que d'attendre indéfiniment.
+	c.WaitDelay = 3 * time.Second
 	c.Dir = cmd.Dir
 	if len(cmd.Env) > 0 {
 		c.Env = cmd.Env

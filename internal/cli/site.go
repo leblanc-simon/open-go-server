@@ -13,6 +13,7 @@ import (
 
 	"github.com/leviathan/ogs/internal/engine"
 	"github.com/leviathan/ogs/internal/exec"
+	"github.com/leviathan/ogs/internal/hook"
 	"github.com/leviathan/ogs/internal/model"
 	"github.com/leviathan/ogs/internal/naming"
 	"github.com/leviathan/ogs/internal/provider/amqp"
@@ -89,6 +90,11 @@ func newSiteCreateCommand(app *App) *cobra.Command {
 				app.printf("\n--dry-run : %s serait écrit avec le contenu suivant.\n\n", path)
 				fmt.Fprint(app.Out, string(data))
 				return nil
+			}
+			// Le hook « preCreate » garde la porte : il peut refuser la création
+			// avant que rien n'ait été écrit.
+			if _, err := app.runHook(cmd.Context(), app.hookRunner(), p, hook.PreCreate, hook.Context{}); err != nil {
+				return err
 			}
 			if err := spec.Save(path, p); err != nil {
 				return wrap(CodeError, err)
@@ -354,6 +360,11 @@ func newSiteCloneCommand(app *App) *cobra.Command {
 				app.printf("\n--dry-run : rien n'a été écrit.\n")
 				return nil
 			}
+			// Le hook « preCreate » garde la porte : il peut refuser la création
+			// avant que rien n'ait été écrit.
+			if _, err := app.runHook(cmd.Context(), app.hookRunner(), target, hook.PreCreate, hook.Context{}); err != nil {
+				return err
+			}
 			if err := spec.Save(path, target); err != nil {
 				return wrap(CodeError, err)
 			}
@@ -538,6 +549,12 @@ func (a *App) applyProjects(cmd *cobra.Command, projects []*model.Project) error
 			a.printf(", %d avertissement(s)", len(report.Warnings))
 		}
 		a.printf(" (audit %s)\n", a.Audit.RunID())
+	}
+
+	for _, p := range projects {
+		if warned, _ := a.runHook(cmd.Context(), provs.Hooks, p, hook.PostCreate, hook.Context{}); warned {
+			warnings++
+		}
 	}
 
 	global, err := a.buildGlobalPlan(provs, projects)

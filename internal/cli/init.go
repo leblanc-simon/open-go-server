@@ -79,7 +79,9 @@ func newInitCommand(app *App) *cobra.Command {
 					"config": cfgPath, "masterKey": keyPath, "stateDB": st.Path(), "schema": v,
 				}, nil, nil)
 			}
-			fmt.Fprintln(app.Out, "\nogs est prêt. Créer un premier projet :\n  ogs project create shop.fr --kind php-symfony")
+			if !app.Quiet {
+				fmt.Fprintln(app.Out, "\nogs est prêt. Créer un premier projet :\n  ogs project create shop.fr --kind php-symfony")
+			}
 			return nil
 		},
 	}

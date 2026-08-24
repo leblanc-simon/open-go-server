@@ -14,6 +14,7 @@ import (
 	"github.com/leviathan/ogs/internal/engine"
 	"github.com/leviathan/ogs/internal/exec"
 	"github.com/leviathan/ogs/internal/fs"
+	"github.com/leviathan/ogs/internal/hook"
 	"github.com/leviathan/ogs/internal/model"
 	appprov "github.com/leviathan/ogs/internal/provider/app"
 	"github.com/leviathan/ogs/internal/spec"
@@ -450,6 +451,10 @@ func newApplyCommand(app *App) *cobra.Command {
 					len(plan.Mutating()), p.ID())); err != nil {
 					return err
 				}
+				// Le hook « preApply » garde la porte : son refus arrête l'opération.
+				if _, err := app.runHook(cmd.Context(), provs.Hooks, p, hook.PreApply, hook.Context{}); err != nil {
+					return err
+				}
 				report, err := engine.Execute(cmd.Context(), plan, engine.Options{
 					OnStep: func(s *engine.Step, stepErr error) {
 						if stepErr == nil {
@@ -485,6 +490,15 @@ func newApplyCommand(app *App) *cobra.Command {
 					app.printf(", %d avertissement(s)", len(report.Warnings))
 				}
 				app.printf(" (audit %s)\n", app.Audit.RunID())
+				// Le hook « postApply » constate : son échec est un avertissement.
+				resources := make([]string, 0, len(report.Outcomes))
+				for _, o := range report.Outcomes {
+					resources = append(resources, o.Step.Resource)
+				}
+				if warned, _ := app.runHook(cmd.Context(), provs.Hooks, p, hook.PostApply,
+					hook.Context{Resources: resources}); warned {
+					warnings++
+				}
 			}
 			// Rotation des journaux : elle porte sur tout le parc, donc après les
 			// projets et une seule fois.

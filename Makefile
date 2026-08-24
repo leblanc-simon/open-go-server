@@ -12,7 +12,13 @@ LDFLAGS := -s -w \
 # Binaire statique : aucune dépendance C, donc un seul fichier à déployer.
 export CGO_ENABLED = 0
 
-.PHONY: all build test vet fmt cover clean install dev-init dev-demo
+ARCH    := $(shell go env GOARCH)
+# nfpm refuse un numéro de version non sémantique : « v1.2.3-4-gabc » devient
+# « 1.2.3-4 », et une construction hors étiquette retombe sur 0.0.0.
+DEBVER  := $(shell git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//' || echo 0.0.0)
+
+.PHONY: all build test vet fmt cover clean install dev-init dev-demo \
+	doc completion man package integration integration-php integration-package integration-hooks tidy check
 
 all: fmt vet test build
 
@@ -33,7 +39,48 @@ cover:
 	go tool cover -func=coverage.out | tail -1
 
 clean:
-	rm -f $(BINARY) coverage.out
+	rm -rf $(BINARY) coverage.out dist
+
+# --- Documentation -----------------------------------------------------------
+# Pages de manuel, scripts de complétion et référence Markdown sont engendrés
+# depuis l'arbre des commandes : la documentation ne peut pas dériver du code.
+doc:
+	rm -rf dist/doc
+	go run ./tools/docgen dist/doc
+
+man: doc
+completion: doc
+
+# --- Paquet Debian -----------------------------------------------------------
+# nfpm n'est pas une dépendance de compilation : on l'exécute depuis son module.
+package: doc
+	@mkdir -p dist
+	gzip -9nf dist/doc/man/*.8
+	go build -trimpath -ldflags "$(LDFLAGS)" -o dist/$(BINARY) $(PKG)
+	OGS_VERSION=$(DEBVER) OGS_ARCH=$(ARCH) \
+		go run github.com/goreleaser/nfpm/v2/cmd/nfpm@latest package \
+		--config nfpm.yaml --packager deb --target dist/
+	@ls -1 dist/*.deb
+
+# --- Essais d'intégration ----------------------------------------------------
+# Ils exigent un système complet — serveur web, PHP, comptes — et s'exécutent
+# donc dans un conteneur. Ils ne font pas partie de « make test ».
+integration:
+	./test/integration/run.sh reload-group
+
+integration-php:
+	./test/integration/run.sh site-complet
+
+integration-package:
+	./test/integration/run.sh paquet
+
+integration-hooks:
+	./test/integration/run.sh hooks
+
+tidy:
+	go mod tidy
+
+check: fmt vet test
 
 install: build
 	install -m 0755 $(BINARY) /usr/bin/$(BINARY)

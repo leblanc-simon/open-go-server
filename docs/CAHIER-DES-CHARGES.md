@@ -108,6 +108,7 @@ Décisions arbitrées et figées pour la v1. Toute remise en cause est une évol
 | D37 | Types livrés | **Prestashop** et **Symfony 3.4 → 8** (+ `static`, `php-plain` et les 4 runtimes) ; les autres frameworks s'ajoutent par `apptypes.yaml` sans code | Symfony 3.4 impose une variante distincte : docroot `web`, `app.php`, pas de Messenger |
 | D38 | Compatibilité PHP | La contrainte `require.php` du **`composer.json` de l'application** fait autorité ; table indicative en secours seulement | Aucune matrice figée à maintenir ; `php switch` refuse une bascule incompatible sans `--force` |
 | D39 | Versions PHP | **7.4 à 8.5**, y compris des versions en fin de support | `doctor` les signale sans jamais bloquer : un Prestashop ancien peut exiger 7.4 |
+| D40 | Hooks | **Deux portées** : un fichier de `/etc/ogs/hooks` nommé d'après l'événement s'applique à tout le parc, `spec.hooks` le remplace pour un projet. Criticité déduite du préfixe : `pre` interrompt, `post` avertit | Un hook s'exécute en root : le script doit vivre sous `/etc/ogs/hooks`, appartenir à root et n'être inscriptible par personne d'autre, sans quoi il est refusé — c'est une escalade de privilèges autrement. Aucun hook en `--dry-run` |
 
 ---
 
@@ -844,12 +845,19 @@ d'un autre. Le site `alpha` n'a strictement aucun droit sur `/home/beta.fr` (bit
 Et `www-data` n'exécute jamais de code applicatif : le PHP est traité par FPM sous l'utilisateur du site,
 le serveur web ne servant que le statique.
 
-**Prise en compte de la nouvelle appartenance.** Les workers Apache et Nginx appellent `initgroups()` à
-chaque fork : un `reload`/`graceful` suffit donc en principe, sans redémarrage complet. Le processus maître
-conserve ses propres credentials, sans conséquence puisqu'il est root. **Ce comportement doit être verrouillé
-par un test d'intégration dédié** (créer un site, recharger, vérifier que le statique est servi sans
-`systemctl restart`) : s'il s'avère faux sur une version donnée, l'apply doit basculer sur un restart
-explicite, avec la coupure que cela implique.
+**Prise en compte de la nouvelle appartenance — vérifié.** Les workers Apache et Nginx appellent
+`initgroups()` à chaque fork : un `reload`/`graceful` suffit, sans redémarrage complet. Le processus maître
+conserve ses propres credentials, sans conséquence puisqu'il est root.
+
+Cette hypothèse, portée en suspens depuis le lot L1, est désormais **mesurée** par le scénario
+d'intégration `test/integration/scenarios/reload-group.sh` (lot L10, `make integration`) : sur une Debian 13
+avec Apache 2.4, un home en 0750 servi à `www-data` hors du groupe renvoie **403** ; après `gpasswd -a` et
+un simple `apache2ctl graceful`, il renvoie **200**. Le scénario compare avec un `restart` et distingue
+explicitement les trois issues, de sorte qu'une régression sur une version future ne passerait pas
+inaperçue : il rendrait le code 2 et son message indiquerait qu'un restart — donc une coupure — devient
+nécessaire.
+
+La conception est donc confirmée : **la création d'un site n'impose aucune coupure du serveur web.**
 
 **Modes alternatifs prévus par le champ `webAccess`** :
 
@@ -2410,7 +2418,7 @@ build multi-architecture. Les tests d'intégration sont obligatoires avant fusio
 | **L7 — TUI** | inspecteur, panneau de détail, actions contextuelles, suivi de logs, wizard de création | Création complète d'un projet depuis la TUI, parité avec la CLI |
 | **L8 — Import** | scan multi-sources, corrélation, adoption interactive, ressources non gérées | Adoption d'un serveur préconfiguré sans régression |
 | **L9 — Applications non-PHP** | types d'application, providers `runtime` (nvm, rbenv, pyenv, venv), templates de service Go/Node/Python/Ruby, vhosts de proxy, attente de disponibilité | Scénarios d'intégration 22 à 25 validés |
-| **L10 — Industrialisation** | hooks, surcharge de templates, `--output json` partout, complétions, man pages, `.deb`, GoReleaser, CI complète, documentation | Paquet installable, documentation publiée |
+| **L10 — Industrialisation** | hooks de parc et de projet, complétions dynamiques bash/zsh/fish, 96 pages de manuel engendrées, paquet `.deb` (nfpm), CI GitHub Actions, scénarios d'intégration conteneurisés, documentation d'exploitation | Paquet installable, documentation publiée |
 
 Les lots L0 à L2 constituent le socle minimal utilisable ; L3 à L6 apportent la valeur cible ; L7 à L10
 finalisent le produit. L9 (applications non-PHP) est le seul lot réellement détachable : le produit est

@@ -7,7 +7,7 @@ PostgreSQL, vhost et files RabbitMQ, pool PHP-FPM, vhost Apache ou Nginx, certif
 et services systemd. Un projet est décrit par un fichier YAML ; un moteur de réconciliation idempotent amène
 le serveur dans l'état décrit.
 
-Le cahier des charges technique complet — 39 décisions d'architecture arbitrées, spécification par module,
+Le cahier des charges technique complet — 40 décisions d'architecture arbitrées, spécification par module,
 plan de tests, découpage en lots — est dans [`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md).
 C'est la référence : toute contribution s'y adosse.
 
@@ -25,7 +25,7 @@ C'est la référence : toute contribution s'y adosse.
 | **L7** | Interface en mode texte : inspecteur, actions contextuelles, assistant de création | **livré** |
 | **L8** | Import d'un serveur existant : scan en lecture seule, corrélation, adoption sans renommage | **livré** |
 | **L9** | Applications Go, Node, Ruby et Python : runtimes par projet, service supervisé, écoute sur socket, proxy | **livré** |
-| L10 | Industrialisation : hooks, paquet .deb, CI, documentation | à venir |
+| **L10** | Industrialisation : hooks de parc et de projet, complétions dynamiques, pages de manuel, paquet `.deb`, CI, scénarios d'intégration conteneurisés | **livré** |
 
 ## Compilation
 
@@ -33,9 +33,24 @@ Aucune dépendance C : le binaire est statique et se déploie seul.
 
 ```sh
 make build        # produit ./ogs
-make test         # tests unitaires et d'intégration
+make test         # tests unitaires
 make cover        # couverture
 make all          # fmt, vet, test, build
+make doc          # pages de manuel, complétions, référence Markdown
+make package      # paquet Debian dans dist/
+```
+
+### Essais sur un système réel
+
+Certains comportements ne se simulent pas : qu'un rechargement d'Apache prenne en compte une nouvelle
+appartenance de groupe, qu'un pool FPM serve bien sous l'identité du projet, qu'un paquet s'installe et se
+retire sans défaire les sites. Ces scénarios s'exécutent dans un conteneur Debian complet.
+
+```sh
+make integration          # un reload suffit-il pour l'appartenance de www-data au groupe ?
+make integration-php      # site PHP servi de bout en bout, sous l'identité du projet
+make integration-hooks    # portées, refus d'un « pre », rejet d'un script détournable
+make integration-package  # installation, usage et désinstallation du .deb
 ```
 
 ## Prise en main sans privilèges
@@ -89,7 +104,11 @@ ogs tui                                    (ou « ogs » sans argument)
 ogs import scan | adopt <id> | unmanaged
 ogs app types | set <id> --kind <type>
 ogs runtime list | install <id> <version>
+ogs completion bash | zsh | fish
 ```
+
+Toutes les commandes acceptent `-o json` ou `-o yaml`, et disposent de complétions dynamiques : les
+identifiants de projet, les services d'un projet, ses bases et ses files sont proposés par le shell.
 
 ## Utilisation réelle
 
@@ -358,6 +377,15 @@ est transmis par `SOCKET_PATH`, et si le code l'ignore, l'attente de disponibili
 | 2 | erreur d'usage | | 7 | verrou indisponible |
 | 3 | échec de validation | | 8 | privilèges insuffisants |
 | 4 | conflit | | 9 | opération annulée |
+
+## Documentation
+
+- [`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md) — la référence : 40 décisions d'architecture
+  arbitrées, spécification par module, plan de tests, découpage en lots.
+- [`docs/INSTALLATION.md`](docs/INSTALLATION.md) — installation, premier démarrage, sauvegarde, mise à jour.
+- [`docs/HOOKS.md`](docs/HOOKS.md) — raccorder l'outil au reste de l'exploitation.
+- `man ogs`, et une page par commande (`man ogs-site-create`) — engendrées depuis l'arbre des commandes,
+  elles ne peuvent pas dériver du code.
 
 ## Licence
 

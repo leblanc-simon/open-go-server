@@ -2,8 +2,11 @@ package exec
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestLocalRun(t *testing.T) {
@@ -65,5 +68,38 @@ func TestCommandStringMentionsUser(t *testing.T) {
 	c := Command{Name: "npm", Args: []string{"install"}, AsUser: "shopfr"}
 	if !strings.Contains(c.String(), "en tant que shopfr") {
 		t.Errorf("rendu %q", c.String())
+	}
+}
+
+func TestLocalRunHonoursContextCancellation(t *testing.T) {
+	// Un script lent doit rendre la main à l'annulation. Sans tuer le groupe de
+	// processus, tuer le shell laisserait « sleep » en vie et Wait resterait
+	// bloqué sur les tuyaux hérités.
+	l := &Local{}
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, err := l.Run(ctx, Command{Name: "sh", Args: []string{"-c", "sleep 30"}})
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("l'annulation doit produire une erreur")
+	}
+	if elapsed > 5*time.Second {
+		t.Errorf("l'annulation a pris %s : les enfants n'ont pas été tués", elapsed)
+	}
+}
+
+func TestLocalRunKillsChildProcesses(t *testing.T) {
+	// Le petit-fils doit mourir avec le groupe : un processus orphelin
+	// continuerait de tourner après l'interruption de l'outil.
+	l := &Local{}
+	marker := filepath.Join(t.TempDir(), "orphelin")
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	_, _ = l.Run(ctx, Command{Name: "sh", Args: []string{"-c",
+		"sh -c 'sleep 1; touch " + marker + "' &  sleep 30"}})
+	time.Sleep(1500 * time.Millisecond)
+	if _, err := os.Stat(marker); err == nil {
+		t.Error("le processus petit-fils a survécu à l'annulation")
 	}
 }

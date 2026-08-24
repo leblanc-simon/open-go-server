@@ -25,6 +25,11 @@ func NewRootCommand() *cobra.Command {
 		PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
 			// Les sorties suivent celles de cobra, ce qui permet de les capturer en test.
 			app.Out, app.Err = cmd.OutOrStdout(), cmd.ErrOrStderr()
+			// La complétion est interrogée par le shell, sous l'identité de
+			// l'utilisateur : elle ne peut ni exiger root ni ouvrir la base.
+			if isCompletionRequest(cmd) {
+				return nil
+			}
 			if cmd.Annotations["skip-setup"] == "true" {
 				return nil
 			}
@@ -82,7 +87,23 @@ func NewRootCommand() *cobra.Command {
 		newRuntimeCommand(app),
 		newAppCommand(app),
 	)
+	// Le générateur de scripts de complétion n'a pas besoin du système.
+	if c, _, err := root.Find([]string{"completion"}); err == nil && c != root {
+		c.Annotations = map[string]string{"skip-setup": "true"}
+	}
+	installCompletions(root, app)
+	localize(root)
 	return root
+}
+
+// isCompletionRequest reconnaît les commandes internes par lesquelles le shell
+// demande des propositions.
+func isCompletionRequest(cmd *cobra.Command) bool {
+	switch cmd.Name() {
+	case cobra.ShellCompRequestCmd, cobra.ShellCompNoDescRequestCmd:
+		return true
+	}
+	return false
 }
 
 // parentAllowsNonRoot propage la dérogation aux sous-commandes de « my ».

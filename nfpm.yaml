@@ -1,0 +1,83 @@
+# Description du paquet Debian, à consommer par nfpm.
+name: ogs
+arch: ${OGS_ARCH}
+platform: linux
+version: ${OGS_VERSION}
+section: admin
+priority: optional
+maintainer: open-go-server
+description: |
+  Administration de serveurs web par état désiré.
+  ogs industrialise le cycle de vie des sites hébergés — utilisateur système,
+  bases de données, files RabbitMQ, pools PHP-FPM, vhosts, certificats TLS,
+  tâches planifiées et services systemd — décrits par un fichier YAML et
+  appliqués par un moteur de réconciliation idempotent.
+vendor: open-go-server
+homepage: https://github.com/leviathan/ogs
+license: WTFPL
+
+# Le binaire est statique : aucune dépendance de bibliothèque. Les serveurs
+# gérés (apache2, mysql, rabbitmq…) sont des dépendances d'exploitation, pas du
+# paquet : ogs sert précisément à administrer ce qui est présent.
+depends:
+  - sudo
+recommends:
+  - logrotate
+suggests:
+  - apache2
+  - nginx
+  - certbot
+
+contents:
+  - src: dist/ogs
+    dst: /usr/bin/ogs
+    file_info:
+      mode: 0755
+
+  - src: dist/doc/completion/ogs.bash
+    dst: /usr/share/bash-completion/completions/ogs
+    file_info: { mode: 0644 }
+  - src: dist/doc/completion/ogs.zsh
+    dst: /usr/share/zsh/vendor-completions/_ogs
+    file_info: { mode: 0644 }
+  - src: dist/doc/completion/ogs.fish
+    dst: /usr/share/fish/vendor_completions.d/ogs.fish
+    file_info: { mode: 0644 }
+
+  # Les pages sont comprimées, comme le veut la politique Debian.
+  - src: dist/doc/man/*.8.gz
+    dst: /usr/share/man/man8/
+    file_info: { mode: 0644 }
+
+  - src: LICENSE
+    dst: /usr/share/doc/ogs/copyright
+    file_info: { mode: 0644 }
+  - src: README.md
+    dst: /usr/share/doc/ogs/README.md
+    file_info: { mode: 0644 }
+  - src: docs/CAHIER-DES-CHARGES.md
+    dst: /usr/share/doc/ogs/CAHIER-DES-CHARGES.md
+    file_info: { mode: 0644 }
+
+  # Les répertoires attendus par l'outil. Leur contenu, lui, est engendré par
+  # « ogs init » : le paquet ne fabrique aucune configuration.
+  - dst: /etc/ogs
+    type: dir
+    file_info:
+      mode: 0700
+  - dst: /etc/ogs/hooks
+    type: dir
+    file_info:
+      mode: 0700
+  - dst: /var/lib/ogs
+    type: dir
+    file_info:
+      mode: 0700
+  - dst: /var/log/ogs
+    type: dir
+    file_info:
+      mode: 0700
+
+scripts:
+  postinstall: packaging/postinstall.sh
+  preremove: packaging/preremove.sh

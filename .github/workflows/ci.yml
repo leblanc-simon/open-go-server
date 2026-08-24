@@ -1,0 +1,136 @@
+name: intégration continue
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CGO_ENABLED: "0"
+
+jobs:
+  verification:
+    name: format, analyse et tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: true
+
+      - name: format
+        run: |
+          # gofmt n'a pas de code de retour d'échec : on regarde sa sortie.
+          fichiers=$(gofmt -l cmd internal tools)
+          if [ -n "$fichiers" ]; then
+            echo "à reformater :"; echo "$fichiers"; exit 1
+          fi
+
+      - name: analyse statique
+        run: go vet ./...
+
+      - name: modules à jour
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+
+      - name: tests
+        run: go test -race -coverprofile=coverage.out ./...
+
+      - name: couverture
+        run: go tool cover -func=coverage.out | tail -1
+
+  compilation:
+    name: compilation ${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        goarch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: true
+      - name: compiler
+        env:
+          GOARCH: ${{ matrix.goarch }}
+        run: go build -trimpath -o ogs-${{ matrix.goarch }} ./cmd/ogs
+      - name: le binaire ne dépend d'aucune bibliothèque
+        if: matrix.goarch == 'amd64'
+        run: |
+          # Le déploiement suppose un fichier unique : une dépendance dynamique
+          # introduite par mégarde doit faire échouer la construction.
+          if ldd ogs-amd64 2>&1 | grep -qv "not a dynamic executable"; then
+            ldd ogs-amd64; exit 1
+          fi
+
+  documentation:
+    name: documentation engendrée
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: true
+      - name: engendrer
+        run: make doc
+      - name: les pages de manuel sont valides
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq groff-base
+          # « -k » invoque preconv, comme le fait man(1) : sans lui, les tirets
+          # cadratins des descriptions seraient signalés à tort.
+          for page in dist/doc/man/*.8; do
+            avertissements=$(groff -k -man -Tutf8 -ww "$page" 2>&1 >/dev/null)
+            if [ -n "$avertissements" ]; then
+              echo "$page :"; echo "$avertissements"; exit 1
+            fi
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: documentation
+          path: dist/doc
+
+  integration:
+    name: intégration « ${{ matrix.scenario }} »
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario: [reload-group, site-complet, hooks, paquet]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # les étiquettes servent à numéroter le paquet
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: true
+      - name: exécuter le scénario
+        run: ./test/integration/run.sh ${{ matrix.scenario }}
+
+  paquet:
+    name: paquet Debian
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: true
+      - name: construire
+        run: make package
+      - name: contrôler
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq lintian
+          dpkg-deb -I dist/*.deb
+          # Les avertissements sont affichés ; seules les erreurs font échouer.
+          lintian --fail-on error dist/*.deb
+      - uses: actions/upload-artifact@v4
+        with:
+          name: paquet-deb
+          path: dist/*.deb

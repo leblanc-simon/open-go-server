@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -13,6 +14,7 @@ import (
 	"github.com/leviathan/ogs/internal/audit"
 	"github.com/leviathan/ogs/internal/config"
 	"github.com/leviathan/ogs/internal/exec"
+	"github.com/leviathan/ogs/internal/hook"
 	"github.com/leviathan/ogs/internal/model"
 	"github.com/leviathan/ogs/internal/naming"
 	"github.com/leviathan/ogs/internal/provider/amqp"
@@ -162,6 +164,33 @@ func (a *App) close() {
 	}
 }
 
+// hookRunner construit l'exécuteur de hooks. Il est isolé pour les commandes qui
+// n'ont pas besoin de l'attelage complet des providers.
+func (a *App) hookRunner() *hook.Runner {
+	return &hook.Runner{
+		Exec: a.Exec, Dir: a.Paths.HooksDir(), Disabled: a.NoHooks,
+		// Hors root, il n'y a rien à escalader : l'exiger interdirait tout essai.
+		RequireRootOwner: os.Getuid() == 0 && a.Prefix == "",
+		Log:              a.printf,
+	}
+}
+
+// runHook exécute un hook et applique la politique de l'événement, tenue en un
+// seul endroit : l'échec d'un hook « pre » interrompt l'opération, celui d'un
+// hook « post » n'est qu'un avertissement — ce qui est fait est fait. Le booléen
+// dit si un avertissement a été émis, pour que l'appelant le comptabilise.
+func (a *App) runHook(ctx context.Context, r *hook.Runner, p *model.Project,
+	event string, hc hook.Context) (bool, error) {
+	if err := r.Run(ctx, p, event, hc); err != nil {
+		if hook.Critical(event) {
+			return false, exitf(CodeError, "%v", err)
+		}
+		a.printf("⚠ %v\n", err)
+		return true, nil
+	}
+	return false, nil
+}
+
 // loadProject charge un projet par identifiant, normalise et valide.
 func (a *App) loadProject(id string) (*model.Project, error) {
 	p, err := spec.Load(a.Paths.ProjectFile(id))
@@ -220,6 +249,7 @@ type providers struct {
 	Unit      *unit.Provider
 	Sudoers   *sudoers.Provider
 	Runtime   *runtime.Provider
+	Hooks     *hook.Runner
 	PHP       *php.Provider
 	Web       *web.Provider
 	Logrotate *logrotate.Provider
@@ -279,6 +309,7 @@ func (a *App) buildProviders() (*providers, error) {
 		Unit:    &unit.Provider{Paths: a.Paths, Exec: a.Exec, Templates: tmpl},
 		Sudoers: &sudoers.Provider{Paths: a.Paths, Exec: a.Exec},
 		Runtime: &runtime.Provider{Paths: a.Paths},
+		Hooks:   a.hookRunner(),
 		PHP:     php,
 		Web: &web.Provider{
 			Paths: a.Paths, Exec: a.Exec, Templates: tmpl, Engine: eng, PHP: php,

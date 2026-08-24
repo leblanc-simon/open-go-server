@@ -14,6 +14,7 @@ import (
 	"github.com/leviathan/ogs/internal/archive"
 	"github.com/leviathan/ogs/internal/engine"
 	"github.com/leviathan/ogs/internal/exec"
+	"github.com/leviathan/ogs/internal/hook"
 	"github.com/leviathan/ogs/internal/model"
 	"github.com/leviathan/ogs/internal/provider/cron"
 	"github.com/leviathan/ogs/internal/provider/system"
@@ -73,6 +74,12 @@ func newDeleteCommand(app *App) *cobra.Command {
 				return err
 			}
 			defer provs.close()
+
+			// Le hook « preDelete » garde la porte : il peut refuser la suppression,
+			// par exemple si une sauvegarde externe n'a pas abouti.
+			if _, err := app.runHook(cmd.Context(), provs.Hooks, p, hook.PreDelete, hook.Context{}); err != nil {
+				return err
+			}
 
 			// 1. Arrêt des services et retrait des tâches : rien ne doit plus
 			// s'exécuter pendant que l'on démonte le site.
@@ -144,6 +151,8 @@ func newDeleteCommand(app *App) *cobra.Command {
 				}
 			}
 
+			_, _ = app.runHook(cmd.Context(), provs.Hooks, p, hook.PostDelete,
+				hook.Context{Resources: removed, Extra: map[string]string{"archive": archived}})
 			_ = app.Audit.Record(p.ID(), "project", "project.delete", "ok", archived)
 			app.printf("\n✓ %s supprimé (%d ressource(s))\n", p.ID(), len(removed))
 			if archived != "" {

@@ -6,6 +6,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/leviathan/ogs/internal/hook"
 	"github.com/leviathan/ogs/internal/model"
 	"github.com/leviathan/ogs/internal/provider/php"
 	"github.com/leviathan/ogs/internal/spec"
@@ -152,6 +153,10 @@ func newPHPSwitchCommand(app *App) *cobra.Command {
 			if err := app.openStore(); err == nil {
 				_ = app.Audit.Record(id, "php/pool/"+target, "php.switch", "ok", from+" → "+version)
 			}
+			// La bascule n'est encore que déclarée : le hook signale l'intention, à
+			// charge pour lui de suivre l'apply s'il veut constater l'effet.
+			_, _ = app.runHook(cmd.Context(), app.hookRunner(), p, hook.PostPHPSwitch,
+				hook.Context{Extra: map[string]string{"php_from": from, "php_to": version}})
 			app.printf("\nAppliquer la bascule :\n  ogs apply %s\n", id)
 			return nil
 		},

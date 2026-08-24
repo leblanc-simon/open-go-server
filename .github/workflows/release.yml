@@ -1,0 +1,56 @@
+name: publication
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CGO_ENABLED: "0"
+
+jobs:
+  publier:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: true
+
+      - name: tests
+        run: go test ./...
+
+      - name: paquets et archives
+        run: |
+          make doc
+          mkdir -p dist
+          version=${GITHUB_REF_NAME#v}
+          for arch in amd64 arm64; do
+            GOARCH=$arch go build -trimpath \
+              -ldflags "-s -w \
+                -X github.com/leviathan/ogs/internal/version.Version=${GITHUB_REF_NAME} \
+                -X github.com/leviathan/ogs/internal/version.Commit=$(git rev-parse --short HEAD) \
+                -X github.com/leviathan/ogs/internal/version.Date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+              -o dist/ogs ./cmd/ogs
+            tar -C dist -czf "dist/ogs_${version}_linux_${arch}.tar.gz" ogs
+            OGS_VERSION=$version OGS_ARCH=$arch \
+              go run github.com/goreleaser/nfpm/v2/cmd/nfpm@latest package \
+              --config nfpm.yaml --packager deb --target dist/
+          done
+          rm -f dist/ogs
+          (cd dist && sha256sum *.tar.gz *.deb > SHA256SUMS)
+          ls -1 dist
+
+      - name: créer la publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            dist/*.tar.gz dist/*.deb dist/SHA256SUMS
