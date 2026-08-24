@@ -108,6 +108,7 @@ Décisions arbitrées et figées pour la v1. Toute remise en cause est une évol
 | D37 | Types livrés | **Prestashop** et **Symfony 3.4 → 8** (+ `static`, `php-plain` et les 4 runtimes) ; les autres frameworks s'ajoutent par `apptypes.yaml` sans code | Symfony 3.4 impose une variante distincte : docroot `web`, `app.php`, pas de Messenger |
 | D38 | Compatibilité PHP | La contrainte `require.php` du **`composer.json` de l'application** fait autorité ; table indicative en secours seulement | Aucune matrice figée à maintenir ; `php switch` refuse une bascule incompatible sans `--force` |
 | D39 | Versions PHP | **7.4 à 8.5**, y compris des versions en fin de support | `doctor` les signale sans jamais bloquer : un Prestashop ancien peut exiger 7.4 |
+| D57 | Accès aux préproductions | **Aucune authentification** : elles sont accessibles par défaut, protégées seulement de l'indexation (`X-Robots-Tag`, `robots.txt`) | Une authentification à poser gêne le travail quotidien — recettes clients, tests d'intégration, webhooks de fournisseurs. La contrepartie est explicite : une préproduction est publique, donc sans donnée réelle |
 | D56 | Droits des répertoires de configuration | `ogs harden` **rapporte** par défaut et n'applique qu'avec `--apply` ; il **ne desserre jamais** et **ne suit aucun lien symbolique** ; `/etc/php` reste ouvert à dessein | Les utilisateurs de projet ont un compte local : sans restriction ils dressent la carte du parc. Mais fermer un répertoire qu'un démon lit sous sa propre identité l'interromprait : le groupe cible est celui du service (rabbitmq, telegraf, redis, postgres), et `/etc/php` reste lisible parce que le PHP en ligne de commande des crons y lit son `php.ini`. Un outil de sécurité qui desserrerait des droits déjà plus stricts serait une régression |
 | D51 | Droits de l'arborescence | Home en **0711**, répertoires du projet en **0710** | Le home se traverse sans s'énumérer : servir un fichier n'exige que la traversée du répertoire et la lecture du fichier. Personne — pas même le serveur web — ne peut lister le contenu, ce qui ôte tout moyen de se promener dans l'arborescence. Le bit de groupe du home est indispensable : Unix retient la première classe applicable sans repli, donc un home en 0701 refuserait la traversée à `www-data` **parce qu'il est membre du groupe** |
 | D52 | Rétention des archives | **14 jours**, purgés par une étape du plan global ; zéro signifie « conserver indéfiniment » et doit être explicite | Une archive contient un dump de base, donc des données de clients : la garder sans terme n'est pas neutre. La purge est une étape annoncée, jamais un effet de bord |
@@ -389,7 +390,6 @@ environments:
     idSuffix: prep                                   # → shopfrprep
     certificate: "@wildcard-prep"                    # certificat partagé (§7.7.4)
     robotsNoindex: true
-    basicAuth: false                                 # activable par projet
     phpEnv: { APP_ENV: dev }
     presetDowngrade: true                            # medium → small
 ```
@@ -489,7 +489,6 @@ explicite :
     cron/job.tmpl
   hooks/                                  scripts utilisateur
   credentials/dns/<provider>.yaml         credentials DNS-01 (chiffrés, 0600)
-  htpasswd/<id>                           authentification basique (préproduction)
 /etc/sudoers.d/ogs-<id>                   délégation à l'utilisateur du projet (0440)
 /etc/logrotate.d/ogs                      rotation des logs de tous les projets (généré)
 /etc/tmpfiles.d/ogs.conf                  répertoires /run/ogs/<id> (généré)
@@ -936,8 +935,9 @@ Différences appliquées automatiquement en `prep` :
   préproduction n'a plus d'étape non critique susceptible d'échouer (§6.2).
 - **Interdiction d'indexation** : en-tête `X-Robots-Tag: noindex, nofollow` sur toutes les réponses, et
   `robots.txt` servi avec `Disallow: /` en priorité sur celui du projet.
-- **Authentification HTTP basique** activable par `--basic-auth` : `ogs` génère le couple identifiant/mot de
-  passe, le stocke dans le keystore et écrit le fichier `htpasswd` (bcrypt) sous `/etc/ogs/htpasswd/`.
+- **Aucune authentification** : une préproduction est accessible par défaut (D57). Elle n'est pas indexée,
+  mais elle est publique — ce qui suppose de ne pas y déposer de données réelles, et de tenir son contenu
+  pour lisible par quiconque connaît son adresse.
 - `APP_ENV=dev` par défaut dans l'environnement du pool, surchargeable.
 - Preset de pool réduit d'un cran (`medium` → `small`), sauf preset explicite.
 
@@ -2019,7 +2019,7 @@ canonique.
 Variante préproduction — projet entièrement distinct, sans ressource partagée avec la production :
 
 ```
-ogs site create shop.fr --env prep --basic-auth
+ogs site create shop.fr --env prep
   → host effectif  shopfr.preprod-pp.net
   → identifiant    shopfrprep
   → home           /home/shopfr.preprod-pp.net

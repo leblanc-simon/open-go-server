@@ -47,15 +47,6 @@
     # L'applicatif doit savoir sous quel schéma il est réellement exposé, sans
     # quoi il produit des URL en http derrière un site en https.
     RequestHeader set X-Forwarded-Proto "{{ if .TLS }}https{{ else }}http{{ end }}"
-{{- if .BasicAuthFile }}
-
-    <Location />
-        AuthType Basic
-        AuthName "Préproduction"
-        AuthUserFile {{ .BasicAuthFile }}
-        Require valid-user
-    </Location>
-{{- end }}
 {{- range .Blocks }}
 
     # bloc {{ .Name }}

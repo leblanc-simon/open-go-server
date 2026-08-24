@@ -271,7 +271,6 @@ func (p *Provider) Build(proj *model.Project, vh model.VHost) (*VHostPlan, error
 		"HSTS":              optionBool(vh.Options, "hsts", true),
 		"CertDir":           certDir,
 		"Noindex":           proj.IsPrep(),
-		"BasicAuthFile":     "",
 		"ClientMaxBodySize": optionString(vh.Options, "clientMaxBodySize", "32M"),
 		"Blocks":            vh.Blocks,
 		"RedirectTarget":    optionString(vh.Options, "target", vh.Domains[0]),

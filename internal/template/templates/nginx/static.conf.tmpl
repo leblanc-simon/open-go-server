@@ -38,11 +38,6 @@ server {
         return 200 "User-agent: *\nDisallow: /\n";
     }
 {{- end }}
-{{- if .BasicAuthFile }}
-
-    auth_basic "Préproduction";
-    auth_basic_user_file {{ .BasicAuthFile }};
-{{- end }}
 
     location / {
         try_files $uri $uri/ =404;

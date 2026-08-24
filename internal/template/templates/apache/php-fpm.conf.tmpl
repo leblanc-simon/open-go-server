@@ -63,15 +63,6 @@
     Header always set X-Robots-Tag "noindex, nofollow"
     Alias /robots.txt {{ .RobotsNoindexFile }}
 {{- end }}
-{{- if .BasicAuthFile }}
-
-    <Location />
-        AuthType Basic
-        AuthName "Préproduction"
-        AuthUserFile {{ .BasicAuthFile }}
-        Require valid-user
-    </Location>
-{{- end }}
 {{- range .Blocks }}
 
     # bloc {{ .Name }}

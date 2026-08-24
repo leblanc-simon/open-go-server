@@ -51,7 +51,6 @@ type siteOptions struct {
 	crons      []string
 	engineName string
 	preset     string
-	basicAuth  bool
 	apply      bool
 }
 
@@ -130,7 +129,6 @@ func newSiteCreateCommand(app *App) *cobra.Command {
 		"tâche à déclarer, sous la forme « expression:commande » (répétable)")
 	f.StringVar(&opts.engineName, "engine", "", "moteur web : apache ou nginx")
 	f.StringVar(&opts.preset, "preset", "", "dimensionnement du pool PHP")
-	f.BoolVar(&opts.basicAuth, "basic-auth", false, "protéger la préproduction par authentification")
 	f.BoolVar(&opts.apply, "apply", true, "appliquer immédiatement")
 	return cmd
 }
@@ -229,17 +227,6 @@ func (a *App) buildSite(host string, opts siteOptions) (*model.Project, error) {
 			return nil, exitf(CodeUsage, "%s", err)
 		}
 		p.Spec.Crons = append(p.Spec.Crons, job)
-	}
-	if opts.basicAuth {
-		if p.Spec.Sudo == nil {
-			p.Spec.Sudo = &model.Sudo{}
-		}
-		// L'authentification de préproduction est portée par le vhost ; on la note
-		// dans les labels pour que la génération la reprenne.
-		if p.Metadata.Labels == nil {
-			p.Metadata.Labels = map[string]string{}
-		}
-		p.Metadata.Labels["basicAuth"] = "true"
 	}
 	// Seconde normalisation et validation, une fois toutes les ressources posées.
 	if err := a.prepare(p); err != nil {

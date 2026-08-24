@@ -68,7 +68,6 @@ type Environment struct {
 	IDSuffix        string            `yaml:"idSuffix"`
 	Certificate     string            `yaml:"certificate"`
 	RobotsNoindex   bool              `yaml:"robotsNoindex"`
-	BasicAuth       bool              `yaml:"basicAuth"`
 	PHPEnv          map[string]string `yaml:"phpEnv"`
 	PresetDowngrade bool              `yaml:"presetDowngrade"`
 }
@@ -199,7 +198,6 @@ func (p Paths) ProjectsDir() string   { return p.join(etcDir, "projects") }
 func (p Paths) ArchivedDir() string   { return p.join(etcDir, "projects", "archived") }
 func (p Paths) TemplatesDir() string  { return p.join(etcDir, "templates") }
 func (p Paths) HooksDir() string      { return p.join(etcDir, "hooks") }
-func (p Paths) HtpasswdDir() string   { return p.join(etcDir, "htpasswd") }
 func (p Paths) DNSCredsDir() string   { return p.join(etcDir, "credentials", "dns") }
 func (p Paths) Lib() string           { return p.join(libDir) }
 func (p Paths) StateDB() string       { return p.join(libDir, "state.db") }
@@ -307,7 +305,6 @@ func (p Paths) Dirs() []struct {
 		{p.TemplatesDir(), 0o750},
 		// Les hooks s'exécutent en root : leur répertoire n'a pas à être lisible.
 		{p.HooksDir(), 0o700},
-		{p.HtpasswdDir(), 0o750},
 		{p.DNSCredsDir(), 0o700},
 		// 0751 et non 0750 : le serveur web doit pouvoir traverser ce répertoire
 		// pour atteindre /var/lib/ogs/acme-challenge, sans quoi tout challenge

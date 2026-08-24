@@ -34,11 +34,6 @@ server {
     access_log {{ .LogDir }}/nginx-access.log;
     error_log  {{ .LogDir }}/nginx-error.log;
     client_max_body_size {{ .ClientMaxBodySize }};
-{{- if .BasicAuthFile }}
-
-    auth_basic "Préproduction";
-    auth_basic_user_file {{ .BasicAuthFile }};
-{{- end }}
 
     location / {
         proxy_pass http://ogs_{{ snake .Project }};
