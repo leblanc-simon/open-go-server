@@ -222,6 +222,16 @@ func TestPlanInstallsRuntimeThenLinksThenWaits(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// L'attente de disponibilité est rendue à part : elle doit venir après le
+	// démarrage des instances, dont le provider d'unités a la charge.
+	health, err := prov.PlanHealth(ctx, proj, obs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if health == nil {
+		t.Fatal("aucune attente de disponibilité")
+	}
+	steps = append(steps, health)
 	var order []string
 	for _, s := range steps {
 		order = append(order, s.Resource)

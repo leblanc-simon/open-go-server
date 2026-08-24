@@ -166,13 +166,15 @@ func TestFullLifecycle(t *testing.T) {
 
 	// 4. Application.
 	h.mustRun("apply", "shopfr", "--yes")
+	// Le home ne se traverse que ; les répertoires ne s'énumèrent pas. Le groupe
+	// n'obtient qu'un droit de passage, ce qui suffit à servir un fichier.
 	modes := map[string]os.FileMode{
-		"":           0o750,
-		"www":        0o750,
-		"www/public": 0o750,
+		"":           0o711,
+		"www":        0o710,
+		"www/public": 0o710,
 		"var":        0o700,
-		"logs":       0o750,
-		".bin":       0o750,
+		"logs":       0o710,
+		".bin":       0o710,
 		".ssh":       0o700,
 	}
 	for rel, want := range modes {
@@ -204,12 +206,12 @@ func TestFullLifecycle(t *testing.T) {
 	if code != CodePartial {
 		t.Errorf("une dérive doit donner le code %d, obtenu %d\n%s", CodePartial, code, out)
 	}
-	if !strings.Contains(out, "0777 → 0750") {
+	if !strings.Contains(out, "0777 → 0710") {
 		t.Errorf("le diff doit expliciter l'écart :\n%s", out)
 	}
 	h.mustRun("apply", "shopfr", "--yes")
 	info, _ := os.Stat(logs)
-	if info.Mode().Perm() != 0o750 {
+	if info.Mode().Perm() != 0o710 {
 		t.Errorf("mode non corrigé : %04o", info.Mode().Perm())
 	}
 }
@@ -1400,8 +1402,8 @@ func TestRuntimeDirectoriesAreDeclared(t *testing.T) {
 	h.mustRun("apply", "--yes")
 	tmpfiles := h.read(t, filepath.Join("etc", "tmpfiles.d", "ogs.conf"))
 	// Le répertoire du projet doit lui appartenir : il y écrit ses verrous et ses
-	// sockets, et www-data doit pouvoir traverser.
-	if !strings.Contains(tmpfiles, "0750 shopfr shopfr") {
+	// sockets, et le groupe traverse jusqu'au socket sans énumérer le reste.
+	if !strings.Contains(tmpfiles, "0710 shopfr shopfr") {
 		t.Errorf("propriétaire attendu :\n%s", tmpfiles)
 	}
 	if !strings.Contains(tmpfiles, "0755 root root") {
@@ -1515,7 +1517,9 @@ func TestSiteCreateWithoutTLSDeclaresNoCertificate(t *testing.T) {
 	}
 	// Et le vhost écrit doit être en HTTP seul.
 	vhost := h.read(t, filepath.Join("etc", "apache2", "sites-available", "shopfr.conf"))
-	for _, interdit := range []string{"SSLEngine", "443"} {
+	// Le port est cherché sous sa forme de directive : le chemin du répertoire
+	// temporaire porte un nombre aléatoire, qui peut contenir « 443 ».
+	for _, interdit := range []string{"SSLEngine", "*:443", "listen 443"} {
 		if strings.Contains(vhost, interdit) {
 			t.Errorf("le vhost contient %q alors que le TLS est refusé :\n%s", interdit, vhost)
 		}
@@ -2000,5 +2004,26 @@ func TestRuntimeInstallRequiresRuntimeKind(t *testing.T) {
 	}
 	if !strings.Contains(out, "go, node, python, ruby") {
 		t.Errorf("les types concernés doivent être énumérés :\n%s", out)
+	}
+}
+
+func TestApplicationProjectGetsDelegationAndRuntimeFlag(t *testing.T) {
+	// Un projet applicatif sans service déclaré n'obtenait aucune règle sudoers :
+	// son propriétaire ne pouvait pas redémarrer sa propre application, ce qui est
+	// pourtant le geste le plus courant après un déploiement.
+	h := newHarness(t)
+	h.mustRun("init")
+	// L'option --runtime est indispensable : sans elle la déclaration est refusée
+	// à l'apply, et rien ne permettait de la donner sans éditer le fichier.
+	h.mustRunPartial("site", "create", "app.fr", "--kind", "node",
+		"--runtime", "22.14.0", "--tls=false", "--yes")
+
+	decl := h.read(t, filepath.Join("etc", "ogs", "projects", "appfr.yaml"))
+	if !strings.Contains(decl, "runtime: 22.14.0") {
+		t.Errorf("la version du runtime doit être déclarée :\n%s", decl)
+	}
+	sudoers := h.read(t, filepath.Join("etc", "sudoers.d", "ogs-appfr"))
+	if !strings.Contains(sudoers, "appfr") {
+		t.Errorf("la délégation doit être écrite :\n%s", sudoers)
 	}
 }

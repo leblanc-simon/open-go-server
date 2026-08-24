@@ -49,6 +49,9 @@ var (
 )
 
 // supportedPHP énumère les versions gérées (D39).
+// dnsProviderOVH est le seul provider DNS géré (D27).
+const dnsProviderOVH = "ovh"
+
 var supportedPHP = []string{"7.4", "8.0", "8.1", "8.2", "8.3", "8.4", "8.5"}
 
 // phpEOL indique les versions dont le support est terminé. Elles restent
@@ -139,7 +142,7 @@ func Project(p *model.Project, homeRoot string) error {
 		add("spec.user.home", "doit valoir spec.layout.root (%q), obtenu %q", root, p.Spec.User.Home)
 	}
 	if !reMode.MatchString(p.Spec.Layout.Mode) {
-		add("spec.layout.mode", "mode octal attendu (exemple 0750), obtenu %q", p.Spec.Layout.Mode)
+		add("spec.layout.mode", "mode octal attendu (exemple 0701), obtenu %q", p.Spec.Layout.Mode)
 	}
 	for i, d := range p.Spec.Layout.Dirs {
 		f := fmt.Sprintf("spec.layout.dirs[%d]", i)
@@ -194,7 +197,30 @@ func Project(p *model.Project, homeRoot string) error {
 	validatePHP(p, add)
 	validateAMQP(p, add)
 	validateCrons(p, add)
+	validateCertificates(p, add)
 	return errs.OrNil()
+}
+
+// validateCertificates contrôle les certificats déclarés. Le provider DNS est
+// refusé dès la déclaration : le découvrir au moment de l'émission ferait échouer
+// un apply qui a déjà créé le site.
+func validateCertificates(p *model.Project, add func(string, string, ...any)) {
+	for i, c := range p.Spec.Certificates {
+		f := fmt.Sprintf("spec.certificates[%d]", i)
+		switch c.Challenge {
+		case "", "http-01", "selfsigned":
+		case "dns-01":
+			if c.DNSProvider != "" && c.DNSProvider != dnsProviderOVH {
+				add(f+".dnsProvider", "provider %q non géré : ogs ne gère qu'%q",
+					c.DNSProvider, dnsProviderOVH)
+			}
+		default:
+			add(f+".challenge", "challenge %q inconnu (http-01, dns-01 ou selfsigned)", c.Challenge)
+		}
+		if len(c.Domains) == 0 {
+			add(f+".domains", "au moins un domaine est requis")
+		}
+	}
 }
 
 func validateDatabases(p *model.Project, add func(string, string, ...any)) {

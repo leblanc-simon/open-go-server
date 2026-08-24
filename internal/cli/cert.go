@@ -344,8 +344,9 @@ func newCertDNSSetCommand(app *App) *cobra.Command {
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			provider := args[0]
-			if provider != "ovh" {
-				return exitf(CodeUsage, "provider %q non géré en v1 (seul « ovh » est testé)", provider)
+			if provider != tlsprov.DNSProviderOVH {
+				return exitf(CodeUsage, "provider %q non géré : ogs ne gère qu'%q",
+					provider, tlsprov.DNSProviderOVH)
 			}
 			creds := map[string]string{}
 			if endpoint != "" {

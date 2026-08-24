@@ -7,9 +7,11 @@ import (
 	"os"
 	"strings"
 	"text/tabwriter"
+	"time"
 
 	"github.com/spf13/cobra"
 
+	"github.com/leviathan/ogs/internal/archive"
 	"github.com/leviathan/ogs/internal/config"
 	"github.com/leviathan/ogs/internal/engine"
 	"github.com/leviathan/ogs/internal/exec"
@@ -17,6 +19,7 @@ import (
 	"github.com/leviathan/ogs/internal/hook"
 	"github.com/leviathan/ogs/internal/model"
 	appprov "github.com/leviathan/ogs/internal/provider/app"
+	"github.com/leviathan/ogs/internal/provider/unit"
 	"github.com/leviathan/ogs/internal/spec"
 	"github.com/leviathan/ogs/internal/store"
 	"github.com/leviathan/ogs/internal/template"
@@ -96,8 +99,10 @@ func (a *App) buildPlan(ctx context.Context, provs *providers, p *model.Project)
 
 	// Application non-PHP : runtime, unité et attente de disponibilité. Elle
 	// précède le vhost de proxy, qui exposerait sinon une erreur 502.
+	var appObs appprov.Observed
 	if appprov.Applies(p) {
-		appObs, err := provs.App.Observe(ctx, p)
+		var err error
+		appObs, err = provs.App.Observe(ctx, p)
 		if err != nil {
 			return nil, wrap(CodeError, err)
 		}
@@ -108,6 +113,41 @@ func (a *App) buildPlan(ctx context.Context, provs *providers, p *model.Project)
 		for _, s := range appSteps {
 			plan.Add(s)
 		}
+	}
+
+	// Tâches planifiées, services et application : ils viennent après
+	// l'arborescence et l'interpréteur dont ils dépendent, mais avant le serveur
+	// web — un vhost de proxy branché sur une application qui n'a pas encore
+	// démarré exposerait une 502.
+	cronSteps, err := provs.Cron.Plan(ctx, p)
+	if err != nil {
+		return nil, wrap(CodeValidation, err)
+	}
+	for _, s := range cronSteps {
+		plan.Add(s)
+	}
+
+	unitObs, err := provs.Unit.Observe(ctx, p)
+	if err != nil {
+		return nil, wrap(CodeError, err)
+	}
+	unitSteps, err := provs.Unit.Plan(ctx, p, unitObs)
+	if err != nil {
+		return nil, wrap(CodeValidation, err)
+	}
+	for _, s := range unitSteps {
+		plan.Add(s)
+	}
+
+	// L'attente de disponibilité vient après le démarrage des instances : attendre
+	// avant d'avoir lancé quoi que ce soit ne pourrait qu'échouer, en accusant
+	// l'application à tort.
+	if appprov.Applies(p) {
+		healthStep, err := provs.App.PlanHealth(ctx, p, appObs)
+		if err != nil {
+			return nil, wrap(CodeValidation, err)
+		}
+		plan.Add(healthStep)
 	}
 
 	if len(p.Spec.Domains) > 0 {
@@ -141,31 +181,11 @@ func (a *App) buildPlan(ctx context.Context, provs *providers, p *model.Project)
 		plan.Add(s)
 	}
 
-	// Tâches planifiées et services : ils viennent après le site, puisqu'ils
-	// s'appuient sur son arborescence et son interpréteur.
-	cronSteps, err := provs.Cron.Plan(ctx, p)
-	if err != nil {
-		return nil, wrap(CodeValidation, err)
-	}
-	for _, s := range cronSteps {
-		plan.Add(s)
-	}
-
-	unitObs, err := provs.Unit.Observe(ctx, p)
-	if err != nil {
-		return nil, wrap(CodeError, err)
-	}
-	unitSteps, err := provs.Unit.Plan(ctx, p, unitObs)
-	if err != nil {
-		return nil, wrap(CodeValidation, err)
-	}
-	for _, s := range unitSteps {
-		plan.Add(s)
-	}
-
 	// La délégation est écrite en dernier : en style systemctl, elle énumère les
-	// instances, dont le nombre vient d'être arrêté.
-	if len(p.Spec.Services) > 0 || p.Spec.Sudo != nil {
+	// instances, dont le nombre vient d'être arrêté. Une application supervisée y
+	// donne droit autant qu'un service déclaré : son propriétaire doit pouvoir la
+	// redémarrer après un déploiement, c'est même le cas d'usage principal.
+	if len(p.Spec.Services) > 0 || p.Spec.Sudo != nil || appprov.Applies(p) {
 		sudoStep, err := provs.Sudoers.Plan(ctx, p, unitObs.Instances)
 		if err != nil {
 			return nil, wrap(CodeValidation, err)
@@ -185,6 +205,15 @@ func (a *App) buildGlobalPlan(provs *providers, projects []*model.Project) (*eng
 	plan.Add(step)
 
 	// Répertoires d'exécution : verrous de tâches et sockets applicatifs.
+	// Purge des archives expirées : une archive porte un dump de base, donc des
+	// données de clients. Elle est une étape du plan, non un effet de bord, pour
+	// être annoncée avant d'être faite.
+	if step, err := a.purgeArchivesStep(); err != nil {
+		return nil, err
+	} else {
+		plan.Add(step)
+	}
+
 	// Les réglages de portée serveur du moteur web : les vhosts de proxy en
 	// dépendent, et le fichier ne relève d'aucun projet en particulier.
 	snippet, err := provs.Web.PlanSnippet()
@@ -215,6 +244,34 @@ func (a *App) buildGlobalPlan(provs *providers, projects []*model.Project) (*eng
 	return plan, nil
 }
 
+// purgeArchivesStep supprime les archives dont l'âge dépasse la rétention.
+func (a *App) purgeArchivesStep() (*engine.Step, error) {
+	retention := time.Duration(a.Cfg.Archives.RetentionDays) * 24 * time.Hour
+	expired, err := archive.Expired(a.Paths.ArchivesDir(), retention, nowFunc())
+	if err != nil {
+		return nil, wrap(CodeError, err)
+	}
+	if len(expired) == 0 {
+		return nil, nil
+	}
+	s := engine.NewStep("archive/purge", engine.Delete,
+		fmt.Sprintf("purge de %d archive(s) de plus de %d jours",
+			len(expired), a.Cfg.Archives.RetentionDays))
+	// Non critique : une archive qu'on n'arrive pas à supprimer ne doit pas
+	// interrompre un déploiement.
+	s.Critical = false
+	s.Diff = func() (string, error) { return strings.Join(expired, "\n"), nil }
+	s.Apply = func(context.Context) error {
+		for _, f := range expired {
+			if err := os.Remove(f); err != nil && !os.IsNotExist(err) {
+				return err
+			}
+		}
+		return nil
+	}
+	return s, nil
+}
+
 // reloadFunc route les intentions de rechargement vers le bon provider. Elles
 // sont dédupliquées par le moteur : un seul rechargement par cible, en fin
 // d'application.
@@ -234,6 +291,10 @@ func (a *App) reloadFunc(provs *providers) func(context.Context, string) error {
 		case target == "systemd:tmpfiles":
 			a.printf("  ↻ systemd-tmpfiles --create\n")
 			return a.systemctlBin(ctx, "systemd-tmpfiles", "--create")
+		case strings.HasPrefix(target, "systemd:restart-target:"):
+			id := strings.TrimPrefix(target, "systemd:restart-target:")
+			a.printf("  ↻ redémarrage des services de %s\n", id)
+			return a.systemctl(ctx, "restart", unit.TargetName(id))
 		case strings.HasPrefix(target, "systemd:enable:"):
 			unit := strings.TrimPrefix(target, "systemd:enable:")
 			a.printf("  ↻ activation de %s\n", unit)

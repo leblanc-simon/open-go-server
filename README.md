@@ -7,7 +7,7 @@ PostgreSQL, vhost et files RabbitMQ, pool PHP-FPM, vhost Apache ou Nginx, certif
 et services systemd. Un projet est décrit par un fichier YAML ; un moteur de réconciliation idempotent amène
 le serveur dans l'état décrit.
 
-Le cahier des charges technique complet — 50 décisions d'architecture arbitrées, spécification par module,
+Le cahier des charges technique complet — 55 décisions d'architecture arbitrées, spécification par module,
 plan de tests, découpage en lots — est dans [`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md).
 C'est la référence : toute contribution s'y adosse.
 
@@ -56,8 +56,12 @@ make integration-postgres  # cluster réel : schéma public durci, extensions, m
 make integration-rabbitmq  # broker réel : isolation par vhost, bindings, arguments immuables
 make integration-acme      # autorité ACME réelle (pebble) : émission, HTTPS, renouvellement
 make integration-systemd   # systemd en PID 1 : instances, durcissement, délégation, cron réel
+make integration-runtimes  # application Go supervisée, socket 0660, Node installé par nvm
 make integration-package   # installation, usage et désinstallation du .deb
-make integration-all       # les dix, à la suite
+make integration-all       # les onze, à la suite
+
+# Hors série : rbenv et pyenv compilent depuis les sources (un quart d'heure).
+make integration-runtimes-compiles
 ```
 
 Ces scénarios ne sont pas décoratifs : ils ont mis au jour vingt défauts que les tests unitaires ne
@@ -92,7 +96,7 @@ ou pas à pas :
 
 ```
 ogs init | doctor | version [--license]
-ogs project create <host> [--kind] [--app-version] [--php] [--env prep] [--id] [--host]
+ogs project create <host> [--kind] [--app-version] [--runtime] [--php] [--env prep] [--id] [--host]
 ogs project list | show | export
 ogs plan | apply | diff  [id...] [-f fichier]
 ogs php list | ports | switch <id> <version> [--pool] [--force]
@@ -109,7 +113,7 @@ ogs amqp credentials set --user … --password …
 ogs cron add | remove | list | enable | disable | run
 ogs service add | remove | list | start | stop | restart | scale | logs
 ogs my start | stop | restart | status      (surface déléguée par sudo)
-ogs site create <host> [--db] [--messenger] [--service] [--cron] …
+ogs site create <host> [--db] [--messenger] [--service] [--cron] [--runtime] …
 ogs site clone <id> --to prep
 ogs project delete <id> [--purge] [--keep-data] [--no-dump]
 ogs project restore <archive> | archives
@@ -371,16 +375,23 @@ est transmis par `SOCKET_PATH`, et si le code l'ignore, l'attente de disponibili
 
 - **Un identifiant unique par projet**, dérivé du host (`shop.fr` → `shopfr`), qui nomme l'utilisateur
   Linux, son groupe, les bases, le vhost RabbitMQ, le pool PHP, le vhost web, les unités systemd et le cron.
-- **Home** en `/home/<host effectif>`, en 0750 ; le code applicatif dans `www/`, le docroot dépendant du
+- **Home** en `/home/<host effectif>`, en 0711, ses répertoires en 0710 ; le code applicatif dans `www/`, le docroot dépendant du
   type d'application (`www` pour Prestashop, `www/public` pour Symfony 4+, `www/web` pour Symfony 3.4).
 - **`logs/` et `.bin/` appartiennent à root** : l'utilisateur y lit mais n'y crée rien. Cela interdit de
   substituer un fichier de log par un lien symbolique et d'obtenir une écriture root arbitraire.
+- **Traverser sans énumérer** : le home est en 0711 et les répertoires du projet en 0710. Servir un fichier
+  n'exige que la traversée du répertoire et la lecture du fichier ; pouvoir lister le contenu ne sert qu'à
+  explorer, ce dont personne n'a besoin — pas même le serveur web. Le bit de groupe du home est
+  indispensable : `www-data` étant membre du groupe, Unix ne se replierait pas sur les droits « autres ».
 - **Isolation** : chaque projet a son groupe privé, et c'est `www-data` qui en devient membre secondaire —
   jamais l'inverse, qui rendrait chaque site lisible par tous les autres.
 - **Préproduction** : `--env prep` produit un projet distinct sur un domaine dédié
   (`<identifiant>.preprod-pp.net`), sans partager la moindre ressource avec la production.
 - **Privilèges MySQL** : le nom de base côté `ON` est un motif où `_` fait joker — il est donc
   systématiquement échappé. Le nom d'utilisateur, lui, est un littéral exact et ne l'est pas.
+- **Archives** : conservées 14 jours, puis purgées par une étape du plan — annoncée, auditée, jamais
+  silencieuse. `archives.retentionDays: 0` conserve indéfiniment, et doit être un choix explicite.
+- **Fournisseur DNS** : OVH seul est géré, refusé dès la déclaration pour tout autre.
 
 ## Codes de retour
 
@@ -394,7 +405,7 @@ est transmis par `SOCKET_PATH`, et si le code l'ignore, l'attente de disponibili
 
 ## Documentation
 
-- [`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md) — la référence : 50 décisions d'architecture
+- [`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md) — la référence : 55 décisions d'architecture
   arbitrées, spécification par module, plan de tests, découpage en lots.
 - [`docs/INSTALLATION.md`](docs/INSTALLATION.md) — installation, premier démarrage, sauvegarde, mise à jour.
 - [`docs/HOOKS.md`](docs/HOOKS.md) — raccorder l'outil au reste de l'exploitation.

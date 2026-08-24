@@ -37,6 +37,7 @@ func newSiteCommand(app *App) *cobra.Command {
 type siteOptions struct {
 	kind       string
 	appVersion string
+	runtime    string
 	phpVersion string
 	env        string
 	id         string
@@ -113,6 +114,7 @@ func newSiteCreateCommand(app *App) *cobra.Command {
 	f := cmd.Flags()
 	f.StringVar(&opts.kind, "kind", string(model.KindSymfony), "type d'application ("+kindsList()+")")
 	f.StringVar(&opts.appVersion, "app-version", "auto", "version applicative")
+	f.StringVar(&opts.runtime, "runtime", "", "version du runtime pour Node, Ruby ou Python (exemple 22.14.0)")
 	f.StringVar(&opts.phpVersion, "php", "", "version PHP (défaut "+model.DefaultPHPVersion+")")
 	f.StringVar(&opts.env, "env", "prod", "environnement : prod ou prep")
 	f.StringVar(&opts.id, "id", "", "forcer l'identifiant")
@@ -144,6 +146,9 @@ func (a *App) buildSite(host string, opts siteOptions) (*model.Project, error) {
 		return nil, exitf(CodeUsage, "%s (types connus : %s)", err, kindsList())
 	}
 	p := model.New(host, env, kind)
+	if opts.runtime != "" {
+		p.Spec.App.Runtime = opts.runtime
+	}
 	if opts.appVersion != "" {
 		p.Spec.App.Version = opts.appVersion
 	}

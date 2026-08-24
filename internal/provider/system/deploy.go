@@ -104,7 +104,8 @@ func (p *Provider) binStep(proj *model.Project) *engine.Step {
 // replaceSymlink remplace un lien de façon atomique : le lien temporaire est créé
 // puis renommé, de sorte qu'aucun appelant ne voit de chemin manquant.
 func replaceSymlink(link, target string) error {
-	if err := os.MkdirAll(filepath.Dir(link), 0o750); err != nil {
+	// Le mode de .bin/ relève de l'arborescence : ce n'est ici qu'un filet.
+	if err := os.MkdirAll(filepath.Dir(link), 0o710); err != nil {
 		return err
 	}
 	tmp := link + ".ogs-tmp"

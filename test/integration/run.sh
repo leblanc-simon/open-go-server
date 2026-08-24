@@ -10,19 +10,28 @@ scenario="${1:-reload-group}"
 echo "compilation du binaire statique…"
 CGO_ENABLED=0 go build -trimpath -o ogs ./cmd/ogs
 
+# Les scénarios de runtime déposent une application : c'est un vrai binaire Go,
+# compilé ici, qui respecte le contrat d'écoute imposé par ogs.
+if [ "$scenario" = "runtimes" ] || [ "$scenario" = "runtimes-compiles" ]; then
+    mkdir -p test/integration/dist
+    (cd test/integration/app && CGO_ENABLED=0 go build -trimpath -o ../dist/app .)
+fi
+
 echo "construction de l'image…"
 docker build -q -f test/integration/Dockerfile -t ogs-integration . >/dev/null
 
-# Le scénario des services et des tâches planifiées exige un vrai systemd en
-# PID 1 : rien de ce qui suit un « systemctl enable » ne s'éprouve autrement.
-if [ "$scenario" = "systemd" ]; then
-    nom=ogs-integration-systemd
+# Les scénarios de runtime et de services exigent un vrai systemd en PID 1 :
+# rien de ce qui suit un « systemctl enable » ne s'éprouve autrement.
+case "$scenario" in
+systemd | runtimes | runtimes-compiles)
+    nom="ogs-integration-$scenario"
     docker rm -f "$nom" >/dev/null 2>&1 || true
     trap 'docker rm -f '"$nom"' >/dev/null 2>&1' EXIT
     echo "démarrage de systemd en PID 1…"
     docker run -d --name "$nom" --privileged --cgroupns=host \
         --tmpfs /run --tmpfs /run/lock \
         -v "$PWD/test/integration/scenarios:/scenarios:ro" \
+        -v "$PWD/test/integration/dist:/depot:ro" \
         --entrypoint /sbin/init ogs-integration >/dev/null
     for _ in $(seq 1 30); do
         etat=$(docker exec "$nom" systemctl is-system-running 2>/dev/null || true)
@@ -32,9 +41,10 @@ if [ "$scenario" = "systemd" ]; then
     echo "systemd : ${etat:-indéterminé}"
     echo "exécution du scénario « $scenario »…"
     echo
-    docker exec "$nom" /scenarios/systemd.sh
+    docker exec "$nom" "/scenarios/$scenario.sh"
     exit $?
-fi
+    ;;
+esac
 
 # Les scénarios ont besoin d'un service tiers joignable par le réseau : la
 # composition les fournit, et le scénario s'exécute dans le conteneur « runner ».

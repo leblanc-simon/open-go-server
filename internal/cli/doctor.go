@@ -8,9 +8,11 @@ import (
 	"path/filepath"
 	"strings"
 	"text/tabwriter"
+	"time"
 
 	"github.com/spf13/cobra"
 
+	"github.com/leviathan/ogs/internal/archive"
 	"github.com/leviathan/ogs/internal/exec"
 	appprov "github.com/leviathan/ogs/internal/provider/app"
 	"github.com/leviathan/ogs/internal/provider/db"
@@ -182,17 +184,47 @@ func (a *App) runChecks(ctx context.Context) []check {
 		}
 	}
 
-	// Capacité TLS du serveur web. Sans mod_ssl, Apache refuse un vhost portant
-	// SSLEngine : le premier site à demander un certificat échouerait à
-	// l'activation, avec un message d'Apache peu parlant.
+	// Archives expirées : la purge a lieu à l'apply, mais un parc dont on
+	// n'applique rien pendant des mois garderait des dumps indéfiniment.
+	if retention := a.Cfg.Archives.RetentionDays; retention > 0 {
+		expired, err := archive.Expired(a.Paths.ArchivesDir(),
+			time.Duration(retention)*24*time.Hour, nowFunc())
+		if err == nil && len(expired) > 0 {
+			add("archives", "avertissement",
+				fmt.Sprintf("%d archive(s) au-delà de %d jours attendent la purge",
+					len(expired), retention),
+				"ogs apply")
+		} else if err == nil {
+			add("archives", "ok", fmt.Sprintf("rétention %d jours", retention), "")
+		}
+	} else {
+		add("archives", "ok", "conservées indéfiniment (rétention désactivée)", "")
+	}
+
+	// Modules Apache exigés par les vhosts produits. Leur absence ne se traduit
+	// pas par un refus clair : Apache accepte la configuration puis rend une 500
+	// avec un message obscur, ou ignore la directive en silence.
 	if eng, err := a.webEngine(); err == nil && eng.Name() == "apache" {
 		mods := filepath.Join(a.Paths.Prefix(), "/etc/apache2/mods-enabled")
-		if _, err := os.Stat(filepath.Join(mods, "ssl.load")); err != nil {
-			add("mod_ssl", "avertissement",
-				"le module ssl d'Apache n'est pas activé : aucun site ne peut être servi en HTTPS",
-				"a2enmod ssl && systemctl reload apache2")
-		} else {
-			add("mod_ssl", "ok", "activé", "")
+		requis := []struct{ nom, pourquoi string }{
+			{"ssl", "aucun site ne peut être servi en HTTPS"},
+			{"proxy", "aucun relais vers PHP-FPM ni vers une application"},
+			{"proxy_fcgi", "PHP ne peut pas être exécuté : le vhost rendra le source"},
+			{"proxy_http", "les applications Go, Node, Ruby et Python ne peuvent pas être relayées"},
+			{"rewrite", "les redirections vers HTTPS et les front controllers ne fonctionnent pas"},
+			{"headers", "les en-têtes de sécurité (HSTS, X-Robots-Tag) sont ignorés"},
+		}
+		var manquants []string
+		for _, m := range requis {
+			if _, err := os.Stat(filepath.Join(mods, m.nom+".load")); err != nil {
+				add("mod_"+m.nom, "avertissement",
+					"module Apache absent : "+m.pourquoi,
+					"a2enmod "+m.nom+" && systemctl reload apache2")
+				manquants = append(manquants, m.nom)
+			}
+		}
+		if len(manquants) == 0 {
+			add("modules apache", "ok", "tous les modules requis sont activés", "")
 		}
 	}
 

@@ -3,3 +3,4 @@
 /coverage.out
 *.ogs-bak-*
 /dev/
+/test/integration/dist/

@@ -47,9 +47,10 @@ func (p *Provider) Build(projects []*model.Project) []byte {
 	}
 	sort.Strings(ids)
 	for _, id := range ids {
-		// 0750 : le projet écrit ses verrous et ses sockets, www-data traverse via
-		// le groupe, personne d'autre n'entre.
-		fmt.Fprintf(&b, "d %s 0750 %s -\n", p.Paths.ProjectRunDir(id), owners[id])
+		// 0710 : le projet écrit ses verrous et ses sockets, le groupe traverse
+		// jusqu'au socket qu'il connaît sans pouvoir énumérer le reste, personne
+		// d'autre n'entre (D51).
+		fmt.Fprintf(&b, "d %s 0710 %s -\n", p.Paths.ProjectRunDir(id), owners[id])
 	}
 	return fs.Render(fs.Header{
 		Project:   fmt.Sprintf("%d projet(s)", len(projects)),

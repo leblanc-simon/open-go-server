@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -450,6 +451,98 @@ func TestReadWritePathsAreOptional(t *testing.T) {
 					t.Errorf("%s : %q doit être facultatif (préfixe « - »)", svc.Name, chemin)
 				}
 			}
+		}
+	}
+}
+
+func TestApplicationInstancesAreEnabledAndStarted(t *testing.T) {
+	// L'unité d'une application supervisée est écrite par le provider applicatif,
+	// mais rien ne la lançait : l'attente de disponibilité échouait alors en
+	// accusant l'application, et tout site non-PHP restait mort-né.
+	prov, proj := fixture(t)
+	proj.Spec.App.Kind = model.KindGo
+	proj.Spec.App.Instances = 2
+	proj.Spec.Services = nil
+
+	steps, err := prov.Plan(context.Background(), proj, Observed{Enabled: map[string]bool{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var resumes []string
+	for _, s := range steps {
+		resumes = append(resumes, s.Resource)
+	}
+	for i := 1; i <= 2; i++ {
+		attendu := "unit/instance/" + InstanceName(proj.ID(), AppServiceName, i)
+		if !slices.Contains(resumes, attendu) {
+			t.Errorf("l'instance %d de l'application doit être activée : %v", i, resumes)
+		}
+	}
+	// La cible doit exister aussi : l'unité applicative la réclame par PartOf.
+	if !slices.Contains(resumes, "unit/target/"+proj.ID()) {
+		t.Errorf("la cible du projet doit être écrite : %v", resumes)
+	}
+
+	// Un projet PHP sans service ne produit rien : il n'a pas d'application
+	// supervisée.
+	php, projPHP := fixture(t)
+	projPHP.Spec.Services = nil
+	steps, err = php.Plan(context.Background(), projPHP, Observed{Enabled: map[string]bool{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range steps {
+		if s.Mutates() {
+			t.Errorf("aucune étape attendue pour un projet sans service ni application : %s", s)
+		}
+	}
+}
+
+func TestChangedUnitRequestsRestart(t *testing.T) {
+	// Relire la définition ne relance rien : sans redémarrage, un changement
+	// d'unité — commande, variable, limite — resterait écrit sans prendre effet.
+	prov, proj := fixture(t)
+	proj.Spec.Services = []model.Service{{
+		Name: "veille", Template: "worker",
+		Params: map[string]string{"command": "/usr/bin/true"},
+	}}
+	apply(t, prov, proj)
+
+	// Le même projet, avec une commande différente.
+	proj.Spec.Services[0].Params["command"] = "/usr/bin/sleep 60"
+	steps, err := prov.Plan(context.Background(), proj, Observed{
+		Enabled: map[string]bool{InstanceName(proj.ID(), "veille", 1): true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var trouve bool
+	for _, s := range steps {
+		if s.Action != engine.Update {
+			continue
+		}
+		if slices.Contains(s.Reload, RestartTargetIntent(proj.ID())) {
+			trouve = true
+		}
+		if !slices.Contains(s.Reload, "systemd:daemon-reload") {
+			t.Errorf("le daemon-reload doit rester demandé : %v", s.Reload)
+		}
+	}
+	if !trouve {
+		t.Errorf("une unité modifiée doit demander le redémarrage groupé :\n%v", steps)
+	}
+
+	// À la création, en revanche, c'est l'activation qui démarre : pas de
+	// redémarrage à demander.
+	neuf, projNeuf := fixture(t)
+	projNeuf.Spec.Services = proj.Spec.Services
+	steps, err = neuf.Plan(context.Background(), projNeuf, Observed{Enabled: map[string]bool{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range steps {
+		if slices.Contains(s.Reload, RestartTargetIntent(projNeuf.ID())) {
+			t.Errorf("aucun redémarrage ne doit être demandé à la création : %s", s)
 		}
 	}
 }

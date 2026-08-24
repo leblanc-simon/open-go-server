@@ -225,7 +225,13 @@ func (p *Provider) buildTarget(proj *model.Project) ([]byte, error) {
 
 // Plan calcule les étapes des unités, de la cible et des instances.
 func (p *Provider) Plan(_ context.Context, proj *model.Project, obs Observed) ([]*engine.Step, error) {
-	if len(proj.Spec.Services) == 0 {
+	// Une application supervisée est un service comme un autre du point de vue de
+	// systemd : son fichier d'unité est écrit par le provider applicatif, mais la
+	// cible, l'activation et le démarrage de ses instances relèvent d'ici — sans
+	// quoi l'unité existerait sans que rien ne la lance, et l'attente de
+	// disponibilité échouerait en accusant l'application.
+	appInstances := appServiceInstances(proj)
+	if len(proj.Spec.Services) == 0 && appInstances == 0 {
 		return p.cleanupSteps(proj, obs), nil
 	}
 	var steps []*engine.Step
@@ -236,7 +242,7 @@ func (p *Provider) Plan(_ context.Context, proj *model.Project, obs Observed) ([
 	if err != nil {
 		return nil, err
 	}
-	if s := p.fileStep("unit/target/"+proj.ID(), targetPath, targetContent,
+	if s := p.fileStepFor(proj.ID(), "unit/target/"+proj.ID(), targetPath, targetContent,
 		"cible "+TargetName(proj.ID())); s != nil {
 		steps = append(steps, s)
 	}
@@ -251,7 +257,7 @@ func (p *Provider) Plan(_ context.Context, proj *model.Project, obs Observed) ([
 			return nil, err
 		}
 		path := filepath.Join(p.Paths.SystemdDir(), ServiceName(proj.ID(), svc.Name))
-		if s := p.fileStep("unit/service/"+svc.Name, path, content,
+		if s := p.fileStepFor(proj.ID(), "unit/service/"+svc.Name, path, content,
 			fmt.Sprintf("unité %s", ServiceName(proj.ID(), svc.Name))); s != nil {
 			steps = append(steps, s)
 		}
@@ -276,6 +282,17 @@ func (p *Provider) Plan(_ context.Context, proj *model.Project, obs Observed) ([
 			steps = append(steps, p.enableStep(proj, name))
 		}
 	}
+	for i := 1; i <= appInstances; i++ {
+		name := InstanceName(proj.ID(), AppServiceName, i)
+		wanted[name] = true
+		if obs.Enabled[name] {
+			steps = append(steps, engine.NewStep("unit/instance/"+name, engine.NoOp,
+				fmt.Sprintf("instance %s active", name)))
+			continue
+		}
+		steps = append(steps, p.enableStep(proj, name))
+	}
+
 	// Le surplus d'instances est désactivé : réduire l'échelle ne doit pas laisser
 	// de worker orphelin.
 	for name := range obs.Enabled {
@@ -285,6 +302,23 @@ func (p *Provider) Plan(_ context.Context, proj *model.Project, obs Observed) ([
 	}
 	sortSteps(steps)
 	return steps, nil
+}
+
+// AppServiceName est le nom logique du service d'une application supervisée. Le
+// provider applicatif écrit « ogs-<id>-app@.service » ; ce nom fait le lien.
+const AppServiceName = "app"
+
+// appServiceInstances renvoie le nombre d'instances de l'application supervisée,
+// ou zéro si le projet n'en a pas.
+func appServiceInstances(proj *model.Project) int {
+	at, err := proj.AppType()
+	if err != nil || at.Runtime == "" {
+		return 0
+	}
+	if n := proj.Spec.App.Instances; n > 0 {
+		return n
+	}
+	return 1
 }
 
 // cleanupSteps retire les unités d'un projet qui n'en déclare plus.
@@ -302,7 +336,9 @@ func (p *Provider) cleanupSteps(proj *model.Project, obs Observed) []*engine.Ste
 
 // fileStep produit l'étape d'écriture d'un fichier d'unité, ou rien s'il est
 // déjà conforme.
-func (p *Provider) fileStep(resource, path string, content []byte, summary string) *engine.Step {
+// fileStepFor écrit un fichier d'unité. Le projet est nécessaire pour demander,
+// le cas échéant, le redémarrage groupé de ses unités.
+func (p *Provider) fileStepFor(project, resource, path string, content []byte, summary string) *engine.Step {
 	state, err := fs.Inspect(path, content)
 	if err != nil || state == fs.StateCurrent {
 		return nil
@@ -335,10 +371,20 @@ func (p *Provider) fileStep(resource, path string, content []byte, summary strin
 		}
 		return fs.WriteAtomic(path, previous, 0o644, fs.KeepOwner)
 	}
-	// Un rechargement du gestionnaire suffit : il est groupé pour tout le plan.
 	s.Reload = []string{"systemd:daemon-reload"}
+	if action == engine.Update {
+		// Relire la définition ne relance rien : un service en cours continue de
+		// tourner avec l'ancienne. Sans ce redémarrage, tout changement d'unité —
+		// nouvelle commande, nouvelle variable, nouvelle limite — resterait écrit
+		// sans jamais prendre effet. La cible les redémarre tous, dans l'ordre.
+		s.Reload = append(s.Reload, RestartTargetIntent(project))
+	}
 	return s
 }
+
+// RestartTargetIntent est l'intention de redémarrage groupé des unités d'un
+// projet, par sa cible.
+func RestartTargetIntent(id string) string { return "systemd:restart-target:" + id }
 
 // enableTargetStep rattache la cible du projet à multi-user.target. Sans ce lien,
 // rien ne réclame la cible au démarrage de la machine : les services du projet

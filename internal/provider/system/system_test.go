@@ -103,11 +103,15 @@ func TestDirectoryModes(t *testing.T) {
 	p, prov, _, _ := fixture(t)
 	apply(t, prov, p)
 	cases := map[string]os.FileMode{
-		"":     0o750, // racine : rwx utilisateur, r-x groupe, rien pour les autres
-		"www":  0o750,
+		// La racine se traverse sans s'énumérer : le serveur web doit atteindre le
+		// docroot, personne n'a besoin de lister le home.
+		"": 0o711,
+		// Les répertoires ne donnent au groupe qu'un droit de passage : servir un
+		// fichier n'exige pas de pouvoir lister ce qui l'entoure.
+		"www":  0o710,
 		"var":  0o700, // hors de portée de www-data
-		"logs": 0o750,
-		".bin": 0o750,
+		"logs": 0o710,
+		".bin": 0o710,
 		".ssh": 0o700,
 	}
 	for dir, want := range cases {
@@ -184,7 +188,7 @@ func TestPlanCorrectsDriftedMode(t *testing.T) {
 		t.Fatal(err)
 	}
 	info, _ := os.Stat(logs)
-	if info.Mode().Perm() != 0o750 {
+	if info.Mode().Perm() != 0o710 {
 		t.Errorf("mode non corrigé : %04o", info.Mode().Perm())
 	}
 }
@@ -302,5 +306,31 @@ func TestBinPHPLink(t *testing.T) {
 	target, _ = os.Readlink(link)
 	if !strings.HasSuffix(target, "php8.5") {
 		t.Errorf("le lien doit suivre la version : %q", target)
+	}
+}
+
+func TestHomeGrantsGroupTraversal(t *testing.T) {
+	// Le bit de groupe du home ne peut pas être ôté. Unix retient la première
+	// classe applicable, sans repli : www-data étant membre du groupe du projet, un
+	// home en 0701 lui appliquerait les droits de groupe — nuls — et lui refuserait
+	// la traversée que les bits « autres » semblaient accorder. Ajouter www-data au
+	// groupe lui retirerait donc l'accès, et le site cesserait d'être servi.
+	p, prov, _, _ := fixture(t)
+	apply(t, prov, p)
+
+	info, err := os.Stat(p.Spec.Layout.Root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mode := info.Mode().Perm()
+	if mode&0o010 == 0 {
+		t.Errorf("le home (%04o) doit être traversable par son groupe, sans quoi "+
+			"l'appartenance de www-data lui retirerait l'accès", mode)
+	}
+	if mode&0o040 != 0 {
+		t.Errorf("le home (%04o) ne doit pas être énumérable par son groupe", mode)
+	}
+	if mode&0o004 != 0 {
+		t.Errorf("le home (%04o) ne doit pas être énumérable par les autres", mode)
 	}
 }

@@ -354,24 +354,50 @@ func (p *Provider) Plan(_ context.Context, proj *model.Project, obs Observed) ([
 		}
 		s.Compensate = func(context.Context) error { return os.Remove(path) }
 		s.Reload = []string{"systemd:daemon-reload"}
+		if action == engine.Update {
+			// Relire la définition ne relance rien : sans ce redémarrage, changer le
+			// mode d'écoute ou la commande resterait écrit sans prendre effet.
+			s.Reload = append(s.Reload, RestartTargetIntent(proj.ID()))
+		}
 		steps = append(steps, s)
 	} else {
 		steps = append(steps, engine.NewStep("app/unit/"+proj.ID(), engine.NoOp, "unité applicative"))
 	}
 
-	// 4. L'attente de disponibilité : sans elle, le premier rechargement du
-	// serveur web exposerait une erreur 502 (§7.11.6).
-	if !obs.Listening {
-		s := engine.NewStep("app/health/"+proj.ID(), engine.Create,
-			fmt.Sprintf("attente de disponibilité sur %s", describeEndpoint(endpoint)))
-		s.Critical = false
-		s.Apply = func(ctx context.Context) error { return p.waitReady(ctx, proj, endpoint) }
-		steps = append(steps, s)
-	} else {
-		steps = append(steps, engine.NewStep("app/health/"+proj.ID(), engine.NoOp,
-			"application à l'écoute"))
-	}
 	return steps, nil
+}
+
+// RestartTargetIntent est l'intention de redémarrage groupé des unités d'un
+// projet. Elle est nommée ici plutôt qu'importée du provider d'unités : la
+// chaîne est un contrat entre les providers et l'orchestrateur, pas une
+// dépendance de code.
+func RestartTargetIntent(id string) string { return "systemd:restart-target:" + id }
+
+// PlanHealth produit l'attente de disponibilité. Elle est séparée du reste parce
+// qu'elle doit venir après le démarrage des instances, dont le provider d'unités
+// a la charge : attendre avant d'avoir lancé quoi que ce soit ne pourrait
+// qu'échouer, en accusant l'application à tort.
+func (p *Provider) PlanHealth(_ context.Context, proj *model.Project, obs Observed) (*engine.Step, error) {
+	at, err := proj.AppType()
+	if err != nil || at.Runtime == "" {
+		return nil, nil
+	}
+	endpoint, err := p.Endpoint(proj)
+	if err != nil {
+		return nil, err
+	}
+	if obs.Listening {
+		return engine.NewStep("app/health/"+proj.ID(), engine.NoOp, "application à l'écoute"), nil
+	}
+	s := engine.NewStep("app/health/"+proj.ID(), engine.Create,
+		fmt.Sprintf("attente de disponibilité sur %s", describeEndpoint(endpoint)))
+	// Sans elle, le premier rechargement du serveur web exposerait une 502 (§7.11.6).
+	s.Critical = false
+	// Les redémarrages en attente doivent avoir eu lieu : autrement on attendrait
+	// une application qui tourne encore avec son ancienne configuration.
+	s.FlushReloads = true
+	s.Apply = func(ctx context.Context) error { return p.waitReady(ctx, proj, endpoint) }
+	return s, nil
 }
 
 // waitReady attend que l'application réponde, dans la limite du délai imparti.

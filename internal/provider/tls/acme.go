@@ -27,6 +27,9 @@ import (
 	"github.com/leviathan/ogs/internal/fs"
 )
 
+// DNSProviderOVH est le seul provider DNS géré (D27).
+const DNSProviderOVH = "ovh"
+
 // DirectoryStaging est l'environnement de test de Let's Encrypt. Il délivre des
 // certificats non reconnus mais sans quota serré : c'est là qu'on éprouve une
 // configuration avant de consommer les quotas de production.
@@ -228,12 +231,14 @@ func (a *ACME) setupChallenge(client *lego.Client, req Request) error {
 	return fmt.Errorf("challenge %q non pris en charge par l'émetteur ACME", req.Challenge)
 }
 
-// dnsProvider construit le provider DNS. OVH est le seul testé (D27) ; les
-// autres providers de lego restent atteignables par variables d'environnement.
+// dnsProvider construit le provider DNS. OVH est le seul géré (D27) : la zone de
+// préproduction y est hébergée, et un provider non éprouvé donnerait une émission
+// qui échoue au moment le moins opportun.
 func (a *ACME) dnsProvider(name string) (challenge.Provider, error) {
-	if name != "ovh" {
-		return nil, fmt.Errorf("provider DNS %q non pris en charge : seul « ovh » est géré en v1 "+
-			"(les autres providers de lego s'utilisent par variables d'environnement)", name)
+	if name != DNSProviderOVH {
+		return nil, fmt.Errorf("provider DNS %q non géré : ogs ne gère qu'%q. "+
+			"Un autre provider demande d'ajouter sa configuration et de l'éprouver",
+			name, DNSProviderOVH)
 	}
 	if a.DNSCredentials == nil {
 		return nil, fmt.Errorf("aucune source d'identifiants DNS configurée")

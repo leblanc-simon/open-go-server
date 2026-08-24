@@ -364,7 +364,17 @@ func (p *Project) Normalize(homeRoot, prepDomain string) error {
 		p.Spec.Layout.LogDir = filepath.Join(p.Spec.Layout.Root, "logs")
 	}
 	if p.Spec.Layout.Mode == "" {
-		p.Spec.Layout.Mode = "0750"
+		// 0711 : seul le propriétaire peut énumérer son home ; les autres ne
+		// peuvent que le traverser, ce dont le serveur web a besoin pour atteindre
+		// le docroot.
+		//
+		// Le bit de groupe est là et ne peut pas en être ôté : Unix retient la
+		// première classe applicable, sans repli. www-data étant membre du groupe du
+		// projet, un home en 0701 lui appliquerait les droits de groupe — nuls — et
+		// lui refuserait la traversée que les bits « autres » semblaient accorder.
+		// Ajouter www-data au groupe lui retirerait donc l'accès, ce qui n'a rien
+		// d'intuitif mais est bien le comportement du noyau.
+		p.Spec.Layout.Mode = "0711"
 	}
 	if p.Spec.Layout.Docroot == "" && at.Docroot != "" {
 		p.Spec.Layout.Docroot = filepath.Join(p.Spec.Layout.Root, at.Docroot)
@@ -406,18 +416,23 @@ func (p *Project) Normalize(homeRoot, prepDomain string) error {
 // déclarées. logs/ et .bin/ appartiennent à root : le projet ne doit pas pouvoir
 // y créer d'entrée, ce qui interdit la substitution d'un fichier de log par un
 // lien symbolique (§7.1.2).
+//
+// Les modes sont en 0710 plutôt qu'en 0750 : le groupe traverse, il n'énumère
+// pas. Servir un fichier n'exige que la traversée du répertoire et la lecture du
+// fichier ; pouvoir lister le contenu ne sert qu'à explorer, ce dont personne
+// n'a besoin — ni le serveur web, ni un voisin membre du groupe.
 func (p *Project) defaultDirs(at AppType) []Dir {
 	want := []Dir{
-		{Path: "www", Mode: "0750"},
+		{Path: "www", Mode: "0710"},
 		{Path: "var", Mode: "0700"},
 		{Path: "var/tmp", Mode: "0700"},
 		{Path: "var/sessions", Mode: "0700"},
-		{Path: "logs", Mode: "0750", Owner: "root"},
-		{Path: ".bin", Mode: "0750", Owner: "root"},
+		{Path: "logs", Mode: "0710", Owner: "root"},
+		{Path: ".bin", Mode: "0710", Owner: "root"},
 		{Path: ".ssh", Mode: "0700"},
 	}
 	if at.Docroot != "" && at.Docroot != "www" {
-		want = append(want, Dir{Path: at.Docroot, Mode: "0750"})
+		want = append(want, Dir{Path: at.Docroot, Mode: "0710"})
 	}
 	existing := make(map[string]bool, len(p.Spec.Layout.Dirs))
 	out := make([]Dir, 0, len(want)+len(p.Spec.Layout.Dirs))

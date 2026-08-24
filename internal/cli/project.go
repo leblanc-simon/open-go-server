@@ -40,6 +40,7 @@ func newProjectCreateCommand(app *App) *cobra.Command {
 		id      string
 		hostOpt string
 		appVer  string
+		runtime string
 		phpVer  string
 		withDB  string
 	)
@@ -61,6 +62,9 @@ func newProjectCreateCommand(app *App) *cobra.Command {
 			p := model.New(args[0], env, kindVal)
 			if appVer != "" {
 				p.Spec.App.Version = appVer
+			}
+			if runtime != "" {
+				p.Spec.App.Runtime = runtime
 			}
 			if id != "" {
 				if err := naming.ValidateIdentifier(id); err != nil {
@@ -137,6 +141,10 @@ func newProjectCreateCommand(app *App) *cobra.Command {
 	f := cmd.Flags()
 	f.StringVar(&kind, "kind", string(model.KindStatic), "type d'application ("+kindsList()+")")
 	f.StringVar(&appVer, "app-version", "auto", "version applicative (« auto » ou par exemple 3.4)")
+	// Sans elle, un projet Node, Ruby ou Python est déclaré mais inapplicable :
+	// la validation exige la version du runtime, et rien ne permettait de la
+	// donner autrement qu'en éditant le fichier à la main.
+	f.StringVar(&runtime, "runtime", "", "version du runtime pour Node, Ruby ou Python (exemple 22.14.0)")
 	f.StringVar(&envName, "env", "prod", "environnement : prod ou prep")
 	f.StringVar(&id, "id", "", "forcer l'identifiant au lieu de le dériver du host")
 	f.StringVar(&hostOpt, "host", "", "host servi, s'il diffère du host canonique")

@@ -83,7 +83,7 @@ Décisions arbitrées et figées pour la v1. Toute remise en cause est une évol
 | D12 | Crons | **`/etc/cron.d/ogs-<id>`** généré, `flock` systématique | Fichier entièrement piloté par l'outil |
 | D13 | systemd | **Unités templatisées** `@.service` + `.target`, instances multiples | `daemon-reload` groupé en fin d'apply |
 | D14 | TUI | **Inspecteur + actions + wizard** (Bubble Tea) | Composant majeur, livré en lot dédié |
-| D15 | Isolation | User dédié, shell `nologin`, **docroot simple**, home `/home/<host effectif>` en 0750 | Pas de mécanique `releases/` ; `/home` doit rester traversable |
+| D15 | Isolation | User dédié, shell `nologin`, **docroot simple**, home `/home/<host effectif>` en 0711 (D51) | Pas de mécanique `releases/` ; `/home` doit rester traversable |
 | D16 | Échecs composites | **Rollback avec étapes optionnelles non bloquantes** | Chaque étape déclare sa criticité et sa compensation |
 | D17 | Tests | Unitaires + **intégration en conteneurs systemd** | CI plus lourde mais garanties réelles |
 | D18 | Binaire | **`ogs`**, statique, `.deb` via GoReleaser | CGO désactivé → SQLite en Go pur |
@@ -108,6 +108,11 @@ Décisions arbitrées et figées pour la v1. Toute remise en cause est une évol
 | D37 | Types livrés | **Prestashop** et **Symfony 3.4 → 8** (+ `static`, `php-plain` et les 4 runtimes) ; les autres frameworks s'ajoutent par `apptypes.yaml` sans code | Symfony 3.4 impose une variante distincte : docroot `web`, `app.php`, pas de Messenger |
 | D38 | Compatibilité PHP | La contrainte `require.php` du **`composer.json` de l'application** fait autorité ; table indicative en secours seulement | Aucune matrice figée à maintenir ; `php switch` refuse une bascule incompatible sans `--force` |
 | D39 | Versions PHP | **7.4 à 8.5**, y compris des versions en fin de support | `doctor` les signale sans jamais bloquer : un Prestashop ancien peut exiger 7.4 |
+| D51 | Droits de l'arborescence | Home en **0711**, répertoires du projet en **0710** | Le home se traverse sans s'énumérer : servir un fichier n'exige que la traversée du répertoire et la lecture du fichier. Personne — pas même le serveur web — ne peut lister le contenu, ce qui ôte tout moyen de se promener dans l'arborescence. Le bit de groupe du home est indispensable : Unix retient la première classe applicable sans repli, donc un home en 0701 refuserait la traversée à `www-data` **parce qu'il est membre du groupe** |
+| D52 | Rétention des archives | **14 jours**, purgés par une étape du plan global ; zéro signifie « conserver indéfiniment » et doit être explicite | Une archive contient un dump de base, donc des données de clients : la garder sans terme n'est pas neutre. La purge est une étape annoncée, jamais un effet de bord |
+| D53 | Fournisseur DNS | **OVH seul**, refusé à la déclaration comme à l'émission | La zone de préproduction y est hébergée. Un fournisseur non éprouvé donnerait une émission qui échoue au moment le moins opportun ; en ajouter un demande de le configurer et de l'éprouver |
+| D54 | Versions de runtime | **Aucun refus** d'une version en fin de support | Même principe que pour PHP (D39) : `doctor` signale, il ne bloque pas. Un projet ancien peut exiger un runtime ancien |
+| D55 | Mise à jour des runtimes | **Projet par projet**, aucune commande de parc | Conséquence assumée de D35 : une bascule globale imposerait un redémarrage échelonné de tous les services, dont le risque excède le confort |
 | D50 | Réglages nginx de portée serveur | Un fragment géré **`/etc/nginx/conf.d/ogs.conf`**, écrit par le plan global, porte la correspondance `$http_upgrade → $connection_upgrade` | Les vhosts de proxy emploient cette variable, que nginx ne fournit pas : sans le fragment, **un seul site applicatif rendait toute la configuration invalide** et emportait tous les autres au rechargement suivant |
 | D47 | Ordre des étapes d'unité | L'ordre suit le **cycle de vie**, non l'alphabet : cible, modèles d'unité, activation des instances ; en sens inverse pour un retrait | Trier par nom faisait démarrer chaque instance avant l'écriture de son modèle — systemd répondait « Unit not found » et aucun service ne démarrait au premier apply |
 | D48 | Activation de la cible | La cible du projet est **liée à `multi-user.target`** | Sans ce lien, rien ne la réclame au démarrage de la machine : les services ne repartent pas après un redémarrage, alors que tout paraît en ordre tant qu'elle reste allumée |
@@ -178,14 +183,14 @@ spec:
   layout:
     root: /home/shop.fr
     docroot: /home/shop.fr/www/public
-    logDir: /home/shop.fr/logs      # root:<id> 0750, non inscriptible par l'utilisateur
-    mode: "0750"                  # racine : rwx utilisateur, r-x groupe, rien pour les autres
+    logDir: /home/shop.fr/logs      # root:<id> 0710, non inscriptible par l'utilisateur
+    mode: "0711"                  # racine : le propriétaire seul énumère, les autres traversent
     dirs:                         # créés avec propriétaire et mode explicites
-      - { path: www,        mode: "0750" }
-      - { path: www/public, mode: "0750" }   # selon le type d'application
+      - { path: www,        mode: "0710" }   # le groupe traverse, il n'énumère pas
+      - { path: www/public, mode: "0710" }   # selon le type d'application
       - { path: var,        mode: "0700" }
-      - { path: logs,       mode: "0750", owner: root }
-      - { path: .bin,       mode: "0750", owner: root }
+      - { path: logs,       mode: "0710", owner: root }
+      - { path: .bin,       mode: "0710", owner: root }
       - { path: .ssh,       mode: "0700" }
       - { path: var/tmp,      mode: "0700" }
       - { path: var/sessions, mode: "0700" }
@@ -503,14 +508,14 @@ explicite :
 
 /run/ogs/                                 0755 root:root
   ogs.lock                                verrou global d'exécution
-  <id>/                                   0750 <id>:<id> — répertoire d'exécution du projet
+  <id>/                                   0710 <id>:<id> — répertoire d'exécution du projet
     <job>.lock                            verrous de crons
     app.sock                              socket de l'application non-PHP (§7.11)
 
-/home/<host effectif>/                    racine projet, 0750 <id>:<id> (docroot simple)
-  public/                                 docroot, 0750
+/home/<host effectif>/                    racine projet, 0711 <id>:<id> (docroot simple)
+  public/                                 docroot, 0710
   var/                                    0700, hors de portée de www-data
-  logs/                                   0750 root:<id> — apache, nginx, php, crons
+  logs/                                   0710 root:<id> — apache, nginx, php, crons
   .bin/php                                lien vers l'interpréteur de la version courante
 ```
 
@@ -778,7 +783,7 @@ groupadd shopfr
 useradd --gid shopfr --home-dir /home/shop.fr --shell /usr/sbin/nologin \
         --no-create-home --comment "ogs=shopfr" shopfr
 gpasswd -a www-data shopfr          # si webAccess = group (défaut)
-install -d -o root -g shopfr -m 0750 /home/shop.fr/logs /home/shop.fr/.bin
+install -d -o root -g shopfr -m 0710 /home/shop.fr/logs /home/shop.fr/.bin
 ln -sfn /usr/bin/php8.5 /home/shop.fr/.bin/php
 install -m 0440 -o root -g root <généré> /etc/sudoers.d/ogs-shopfr
 ```
@@ -792,30 +797,43 @@ adopté ou étranger.
 
 ```
 /home                        0755  root:root      traversable par tous (standard)
-/home/shop.fr                0750  shopfr:shopfr  rwx utilisateur, r-x groupe, --- autres
-├── www/                     0750  shopfr:shopfr  code applicatif
-│   └── public/              0750  shopfr:shopfr  docroot (Symfony) ; pour Prestashop, www/ l'est
+/home/shop.fr                0711  shopfr:shopfr  le propriétaire seul énumère ; les autres traversent
+├── www/                     0710  shopfr:shopfr  code applicatif — le groupe traverse, il n'énumère pas
+│   └── public/              0710  shopfr:shopfr  docroot (Symfony) ; pour Prestashop, www/ l'est
 ├── .ssh/                    0700  shopfr:shopfr  clé de déploiement (§7.1.7)
 │   ├── id_ed25519           0600  shopfr:shopfr
 │   └── id_ed25519.pub       0644  shopfr:shopfr
 ├── var/                     0700  shopfr:shopfr  cache, sessions, logs applicatifs
 │   ├── tmp/                 0700  shopfr:shopfr  upload_tmp_dir
 │   └── sessions/            0700  shopfr:shopfr  session.save_path
-├── logs/                    0750  root:shopfr    ← répertoire NON inscriptible par l'utilisateur
+├── logs/                    0710  root:shopfr    ← répertoire NON inscriptible par l'utilisateur
 │   ├── apache-access.log    0640  root:shopfr    écrit par le master Apache (root)
 │   ├── apache-error.log     0640  root:shopfr
 │   ├── php-error.log        0640  root:shopfr    écrit par le master FPM (root)
 │   ├── php-slow.log         0640  root:shopfr
 │   └── cron-scheduler.log   0640  shopfr:shopfr  pré-créé par ogs, écrit par la tâche
-├── .bin/                    0750  root:shopfr    ← répertoire NON inscriptible par l'utilisateur
+├── .bin/                    0710  root:shopfr    ← répertoire NON inscriptible par l'utilisateur
 │   ├── php → /usr/bin/php8.5                    lien géré par ogs (§7.5)
 │   └── node, ruby, python, app                  liens des autres runtimes (§7.11)
 └── .env                     0600  shopfr:shopfr  lu par FPM (sous shopfr), pas par www-data
 ```
 
 Le pool PHP-FPM tourne sous `shopfr:shopfr` : il accède donc à l'intégralité du home, `.env` et `var/`
-compris. `www-data`, membre secondaire du groupe `shopfr`, obtient exactement la traversée du home et la
-lecture de `public/` — et rien de plus, puisque `var/` est en 0700 et `.env` en 0600.
+compris. `www-data`, membre secondaire du groupe `shopfr`, obtient exactement ce qu'il lui faut : traverser
+le home et `www/`, lire les fichiers que leurs propres droits lui ouvrent. Rien de plus — `var/` est en
+0700 et `.env` en 0600.
+
+**Traverser sans énumérer (D51).** Le home est en 0711 et les répertoires du projet en 0710 : le bit
+d'exécution seul autorise le passage vers un chemin connu, le bit de lecture — absent — aurait autorisé
+d'en dresser la liste. Servir un fichier n'a jamais besoin que du premier. Un membre du groupe, y compris
+`www-data`, ne peut donc pas parcourir l'arborescence pour découvrir ce qu'elle contient : il doit déjà
+savoir ce qu'il cherche. Le home est traversable par le groupe **et** par les autres, et cela n'est pas
+une négligence : Unix retient la première classe applicable, sans repli. `www-data` étant membre du groupe
+du projet, un home en 0701 lui appliquerait les droits de groupe — nuls — et lui refuserait la traversée que
+les bits « autres » semblaient accorder. Ajouter `www-data` au groupe lui retirerait donc l'accès, et le
+site cesserait d'être servi. Le bit « autres » sert, lui, au mode `webAccess: acl`, où le serveur web n'est
+pas membre du groupe. Rien n'est lisible pour autant : les répertoires du niveau suivant sont fermés aux
+autres, et aucun n'est énumérable.
 
 **Pourquoi `logs/` et `.bin/` appartiennent à root.** Ces deux répertoires sont lisibles et traversables par
 l'utilisateur (groupe `shopfr`, `r-x`) mais **il ne peut pas y créer, renommer ni supprimer d'entrée**. Ce
@@ -2429,11 +2447,11 @@ build multi-architecture. Les tests d'intégration sont obligatoires avant fusio
 | **L7 — TUI** | inspecteur, panneau de détail, actions contextuelles, suivi de logs, wizard de création | Création complète d'un projet depuis la TUI, parité avec la CLI |
 | **L8 — Import** | scan multi-sources, corrélation, adoption interactive, ressources non gérées | Adoption d'un serveur préconfiguré sans régression |
 | **L9 — Applications non-PHP** | types d'application, providers `runtime` (nvm, rbenv, pyenv, venv), templates de service Go/Node/Python/Ruby, vhosts de proxy, attente de disponibilité | Scénarios d'intégration 22 à 25 validés |
-| **L10 — Industrialisation** | hooks de parc et de projet, complétions dynamiques bash/zsh/fish, 96 pages de manuel engendrées, paquet `.deb` (nfpm), CI GitHub Actions, dix scénarios d'intégration conteneurisés (Apache, PHP, nginx, hooks, MariaDB, PostgreSQL, RabbitMQ, ACME, systemd et cron, paquet), documentation d'exploitation | Paquet installable, documentation publiée |
+| **L10 — Industrialisation** | hooks de parc et de projet, complétions dynamiques bash/zsh/fish, 96 pages de manuel engendrées, paquet `.deb` (nfpm), CI GitHub Actions, onze scénarios d'intégration conteneurisés (Apache, PHP, nginx, hooks, MariaDB, PostgreSQL, RabbitMQ, ACME, systemd et cron, runtimes, paquet), plus un scénario optionnel pour les runtimes qui compilent, documentation d'exploitation | Paquet installable, documentation publiée |
 
 ### Ce que les essais sur système réel ont corrigé
 
-Les scénarios conteneurisés du lot L10 ont mis au jour vingt-et-un défauts qu'aucun test unitaire ne
+Les scénarios conteneurisés du lot L10 ont mis au jour vingt-cinq défauts qu'aucun test unitaire ne
 pouvait voir, parce que tous supposaient un interlocuteur simulé :
 
 | Défaut | Conséquence en exploitation |
@@ -2459,6 +2477,10 @@ pouvait voir, parce que tous supposaient un interlocuteur simulé :
 | Intentions de rechargement calculées d'avance | un vidage anticipé consommait celle d'une étape à venir : la cible ne réclamait pas ses instances |
 | `AsUser` recollait l'argv sans citation | tout argument contenant une espace était redécoupé par le shell : `ogs cron run` était inutilisable |
 | `ogs cron run` sans répertoire de travail | la commande d'essai ne reproduisait pas ce que cron exécute, dans un sens comme dans l'autre |
+| Unité applicative écrite mais jamais activée ni démarrée | **tout site non-PHP était mort-né** : l'attente de disponibilité échouait ensuite en accusant l'application, alors que rien n'avait été lancé |
+| Attente de disponibilité placée avant le démarrage | elle ne pouvait qu'échouer ; les services et l'application démarrent désormais avant le serveur web, dont un vhost de proxy exposerait sinon une 502 |
+| Modules Apache requis non contrôlés | `mod_proxy_http` absent donnait une 500 et un message d'Apache incompréhensible ; `doctor` énumère maintenant les six modules dont les vhosts dépendent |
+| Mode de `logs/` imposé par deux providers | le plan oscillait entre deux valeurs, donc restait éternellement en écart |
 | `$connection_upgrade` employé par les vhosts de proxy mais défini nulle part | **toute application Go, Node, Ruby ou Python rendait la configuration nginx entière invalide** : au rechargement suivant, tous les sites de la machine tombaient (D50) |
 | Suppression d'un projet sans rechargement des serveurs | le maître PHP-FPM gardait le pool en mémoire : **ses workers continuaient de tourner et le site restait servi** |
 
@@ -2511,24 +2533,26 @@ complet sans lui pour un parc exclusivement PHP.
 10. Un seul serveur de préproduction par domaine de préproduction (conséquence du wildcard DNS unique,
    D27). Un parc multi-serveurs impose un sous-domaine par machine.
 
+**Points arbitrés le 24/08/2026** :
+
+- **Fournisseur DNS** : OVH, et lui seul (D53). Aucun autre n'est géré ; en ajouter un demandera de le
+  configurer et de l'éprouver, non de le déclarer.
+- **Rétention des archives** : 14 jours (D52).
+- **Accès SFTP** : écarté, et non rouvert.
+- **Versions de runtime** : aucun refus d'une version en fin de support (D54).
+- **Mise à jour des runtimes** : projet par projet, sans commande de parc (D55).
+- **Droits de l'arborescence** : home en 0711, répertoires en 0710 (D51), pour ôter tout moyen de se
+  promener dans le home.
+
 **Points restant à arbitrer** :
 
-- **Provider DNS de `preprod-pp.net`** : à préciser, car il conditionne le challenge DNS-01 du wildcard,
-  qui n'est plus optionnel mais requis dès la première préproduction. Plus largement, lego propose plus
-  de cent providers ; lesquels documenter et tester réellement ? (proposition : celui de `preprod-pp.net`
-  en priorité, puis OVH, Cloudflare, Gandi — les autres restent utilisables sans garantie).
-- **Seuil d'archivage** (défaut 5 Gio) et **durée de rétention** des archives : purge automatique ou
-  jamais ?
-- **Accès SFTP** : écarté en v1 (D15, docroot simple, shell `nologin`). À rouvrir si des tiers doivent
-  déposer des fichiers. Le home en 0750 avec groupe privé s'y prête bien : un chroot SFTP exigerait en
-  revanche que le répertoire de chroot appartienne à root, donc un niveau intermédiaire
-  (`/home/shop.fr` root:root 0755 + `/home/shop.fr/app` en 0750), ce qui modifierait le layout.
-- **Mode `webAccess: acl` par défaut ?** Le mode `group` est retenu pour la v1 ; si tu héberges des
-  clients tiers non fiables, basculer le défaut sur `acl` restreint `www-data` au seul docroot.
-- **Redis / Memcached / Elasticsearch** : hors périmètre v1, candidats naturels à un futur système de
+- **Mode `webAccess: acl` par défaut ?** Le mode `group` est retenu ; si le serveur héberge des clients
+  tiers non fiables, basculer le défaut sur `acl` restreindrait `www-data` au seul docroot. La question
+  perd de son acuité depuis D51 : le groupe n'obtient plus qu'un droit de passage.
+- **Redis / Memcached / Elasticsearch** : hors périmètre, candidats naturels à un futur système de
   plugins (D19 n'ouvre pour l'instant que templates et hooks).
-- **Versions de runtime par défaut** : quelles versions de Node, Ruby et Python proposer, et faut-il que
-  `ogs` refuse une version en fin de support ?
-- **Mise à jour des runtimes** : conséquence directe de D35, elle est à faire projet par projet. Une
-  commande `runtime upgrade --all --to <version>` serait-elle utile, avec redémarrage échelonné des
-  services ?
+- **Seuil d'archivage** (défaut 5 Gio) : au-delà, l'archivage est refusé faute de place ; faut-il le
+  rendre configurable ?
+- **`ogs db restore` sur une base non vide** : la sauvegarde étant un script SQL, la restauration échoue
+  sur le premier objet existant. Faut-il une option `--clean` — donc destructive — ou l'exigence d'une
+  base vide reste-t-elle la règle ?

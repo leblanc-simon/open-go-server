@@ -229,7 +229,10 @@ func (p *Provider) Plan(_ context.Context, proj *model.Project) ([]*engine.Step,
 // createLog crée un fichier de journal appartenant à l'utilisateur du projet, de
 // sorte que la tâche puisse y écrire sans pouvoir remplacer le fichier.
 func (p *Provider) createLog(proj *model.Project, path string) error {
-	if err := fs.EnsureDir(filepath.Dir(path), 0o750, fs.KeepOwner); err != nil {
+	// MkdirAll plutôt qu'EnsureDir : le mode de logs/ est fixé par l'arborescence
+	// du projet, et l'imposer ici le remettrait à cette valeur à chaque apply — le
+	// plan resterait éternellement en écart entre les deux.
+	if err := os.MkdirAll(filepath.Dir(path), 0o710); err != nil {
 		return err
 	}
 	owner := fs.KeepOwner

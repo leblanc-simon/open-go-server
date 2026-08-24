@@ -550,7 +550,11 @@ func newArchiveListCommand(app *App) *cobra.Command {
 				Created string `json:"created" yaml:"created"`
 				Size    string `json:"size" yaml:"size"`
 				Secrets int    `json:"secrets" yaml:"secrets"`
+				// Expire dit ce qu'il reste avant la purge : une archive qui va
+				// disparaître doit se voir avant, pas après.
+				Expire string `json:"expire" yaml:"expire"`
 			}
+			retention := app.Cfg.Archives.RetentionDays
 			var rows []row
 			for _, e := range entries {
 				if e.IsDir() || !strings.HasSuffix(e.Name(), ".tar.zst") {
@@ -566,10 +570,23 @@ func newArchiveListCommand(app *App) *cobra.Command {
 				if info != nil {
 					size = info.Size()
 				}
+				expire := "jamais"
+				if retention > 0 {
+					reste := int(manifest.CreatedAt.AddDate(0, 0, retention).Sub(nowFunc()).Hours() / 24)
+					switch {
+					case reste < 0:
+						expire = "au prochain apply"
+					case reste == 0:
+						expire = "aujourd'hui"
+					default:
+						expire = fmt.Sprintf("dans %d jour(s)", reste)
+					}
+				}
 				rows = append(rows, row{
 					Project: manifest.Project, File: e.Name(),
 					Created: manifest.CreatedAt.Format("02/01/2006 15:04"),
 					Size:    humanBytes(size), Secrets: manifest.Secrets,
+					Expire: expire,
 				})
 			}
 			return wrap(CodeError, app.emit("ArchiveList", rows, nil, func(tw *tabwriter.Writer) {
@@ -577,9 +594,10 @@ func newArchiveListCommand(app *App) *cobra.Command {
 					fmt.Fprintln(app.Out, "aucune archive")
 					return
 				}
-				fmt.Fprintln(tw, "PROJET\tARCHIVE\tCRÉÉE\tTAILLE\tSECRETS")
+				fmt.Fprintln(tw, "PROJET\tARCHIVE\tCRÉÉE\tTAILLE\tSECRETS\tPURGE")
 				for _, r := range rows {
-					fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%d\n", r.Project, r.File, r.Created, r.Size, r.Secrets)
+					fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%d\t%s\n",
+						r.Project, r.File, r.Created, r.Size, r.Secrets, r.Expire)
 				}
 			}))
 		},

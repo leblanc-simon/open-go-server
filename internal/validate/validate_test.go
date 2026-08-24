@@ -232,3 +232,32 @@ func TestAdoptedProjectStillRefusesDangerousRoots(t *testing.T) {
 		}
 	}
 }
+
+func TestCertificateDNSProviderIsRefusedAtDeclaration(t *testing.T) {
+	// Un provider non géré doit être refusé à la déclaration : le découvrir au
+	// moment de l'émission ferait échouer un apply qui a déjà créé le site, base
+	// et compte compris.
+	p := newProject(t, "shop.fr", naming.EnvProd, model.KindStatic)
+	p.Spec.Certificates = []model.Certificate{{
+		Name: "shopfr", Domains: []string{"shop.fr"},
+		Challenge: "dns-01", DNSProvider: "cloudflare",
+	}}
+	err := Project(p, "/home")
+	if err == nil {
+		t.Fatal("un provider DNS non géré doit être refusé")
+	}
+	if !strings.Contains(err.Error(), "cloudflare") || !strings.Contains(err.Error(), "ovh") {
+		t.Errorf("le message doit nommer le provider refusé et celui qui est géré : %v", err)
+	}
+
+	// OVH passe, et un certificat sans provider explicite aussi.
+	p.Spec.Certificates[0].DNSProvider = "ovh"
+	if err := Project(p, "/home"); err != nil {
+		t.Errorf("ovh doit être accepté : %v", err)
+	}
+	p.Spec.Certificates[0].Challenge = "http-01"
+	p.Spec.Certificates[0].DNSProvider = ""
+	if err := Project(p, "/home"); err != nil {
+		t.Errorf("http-01 sans provider doit être accepté : %v", err)
+	}
+}

@@ -12,8 +12,8 @@ Les commits ne mentionnent jamais l'assistance d'un outil d'IA.
 
 ## La référence
 
-[`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md) fait autorité : 50 décisions d'architecture
-arbitrées (D1–D50, tableau §2), spécification par module, plan de tests, découpage en lots. **Consulter le
+[`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md) fait autorité : 55 décisions d'architecture
+arbitrées (D1–D55, tableau §2), spécification par module, plan de tests, découpage en lots. **Consulter le
 tableau des décisions avant de proposer une architecture** — la plupart des questions « pourquoi pas
 plutôt… ? » y sont déjà tranchées, avec leur raison. Toute décision nouvelle s'y ajoute.
 
@@ -43,13 +43,16 @@ make dev-demo                                   # crée ./dev, deux projets, pla
 
 ### Essais sur système réel
 
-Dix scénarios conteneurisés éprouvent ce que les tests unitaires ne peuvent pas voir. Ils ont mis au jour
-vingt-et-un défauts invisibles autrement (§18 du cahier des charges) : **y recourir avant de déclarer un
+Onze scénarios conteneurisés éprouvent ce que les tests unitaires ne peuvent pas voir. Ils ont mis au jour
+vingt-cinq défauts invisibles autrement (§18 du cahier des charges) : **y recourir avant de déclarer un
 provider fonctionnel**.
 
 ```sh
-make integration-all       # les dix, à la suite
+make integration-all       # les onze, à la suite
 make integration-nginx     # un seul (voir SCENARIOS dans le Makefile)
+
+# Hors série : rbenv et pyenv compilent depuis les sources (un quart d'heure).
+make integration-runtimes-compiles
 ```
 
 Mécanique dans `test/integration/` : une image Debian portant Apache, nginx, PHP-FPM, MariaDB, PostgreSQL,
@@ -76,8 +79,10 @@ les précédentes en ordre inverse, une étape non critique produit un avertisse
 (un certificat qui échoue ne doit pas détruire un site par ailleurs fonctionnel).
 
 `plan`, `diff` et `apply` partagent le même calcul : `apply.go:buildPlan` assemble les providers dans un
-ordre qui est une décision, non un détail — système → bases → AMQP → applicatif → PHP → web → TLS → bascule
-TLS du vhost → PHP obsolète → cron → unités → sudoers. `buildGlobalPlan` porte ce qui vaut pour tout le
+ordre qui est une décision, non un détail — système → bases → AMQP → applicatif (runtime, lien, unité) →
+PHP → cron → unités et démarrage des instances → attente de disponibilité → web → TLS → bascule TLS du
+vhost → sudoers. Les services démarrent **avant** le serveur web : un vhost de proxy branché sur une
+application qui n'a pas encore démarré exposerait une 502. `buildGlobalPlan` porte ce qui vaut pour tout le
 parc (logrotate, fragment nginx, tmpfiles, unités de renouvellement).
 
 ### Les rechargements, groupés mais pas naïvement
@@ -140,6 +145,10 @@ entier. `exec.Recorder` (mode préfixé) simule tout et permet aux tests d'asser
 
 Ils ont tous coûté un défaut réel ; les tests unitaires ne les voyaient pas.
 
+- **Home en 0711, répertoires du projet en 0710** (D51) : traverser sans énumérer. Le bit de groupe du home
+  ne peut pas être ôté — Unix retient la première classe applicable sans repli, donc un 0701 refuserait la
+  traversée à `www-data` *parce qu'il est membre du groupe*. Un seul endroit décide de ces modes —
+  `model.defaultDirs` : un provider qui les imposerait aussi ferait osciller le plan entre deux valeurs.
 - **`/var/lib/ogs` en 0751**, pas 0750 : le serveur web doit traverser jusqu'au répertoire du challenge ACME.
 - Le client ACME écrit sous **`<webroot>/.well-known/acme-challenge/`** : Apache aliase ce répertoire,
   nginx prend le webroot et y accole l'URI. Les deux directives n'ont pas la même sémantique.
@@ -154,6 +163,14 @@ Ils ont tous coûté un défaut réel ; les tests unitaires ne les voyaient pas.
   `unit/service` dans l'alphabet, ce qui ferait démarrer une instance avant l'écriture de son modèle.
 - La cible d'un projet doit être liée à `multi-user.target`, sinon les services ne repartent pas après un
   redémarrage.
+- Une unité **modifiée** exige un redémarrage : `daemon-reload` relit la définition, il ne relance rien.
+  L'intention `systemd:restart-target:<id>` s'en charge, et l'attente de disponibilité la vide avant
+  d'attendre.
+- Une **application supervisée** est un service comme un autre : le provider applicatif écrit son unité,
+  le provider d'unités active et démarre ses instances. Les deux sont nécessaires — l'unité seule ne
+  démarre rien.
+- Apache a besoin de six modules (`ssl`, `proxy`, `proxy_fcgi`, `proxy_http`, `rewrite`, `headers`) ;
+  sans eux la configuration est acceptée puis rend une 500 illisible. `doctor` les énumère.
 - MySQL : le nom de base après `ON` est un motif où `_` est un joker, donc échappé — **et déséchappé à la
   relecture**, sans quoi toute base contenant un souligné reste éternellement « en écart ». Le nom
   d'utilisateur, lui, est un littéral.

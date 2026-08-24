@@ -25,6 +25,15 @@ type Config struct {
 	Deployment   Deployment             `yaml:"deployment"`
 	Certificates map[string]SharedCert  `yaml:"certificates"`
 	ACME         ACME                   `yaml:"acme"`
+	Archives     Archives               `yaml:"archives"`
+}
+
+// Archives paramètre le sort des archives de projets supprimés.
+type Archives struct {
+	// RetentionDays borne leur conservation. Une archive contient un dump de base,
+	// donc des données de clients : la garder indéfiniment n'est pas neutre.
+	// Zéro signifie « ne jamais purger », et doit être un choix explicite.
+	RetentionDays int `yaml:"retentionDays"`
 }
 
 // ACME paramètre le dialogue avec l'autorité de certification.
@@ -102,6 +111,7 @@ func Default() *Config {
 			},
 		},
 		Logs:       Logs{Rotate: 30, MaxSize: "200M", Compress: true},
+		Archives:   Archives{RetentionDays: 14},
 		Sudo:       Sudo{Style: "ogs", Verbs: []string{"start", "stop", "restart", "status"}},
 		Deployment: Deployment{KnownHosts: []string{"github.com", "gitlab.com"}},
 		Certificates: map[string]SharedCert{
@@ -132,6 +142,16 @@ func (c *Config) Validate() error {
 	}
 	if c.Web.Engine != "" && c.Web.Engine != "apache" && c.Web.Engine != "nginx" {
 		return fmt.Errorf("web.engine %q inconnu (attendu : apache ou nginx)", c.Web.Engine)
+	}
+	for nom, cert := range c.Certificates {
+		if cert.Challenge == "dns-01" && cert.DNSProvider != "" && cert.DNSProvider != "ovh" {
+			return fmt.Errorf("certificates.%s.dnsProvider %q non géré : ogs ne gère qu'« ovh »",
+				nom, cert.DNSProvider)
+		}
+	}
+	if c.Archives.RetentionDays < 0 {
+		return fmt.Errorf("archives.retentionDays ne peut pas être négatif (valeur : %d)",
+			c.Archives.RetentionDays)
 	}
 	return nil
 }

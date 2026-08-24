@@ -5,8 +5,10 @@ package archive
 import (
 	"archive/tar"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -15,6 +17,9 @@ import (
 
 	"github.com/klauspost/compress/zstd"
 )
+
+// Extension est le suffixe des archives produites.
+const Extension = ".tar.zst"
 
 // ManifestName est le nom du manifeste dans l'archive. Il vient en premier, de
 // sorte qu'un « tar -tf » ou un « zstdcat | head » le montre immédiatement.
@@ -413,7 +418,7 @@ func Secrets(path string) (map[string][2][]byte, error) {
 
 // FileName construit le nom d'une archive.
 func FileName(id string, at time.Time) string {
-	return fmt.Sprintf("%s-%s.tar.zst", id, at.UTC().Format("20060102-150405"))
+	return fmt.Sprintf("%s-%s%s", id, at.UTC().Format("20060102-150405"), Extension)
 }
 
 // sanitize rend un nom de secret utilisable comme nom de fichier.
@@ -432,3 +437,44 @@ func within(root, target string) bool {
 // Available renvoie l'espace disponible, en octets, sur le système de fichiers
 // contenant le chemin donné.
 func Available(path string) (uint64, error) { return available(path) }
+
+// Expired énumère les archives dont l'âge dépasse la rétention. Une rétention
+// nulle signifie « ne jamais purger » : c'est un choix explicite, pas un défaut.
+//
+// La date de référence est celle du manifeste, non celle du fichier : une copie
+// ou une restauration de sauvegarde change l'horodatage du fichier, pas la date
+// à laquelle le projet a été supprimé.
+func Expired(dir string, retention time.Duration, now time.Time) ([]string, error) {
+	if retention <= 0 {
+		return nil, nil
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var out []string
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), Extension) {
+			continue
+		}
+		full := filepath.Join(dir, e.Name())
+		created := time.Time{}
+		if m, err := ReadManifest(full); err == nil {
+			created = m.CreatedAt
+		} else if info, err := e.Info(); err == nil {
+			// Manifeste illisible : l'archive est inexploitable, mais son âge se
+			// déduit encore du fichier. La laisser indéfiniment serait pire.
+			created = info.ModTime()
+		} else {
+			continue
+		}
+		if now.Sub(created) > retention {
+			out = append(out, full)
+		}
+	}
+	sort.Strings(out)
+	return out, nil
+}

@@ -49,6 +49,11 @@ man ogs
 ogs completion bash > /etc/bash_completion.d/ogs   # inutile avec le paquet
 ```
 
+Sur une machine où Apache est le moteur retenu, `doctor` énumère aussi les modules dont les vhosts
+dépendent (`ssl`, `proxy`, `proxy_fcgi`, `proxy_http`, `rewrite`, `headers`). Leur absence ne se traduit
+pas par un refus clair : Apache accepte la configuration puis rend une erreur 500 dont le message
+n'oriente vers rien.
+
 `ogs doctor` distingue ce qui empêche de travailler (base d'état illisible, clé maître absente) de ce qui
 restreint le champ d'action (aucun serveur MySQL détecté, PHP 7.4 non installé). Le code de retour ne vaut
 0 que si rien ne bloque.
@@ -93,6 +98,46 @@ Les migrations de schéma de la base d'état sont appliquées au premier lanceme
 sont lues telles quelles : une version plus récente d'`ogs` n'exige jamais de réécrire les fichiers
 existants. Après une mise à jour, `ogs diff` sur l'ensemble du parc indique si les templates livrés ont
 évolué — et donc quels fichiers un `apply` réécrirait.
+
+## Applications Go, Node, Ruby et Python
+
+Un projet non-PHP est servi par un vhost de proxy et supervisé par systemd. Deux choses le distinguent :
+
+```sh
+# La version du runtime est indispensable dès la création : sans elle, la
+# déclaration est refusée à l'application.
+ogs site create app.fr --kind node --runtime 22.14.0
+ogs runtime install appfr 22.14.0     # nvm, rbenv ou pyenv, dans le home du projet
+```
+
+Le runtime est installé **par projet**, dans son home (D35) : deux sites ne partagent rien, et une mise à
+jour se fait site par site. Ruby et Python compilent depuis les sources, ce qui demande les paquets de
+compilation de la distribution et plusieurs minutes ; Node télécharge une version précompilée.
+
+L'application écoute sur un socket Unix `0660` — joignable par le serveur web et par elle seule — ou, pour
+Go dont aucune convention ne s'impose, sur un port de la boucle locale. Le mode se déclare par
+`spec.app.listen`. `ogs doctor` signale toute écoute qui déborderait sur une interface publique : elle
+contournerait le vhost, donc le TLS et l'authentification.
+
+Le propriétaire du projet redémarre son application lui-même :
+
+```sh
+sudo ogs my restart
+```
+
+## Archives et rétention
+
+Supprimer un projet produit une archive dans `/var/lib/ogs/archives` : déclaration, fichiers générés,
+secrets chiffrés, arborescence et dump des bases. **Elle est conservée 14 jours**, puis purgée par une
+étape du plan — annoncée par `ogs plan`, auditée, jamais silencieuse.
+
+```sh
+ogs project archives            # la colonne PURGE dit ce qu'il reste à chaque archive
+```
+
+Le délai se règle par `archives.retentionDays` dans `/etc/ogs/config.yaml`. La valeur `0` signifie
+« conserver indéfiniment » : c'est un choix explicite, pas un défaut, car une archive contient des
+données de clients.
 
 ## Sauvegarde
 

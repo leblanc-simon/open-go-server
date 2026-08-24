@@ -221,3 +221,54 @@ func TestAvailableSpace(t *testing.T) {
 		t.Error("espace disponible nul : la mesure est-elle correcte ?")
 	}
 }
+
+func TestExpiredUsesTheManifestDate(t *testing.T) {
+	// L'âge se lit dans le manifeste, non dans l'horodatage du fichier : restaurer
+	// une sauvegarde du répertoire d'archives ne doit pas rajeunir ce qu'il
+	// contient, ni le vieillir.
+	dir := t.TempDir()
+	maintenant := time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC)
+
+	ecrire := func(nom string, cree time.Time) string {
+		chemin := filepath.Join(dir, nom)
+		w, err := Create(chemin, Manifest{Project: "shopfr", CreatedAt: cree})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := w.Close(); err != nil {
+			t.Fatal(err)
+		}
+		// L'horodatage du fichier dit le contraire du manifeste, exprès.
+		if err := os.Chtimes(chemin, maintenant, maintenant); err != nil {
+			t.Fatal(err)
+		}
+		return chemin
+	}
+	vieille := ecrire("shopfr-vieille"+Extension, maintenant.AddDate(0, 0, -20))
+	recente := ecrire("shopfr-recente"+Extension, maintenant.AddDate(0, 0, -3))
+
+	expirees, err := Expired(dir, 14*24*time.Hour, maintenant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(expirees) != 1 || expirees[0] != vieille {
+		t.Errorf("attendu la seule archive de plus de 14 jours, obtenu %v", expirees)
+	}
+	if _, err := os.Stat(recente); err != nil {
+		t.Errorf("l'archive récente ne doit pas être touchée : %v", err)
+	}
+
+	// Une rétention nulle ne purge rien : c'est « conserver indéfiniment ».
+	expirees, err = Expired(dir, 0, maintenant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(expirees) != 0 {
+		t.Errorf("une rétention nulle ne doit rien purger, obtenu %v", expirees)
+	}
+
+	// Un répertoire absent n'est pas une erreur : rien n'a encore été archivé.
+	if _, err := Expired(filepath.Join(dir, "absent"), time.Hour, maintenant); err != nil {
+		t.Errorf("répertoire absent : %v", err)
+	}
+}
