@@ -23,7 +23,7 @@ docker build -q -f test/integration/Dockerfile -t ogs-integration . >/dev/null
 # Les scénarios de runtime et de services exigent un vrai systemd en PID 1 :
 # rien de ce qui suit un « systemctl enable » ne s'éprouve autrement.
 case "$scenario" in
-systemd | runtimes | runtimes-compiles)
+systemd | runtimes | runtimes-compiles | harden)
     nom="ogs-integration-$scenario"
     docker rm -f "$nom" >/dev/null 2>&1 || true
     trap 'docker rm -f '"$nom"' >/dev/null 2>&1' EXIT

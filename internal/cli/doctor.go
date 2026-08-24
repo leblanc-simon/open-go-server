@@ -16,6 +16,7 @@ import (
 	"github.com/leviathan/ogs/internal/exec"
 	appprov "github.com/leviathan/ogs/internal/provider/app"
 	"github.com/leviathan/ogs/internal/provider/db"
+	"github.com/leviathan/ogs/internal/provider/hardening"
 	"github.com/leviathan/ogs/internal/validate"
 )
 
@@ -181,6 +182,19 @@ func (a *App) runChecks(ctx context.Context) []check {
 					fmt.Sprintf("joignable en tant que %s", role), "")
 			}
 			client.Close()
+		}
+	}
+
+	// Droits des répertoires de configuration : sur un serveur mutualisé, les
+	// utilisateurs de projet ont un compte local et lisent tout ce qui n'est pas
+	// fermé.
+	if etats := a.hardeningProvider().Observe(); len(etats) > 0 {
+		if n := hardening.Restrict(etats); n > 0 {
+			add("droits de /etc", "avertissement",
+				fmt.Sprintf("%d répertoire(s) de configuration lisibles au-delà de root", n),
+				"ogs harden --apply")
+		} else {
+			add("droits de /etc", "ok", "répertoires de configuration fermés", "")
 		}
 	}
 

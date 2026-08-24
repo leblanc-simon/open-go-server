@@ -7,7 +7,7 @@ PostgreSQL, vhost et files RabbitMQ, pool PHP-FPM, vhost Apache ou Nginx, certif
 et services systemd. Un projet est décrit par un fichier YAML ; un moteur de réconciliation idempotent amène
 le serveur dans l'état décrit.
 
-Le cahier des charges technique complet — 55 décisions d'architecture arbitrées, spécification par module,
+Le cahier des charges technique complet — 56 décisions d'architecture arbitrées, spécification par module,
 plan de tests, découpage en lots — est dans [`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md).
 C'est la référence : toute contribution s'y adosse.
 
@@ -57,8 +57,9 @@ make integration-rabbitmq  # broker réel : isolation par vhost, bindings, argum
 make integration-acme      # autorité ACME réelle (pebble) : émission, HTTPS, renouvellement
 make integration-systemd   # systemd en PID 1 : instances, durcissement, délégation, cron réel
 make integration-runtimes  # application Go supervisée, socket 0660, Node installé par nvm
+make integration-harden    # /etc fermé aux utilisateurs, sans qu'aucun service en souffre
 make integration-package   # installation, usage et désinstallation du .deb
-make integration-all       # les onze, à la suite
+make integration-all       # les douze, à la suite
 
 # Hors série : rbenv et pyenv compilent depuis les sources (un quart d'heure).
 make integration-runtimes-compiles
@@ -95,7 +96,7 @@ ou pas à pas :
 ## Commandes principales
 
 ```
-ogs init | doctor | version [--license]
+ogs init | doctor | harden [--explain] [--apply] | version [--license]
 ogs project create <host> [--kind] [--app-version] [--runtime] [--php] [--env prep] [--id] [--host]
 ogs project list | show | export
 ogs plan | apply | diff  [id...] [-f fichier]
@@ -392,6 +393,9 @@ est transmis par `SOCKET_PATH`, et si le code l'ignore, l'attente de disponibili
 - **Archives** : conservées 14 jours, puis purgées par une étape du plan — annoncée, auditée, jamais
   silencieuse. `archives.retentionDays: 0` conserve indéfiniment, et doit être un choix explicite.
 - **Fournisseur DNS** : OVH seul est géré, refusé dès la déclaration pour tout autre.
+- **Répertoires de configuration** : `ogs harden` les ferme aux utilisateurs du serveur — qui y ont un
+  compte local — sans jamais desserrer ce qui l'est déjà plus, et sans toucher `/etc/php`, où le PHP des
+  crons lit son `php.ini`.
 
 ## Codes de retour
 
@@ -405,7 +409,7 @@ est transmis par `SOCKET_PATH`, et si le code l'ignore, l'attente de disponibili
 
 ## Documentation
 
-- [`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md) — la référence : 55 décisions d'architecture
+- [`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md) — la référence : 56 décisions d'architecture
   arbitrées, spécification par module, plan de tests, découpage en lots.
 - [`docs/INSTALLATION.md`](docs/INSTALLATION.md) — installation, premier démarrage, sauvegarde, mise à jour.
 - [`docs/HOOKS.md`](docs/HOOKS.md) — raccorder l'outil au reste de l'exploitation.

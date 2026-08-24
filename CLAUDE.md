@@ -12,7 +12,7 @@ Les commits ne mentionnent jamais l'assistance d'un outil d'IA.
 
 ## La référence
 
-[`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md) fait autorité : 55 décisions d'architecture
+[`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md) fait autorité : 56 décisions d'architecture
 arbitrées (D1–D55, tableau §2), spécification par module, plan de tests, découpage en lots. **Consulter le
 tableau des décisions avant de proposer une architecture** — la plupart des questions « pourquoi pas
 plutôt… ? » y sont déjà tranchées, avec leur raison. Toute décision nouvelle s'y ajoute.
@@ -43,12 +43,12 @@ make dev-demo                                   # crée ./dev, deux projets, pla
 
 ### Essais sur système réel
 
-Onze scénarios conteneurisés éprouvent ce que les tests unitaires ne peuvent pas voir. Ils ont mis au jour
-vingt-cinq défauts invisibles autrement (§18 du cahier des charges) : **y recourir avant de déclarer un
+Douze scénarios conteneurisés éprouvent ce que les tests unitaires ne peuvent pas voir. Ils ont mis au jour
+plus de trente défauts invisibles autrement (§18 du cahier des charges) : **y recourir avant de déclarer un
 provider fonctionnel**.
 
 ```sh
-make integration-all       # les onze, à la suite
+make integration-all       # les douze, à la suite
 make integration-nginx     # un seul (voir SCENARIOS dans le Makefile)
 
 # Hors série : rbenv et pyenv compilent depuis les sources (un quart d'heure).
@@ -169,6 +169,11 @@ Ils ont tous coûté un défaut réel ; les tests unitaires ne les voyaient pas.
 - Une **application supervisée** est un service comme un autre : le provider applicatif écrit son unité,
   le provider d'unités active et démarre ses instances. Les deux sont nécessaires — l'unité seule ne
   démarre rien.
+- `ogs harden` restreint les droits de `/etc` (D56). Deux invariants : il **ne desserre jamais** — un
+  répertoire déjà plus strict est laissé tel quel — et il **préserve le bit d'exécution** des fichiers,
+  sans quoi il rendrait les hooks inexécutables donc refusés par ogs lui-même. `/etc/php` reste ouvert :
+  le PHP en ligne de commande des crons y lit son `php.ini`, et le fermer changerait le comportement de
+  PHP sans le moindre message.
 - Apache a besoin de six modules (`ssl`, `proxy`, `proxy_fcgi`, `proxy_http`, `rewrite`, `headers`) ;
   sans eux la configuration est acceptée puis rend une 500 illisible. `doctor` les énumère.
 - MySQL : le nom de base après `ON` est un motif où `_` est un joker, donc échappé — **et déséchappé à la

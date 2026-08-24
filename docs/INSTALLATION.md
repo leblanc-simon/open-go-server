@@ -125,6 +125,61 @@ Le propriétaire du projet redémarre son application lui-même :
 sudo ogs my restart
 ```
 
+## Fermer les répertoires de configuration
+
+Sur un serveur mutualisé, les utilisateurs de projet ont un compte local. Sans restriction, ils lisent
+`/etc/nginx`, `/etc/mysql` ou `/etc/telegraf`, y trouvent des chemins, des noms de bases et des jetons, et
+dressent la carte du serveur — celle des sites de leurs voisins comprise.
+
+```sh
+ogs harden              # rapporte, ne touche à rien ; code 6 s'il reste à restreindre
+ogs harden --explain    # pourquoi chaque restriction, et ce qu'elle peut casser
+ogs harden --apply      # applique, après confirmation
+```
+
+Deux règles gouvernent la commande : elle **ne desserre jamais** — un répertoire déjà plus strict que la
+cible est laissé tel quel — et elle **ne suit aucun lien symbolique**. Un chemin absent signifie un service
+non installé : il n'y a rien à faire.
+
+| Chemin | Cible | Pourquoi |
+|---|---|---|
+| `/etc/ogs` | `0700 root:root`, fichiers `0600` | clé maître, déclarations de projets, identifiants |
+| `/etc/letsencrypt` | `0700 root:root`, fichiers `0600`, récursif | clés privées |
+| `/etc/apache2`, `/etc/nginx` | `0750 root:root` | vhosts : domaines, chemins, authentifications |
+| `/etc/php` | `0755` — **inchangé** | le PHP en ligne de commande, exécuté sous l'identité du projet par les crons, y lit son `php.ini` |
+| `/etc/mysql` | `0750 root:root` | `debian.cnf` porte les identifiants de maintenance |
+| `/etc/postgresql` | `0750 root:postgres` | `pg_hba.conf` décrit qui peut se connecter |
+| `/etc/rabbitmq` | `0750 root:rabbitmq`, fichiers `0640` | cookie Erlang, mot de passe d'administration |
+| `/etc/telegraf` | `0750 root:telegraf`, fichiers `0640` | jetons d'écriture des métriques |
+| `/etc/redis` | `0750 root:redis`, fichiers `0640` | `requirepass` en clair |
+| `/etc/ssl/private` | `0710 root:ssl-cert` | convention Debian ; les services concernés sont dans le groupe |
+| `/etc/cron.d` | `0750 root:root` | révèle les commandes et les identités de chaque projet |
+| `/etc/logrotate.d` | `0750 root:root` | révèle l'emplacement des journaux du parc |
+| `/etc/sudoers.d` | `0750 root:root` | révèle les délégations accordées |
+
+Le groupe est celui du service quand le démon lit sa configuration sous sa propre identité — RabbitMQ,
+Telegraf, Redis, PostgreSQL. Pour Apache et Nginx, le processus maître lit en root et les workers héritent
+des descripteurs déjà ouverts : `root:root` suffit.
+
+La table s'ajuste dans `/etc/ogs/config.yaml` :
+
+```yaml
+hardening:
+  skip: [/etc/mysql]              # laisser un chemin tranquille
+  targets:                        # ou remplacer la table entière
+    - path: /etc/monagent
+      owner: root
+      group: monagent
+      dirMode: 0750
+      fileMode: 0640
+```
+
+**Ce que la commande ne fait pas.** Elle ne touche ni `/etc/systemd/system` — ses unités ne portent aucun
+secret et plusieurs outils d'exploitation les lisent — ni `/etc/php` au-delà de son constat. Elle ne
+descend pas non plus dans les fichiers d'un répertoire dont la cible ne fixe pas de `fileMode` : fermer un
+répertoire suffit à rendre son contenu inatteignable, et modifier chaque fichier multiplierait les risques
+sans rien apporter.
+
 ## Archives et rétention
 
 Supprimer un projet produit une archive dans `/var/lib/ogs/archives` : déclaration, fichiers générés,

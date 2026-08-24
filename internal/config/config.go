@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/leviathan/ogs/internal/naming"
+	"github.com/leviathan/ogs/internal/provider/hardening"
 )
 
 // Config est la configuration globale, chargée depuis /etc/ogs/config.yaml.
@@ -26,6 +27,15 @@ type Config struct {
 	Certificates map[string]SharedCert  `yaml:"certificates"`
 	ACME         ACME                   `yaml:"acme"`
 	Archives     Archives               `yaml:"archives"`
+	Hardening    Hardening              `yaml:"hardening"`
+}
+
+// Hardening paramètre la restriction des droits de /etc.
+type Hardening struct {
+	// Skip énumère les chemins que « ogs harden » doit laisser tranquilles.
+	Skip []string `yaml:"skip,omitempty"`
+	// Targets remplace la table livrée. Vide, celle d'ogs s'applique.
+	Targets []hardening.Target `yaml:"targets,omitempty"`
 }
 
 // Archives paramètre le sort des archives de projets supprimés.
@@ -287,11 +297,16 @@ func (p Paths) Dirs() []struct {
 		Path string
 		Mode os.FileMode
 	}{
-		{p.Etc(), 0o755},
-		{p.ProjectsDir(), 0o755},
-		{p.ArchivedDir(), 0o755},
-		{p.TemplatesDir(), 0o755},
-		{p.HooksDir(), 0o750},
+		// 0700 : les déclarations de projets dressent la carte du parc — hôtes,
+		// utilisateurs, noms de bases, transports —, et le répertoire porte la clé
+		// maître. Rien de tout cela ne concerne les utilisateurs du serveur, qui y
+		// ont un compte local.
+		{p.Etc(), 0o700},
+		{p.ProjectsDir(), 0o700},
+		{p.ArchivedDir(), 0o700},
+		{p.TemplatesDir(), 0o750},
+		// Les hooks s'exécutent en root : leur répertoire n'a pas à être lisible.
+		{p.HooksDir(), 0o700},
 		{p.HtpasswdDir(), 0o750},
 		{p.DNSCredsDir(), 0o700},
 		// 0751 et non 0750 : le serveur web doit pouvoir traverser ce répertoire
