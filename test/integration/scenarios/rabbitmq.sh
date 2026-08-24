@@ -3,6 +3,7 @@
 # permissions, exchanges, files, bindings, préréglage Messenger, et le point le
 # plus délicat — les arguments de file, immuables une fois la file créée.
 set -uo pipefail
+. /scenarios/lib.sh
 
 api="http://rabbitmq:15672/api"
 auth="admin:motdepasse-essai"
@@ -12,6 +13,7 @@ curl -sf -u "$auth" "$api/overview" | grep -o '"management_version":"[^"]*"'
 
 version=$(ls /etc/php | head -1)
 ogs init --quiet
+choisir_moteur apache
 ogs amqp credentials set --user admin --password motdepasse-essai \
     --url http://rabbitmq:15672 --amqp-port 5672 >/dev/null
 

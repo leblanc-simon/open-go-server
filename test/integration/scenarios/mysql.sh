@@ -4,6 +4,7 @@
 # Les tests unitaires vérifient les instructions produites ; ici on vérifie que
 # le serveur les accepte et qu'elles ont l'effet annoncé.
 set -uo pipefail
+. /scenarios/lib.sh
 
 echo "=== scénario : bases MariaDB ==="
 # Le serveur est démarré à la main : pas d'init dans ce conteneur.
@@ -21,6 +22,7 @@ fi
 
 version=$(ls /etc/php | head -1)
 ogs init --quiet
+choisir_moteur apache
 
 echo
 echo "--- création d'un site avec sa base ---"

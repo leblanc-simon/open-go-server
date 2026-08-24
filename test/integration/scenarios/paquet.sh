@@ -2,6 +2,7 @@
 # Éprouve l'installation, l'usage et la désinstallation du paquet Debian sur un
 # système propre : un paquet qui se construit n'est pas un paquet qui s'installe.
 set -uo pipefail
+. /scenarios/lib.sh
 
 echo "=== scénario : cycle de vie du paquet ==="
 # L'image porte un binaire pour les autres scénarios : on l'écarte, sinon
@@ -33,6 +34,7 @@ bash -lc 'source /usr/share/bash-completion/completions/ogs && complete -p ogs' 
 echo "--- l'outil fonctionne après installation ---"
 version=$(ls /etc/php | head -1)
 ogs init --quiet
+choisir_moteur apache
 ogs site create paquet.test --kind php-plain --php "$version" --tls=false --yes 2>&1 | tail -3
 if [ ! -d /home/paquet.test ]; then
     echo "ÉCHEC : le site n'a pas été créé après installation du paquet"

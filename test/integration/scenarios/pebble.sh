@@ -4,6 +4,7 @@
 # HTTPS, renouvellement. Ce que les tests unitaires ne peuvent pas faire, faute
 # d'interlocuteur.
 set -uo pipefail
+. /scenarios/lib.sh
 
 echo "=== scénario : ACME avec pebble ==="
 
@@ -14,6 +15,7 @@ export LEGO_CA_CERTIFICATES=/certs/minica.pem
 apache2ctl start
 sleep 1
 ogs init --quiet
+choisir_moteur apache
 
 # L'autorité visée et le contact : l'API en exige un pour notifier les expirations.
 python3 - <<'PY'

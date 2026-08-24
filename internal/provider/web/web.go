@@ -513,6 +513,54 @@ func (p *Provider) enable(ctx context.Context, bp *VHostPlan) error {
 	return nil
 }
 
+// PlanSnippet produit l'étape du fragment de portée serveur. Elle est globale :
+// le fichier ne dépend d'aucun projet, mais tous les vhosts de proxy en
+// dépendent.
+func (p *Provider) PlanSnippet() (*engine.Step, error) {
+	path := p.Engine.SnippetPath()
+	if path == "" {
+		return nil, nil
+	}
+	body, err := p.Templates.Render(p.Engine.TemplateName("http-snippet"), map[string]any{})
+	if err != nil {
+		return nil, err
+	}
+	content := fs.Render(fs.Header{
+		Project: "parc", Resource: "web/snippet", Generated: p.now(),
+		Template: p.Templates.OverridePath(p.Engine.TemplateName("http-snippet")),
+	}, body, p.Engine.CommentPrefix())
+
+	state, err := fs.Inspect(path, content)
+	if err != nil {
+		return nil, err
+	}
+	if state == fs.StateCurrent {
+		return engine.NewStep("web/snippet", engine.NoOp, "réglages "+p.Engine.Name()), nil
+	}
+	action := engine.Create
+	if state != fs.StateAbsent {
+		action = engine.Update
+	}
+	s := engine.NewStep("web/snippet", action, "réglages "+p.Engine.Name()+" ("+filepath.Base(path)+")")
+	s.Apply = func(ctx context.Context) error {
+		if err := fs.EnsureDir(filepath.Dir(path), 0o755, fs.KeepOwner); err != nil {
+			return err
+		}
+		if err := fs.WriteAtomic(path, content, 0o644, fs.KeepOwner); err != nil {
+			return err
+		}
+		// La configuration est revalidée : un fragment fautif casserait tous les
+		// sites, pas seulement celui qu'on installe.
+		if err := validate(ctx, p.Engine, p.Exec); err != nil {
+			_ = os.Remove(path)
+			return err
+		}
+		return nil
+	}
+	s.Reload = []string{"web:" + p.Engine.Name()}
+	return s, nil
+}
+
 // Reload recharge le serveur web. Un rechargement suffit à prendre en compte une
 // nouvelle appartenance de groupe : les workers rappellent initgroups() au fork.
 func (p *Provider) Reload(ctx context.Context) error {

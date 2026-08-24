@@ -185,6 +185,14 @@ func (a *App) buildGlobalPlan(provs *providers, projects []*model.Project) (*eng
 	plan.Add(step)
 
 	// Répertoires d'exécution : verrous de tâches et sockets applicatifs.
+	// Les réglages de portée serveur du moteur web : les vhosts de proxy en
+	// dépendent, et le fichier ne relève d'aucun projet en particulier.
+	snippet, err := provs.Web.PlanSnippet()
+	if err != nil {
+		return nil, wrap(CodeError, err)
+	}
+	plan.Add(snippet)
+
 	runtimeStep, err := provs.Runtime.Plan(projects)
 	if err != nil {
 		return nil, wrap(CodeError, err)

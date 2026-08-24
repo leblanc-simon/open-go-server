@@ -6,6 +6,7 @@
 # L'enjeu est concret : si un rechargement ne suffit pas, chaque création de site
 # impose une coupure, et la conception de l'application doit en tenir compte.
 set -uo pipefail
+. /scenarios/lib.sh
 
 echo "=== scénario : prise en compte de l'appartenance de groupe ==="
 apache2ctl start
@@ -13,6 +14,7 @@ sleep 1
 
 # Un site servi depuis un home 0750, dont seul le groupe donne accès.
 ogs init --quiet
+choisir_moteur apache
 ogs site create site.test --kind static --tls=false --yes --quiet >/dev/null 2>&1 || true
 if [ ! -d /home/site.test ]; then
     echo "ÉCHEC : le site n'a pas été créé"

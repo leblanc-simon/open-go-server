@@ -1,0 +1,12 @@
+# Réglages de portée serveur nécessaires aux vhosts produits par ogs.
+
+# Les vhosts de proxy relaient les connexions montantes (WebSocket, EventSource)
+# vers l'applicatif. La correspondance ci-dessous est la seule façon de fixer
+# l'en-tête Connection selon la demande : « upgrade » quand le client en demande
+# une, « close » sinon. Sans elle, la variable est inconnue et nginx refuse
+# l'ensemble de sa configuration — un seul site applicatif suffirait donc à
+# emporter tous les autres au prochain rechargement.
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}

@@ -108,6 +108,7 @@ Décisions arbitrées et figées pour la v1. Toute remise en cause est une évol
 | D37 | Types livrés | **Prestashop** et **Symfony 3.4 → 8** (+ `static`, `php-plain` et les 4 runtimes) ; les autres frameworks s'ajoutent par `apptypes.yaml` sans code | Symfony 3.4 impose une variante distincte : docroot `web`, `app.php`, pas de Messenger |
 | D38 | Compatibilité PHP | La contrainte `require.php` du **`composer.json` de l'application** fait autorité ; table indicative en secours seulement | Aucune matrice figée à maintenir ; `php switch` refuse une bascule incompatible sans `--force` |
 | D39 | Versions PHP | **7.4 à 8.5**, y compris des versions en fin de support | `doctor` les signale sans jamais bloquer : un Prestashop ancien peut exiger 7.4 |
+| D50 | Réglages nginx de portée serveur | Un fragment géré **`/etc/nginx/conf.d/ogs.conf`**, écrit par le plan global, porte la correspondance `$http_upgrade → $connection_upgrade` | Les vhosts de proxy emploient cette variable, que nginx ne fournit pas : sans le fragment, **un seul site applicatif rendait toute la configuration invalide** et emportait tous les autres au rechargement suivant |
 | D47 | Ordre des étapes d'unité | L'ordre suit le **cycle de vie**, non l'alphabet : cible, modèles d'unité, activation des instances ; en sens inverse pour un retrait | Trier par nom faisait démarrer chaque instance avant l'écriture de son modèle — systemd répondait « Unit not found » et aucun service ne démarrait au premier apply |
 | D48 | Activation de la cible | La cible du projet est **liée à `multi-user.target`** | Sans ce lien, rien ne la réclame au démarrage de la machine : les services ne repartent pas après un redémarrage, alors que tout paraît en ordre tant qu'elle reste allumée |
 | D49 | Chemins inscriptibles d'une unité | `ReadWritePaths` est **facultatif** (préfixe `-`) | `var/` est créé par l'application, non par ogs : un service déclaré avant le déploiement du code échouait en 226/NAMESPACE, avant même d'exécuter sa commande |
@@ -858,10 +859,11 @@ le serveur web ne servant que le statique.
 `initgroups()` à chaque fork : un `reload`/`graceful` suffit, sans redémarrage complet. Le processus maître
 conserve ses propres credentials, sans conséquence puisqu'il est root.
 
-Cette hypothèse, portée en suspens depuis le lot L1, est désormais **mesurée** par le scénario
-d'intégration `test/integration/scenarios/reload-group.sh` (lot L10, `make integration`) : sur une Debian 13
-avec Apache 2.4, un home en 0750 servi à `www-data` hors du groupe renvoie **403** ; après `gpasswd -a` et
-un simple `apache2ctl graceful`, il renvoie **200**. Le scénario compare avec un `restart` et distingue
+Cette hypothèse, portée en suspens depuis le lot L1, est désormais **mesurée** sur les deux moteurs. Sur
+une Debian 13 avec Apache 2.4 (`make integration`), un home en 0750 servi à `www-data` hors du groupe
+renvoie **403** ; après `gpasswd -a` et un simple `apache2ctl graceful`, il renvoie **200**. Sur nginx
+(`make integration-nginx`), le même essai renvoie **404** — ne pouvant traverser le home, nginx ne trouve
+pas le fichier — puis **200** après un `reload`. Le scénario compare avec un `restart` et distingue
 explicitement les trois issues, de sorte qu'une régression sur une version future ne passerait pas
 inaperçue : il rendrait le code 2 et son message indiquerait qu'un restart — donc une coupure — devient
 nécessaire.
@@ -2427,12 +2429,12 @@ build multi-architecture. Les tests d'intégration sont obligatoires avant fusio
 | **L7 — TUI** | inspecteur, panneau de détail, actions contextuelles, suivi de logs, wizard de création | Création complète d'un projet depuis la TUI, parité avec la CLI |
 | **L8 — Import** | scan multi-sources, corrélation, adoption interactive, ressources non gérées | Adoption d'un serveur préconfiguré sans régression |
 | **L9 — Applications non-PHP** | types d'application, providers `runtime` (nvm, rbenv, pyenv, venv), templates de service Go/Node/Python/Ruby, vhosts de proxy, attente de disponibilité | Scénarios d'intégration 22 à 25 validés |
-| **L10 — Industrialisation** | hooks de parc et de projet, complétions dynamiques bash/zsh/fish, 96 pages de manuel engendrées, paquet `.deb` (nfpm), CI GitHub Actions, neuf scénarios d'intégration conteneurisés (serveur web, PHP, hooks, MariaDB, PostgreSQL, RabbitMQ, ACME, systemd et cron, paquet), documentation d'exploitation | Paquet installable, documentation publiée |
+| **L10 — Industrialisation** | hooks de parc et de projet, complétions dynamiques bash/zsh/fish, 96 pages de manuel engendrées, paquet `.deb` (nfpm), CI GitHub Actions, dix scénarios d'intégration conteneurisés (Apache, PHP, nginx, hooks, MariaDB, PostgreSQL, RabbitMQ, ACME, systemd et cron, paquet), documentation d'exploitation | Paquet installable, documentation publiée |
 
 ### Ce que les essais sur système réel ont corrigé
 
-Les scénarios conteneurisés du lot L10 ont mis au jour vingt défauts qu'aucun test unitaire ne pouvait
-voir, parce que tous supposaient un interlocuteur simulé :
+Les scénarios conteneurisés du lot L10 ont mis au jour vingt-et-un défauts qu'aucun test unitaire ne
+pouvait voir, parce que tous supposaient un interlocuteur simulé :
 
 | Défaut | Conséquence en exploitation |
 |---|---|
@@ -2457,6 +2459,7 @@ voir, parce que tous supposaient un interlocuteur simulé :
 | Intentions de rechargement calculées d'avance | un vidage anticipé consommait celle d'une étape à venir : la cible ne réclamait pas ses instances |
 | `AsUser` recollait l'argv sans citation | tout argument contenant une espace était redécoupé par le shell : `ogs cron run` était inutilisable |
 | `ogs cron run` sans répertoire de travail | la commande d'essai ne reproduisait pas ce que cron exécute, dans un sens comme dans l'autre |
+| `$connection_upgrade` employé par les vhosts de proxy mais défini nulle part | **toute application Go, Node, Ruby ou Python rendait la configuration nginx entière invalide** : au rechargement suivant, tous les sites de la machine tombaient (D50) |
 | Suppression d'un projet sans rechargement des serveurs | le maître PHP-FPM gardait le pool en mémoire : **ses workers continuaient de tourner et le site restait servi** |
 
 Les lots L0 à L2 constituent le socle minimal utilisable ; L3 à L6 apportent la valeur cible ; L7 à L10

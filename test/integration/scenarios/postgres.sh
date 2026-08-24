@@ -3,6 +3,7 @@
 # du schéma public, extensions, isolation entre deux projets, sélection de
 # cluster, rotation, dump et suppression.
 set -uo pipefail
+. /scenarios/lib.sh
 
 version=$(ls /etc/postgresql | head -1)
 echo "=== scénario : PostgreSQL $version ==="
@@ -25,6 +26,7 @@ for cluster in main second; do
 done
 
 ogs init --quiet
+choisir_moteur apache
 
 echo
 echo "--- ce que doctor voit des clusters ---"

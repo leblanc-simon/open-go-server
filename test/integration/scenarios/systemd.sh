@@ -4,12 +4,14 @@
 # « systemctl enable » — instances templatisées, mise à l'échelle, durcissement,
 # délégation par sudo — ne s'éprouve pas autrement.
 set -uo pipefail
+. /scenarios/lib.sh
 
 echo "=== scénario : services systemd et tâches planifiées ==="
 systemctl is-system-running || true
 version=$(ls /etc/php | head -1)
 
 ogs init --quiet
+choisir_moteur apache
 
 echo
 echo "--- création d'un site avec deux services et une tâche ---"

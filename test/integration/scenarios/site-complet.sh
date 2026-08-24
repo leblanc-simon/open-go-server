@@ -2,6 +2,7 @@
 # Éprouve la création complète d'un site PHP sur un système réel : utilisateur,
 # arborescence, pool FPM, vhost, et vérifie que PHP est effectivement exécuté.
 set -uo pipefail
+. /scenarios/lib.sh
 
 echo "=== scénario : site PHP servi de bout en bout ==="
 version=$(ls /etc/php | head -1)
@@ -11,6 +12,7 @@ apache2ctl start
 sleep 1
 
 ogs init --quiet
+choisir_moteur apache
 ogs site create php.test --kind php-plain --php "$version" --tls=false --yes 2>&1 | tail -5
 
 if [ ! -f "/etc/php/$version/fpm/pool.d/phptest.conf" ]; then

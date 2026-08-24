@@ -11,6 +11,7 @@ RUN rm -f /etc/dpkg/dpkg.cfg.d/docker
 RUN apt-get update && apt-get install -y --no-install-recommends \
         apache2 \
         libapache2-mod-fcgid \
+        nginx \
         php-fpm \
         curl \
         ca-certificates \

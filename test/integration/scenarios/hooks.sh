@@ -2,9 +2,11 @@
 # Éprouve les hooks sur un système réel : portée serveur, portée projet, refus
 # d'un hook « pre », et refus des scripts qu'un utilisateur pourrait détourner.
 set -uo pipefail
+. /scenarios/lib.sh
 
 echo "=== scénario : hooks ==="
 ogs init --quiet
+choisir_moteur apache
 mkdir -p /etc/ogs/hooks
 trace=/tmp/trace-hooks
 

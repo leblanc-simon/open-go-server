@@ -37,6 +37,9 @@ type Engine interface {
 	Installed() bool
 	// ProxyReference traduit une cible applicative en référence de proxy.
 	ProxyReference(target string, unix bool) string
+	// SnippetPath est le fichier de réglages de portée serveur, vide si le moteur
+	// n'en a pas besoin.
+	SnippetPath() string
 }
 
 // apacheEngine implémente Engine pour Apache 2.4 sur Debian et Ubuntu.
@@ -53,6 +56,10 @@ func (a apacheEngine) FileName(name string) string  { return name + ".conf" }
 func (a apacheEngine) TemplateName(t string) string { return "apache/" + t + ".conf" }
 func (a apacheEngine) Unit() string                 { return "apache2" }
 func (a apacheEngine) CommentPrefix() string        { return "#" }
+
+// SnippetPath : Apache n'a besoin d'aucun réglage de portée serveur, ses vhosts
+// sont autonomes.
+func (a apacheEngine) SnippetPath() string { return "" }
 
 func (a apacheEngine) ValidateArgs() (string, []string) {
 	return filepath.Join(a.prefix, "/usr/sbin/apachectl"), []string{"-t"}
@@ -93,6 +100,12 @@ func (n nginxEngine) FileName(name string) string  { return name + ".conf" }
 func (n nginxEngine) TemplateName(t string) string { return "nginx/" + t + ".conf" }
 func (n nginxEngine) Unit() string                 { return "nginx" }
 func (n nginxEngine) CommentPrefix() string        { return "#" }
+
+// SnippetPath : nginx exige que certains réglages vivent dans le contexte http,
+// hors de tout server. Debian charge tout /etc/nginx/conf.d.
+func (n nginxEngine) SnippetPath() string {
+	return filepath.Join(n.prefix, "/etc/nginx/conf.d/ogs.conf")
+}
 
 func (n nginxEngine) ValidateArgs() (string, []string) {
 	return filepath.Join(n.prefix, "/usr/sbin/nginx"), []string{"-t"}

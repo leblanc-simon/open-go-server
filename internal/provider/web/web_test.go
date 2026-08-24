@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -425,5 +426,82 @@ func TestEveryTemplateServesHTTPSWhenTLSIsEnabled(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestNginxSnippetDefinesProxyVariables(t *testing.T) {
+	// Le vhost de proxy emploie $connection_upgrade, qui n'existe pas par défaut.
+	// Sans ce fragment de portée http, nginx refuse l'ensemble de sa
+	// configuration : un seul site applicatif emporterait tous les autres au
+	// prochain rechargement.
+	prov, paths := fixture(t, "nginx")
+	step, err := prov.PlanSnippet()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if step == nil {
+		t.Fatal("nginx doit produire un fragment de portée serveur")
+	}
+	if err := step.Apply(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(paths.Prefix(), "/etc/nginx/conf.d/ogs.conf"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"map $http_upgrade $connection_upgrade", "default upgrade", "close"} {
+		if !strings.Contains(string(data), want) {
+			t.Errorf("%q absent du fragment :\n%s", want, data)
+		}
+	}
+	// Rejoué, il ne doit plus rien changer.
+	again, err := prov.PlanSnippet()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.Mutates() {
+		t.Errorf("le fragment déjà conforme ne doit pas être réécrit : %s", again)
+	}
+
+	// Apache n'a pas de réglage de portée serveur : aucune étape.
+	apache, _ := fixture(t, "apache")
+	step, err = apache.PlanSnippet()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if step != nil {
+		t.Errorf("Apache ne doit produire aucun fragment : %s", step)
+	}
+}
+
+func TestProxyVHostReferencesOnlyDefinedVariables(t *testing.T) {
+	// Toute variable employée par un vhost doit être fournie par nginx ou par le
+	// fragment d'ogs : une variable inconnue est une erreur de configuration, pas
+	// un avertissement.
+	prov, _ := fixture(t, "nginx")
+	prov.CertRef = func(*model.Project) (string, bool) { return "shopfr", true }
+	p := project(t, "shop.fr", model.KindGo, "", "")
+	p.Spec.Web.VHosts = prov.vhosts(p)
+	p.Spec.Web.VHosts[0].Options = map[string]any{"proxyTarget": "127.0.0.1:20101"}
+	bp, err := prov.Build(p, prov.vhosts(p)[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	fragment, err := prov.Templates.Render("nginx/http-snippet.conf", map[string]any{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Les variables intégrées à nginx qu'emploient nos templates.
+	integrees := map[string]bool{
+		"$http_upgrade": true, "$host": true, "$remote_addr": true, "$scheme": true,
+		"$proxy_add_x_forwarded_for": true, "$request_uri": true, "$uri": true,
+		"$is_args": true, "$args": true, "$document_root": true,
+		"$fastcgi_script_name": true, "$1": true, "$2": true, "$3": true, "$4": true, "$5": true,
+	}
+	for _, mot := range regexp.MustCompile(`\$[a-z_]+`).FindAllString(string(bp.Content), -1) {
+		if integrees[mot] || strings.Contains(string(fragment), mot) {
+			continue
+		}
+		t.Errorf("variable %s employée par le vhost mais définie nulle part", mot)
 	}
 }
