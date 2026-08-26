@@ -11,9 +11,9 @@ import (
 )
 
 // newHardenCommand construit « ogs harden ». Le rapport est le comportement par
-// défaut, et l'application se demande : restreindre /etc dépasse le périmètre
-// d'un projet, et une commande qui modifierait le système au premier essai
-// n'inspirerait pas confiance.
+// défaut, et l'application se demande : restreindre /etc et la racine des homes
+// dépasse le périmètre d'un projet, et une commande qui modifierait le système au
+// premier essai n'inspirerait pas confiance.
 func newHardenCommand(app *App) *cobra.Command {
 	var (
 		apply   bool
@@ -21,11 +21,15 @@ func newHardenCommand(app *App) *cobra.Command {
 	)
 	cmd := &cobra.Command{
 		Use:   "harden",
-		Short: "Restreindre les droits des répertoires de configuration du système",
+		Short: "Restreindre les droits des répertoires sensibles du système",
 		Long: "Sur un serveur mutualisé, les utilisateurs de projet ont un compte local :\n" +
 			"sans restriction ils lisent /etc/nginx, /etc/mysql ou /etc/telegraf, y trouvent\n" +
 			"des chemins, des noms de bases et des jetons, et dressent la carte du serveur —\n" +
-			"celle des sites de leurs voisins comprise.\n\n" +
+			"celle des sites de leurs voisins comprise. La racine des homes leur donne la\n" +
+			"même carte d'un seul « ls /home » : elle passe en 0711, traversable sans être\n" +
+			"énumérable, ce qui ne change rien à la façon dont le serveur web sert un\n" +
+			"fichier. Le gain est partiel et il faut le savoir : /etc/passwd est lisible par\n" +
+			"tous et énumère déjà les homes.\n\n" +
 			"Sans option, la commande rapporte et ne touche à rien ; le code 6 signale qu'il\n" +
 			"reste des droits à restreindre. « --apply » applique.\n\n" +
 			"Deux règles la gouvernent : elle ne desserre jamais — un répertoire déjà plus\n" +
@@ -38,7 +42,11 @@ func newHardenCommand(app *App) *cobra.Command {
 				fmt.Fprintln(tw, "CHEMIN\tÉTAT\tCONSTATÉ\tCIBLE")
 				for _, st := range states {
 					constate := "—"
-					if st.Present {
+					switch {
+					// Un refus s'explique : sinon il passe pour un défaut d'ogs.
+					case st.Reason != "":
+						constate = st.Reason
+					case st.Present:
 						constate = fmt.Sprintf("%04o %s:%s", st.Mode, st.Owner, st.Group)
 						// Sans cette mention, un répertoire déjà conforme mais dont les
 						// fichiers ne le sont pas paraîtrait signalé sans raison.
@@ -86,7 +94,7 @@ func newHardenCommand(app *App) *cobra.Command {
 			}
 
 			if err := app.confirm(fmt.Sprintf(
-				"restreindre %d répertoire(s) de configuration du système ?", reste)); err != nil {
+				"restreindre %d répertoire(s) du système ?", reste)); err != nil {
 				return err
 			}
 			if err := app.openStore(); err != nil {
@@ -136,8 +144,10 @@ func newHardenCommand(app *App) *cobra.Command {
 // hardeningProvider construit le provider avec les réglages de configuration.
 func (a *App) hardeningProvider() *hardening.Provider {
 	return &hardening.Provider{
-		Prefix:  a.Paths.Prefix(),
-		Targets: a.Cfg.Hardening.Targets,
-		Skip:    a.Cfg.Hardening.Skip,
+		Prefix: a.Paths.Prefix(),
+		// La racine hors préfixe : c'est le provider qui décale les chemins.
+		HomeRoot: a.Cfg.Naming.HomeRoot,
+		Targets:  a.Cfg.Hardening.Targets,
+		Skip:     a.Cfg.Hardening.Skip,
 	}
 }

@@ -17,4 +17,18 @@ else:
     s += "\nweb:\n  engine: %s\n" % moteur
 open(chemin, "w").write(s)
 PY
+    # Et il arrête l'autre. Les deux moteurs sont activés dans l'image : sous un
+    # vrai systemd, ils se disputent le port 80 au démarrage, et le perdant reste
+    # « failed » — le scénario éprouve alors un serveur qui n'a jamais chargé les
+    # vhosts d'ogs, ou la page par défaut de Debian servie par le vainqueur
+    # depuis /var/www/html. Le résultat dépendait d'une course.
+    if [ -d /run/systemd/system ]; then
+        local autre=nginx
+        [ "$1" = nginx ] && autre=apache2
+        systemctl disable --now "$autre" >/dev/null 2>&1 || true
+        # Passé StartLimitBurst, systemd refuse de démarrer alors que la cause est
+        # levée : acquitter le compteur avant de relever le moteur retenu.
+        systemctl reset-failed "$1" >/dev/null 2>&1 || true
+        systemctl restart "$1" >/dev/null 2>&1 || true
+    fi
 }

@@ -30,11 +30,13 @@ type Config struct {
 	Hardening    Hardening              `yaml:"hardening"`
 }
 
-// Hardening paramètre la restriction des droits de /etc.
+// Hardening paramètre la restriction des droits des répertoires sensibles :
+// ceux de configuration, et la racine des homes (D60).
 type Hardening struct {
 	// Skip énumère les chemins que « ogs harden » doit laisser tranquilles.
 	Skip []string `yaml:"skip,omitempty"`
-	// Targets remplace la table livrée. Vide, celle d'ogs s'applique.
+	// Targets remplace la table livrée — la racine des homes comprise, qu'il faut
+	// alors y réinscrire. Vide, celle d'ogs s'applique.
 	Targets []hardening.Target `yaml:"targets,omitempty"`
 }
 

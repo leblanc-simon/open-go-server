@@ -140,16 +140,21 @@ func (a *App) runChecks(ctx context.Context) []check {
 	}
 
 	// Racine des homes : elle doit rester traversable par tous, sinon le serveur
-	// web ne peut atteindre aucun docroot.
+	// web ne peut atteindre aucun docroot. Traversable, non énumérable : la cible
+	// est 0711 (D60) — le correctif proposé ne rouvre donc pas la lecture. Et
+	// « harden » ne desserre jamais ce qu'un administrateur a fermé : un 0700 ici
+	// resterait en place, sans qu'aucun contrôle de configuration ne le dise, la
+	// configuration étant par ailleurs valide.
 	homeRoot := a.homeRoot()
 	if info, err := os.Stat(homeRoot); err != nil {
 		add("racine des homes", "échec", err.Error(), "")
 	} else if info.Mode().Perm()&0o001 == 0 {
 		add("racine des homes", "échec",
 			fmt.Sprintf("%s (mode %04o) n'est pas traversable : aucun docroot ne sera servi", homeRoot, info.Mode().Perm()),
-			"chmod 0755 "+homeRoot)
+			"chmod 0711 "+homeRoot)
 	} else {
-		add("racine des homes", "ok", homeRoot, "")
+		add("racine des homes", "ok",
+			fmt.Sprintf("%s (mode %04o)", homeRoot, info.Mode().Perm()), "")
 	}
 
 	// Binaires attendus par le provider système.
@@ -185,16 +190,17 @@ func (a *App) runChecks(ctx context.Context) []check {
 		}
 	}
 
-	// Droits des répertoires de configuration : sur un serveur mutualisé, les
-	// utilisateurs de projet ont un compte local et lisent tout ce qui n'est pas
-	// fermé.
+	// Droits des répertoires sensibles — configuration et racine des homes : sur un
+	// serveur mutualisé, les utilisateurs de projet ont un compte local et lisent
+	// tout ce qui n'est pas fermé.
 	if etats := a.hardeningProvider().Observe(); len(etats) > 0 {
 		if n := hardening.Restrict(etats); n > 0 {
-			add("droits de /etc", "avertissement",
-				fmt.Sprintf("%d répertoire(s) de configuration lisibles au-delà de root", n),
+			add("droits des répertoires système", "avertissement",
+				fmt.Sprintf("%d répertoire(s) énumérables au-delà de root", n),
 				"ogs harden --apply")
 		} else {
-			add("droits de /etc", "ok", "répertoires de configuration fermés", "")
+			add("droits des répertoires système", "ok",
+				"configuration et racine des homes fermées", "")
 		}
 	}
 

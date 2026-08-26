@@ -10,7 +10,7 @@
 set -uo pipefail
 . /scenarios/lib.sh
 
-echo "=== scénario : durcissement des droits de /etc ==="
+echo "=== scénario : durcissement des droits de /etc et de /home ==="
 version=$(ls /etc/php | head -1)
 
 # Les serveurs sont démarrés avant : on veut constater qu'ils survivent.
@@ -51,6 +51,13 @@ for d in /etc/nginx /etc/apache2 /etc/mysql /etc/ogs /etc/telegraf /etc/cron.d; 
         echo "  $d : fermé ($(stat -c %a "$d"))"
     fi
 done
+# La racine des homes donne la carte du parc d'un seul « ls » (D60).
+echo "  /home : $(stat -c %a /home) — $(su -s /bin/sh shopfr -c 'ls /home' 2>/dev/null | tr '\n' ' ')"
+if ! su -s /bin/sh shopfr -c 'ls /home' >/dev/null 2>&1; then
+    echo "ÉCHEC : le scénario devait partir d'un /home énumérable"
+    exit 1
+fi
+
 # Le jeton de l'agent est-il lisible ?
 if su -s /bin/sh shopfr -c 'cat /etc/telegraf/telegraf.conf' 2>/dev/null | grep -q secret; then
     echo "  le jeton de métriques est lisible par le projet"
@@ -95,6 +102,31 @@ if su -s /bin/sh shopfr -c 'cat /etc/telegraf/telegraf.conf' 2>/dev/null | grep 
     exit 1
 fi
 echo "  le jeton de métriques n'est plus lisible"
+
+echo
+echo "--- la racine des homes : traversable, plus énumérable (D60) ---"
+if [ "$(stat -c %a /home)" != "711" ]; then
+    echo "ÉCHEC : /home est en $(stat -c %a /home), attendu 711"
+    exit 1
+fi
+if su -s /bin/sh shopfr -c 'ls /home' >/dev/null 2>&1; then
+    echo "ÉCHEC : /home reste énumérable par un utilisateur de projet"
+    exit 1
+fi
+echo "  ls /home : refusé"
+# Mais le projet atteint son propre home, chemin connu : c'est la traversée.
+if ! su -s /bin/sh shopfr -c 'cat /home/shop.fr/www/public/index.php' >/dev/null 2>&1; then
+    echo "ÉCHEC : le projet n'atteint plus son propre home"
+    exit 1
+fi
+echo "  cat /home/shop.fr/www/public/index.php : servi"
+# Et le durcissement n'a pas débordé sur l'arborescence du projet, dont
+# model.defaultDirs est le seul juge (0711 le home, 0710 ses répertoires).
+if [ "$(stat -c %a /home/shop.fr)" != "711" ] || [ "$(stat -c %a /home/shop.fr/www)" != "710" ]; then
+    echo "ÉCHEC : harden a débordé sur le projet ($(stat -c %a /home/shop.fr), $(stat -c %a /home/shop.fr/www))"
+    exit 1
+fi
+echo "  le home du projet ($(stat -c %a /home/shop.fr)) et son www ($(stat -c %a /home/shop.fr/www)) sont intacts"
 
 echo
 echo "--- et rien n'est cassé ---"
@@ -151,7 +183,7 @@ echo "cron : a déclenché la tâche ($(tail -1 "$journal"))"
 echo
 echo "--- ogs lui-même fonctionne toujours ---"
 ogs harden 2>&1 | tail -2
-ogs doctor 2>&1 | grep -iE "droits de /etc"
+ogs doctor 2>&1 | grep -iE "droits des répertoires"
 ogs project list 2>&1 | tail -2
 
 echo
@@ -163,6 +195,8 @@ fi
 echo "  /etc/ogs/projects est hors de portée"
 
 echo
-echo "RÉSULTAT : les répertoires de configuration sont fermés aux utilisateurs de"
-echo "           projet, sans qu'aucun service ni ogs lui-même n'en souffre ; un"
-echo "           répertoire déjà plus strict n'est pas desserré."
+echo "RÉSULTAT : les répertoires de configuration et la racine des homes sont fermés"
+echo "           aux utilisateurs de projet, sans qu'aucun service ni ogs lui-même"
+echo "           n'en souffre : le site est servi, /home reste traversable et"
+echo "           l'arborescence des projets est intacte ; un répertoire déjà plus"
+echo "           strict n'est pas desserré."

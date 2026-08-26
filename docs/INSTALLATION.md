@@ -125,11 +125,12 @@ Le propriétaire du projet redémarre son application lui-même :
 sudo ogs my restart
 ```
 
-## Fermer les répertoires de configuration
+## Fermer les répertoires sensibles
 
 Sur un serveur mutualisé, les utilisateurs de projet ont un compte local. Sans restriction, ils lisent
 `/etc/nginx`, `/etc/mysql` ou `/etc/telegraf`, y trouvent des chemins, des noms de bases et des jetons, et
-dressent la carte du serveur — celle des sites de leurs voisins comprise.
+dressent la carte du serveur — celle des sites de leurs voisins comprise. Un simple `ls /home` la leur
+donne aussi.
 
 ```sh
 ogs harden              # rapporte, ne touche à rien ; code 6 s'il reste à restreindre
@@ -156,12 +157,35 @@ non installé : il n'y a rien à faire.
 | `/etc/cron.d` | `0750 root:root` | révèle les commandes et les identités de chaque projet |
 | `/etc/logrotate.d` | `0750 root:root` | révèle l'emplacement des journaux du parc |
 | `/etc/sudoers.d` | `0750 root:root` | révèle les délégations accordées |
+| `/home` (`naming.homeRoot`) | `0711 root:root` | la racine des homes énumère le parc : chaque voisin, et le chemin de son code |
 
 Le groupe est celui du service quand le démon lit sa configuration sous sa propre identité — RabbitMQ,
 Telegraf, Redis, PostgreSQL. Pour Apache et Nginx, le processus maître lit en root et les workers héritent
 des descripteurs déjà ouverts : `root:root` suffit.
 
-La table s'ajuste dans `/etc/ogs/config.yaml` :
+**La racine des homes** (D60) se traverse sans s'énumérer, comme le home d'un projet (D51) : servir un
+fichier n'exige que la traversée des répertoires et la lecture du fichier, et le serveur web n'a jamais
+besoin de lister `/home`. Rien ne change donc pour les sites, ni pour un projet qui atteint son propre
+home. Trois choses changent, et il faut les connaître avant d'appliquer :
+
+- les globs non privilégiés cessent d'aboutir : `ls /home`, `du -sh /home/*`, la complétion d'un chemin.
+  Sous `sudo`, tout fonctionne comme avant ;
+- un agent de sauvegarde ou de supervision qui parcourrait `/home` **sous une identité non root** est à
+  revoir. C'est le seul point qui peut réellement mordre ;
+- le gain est **partiel**, et le savoir évite de s'en croire protégé : `/etc/passwd` est lisible par tous
+  et énumère déjà tous les homes. La mesure gêne le parcours à l'aveugle, elle ne cloisonne rien.
+
+Le traitement n'est jamais récursif : sous la racine vivent les répertoires des projets, dont `ogs` décide
+ailleurs (`0711` le home, `0710` ses répertoires). Une racine montée depuis le réseau — `/home` sur NFS —
+est rapportée « refusé » : son mode appartient au serveur, et un export en `root_squash` refuserait
+`chmod` à root lui-même.
+
+La règle « ne desserre jamais » vaut aussi ici, et elle mord : un `/home` en `0700` ne rend plus un seul
+fichier et reste pourtant en place. C'est `ogs doctor` qui le signale — aucune vérification de
+configuration ne le verrait, la configuration étant par ailleurs valide.
+
+La table s'ajuste dans `/etc/ogs/config.yaml` — `skip` en écarte un chemin, `targets` remplace la table
+**entière**, racine des homes comprise, qu'il faut alors y réinscrire :
 
 ```yaml
 hardening:

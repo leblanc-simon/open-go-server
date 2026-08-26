@@ -163,7 +163,7 @@ func TestLaTableParDefautNeFermePasEtcPHP(t *testing.T) {
 	// Le PHP en ligne de commande, exécuté sous l'identité du projet par les
 	// crons, lit son php.ini dans /etc/php : le fermer changerait silencieusement
 	// le comportement de PHP.
-	for _, t2 := range Defaults() {
+	for _, t2 := range Defaults("/home") {
 		if t2.Path != "/etc/php" {
 			continue
 		}
@@ -173,4 +173,119 @@ func TestLaTableParDefautNeFermePasEtcPHP(t *testing.T) {
 		return
 	}
 	t.Error("/etc/php doit figurer dans la table, ne serait-ce que pour dire qu'on n'y touche pas")
+}
+
+func TestFermeLaRacineDesHomes(t *testing.T) {
+	// D60 : 0711 ferme l'énumération sans toucher à la traversée — le serveur web
+	// sert un fichier en traversant les répertoires et en lisant le fichier, il
+	// n'a jamais besoin de lister /home.
+	p, prefix := fixture(t, Target{Path: "/home", Owner: "root", Group: "root", DirMode: 0o711})
+	racine := filepath.Join(prefix, "home")
+	creer(t, racine, 0o755)
+	// Un projet, avec les modes que model.defaultDirs lui donne.
+	creer(t, filepath.Join(racine, "shop.fr"), 0o711)
+	creer(t, filepath.Join(racine, "shop.fr/www"), 0o710)
+
+	states := appliquer(t, p)
+	if states[0].Verdict != VerdictRestrict {
+		t.Fatalf("verdict = %s, attendu %s", states[0].Verdict, VerdictRestrict)
+	}
+	info, err := os.Stat(racine)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := info.Mode().Perm()
+	if got != 0o711 {
+		t.Errorf("mode = %04o, attendu 0711", got)
+	}
+	if got&0o001 == 0 {
+		t.Error("la traversée doit rester ouverte à tous : sinon plus un site n'est servi")
+	}
+	if got&0o004 != 0 {
+		t.Error("l'énumération reste ouverte : le durcissement n'a servi à rien")
+	}
+	// Ni Recursive ni FileMode : les répertoires des projets appartiennent à
+	// model.defaultDirs, et un second juge ferait osciller le plan.
+	for chemin, attendu := range map[string]os.FileMode{
+		"shop.fr":     0o711,
+		"shop.fr/www": 0o710,
+	} {
+		info, err := os.Stat(filepath.Join(racine, chemin))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode().Perm() != attendu {
+			t.Errorf("%s = %04o, attendu %04o : harden a débordé sur l'arborescence du projet",
+				chemin, info.Mode().Perm(), attendu)
+		}
+	}
+}
+
+func TestLaRacineDesHomesSuitLaConfiguration(t *testing.T) {
+	// naming.homeRoot peut désigner ailleurs que /home ; la table par défaut doit
+	// viser la racine réellement employée, sinon elle durcit un chemin vide.
+	cible := func(targets []Target, chemin string) *Target {
+		for i := range targets {
+			if targets[i].Path == chemin {
+				return &targets[i]
+			}
+		}
+		return nil
+	}
+	t2 := cible(Defaults("/srv/sites"), "/srv/sites")
+	if t2 == nil {
+		t.Fatal("la racine des homes configurée doit figurer dans la table")
+	}
+	if t2.DirMode != 0o711 {
+		t.Errorf("mode = %04o, attendu 0711", t2.DirMode)
+	}
+	if t2.Recursive || t2.FileMode != 0 {
+		t.Error("la racine des homes ne se traite pas récursivement : sous elle vivent les projets")
+	}
+	if cible(Defaults("/home"), "/home") == nil {
+		t.Error("/home doit figurer dans la table par défaut")
+	}
+	// Une racine absente ou réduite à « / » n'entre pas dans la table : durcir la
+	// racine du système fermerait tout.
+	for _, racine := range []string{"", "/", "//", "/.."} {
+		for _, t3 := range Defaults(racine) {
+			if t3.Path == "/" {
+				t.Errorf("Defaults(%q) vise « / »", racine)
+			}
+		}
+	}
+}
+
+func TestNeDesserrePasUneRacineDesHomesDejaFermee(t *testing.T) {
+	// Un /home en 0700 casse tout le parc — plus un site servi — mais ce n'est pas
+	// à un outil de durcissement de le rouvrir : il ne desserre jamais. C'est
+	// « doctor » qui a le devoir de le dire.
+	p, prefix := fixture(t, Target{Path: "/home", DirMode: 0o711})
+	creer(t, filepath.Join(prefix, "home"), 0o700)
+
+	states := p.Observe()
+	if states[0].Verdict != VerdictStricter {
+		t.Fatalf("verdict = %s, attendu %s", states[0].Verdict, VerdictStricter)
+	}
+	appliquer(t, p)
+	info, _ := os.Stat(filepath.Join(prefix, "home"))
+	if got := info.Mode().Perm(); got != 0o700 {
+		t.Errorf("mode = %04o : la racine a été desserrée", got)
+	}
+}
+
+func TestUnRefusSExplique(t *testing.T) {
+	// « refusé » sans motif laisse soupçonner un défaut d'ogs là où il y a une
+	// décision.
+	p, prefix := fixture(t, Target{Path: "/home", DirMode: 0o711})
+	if err := os.WriteFile(filepath.Join(prefix, "home"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	st := p.Observe()[0]
+	if st.Verdict != VerdictRefused {
+		t.Fatalf("verdict = %s, attendu %s", st.Verdict, VerdictRefused)
+	}
+	if st.Reason == "" {
+		t.Error("un refus doit porter son motif")
+	}
 }

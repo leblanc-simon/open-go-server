@@ -12,8 +12,8 @@ Les commits ne mentionnent jamais l'assistance d'un outil d'IA.
 
 ## La référence
 
-[`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md) fait autorité : 59 décisions d'architecture
-arbitrées (D1–D59, tableau §2), spécification par module, plan de tests, découpage en lots. **Consulter le
+[`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md) fait autorité : 60 décisions d'architecture
+arbitrées (D1–D60, tableau §2), spécification par module, plan de tests, découpage en lots. **Consulter le
 tableau des décisions avant de proposer une architecture** — la plupart des questions « pourquoi pas
 plutôt… ? » y sont déjà tranchées, avec leur raison. Toute décision nouvelle s'y ajoute.
 
@@ -23,7 +23,7 @@ plutôt… ? » y sont déjà tranchées, avec leur raison. Toute décision nouv
 make build            # ./ogs, statique (CGO_ENABLED=0), aucune dépendance C
 make test             # tests unitaires
 make check            # fmt + vet + test
-make cover            # couverture (62,5 % actuellement)
+make cover            # couverture (61,5 % actuellement)
 make doc              # pages de manuel, complétions, référence Markdown → dist/doc
 make package          # paquet Debian → dist/*.deb (nfpm, réseau requis)
 
@@ -66,7 +66,11 @@ Deux pièges du harnais :
   lui-même devant le vrai. Il échoue explicitement sur ce qu'il ne sait pas faire : un substitut
   complaisant rendrait les scénarios creux.
 - l'image porte les deux moteurs web, donc `ogs` refuse de choisir : chaque scénario appelle
-  `choisir_moteur apache|nginx` (`scenarios/lib.sh`) après `ogs init`.
+  `choisir_moteur apache|nginx` (`scenarios/lib.sh`) après `ogs init`. Cette fonction **arrête aussi
+  l'autre** : les deux moteurs sont activés dans l'image, et sous un vrai systemd ils se disputent le
+  port 80 au démarrage. Le perdant restait « failed » et le scénario interrogeait le vainqueur, qui n'avait
+  jamais chargé les vhosts d'ogs et servait la page par défaut de Debian depuis `/var/www/html` — un
+  scénario dont le verdict dépendait d'une course.
 
 ## Architecture
 
@@ -173,7 +177,11 @@ Ils ont tous coûté un défaut réel ; les tests unitaires ne les voyaient pas.
   répertoire déjà plus strict est laissé tel quel — et il **préserve le bit d'exécution** des fichiers,
   sans quoi il rendrait les hooks inexécutables donc refusés par ogs lui-même. `/etc/php` reste ouvert :
   le PHP en ligne de commande des crons y lit son `php.ini`, et le fermer changerait le comportement de
-  PHP sans le moindre message.
+  PHP sans le moindre message. La **racine des homes** y figure aussi, en 0711 (D60) : traversable sans
+  être énumérable, jamais récursivement — sous elle, `model.defaultDirs` est le seul juge. Le gain est
+  partiel et doit être annoncé comme tel : `/etc/passwd` énumère déjà tous les homes. Et « ne desserre
+  jamais » mord ici — un `/home` en 0700 ne rend plus un fichier et reste en place ; c'est `doctor` qui
+  le dit.
 - **Un rechargement du serveur web peut tuer le serveur.** `apachectl graceful` ne teste pas la
   configuration : un maître Apache qui relit une configuration invalide meurt, et tous les sites tombent.
   D'où la revalidation dans `web.Provider.Reload`, en plus de celle de l'écriture — les intentions étant

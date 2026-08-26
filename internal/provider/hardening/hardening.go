@@ -1,8 +1,9 @@
-// Package hardening restreint les droits des répertoires de configuration du
-// système. Un serveur mutualisé porte des utilisateurs de projet qui ont un
-// compte local : sans restriction, ils lisent /etc/nginx, /etc/mysql ou
-// /etc/telegraf, y trouvent des chemins, des noms de bases, des jetons, et
-// dressent la carte du serveur — y compris celle des sites de leurs voisins.
+// Package hardening restreint les droits des répertoires sensibles du système :
+// ceux de configuration, et la racine des homes. Un serveur mutualisé porte des
+// utilisateurs de projet qui ont un compte local : sans restriction, ils lisent
+// /etc/nginx, /etc/mysql ou /etc/telegraf, y trouvent des chemins, des noms de
+// bases, des jetons, et dressent la carte du serveur — y compris celle des sites
+// de leurs voisins. Un simple « ls /home » la leur donne aussi (D60).
 //
 // Deux règles gouvernent ce paquet :
 //
@@ -50,8 +51,9 @@ type Target struct {
 	Risk string `yaml:"-" json:"risk,omitempty"`
 }
 
-// Defaults énumère les répertoires de configuration à restreindre, dans l'ordre
-// où ils sont rapportés. La liste vise Debian et ses dérivées.
+// Defaults énumère les répertoires à restreindre, dans l'ordre où ils sont
+// rapportés. La liste vise Debian et ses dérivées. homeRoot est la racine des
+// homes (naming.homeRoot) ; vide, ou réduite à « / », elle est omise.
 //
 // Ce qui n'y figure pas est aussi un choix : /etc/php reste lisible parce que
 // l'interpréteur en ligne de commande, exécuté sous l'identité du projet par les
@@ -60,8 +62,8 @@ type Target struct {
 // les mots de passe, est fermé. /etc/systemd/system reste lisible également : ses
 // unités sont écrites par ogs et ne portent aucun secret, et plusieurs outils
 // d'exploitation les lisent.
-func Defaults() []Target {
-	return []Target{
+func Defaults(homeRoot string) []Target {
+	targets := []Target{
 		{
 			Path: "/etc/ogs", Owner: "root", Group: "root", DirMode: 0o700, FileMode: 0o600,
 			Recursive: true,
@@ -143,6 +145,25 @@ func Defaults() []Target {
 			Risk: "aucun : sudo lit en root",
 		},
 	}
+	// La racine des homes (D60). Ni Recursive ni FileMode : sous /home vivent les
+	// répertoires des projets, dont model.defaultDirs est le seul juge (0711 pour
+	// le home, 0710 pour ses répertoires). Un durcissement qui les imposerait
+	// aussi ferait osciller le plan entre deux valeurs.
+	if root := filepath.Clean(homeRoot); root != "" && root != "." && root != "/" {
+		targets = append(targets, Target{
+			Path: root, Owner: "root", Group: "root", DirMode: 0o711,
+			Why: "la racine des homes énumère le parc : un « ls /home » donne " +
+				"le nom de chaque site voisin, et le chemin de son code",
+			Risk: "la traversée reste ouverte à tous, donc le serveur web sert les " +
+				"fichiers comme avant et chaque projet atteint son home ; ce qui " +
+				"disparaît est l'énumération — les globs non privilégiés " +
+				"(ls /home, du -sh /home/*), la complétion, et tout agent de " +
+				"sauvegarde ou de supervision qui parcourrait /home sous une " +
+				"identité non root. Le gain est partiel, et il faut le savoir : " +
+				"/etc/passwd est lisible par tous et énumère déjà les homes",
+		})
+	}
+	return targets
 }
 
 // State est l'état constaté d'une cible.
@@ -152,10 +173,13 @@ type State struct {
 	// installé, il n'y a rien à faire.
 	Present bool `json:"present" yaml:"present"`
 	// Symlink signale un lien symbolique, que l'on refuse de suivre.
-	Symlink bool        `json:"symlink" yaml:"symlink"`
-	Mode    os.FileMode `json:"mode" yaml:"mode"`
-	Owner   string      `json:"owner" yaml:"owner"`
-	Group   string      `json:"group" yaml:"group"`
+	Symlink bool `json:"symlink" yaml:"symlink"`
+	// Reason motive un refus. Un rapport qui dit « refusé » sans dire pourquoi
+	// laisse l'administrateur soupçonner un défaut là où il y a une décision.
+	Reason string      `json:"reason,omitempty" yaml:"reason,omitempty"`
+	Mode   os.FileMode `json:"mode" yaml:"mode"`
+	Owner  string      `json:"owner" yaml:"owner"`
+	Group  string      `json:"group" yaml:"group"`
 	// Verdict résume la comparaison : conforme, à restreindre, déjà plus strict,
 	// absent, ou refusé.
 	Verdict string `json:"verdict" yaml:"verdict"`
@@ -176,6 +200,10 @@ const (
 type Provider struct {
 	// Prefix décale les chemins, pour les essais.
 	Prefix string
+	// HomeRoot est la racine des homes, qui entre dans la table par défaut (D60).
+	// Sans effet lorsque Targets remplace la table : celle-ci est alors prise
+	// telle quelle.
+	HomeRoot string
 	// Targets remplace la table par défaut lorsqu'elle est renseignée.
 	Targets []Target
 	// Skip énumère les chemins à laisser tranquilles.
@@ -188,7 +216,7 @@ type Provider struct {
 func (p *Provider) targets() []Target {
 	list := p.Targets
 	if len(list) == 0 {
-		list = Defaults()
+		list = Defaults(p.HomeRoot)
 	}
 	skip := map[string]bool{}
 	for _, s := range p.Skip {
@@ -228,14 +256,26 @@ func (p *Provider) observeOne(t Target) State {
 	if info.Mode()&os.ModeSymlink != 0 {
 		st.Symlink = true
 		st.Verdict = VerdictRefused
+		st.Reason = "lien symbolique : la cible est inconnue"
 		return st
 	}
 	if !info.IsDir() {
 		st.Verdict = VerdictRefused
+		st.Reason = "n'est pas un répertoire"
 		return st
 	}
 	st.Mode = info.Mode().Perm()
 	st.Owner, st.Group = ownerNames(info)
+
+	// Un chemin monté depuis le réseau — /home sur NFS est le cas courant —
+	// n'appartient pas à cette machine : le mode vient du serveur, et root_squash
+	// fait échouer le chmod. Le dire « refusé » vaut mieux qu'un avertissement
+	// d'échec à chaque apply, qui finirait par ne plus être lu.
+	if fs, distant := remoteFS(path); distant {
+		st.Verdict = VerdictRefused
+		st.Reason = "monté en " + fs + " : le mode ne nous appartient pas"
+		return st
+	}
 
 	switch {
 	case looser(st.Mode, t.DirMode) || !ownerMatches(t, st):
