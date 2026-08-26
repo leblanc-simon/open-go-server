@@ -54,9 +54,12 @@ completion: doc
 
 # --- Paquet Debian -----------------------------------------------------------
 # nfpm n'est pas une dépendance de compilation : on l'exécute depuis son module.
+# Le « -n » des compressions écarte l'horodatage : sans lui, deux constructions
+# du même arbre donneraient deux paquets différents.
 package: doc
 	@mkdir -p dist
 	gzip -9nf dist/doc/man/*.8
+	./packaging/changelog.sh $(DEBVER) | gzip -9n > dist/doc/changelog.gz
 	go build -trimpath -ldflags "$(LDFLAGS)" -o dist/$(BINARY) $(PKG)
 	OGS_VERSION=$(DEBVER) OGS_ARCH=$(ARCH) \
 		go run github.com/goreleaser/nfpm/v2/cmd/nfpm@latest package \

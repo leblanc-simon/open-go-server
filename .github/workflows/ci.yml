@@ -36,6 +36,11 @@ jobs:
           git diff --exit-code go.mod go.sum
 
       - name: tests
+        # Le détecteur de courses repose sur l'instrumentation du compilateur C :
+        # « -race » exige donc cgo, là où le reste de la chaîne compile en
+        # statique. La dérogation ne vaut que pour cette étape.
+        env:
+          CGO_ENABLED: "1"
         run: go test -race -coverprofile=coverage.out ./...
 
       - name: couverture

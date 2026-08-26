@@ -1,0 +1,26 @@
+# Dérogations lintian, installées en /usr/share/lintian/overrides/ogs.
+# Chacune couvre une décision d'architecture, non un défaut toléré.
+
+# Le binaire est compilé par Go sans cgo : il est statique par construction, et
+# la CI fait échouer la compilation si une dépendance dynamique s'y glisse. Le
+# déploiement suppose un fichier unique, posable sur un serveur nu.
+ogs: statically-linked-binary [usr/bin/ogs]
+
+# Les modes restrictifs sont le sujet même de l'outil (D51, D56) : /etc/ogs porte
+# la clé maître et les déclarations du parc, /var/log/ogs le journal d'audit.
+ogs: non-standard-dir-perm 0700 != 0755 [etc/ogs/]
+ogs: non-standard-dir-perm 0700 != 0755 [etc/ogs/hooks/]
+ogs: non-standard-dir-perm 0700 != 0755 [var/log/ogs/]
+# 0751 : le serveur web doit traverser jusqu'au répertoire du challenge ACME,
+# sans pouvoir énumérer le reste de l'état.
+ogs: non-standard-dir-perm 0751 != 0755 [var/lib/ogs/]
+
+# « deb-systemd-invoke » vaut pour les unités livrées par un paquet. Le timer de
+# renouvellement n'en est pas une : c'est « ogs init » qui l'écrit, sur la
+# machine administrée. Le paquet ne peut que l'arrêter s'il existe.
+ogs: maintainer-script-calls-systemctl [prerm:10]
+
+# Le projet est écrit en français, journal des versions compris ; le contrôle
+# orthographique de lintian ne connaît que l'anglais et prend « authentification »
+# pour une faute. Sans contexte : la dérogation vaut pour tout le journal.
+ogs: spelling-error-in-changelog

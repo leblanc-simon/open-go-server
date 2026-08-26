@@ -18,7 +18,21 @@ if [ "$scenario" = "runtimes" ] || [ "$scenario" = "runtimes-compiles" ]; then
 fi
 
 echo "construction de l'image…"
-docker build -q -f test/integration/Dockerfile -t ogs-integration . >/dev/null
+# Le registre public est un tiers faillible : douze scénarios tirent la même
+# image de base en parallèle, et un jeton d'authentification qui n'arrive pas
+# fait échouer un essai qui n'a rien à voir avec le code. On réessaie, avec une
+# attente croissante, avant de conclure.
+for tentative in 1 2 3; do
+    if docker build -q -f test/integration/Dockerfile -t ogs-integration . >/dev/null; then
+        break
+    fi
+    if [ "$tentative" = 3 ]; then
+        echo "échec de la construction de l'image après trois tentatives" >&2
+        exit 1
+    fi
+    echo "construction en échec, nouvelle tentative dans $((tentative * 15)) s…" >&2
+    sleep $((tentative * 15))
+done
 
 # Les scénarios de runtime et de services exigent un vrai systemd en PID 1 :
 # rien de ce qui suit un « systemctl enable » ne s'éprouve autrement. La

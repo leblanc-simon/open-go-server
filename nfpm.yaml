@@ -5,7 +5,7 @@ platform: linux
 version: ${OGS_VERSION}
 section: admin
 priority: optional
-maintainer: open-go-server
+maintainer: Simon Leblanc <contact@leblanc-simon.eu>
 description: |
   Administration de serveurs web par état désiré.
   ogs industrialise le cycle de vie des sites hébergés — utilisateur système,
@@ -51,6 +51,16 @@ contents:
 
   - src: LICENSE
     dst: /usr/share/doc/ogs/copyright
+    file_info: { mode: 0644 }
+  # Paquet natif : le journal des versions se nomme « changelog.gz », sans
+  # « .Debian ». Il est engendré depuis les étiquettes par packaging/changelog.sh.
+  - src: dist/doc/changelog.gz
+    dst: /usr/share/doc/ogs/changelog.gz
+    file_info: { mode: 0644 }
+  # Les dérogations voyagent avec le paquet : un contrôle lintian fait ailleurs
+  # qu'en CI doit lire les mêmes raisons.
+  - src: packaging/lintian-overrides
+    dst: /usr/share/lintian/overrides/ogs
     file_info: { mode: 0644 }
   - src: README.md
     dst: /usr/share/doc/ogs/README.md
