@@ -4,9 +4,9 @@ import (
 	"fmt"
 	"path/filepath"
 
-	"github.com/leviathan/ogs/internal/model"
-	"github.com/leviathan/ogs/internal/naming"
-	"github.com/leviathan/ogs/internal/provider/db"
+	"leblanc.io/open-go-server/internal/model"
+	"leblanc.io/open-go-server/internal/naming"
+	"leblanc.io/open-go-server/internal/provider/db"
 )
 
 // Adopt construit la déclaration d'un projet à partir d'un candidat. L'adoption

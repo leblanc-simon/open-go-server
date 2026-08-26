@@ -10,11 +10,11 @@ import (
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 
-	"github.com/leviathan/ogs/internal/engine"
-	"github.com/leviathan/ogs/internal/model"
-	"github.com/leviathan/ogs/internal/provider/tls"
-	"github.com/leviathan/ogs/internal/spec"
-	"github.com/leviathan/ogs/internal/tui"
+	"leblanc.io/open-go-server/internal/engine"
+	"leblanc.io/open-go-server/internal/model"
+	"leblanc.io/open-go-server/internal/provider/tls"
+	"leblanc.io/open-go-server/internal/spec"
+	"leblanc.io/open-go-server/internal/tui"
 )
 
 func newTUICommand(app *App) *cobra.Command {

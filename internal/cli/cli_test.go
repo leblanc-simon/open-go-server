@@ -11,8 +11,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/leviathan/ogs/internal/secret"
-	"github.com/leviathan/ogs/internal/store"
+	"leblanc.io/open-go-server/internal/secret"
+	"leblanc.io/open-go-server/internal/store"
 )
 
 // harness exécute la CLI en mode préfixé, ce qui permet d'éprouver le flux

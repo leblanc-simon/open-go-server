@@ -1,4 +1,4 @@
-module github.com/leviathan/ogs
+module leblanc.io/open-go-server
 
 go 1.26.5
 

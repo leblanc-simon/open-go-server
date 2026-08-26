@@ -13,10 +13,10 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/leviathan/ogs/internal/config"
-	"github.com/leviathan/ogs/internal/provider/db"
-	"github.com/leviathan/ogs/internal/provider/php"
-	"github.com/leviathan/ogs/internal/provider/web"
+	"leblanc.io/open-go-server/internal/config"
+	"leblanc.io/open-go-server/internal/provider/db"
+	"leblanc.io/open-go-server/internal/provider/php"
+	"leblanc.io/open-go-server/internal/provider/web"
 )
 
 // Kind est la nature d'une ressource découverte.

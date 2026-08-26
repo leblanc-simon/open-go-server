@@ -8,9 +8,9 @@ import (
 
 	"github.com/goccy/go-yaml"
 
-	"github.com/leviathan/ogs/internal/fs"
-	"github.com/leviathan/ogs/internal/secret"
-	"github.com/leviathan/ogs/internal/store"
+	"leblanc.io/open-go-server/internal/fs"
+	"leblanc.io/open-go-server/internal/secret"
+	"leblanc.io/open-go-server/internal/store"
 )
 
 func newInitCommand(app *App) *cobra.Command {

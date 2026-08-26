@@ -6,9 +6,9 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/leviathan/ogs/internal/model"
-	appprov "github.com/leviathan/ogs/internal/provider/app"
-	"github.com/leviathan/ogs/internal/spec"
+	"leblanc.io/open-go-server/internal/model"
+	appprov "leblanc.io/open-go-server/internal/provider/app"
+	"leblanc.io/open-go-server/internal/spec"
 )
 
 func newRuntimeCommand(app *App) *cobra.Command {

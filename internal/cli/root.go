@@ -6,7 +6,7 @@ import (
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 
-	"github.com/leviathan/ogs/internal/version"
+	"leblanc.io/open-go-server/internal/version"
 )
 
 // NewRootCommand construit l'arbre des commandes.

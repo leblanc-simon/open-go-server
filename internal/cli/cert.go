@@ -11,10 +11,10 @@ import (
 	"github.com/goccy/go-yaml"
 	"github.com/spf13/cobra"
 
-	"github.com/leviathan/ogs/internal/fs"
-	"github.com/leviathan/ogs/internal/hook"
-	"github.com/leviathan/ogs/internal/model"
-	tlsprov "github.com/leviathan/ogs/internal/provider/tls"
+	"leblanc.io/open-go-server/internal/fs"
+	"leblanc.io/open-go-server/internal/hook"
+	"leblanc.io/open-go-server/internal/model"
+	tlsprov "leblanc.io/open-go-server/internal/provider/tls"
 )
 
 func newCertCommand(app *App) *cobra.Command {

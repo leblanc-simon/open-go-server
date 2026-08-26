@@ -8,10 +8,10 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/leviathan/ogs/internal/config"
-	"github.com/leviathan/ogs/internal/model"
-	"github.com/leviathan/ogs/internal/provider/php"
-	"github.com/leviathan/ogs/internal/spec"
+	"leblanc.io/open-go-server/internal/config"
+	"leblanc.io/open-go-server/internal/model"
+	"leblanc.io/open-go-server/internal/provider/php"
+	"leblanc.io/open-go-server/internal/spec"
 )
 
 // installCompletions dote l'arbre de commandes de complétions dynamiques.

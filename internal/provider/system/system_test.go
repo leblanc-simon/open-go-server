@@ -7,11 +7,11 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/leviathan/ogs/internal/config"
-	"github.com/leviathan/ogs/internal/engine"
-	"github.com/leviathan/ogs/internal/exec"
-	"github.com/leviathan/ogs/internal/model"
-	"github.com/leviathan/ogs/internal/naming"
+	"leblanc.io/open-go-server/internal/config"
+	"leblanc.io/open-go-server/internal/engine"
+	"leblanc.io/open-go-server/internal/exec"
+	"leblanc.io/open-go-server/internal/model"
+	"leblanc.io/open-go-server/internal/naming"
 )
 
 // fixture prépare un projet dont la racine est dans un répertoire temporaire,

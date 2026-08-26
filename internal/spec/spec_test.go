@@ -7,8 +7,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/leviathan/ogs/internal/model"
-	"github.com/leviathan/ogs/internal/naming"
+	"leblanc.io/open-go-server/internal/model"
+	"leblanc.io/open-go-server/internal/naming"
 )
 
 const sample = `

@@ -12,7 +12,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/leviathan/ogs/internal/store"
+	"leblanc.io/open-go-server/internal/store"
 )
 
 // Logger journalise les étapes d'une exécution.

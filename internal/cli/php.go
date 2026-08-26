@@ -6,10 +6,10 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/leviathan/ogs/internal/hook"
-	"github.com/leviathan/ogs/internal/model"
-	"github.com/leviathan/ogs/internal/provider/php"
-	"github.com/leviathan/ogs/internal/spec"
+	"leblanc.io/open-go-server/internal/hook"
+	"leblanc.io/open-go-server/internal/model"
+	"leblanc.io/open-go-server/internal/provider/php"
+	"leblanc.io/open-go-server/internal/spec"
 )
 
 func newPHPCommand(app *App) *cobra.Command {

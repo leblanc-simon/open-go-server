@@ -6,7 +6,7 @@ import (
 	"path"
 	"path/filepath"
 
-	"github.com/leviathan/ogs/internal/naming"
+	"leblanc.io/open-go-server/internal/naming"
 )
 
 // APIVersion et Kind identifient le schéma du fichier projet.

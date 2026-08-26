@@ -12,8 +12,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/leviathan/ogs/internal/config"
-	"github.com/leviathan/ogs/internal/fs"
+	"leblanc.io/open-go-server/internal/config"
+	"leblanc.io/open-go-server/internal/fs"
 )
 
 // Noms des fichiers d'un certificat, alignés sur les conventions de lego et de

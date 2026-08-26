@@ -9,8 +9,8 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	"github.com/leviathan/ogs/internal/model"
-	"github.com/leviathan/ogs/internal/naming"
+	"leblanc.io/open-go-server/internal/model"
+	"leblanc.io/open-go-server/internal/naming"
 )
 
 // fakeBackend est un parc en mémoire : l'interface est ainsi éprouvable sans

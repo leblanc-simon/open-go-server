@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/leviathan/ogs/internal/naming"
+	"leblanc.io/open-go-server/internal/naming"
 )
 
 // NewMySQLClient ouvre une connexion administrateur par socket Unix. L'absence de

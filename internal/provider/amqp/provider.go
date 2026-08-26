@@ -7,11 +7,11 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/leviathan/ogs/internal/config"
-	"github.com/leviathan/ogs/internal/engine"
-	"github.com/leviathan/ogs/internal/model"
-	"github.com/leviathan/ogs/internal/secret"
-	"github.com/leviathan/ogs/internal/store"
+	"leblanc.io/open-go-server/internal/config"
+	"leblanc.io/open-go-server/internal/engine"
+	"leblanc.io/open-go-server/internal/model"
+	"leblanc.io/open-go-server/internal/secret"
+	"leblanc.io/open-go-server/internal/store"
 )
 
 // Provider réconcilie le vhost RabbitMQ d'un projet.

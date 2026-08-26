@@ -11,16 +11,16 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/leviathan/ogs/internal/engine"
-	"github.com/leviathan/ogs/internal/exec"
-	"github.com/leviathan/ogs/internal/hook"
-	"github.com/leviathan/ogs/internal/model"
-	"github.com/leviathan/ogs/internal/naming"
-	"github.com/leviathan/ogs/internal/provider/amqp"
-	"github.com/leviathan/ogs/internal/provider/db"
-	"github.com/leviathan/ogs/internal/provider/unit"
-	"github.com/leviathan/ogs/internal/spec"
-	"github.com/leviathan/ogs/internal/validate"
+	"leblanc.io/open-go-server/internal/engine"
+	"leblanc.io/open-go-server/internal/exec"
+	"leblanc.io/open-go-server/internal/hook"
+	"leblanc.io/open-go-server/internal/model"
+	"leblanc.io/open-go-server/internal/naming"
+	"leblanc.io/open-go-server/internal/provider/amqp"
+	"leblanc.io/open-go-server/internal/provider/db"
+	"leblanc.io/open-go-server/internal/provider/unit"
+	"leblanc.io/open-go-server/internal/spec"
+	"leblanc.io/open-go-server/internal/validate"
 )
 
 func newSiteCommand(app *App) *cobra.Command {

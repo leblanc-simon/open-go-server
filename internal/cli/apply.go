@@ -11,19 +11,19 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/leviathan/ogs/internal/archive"
-	"github.com/leviathan/ogs/internal/config"
-	"github.com/leviathan/ogs/internal/engine"
-	"github.com/leviathan/ogs/internal/exec"
-	"github.com/leviathan/ogs/internal/fs"
-	"github.com/leviathan/ogs/internal/hook"
-	"github.com/leviathan/ogs/internal/model"
-	appprov "github.com/leviathan/ogs/internal/provider/app"
-	"github.com/leviathan/ogs/internal/provider/unit"
-	"github.com/leviathan/ogs/internal/spec"
-	"github.com/leviathan/ogs/internal/store"
-	"github.com/leviathan/ogs/internal/template"
-	"github.com/leviathan/ogs/internal/validate"
+	"leblanc.io/open-go-server/internal/archive"
+	"leblanc.io/open-go-server/internal/config"
+	"leblanc.io/open-go-server/internal/engine"
+	"leblanc.io/open-go-server/internal/exec"
+	"leblanc.io/open-go-server/internal/fs"
+	"leblanc.io/open-go-server/internal/hook"
+	"leblanc.io/open-go-server/internal/model"
+	appprov "leblanc.io/open-go-server/internal/provider/app"
+	"leblanc.io/open-go-server/internal/provider/unit"
+	"leblanc.io/open-go-server/internal/spec"
+	"leblanc.io/open-go-server/internal/store"
+	"leblanc.io/open-go-server/internal/template"
+	"leblanc.io/open-go-server/internal/validate"
 )
 
 // buildPlan observe le système et calcule le plan d'un projet. L'ordre des

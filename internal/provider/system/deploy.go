@@ -6,10 +6,10 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/leviathan/ogs/internal/engine"
-	"github.com/leviathan/ogs/internal/exec"
-	"github.com/leviathan/ogs/internal/fs"
-	"github.com/leviathan/ogs/internal/model"
+	"leblanc.io/open-go-server/internal/engine"
+	"leblanc.io/open-go-server/internal/exec"
+	"leblanc.io/open-go-server/internal/fs"
+	"leblanc.io/open-go-server/internal/model"
 )
 
 // KeyName est le nom de la clé de déploiement.

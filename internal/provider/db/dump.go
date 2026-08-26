@@ -8,8 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/leviathan/ogs/internal/exec"
-	"github.com/leviathan/ogs/internal/model"
+	"leblanc.io/open-go-server/internal/exec"
+	"leblanc.io/open-go-server/internal/model"
 )
 
 // Dump sauvegarde une base. Les sauvegardes planifiées sont hors périmètre : cette

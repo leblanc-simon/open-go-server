@@ -6,8 +6,8 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/leviathan/ogs/internal/exec"
-	"github.com/leviathan/ogs/internal/template"
+	"leblanc.io/open-go-server/internal/exec"
+	"leblanc.io/open-go-server/internal/template"
 )
 
 // execCommand est un raccourci de construction de commande.

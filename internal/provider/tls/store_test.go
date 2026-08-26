@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/leviathan/ogs/internal/config"
+	"leblanc.io/open-go-server/internal/config"
 )
 
 func newStore(t *testing.T) Store {

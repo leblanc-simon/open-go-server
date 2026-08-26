@@ -16,7 +16,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/spf13/cobra/doc"
 
-	"github.com/leviathan/ogs/internal/cli"
+	"leblanc.io/open-go-server/internal/cli"
 )
 
 // placeholder reconnaît un argument encadré par des chevrons.

@@ -9,8 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/leviathan/ogs/internal/exec"
-	"github.com/leviathan/ogs/internal/model"
+	"leblanc.io/open-go-server/internal/exec"
+	"leblanc.io/open-go-server/internal/model"
 )
 
 // Runtimes gérés. Go n'en a pas : un binaire compilé est autonome.

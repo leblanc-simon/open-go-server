@@ -8,12 +8,12 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/leviathan/ogs/internal/config"
-	"github.com/leviathan/ogs/internal/exec"
-	"github.com/leviathan/ogs/internal/model"
-	"github.com/leviathan/ogs/internal/naming"
-	"github.com/leviathan/ogs/internal/secret"
-	"github.com/leviathan/ogs/internal/store"
+	"leblanc.io/open-go-server/internal/config"
+	"leblanc.io/open-go-server/internal/exec"
+	"leblanc.io/open-go-server/internal/model"
+	"leblanc.io/open-go-server/internal/naming"
+	"leblanc.io/open-go-server/internal/secret"
+	"leblanc.io/open-go-server/internal/store"
 )
 
 func fixture(t *testing.T) (*Provider, *model.Project) {

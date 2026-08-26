@@ -9,8 +9,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/leviathan/ogs/internal/model"
-	"github.com/leviathan/ogs/internal/naming"
+	"leblanc.io/open-go-server/internal/model"
+	"leblanc.io/open-go-server/internal/naming"
 )
 
 // Error est une erreur de validation localisée dans le document.

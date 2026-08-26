@@ -8,7 +8,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	"github.com/leviathan/ogs/internal/model"
+	"leblanc.io/open-go-server/internal/model"
 )
 
 // Backend est ce que la TUI attend de l'application : elle n'appelle jamais un

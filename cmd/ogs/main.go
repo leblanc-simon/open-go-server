@@ -8,7 +8,7 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/leviathan/ogs/internal/cli"
+	"leblanc.io/open-go-server/internal/cli"
 )
 
 func main() {

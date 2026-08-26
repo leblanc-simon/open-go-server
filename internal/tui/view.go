@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/leviathan/ogs/internal/model"
+	"leblanc.io/open-go-server/internal/model"
 )
 
 // View rend l'écran courant.

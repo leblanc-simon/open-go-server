@@ -12,7 +12,7 @@ import (
 
 	"github.com/goccy/go-yaml"
 
-	"github.com/leviathan/ogs/internal/model"
+	"leblanc.io/open-go-server/internal/model"
 )
 
 // ErrNotFound est renvoyé lorsqu'aucun fichier de projet ne correspond.

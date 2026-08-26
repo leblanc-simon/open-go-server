@@ -11,8 +11,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/leviathan/ogs/internal/exec"
-	"github.com/leviathan/ogs/internal/model"
+	"leblanc.io/open-go-server/internal/exec"
+	"leblanc.io/open-go-server/internal/model"
 )
 
 // Événements du cycle de vie.

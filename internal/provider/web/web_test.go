@@ -10,15 +10,15 @@ import (
 	"testing"
 	"time"
 
-	"github.com/leviathan/ogs/internal/config"
-	"github.com/leviathan/ogs/internal/engine"
-	"github.com/leviathan/ogs/internal/exec"
-	"github.com/leviathan/ogs/internal/fs"
-	"github.com/leviathan/ogs/internal/model"
-	"github.com/leviathan/ogs/internal/naming"
-	"github.com/leviathan/ogs/internal/provider/php"
-	"github.com/leviathan/ogs/internal/store"
-	"github.com/leviathan/ogs/internal/template"
+	"leblanc.io/open-go-server/internal/config"
+	"leblanc.io/open-go-server/internal/engine"
+	"leblanc.io/open-go-server/internal/exec"
+	"leblanc.io/open-go-server/internal/fs"
+	"leblanc.io/open-go-server/internal/model"
+	"leblanc.io/open-go-server/internal/naming"
+	"leblanc.io/open-go-server/internal/provider/php"
+	"leblanc.io/open-go-server/internal/store"
+	"leblanc.io/open-go-server/internal/template"
 )
 
 func fixture(t *testing.T, engineName string) (*Provider, config.Paths) {

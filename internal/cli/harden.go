@@ -6,8 +6,8 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/leviathan/ogs/internal/engine"
-	"github.com/leviathan/ogs/internal/provider/hardening"
+	"leblanc.io/open-go-server/internal/engine"
+	"leblanc.io/open-go-server/internal/provider/hardening"
 )
 
 // newHardenCommand construit « ogs harden ». Le rapport est le comportement par

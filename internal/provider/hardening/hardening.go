@@ -25,7 +25,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/leviathan/ogs/internal/engine"
+	"leblanc.io/open-go-server/internal/engine"
 )
 
 // Target décrit un chemin à restreindre.

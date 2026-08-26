@@ -8,7 +8,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/leviathan/ogs/internal/naming"
+	"leblanc.io/open-go-server/internal/naming"
 )
 
 // reIdentifier est la liste blanche des identifiants d'objets SQL. Les noms

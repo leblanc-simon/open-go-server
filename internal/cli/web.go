@@ -6,7 +6,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/leviathan/ogs/internal/provider/system"
+	"leblanc.io/open-go-server/internal/provider/system"
 )
 
 func newWebCommand(app *App) *cobra.Command {

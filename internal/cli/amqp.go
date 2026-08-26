@@ -9,10 +9,10 @@ import (
 	"github.com/goccy/go-yaml"
 	"github.com/spf13/cobra"
 
-	"github.com/leviathan/ogs/internal/fs"
-	"github.com/leviathan/ogs/internal/model"
-	"github.com/leviathan/ogs/internal/provider/amqp"
-	"github.com/leviathan/ogs/internal/spec"
+	"leblanc.io/open-go-server/internal/fs"
+	"leblanc.io/open-go-server/internal/model"
+	"leblanc.io/open-go-server/internal/provider/amqp"
+	"leblanc.io/open-go-server/internal/spec"
 )
 
 func newAMQPCommand(app *App) *cobra.Command {

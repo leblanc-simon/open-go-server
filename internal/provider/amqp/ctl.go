@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/leviathan/ogs/internal/exec"
+	"leblanc.io/open-go-server/internal/exec"
 )
 
 // ctlClient pilote le broker par rabbitmqctl, en mode dégradé : la CLI ne permet

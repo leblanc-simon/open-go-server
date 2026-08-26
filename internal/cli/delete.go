@@ -13,17 +13,17 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/leviathan/ogs/internal/archive"
-	"github.com/leviathan/ogs/internal/engine"
-	"github.com/leviathan/ogs/internal/exec"
-	"github.com/leviathan/ogs/internal/hook"
-	"github.com/leviathan/ogs/internal/model"
-	"github.com/leviathan/ogs/internal/provider/cron"
-	"github.com/leviathan/ogs/internal/provider/system"
-	"github.com/leviathan/ogs/internal/provider/unit"
-	"github.com/leviathan/ogs/internal/spec"
-	"github.com/leviathan/ogs/internal/store"
-	"github.com/leviathan/ogs/internal/version"
+	"leblanc.io/open-go-server/internal/archive"
+	"leblanc.io/open-go-server/internal/engine"
+	"leblanc.io/open-go-server/internal/exec"
+	"leblanc.io/open-go-server/internal/hook"
+	"leblanc.io/open-go-server/internal/model"
+	"leblanc.io/open-go-server/internal/provider/cron"
+	"leblanc.io/open-go-server/internal/provider/system"
+	"leblanc.io/open-go-server/internal/provider/unit"
+	"leblanc.io/open-go-server/internal/spec"
+	"leblanc.io/open-go-server/internal/store"
+	"leblanc.io/open-go-server/internal/version"
 )
 
 // ArchiveSizeThreshold est la taille au-delà de laquelle l'archivage demande une

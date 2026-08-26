@@ -23,8 +23,8 @@ import (
 	"github.com/go-acme/lego/v4/providers/http/webroot"
 	"github.com/go-acme/lego/v4/registration"
 
-	"github.com/leviathan/ogs/internal/config"
-	"github.com/leviathan/ogs/internal/fs"
+	"leblanc.io/open-go-server/internal/config"
+	"leblanc.io/open-go-server/internal/fs"
 )
 
 // DNSProviderOVH est le seul provider DNS géré (D27).

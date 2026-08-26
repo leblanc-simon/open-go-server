@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/leviathan/ogs/internal/engine"
+	"leblanc.io/open-go-server/internal/engine"
 )
 
 func fixture(t *testing.T, cibles ...Target) (*Provider, string) {

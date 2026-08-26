@@ -9,9 +9,9 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/leviathan/ogs/internal/model"
-	"github.com/leviathan/ogs/internal/provider/db"
-	"github.com/leviathan/ogs/internal/spec"
+	"leblanc.io/open-go-server/internal/model"
+	"leblanc.io/open-go-server/internal/provider/db"
+	"leblanc.io/open-go-server/internal/spec"
 )
 
 func newDBCommand(app *App) *cobra.Command {

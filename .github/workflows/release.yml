@@ -33,9 +33,9 @@ jobs:
           for arch in amd64 arm64; do
             GOARCH=$arch go build -trimpath \
               -ldflags "-s -w \
-                -X github.com/leviathan/ogs/internal/version.Version=${GITHUB_REF_NAME} \
-                -X github.com/leviathan/ogs/internal/version.Commit=$(git rev-parse --short HEAD) \
-                -X github.com/leviathan/ogs/internal/version.Date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                -X leblanc.io/open-go-server/internal/version.Version=${GITHUB_REF_NAME} \
+                -X leblanc.io/open-go-server/internal/version.Commit=$(git rev-parse --short HEAD) \
+                -X leblanc.io/open-go-server/internal/version.Date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
               -o dist/ogs ./cmd/ogs
             tar -C dist -czf "dist/ogs_${version}_linux_${arch}.tar.gz" ogs
             OGS_VERSION=$version OGS_ARCH=$arch \

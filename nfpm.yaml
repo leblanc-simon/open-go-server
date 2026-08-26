@@ -13,7 +13,7 @@ description: |
   tâches planifiées et services systemd — décrits par un fichier YAML et
   appliqués par un moteur de réconciliation idempotent.
 vendor: open-go-server
-homepage: https://github.com/leviathan/ogs
+homepage: https://leblanc.io/open-go-server
 license: WTFPL
 
 # Le binaire est statique : aucune dépendance de bibliothèque. Les serveurs

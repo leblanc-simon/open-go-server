@@ -3,7 +3,7 @@ package amqp
 import (
 	"fmt"
 
-	"github.com/leviathan/ogs/internal/model"
+	"leblanc.io/open-go-server/internal/model"
 )
 
 // DefaultExchange est l'exchange dans lequel Symfony Messenger publie.

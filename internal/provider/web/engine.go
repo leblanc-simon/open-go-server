@@ -8,7 +8,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/leviathan/ogs/internal/exec"
+	"leblanc.io/open-go-server/internal/exec"
 )
 
 // Engine abstrait un serveur web. Les deux implémentations partagent le même

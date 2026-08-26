@@ -7,8 +7,8 @@ import (
 	"path/filepath"
 	"sort"
 
-	"github.com/leviathan/ogs/internal/config"
-	"github.com/leviathan/ogs/internal/validate"
+	"leblanc.io/open-go-server/internal/config"
+	"leblanc.io/open-go-server/internal/validate"
 )
 
 // Supported énumère les versions gérées (D39). Les versions en fin de support en

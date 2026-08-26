@@ -12,12 +12,12 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/leviathan/ogs/internal/archive"
-	"github.com/leviathan/ogs/internal/exec"
-	appprov "github.com/leviathan/ogs/internal/provider/app"
-	"github.com/leviathan/ogs/internal/provider/db"
-	"github.com/leviathan/ogs/internal/provider/hardening"
-	"github.com/leviathan/ogs/internal/validate"
+	"leblanc.io/open-go-server/internal/archive"
+	"leblanc.io/open-go-server/internal/exec"
+	appprov "leblanc.io/open-go-server/internal/provider/app"
+	"leblanc.io/open-go-server/internal/provider/db"
+	"leblanc.io/open-go-server/internal/provider/hardening"
+	"leblanc.io/open-go-server/internal/validate"
 )
 
 // check est le résultat d'un contrôle de diagnostic.

@@ -8,9 +8,9 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/leviathan/ogs/internal/importer"
-	"github.com/leviathan/ogs/internal/provider/db"
-	"github.com/leviathan/ogs/internal/spec"
+	"leblanc.io/open-go-server/internal/importer"
+	"leblanc.io/open-go-server/internal/provider/db"
+	"leblanc.io/open-go-server/internal/spec"
 )
 
 func newImportCommand(app *App) *cobra.Command {

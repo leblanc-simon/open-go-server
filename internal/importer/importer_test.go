@@ -7,9 +7,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/leviathan/ogs/internal/config"
-	"github.com/leviathan/ogs/internal/model"
-	"github.com/leviathan/ogs/internal/provider/web"
+	"leblanc.io/open-go-server/internal/config"
+	"leblanc.io/open-go-server/internal/model"
+	"leblanc.io/open-go-server/internal/provider/web"
 )
 
 // legacyServer construit un serveur « configuré à la main », tel qu'on en

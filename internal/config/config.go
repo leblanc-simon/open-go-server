@@ -7,8 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/leviathan/ogs/internal/naming"
-	"github.com/leviathan/ogs/internal/provider/hardening"
+	"leblanc.io/open-go-server/internal/naming"
+	"leblanc.io/open-go-server/internal/provider/hardening"
 )
 
 // Config est la configuration globale, chargée depuis /etc/ogs/config.yaml.
