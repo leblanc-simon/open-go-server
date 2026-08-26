@@ -29,6 +29,12 @@ func writeHook(t *testing.T, dir, name, body string, mode os.FileMode) string {
 	if err := os.WriteFile(path, []byte(body), mode); err != nil {
 		t.Fatal(err)
 	}
+	// Le mode passé à WriteFile est rogné par l'umask : sous 0022, le script du
+	// test « inscriptible par tous » naissait en 0755 et le contrôle n'avait rien
+	// à refuser. Chmod, lui, impose le mode demandé.
+	if err := os.Chmod(path, mode); err != nil {
+		t.Fatal(err)
+	}
 	return path
 }
 
