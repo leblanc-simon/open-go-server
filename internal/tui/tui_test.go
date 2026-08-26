@@ -26,6 +26,8 @@ type fakeBackend struct {
 	diffLines []string
 }
 
+func (f *fakeBackend) PrepDomain() string { return "preprod-pp.net" }
+
 func (f *fakeBackend) Projects() ([]*model.Project, error) { return f.projects, nil }
 
 func (f *fakeBackend) Snapshot(_ context.Context, p *model.Project) (Snapshot, error) {
@@ -266,6 +268,7 @@ func TestWizardCollectsAnswers(t *testing.T) {
 	m := New(backend)
 	_ = drive(m, m.Init()())
 	msgs := []tea.Msg{key("n")}
+	msgs = append(msgs, key("enter")) // environnement : prod
 	msgs = append(msgs, typeText("shop.fr")...)
 	msgs = append(msgs, key("enter"))         // host
 	msgs = append(msgs, key("enter"))         // type : défaut php-symfony
@@ -273,7 +276,6 @@ func TestWizardCollectsAnswers(t *testing.T) {
 	msgs = append(msgs, key("enter"))         // version applicative
 	msgs = append(msgs, typeText("8.5")...)   //
 	msgs = append(msgs, key("enter"))         // version PHP
-	msgs = append(msgs, key("enter"))         // environnement : prod
 	msgs = append(msgs, typeText("mysql")...) //
 	msgs = append(msgs, key("enter"))         // base
 	msgs = append(msgs, typeText("async")...) //
@@ -297,11 +299,30 @@ func TestWizardCollectsAnswers(t *testing.T) {
 	}
 }
 
+// L'assistant annonce le host qui sera servi : une préproduction saisie avec un
+// host déjà construit le construirait deux fois.
+func TestWizardHostHelpAnnouncesPrepHost(t *testing.T) {
+	backend := &fakeBackend{}
+	m := New(backend)
+	_ = drive(m, m.Init()())
+	msgs := []tea.Msg{key("n")}
+	msgs = append(msgs, typeText("prep")...)
+	msgs = append(msgs, key("enter")) // environnement : prep
+	view := drive(m, msgs...)
+	if !strings.Contains(view, "shop.preprod-pp.net") {
+		t.Errorf("l'aide doit montrer le host construit :\n%s", view)
+	}
+	if !strings.Contains(view, "host de production") {
+		t.Errorf("l'aide doit dire quel host saisir :\n%s", view)
+	}
+}
+
 func TestWizardRejectsUnknownChoice(t *testing.T) {
 	backend := &fakeBackend{}
 	m := New(backend)
 	_ = drive(m, m.Init()())
 	msgs := []tea.Msg{key("n")}
+	msgs = append(msgs, key("enter")) // environnement : prod
 	msgs = append(msgs, typeText("shop.fr")...)
 	msgs = append(msgs, key("enter"))
 	msgs = append(msgs, typeText("php-drupal")...)
@@ -319,7 +340,7 @@ func TestWizardRequiresHost(t *testing.T) {
 	backend := &fakeBackend{}
 	m := New(backend)
 	_ = drive(m, m.Init()())
-	view := drive(m, key("n"), key("enter"))
+	view := drive(m, key("n"), key("enter"), key("enter"))
 	if !strings.Contains(view, "obligatoire") {
 		t.Errorf("le host est obligatoire :\n%s", view)
 	}
@@ -330,6 +351,7 @@ func TestWizardEscapeAbandonsWithoutWriting(t *testing.T) {
 	m := New(backend)
 	_ = drive(m, m.Init()())
 	msgs := []tea.Msg{key("n")}
+	msgs = append(msgs, key("enter")) // environnement : prod
 	msgs = append(msgs, typeText("shop.fr")...)
 	msgs = append(msgs, key("esc"))
 	drive(m, msgs...)

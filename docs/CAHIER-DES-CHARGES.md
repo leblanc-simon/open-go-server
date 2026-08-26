@@ -92,7 +92,7 @@ Décisions arbitrées et figées pour la v1. Toute remise en cause est une évol
 | D21 | Accès | **Root strict** pour toute opération d'administration, avec une exception délimitée : `ogs my <verbe>` (D28) | Audit non nominatif (voir §14.3) |
 | D22 | Sorties | `--output json\|yaml\|table`, codes de retour normalisés, complétion | Toute commande de lecture doit être sérialisable |
 | D23 | Nommage | **Un identifiant unique** dérivé du host nomme user, groupe, bases, vhost AMQP, pool, vhost web, unités, cron | Contrainte de longueur commune à 32 car. ; suffixes de rôle pour les ressources additionnelles |
-| D24 | Environnements | `prod` et `prep` ; la préproduction suffixe l'identifiant par **`prep`** (sans séparateur) et vit sur un domaine dédié : `<id de prod>.preprod-pp.net` | Réserve 4 car. sur les 32 disponibles ; le domaine est une clé de configuration globale |
+| D24 | Environnements | `prod` et `prep` ; la préproduction suffixe l'identifiant par **`prep`** (sans séparateur) et vit sur un domaine dédié : `<label de prod>.preprod-pp.net` (D58) | Réserve 4 car. sur les 32 disponibles ; le domaine est une clé de configuration globale |
 | D25 | Accès du serveur web | **Groupe privé par projet**, `www-data` ajouté comme **membre secondaire** de chaque groupe | Isolation inter-sites préservée ; `.env` et `var/` restent hors de portée de `www-data` |
 | D26 | Certificats partagés | Un certificat peut être de **portée serveur** et référencé par `@<nom>` ; la préproduction utilise un wildcard `*.preprod-pp.net` unique | Impose DNS-01 et des credentials en écriture sur la zone ; supprime tout appel ACME à la création d'une préproduction |
 | D27 | DNS | **Hors périmètre** : un wildcard `*.preprod-pp.net` est créé manuellement une fois ; `doctor` vérifie seulement la résolution | Un seul serveur de préproduction par domaine |
@@ -109,6 +109,8 @@ Décisions arbitrées et figées pour la v1. Toute remise en cause est une évol
 | D38 | Compatibilité PHP | La contrainte `require.php` du **`composer.json` de l'application** fait autorité ; table indicative en secours seulement | Aucune matrice figée à maintenir ; `php switch` refuse une bascule incompatible sans `--force` |
 | D39 | Versions PHP | **7.4 à 8.5**, y compris des versions en fin de support | `doctor` les signale sans jamais bloquer : un Prestashop ancien peut exiger 7.4 |
 | D57 | Accès aux préproductions | **Aucune authentification** : elles sont accessibles par défaut, protégées seulement de l'indexation (`X-Robots-Tag`, `robots.txt`) | Une authentification à poser gêne le travail quotidien — recettes clients, tests d'intégration, webhooks de fournisseurs. La contrepartie est explicite : une préproduction est publique, donc sans donnée réelle |
+| D58 | Host de préproduction | Le sous-domaine reprend le host canonique **privé de son extension** (`jardindeco.fr` → `jardindeco.preprod-pp.net`) ; un host **déjà posé** sur le domaine de préproduction est pris **tel quel**, et l'identifiant se dérive alors de son seul label | L'extension n'apporte rien à un nom qui vit sur un domaine dédié. Et le host construit est celui qu'on a sous les yeux : le saisir tel quel est le réflexe naturel, qui donnait `jardindecopreprodppnet.preprod-pp.net`, le home du même nom et l'utilisateur `jardindecopreprodppnetprep`. Deux contreparties assumées : deux hosts ne différant que par leur extension revendiquent le même sous-domaine — la collision est refusée par le contrôle d'unicité du host effectif, jamais silencieuse ; seul le **dernier** label est retiré, reconnaître `co.uk` ou `com.br` exigeant une liste des suffixes publics, hors périmètre |
+| D59 | Unité du moteur web | ogs gère un complément d'unité `/etc/systemd/system/<moteur>.d/ogs.conf` qui **énumère** les répertoires de journaux des projets en `ReadWritePaths=-<chemin>` ; il est écrit **avant** les vhosts et déclenche un **redémarrage** du moteur, non un rechargement | Les distributions durcissent l'unité du serveur web — Ubuntu livre `apache2.service` avec `ProtectHome=read-only` — et un service ainsi protégé voit `/home` en lecture seule dans son seul espace de noms : le maître s'arrête en ouvrant le journal d'un vhost et emporte tous les sites, alors que `mount` affiche `rw` et que root écrit sans peine. `ReadWritePaths` remonte les chemins après application des protections, ce qui laisse le durcissement intact. Chaque répertoire est énuméré plutôt que la racine des homes : rien d'autre que les journaux n'a besoin de s'ouvrir. Le préfixe `-` est indispensable — un chemin absent fait échouer le service en 226/NAMESPACE — et le redémarrage l'est aussi : l'espace de noms est établi au démarrage, un `reload` ne le refait pas |
 | D56 | Droits des répertoires de configuration | `ogs harden` **rapporte** par défaut et n'applique qu'avec `--apply` ; il **ne desserre jamais** et **ne suit aucun lien symbolique** ; `/etc/php` reste ouvert à dessein | Les utilisateurs de projet ont un compte local : sans restriction ils dressent la carte du parc. Mais fermer un répertoire qu'un démon lit sous sa propre identité l'interromprait : le groupe cible est celui du service (rabbitmq, telegraf, redis, postgres), et `/etc/php` reste lisible parce que le PHP en ligne de commande des crons y lit son `php.ini`. Un outil de sécurité qui desserrerait des droits déjà plus stricts serait une régression |
 | D51 | Droits de l'arborescence | Home en **0711**, répertoires du projet en **0710** | Le home se traverse sans s'énumérer : servir un fichier n'exige que la traversée du répertoire et la lecture du fichier. Personne — pas même le serveur web — ne peut lister le contenu, ce qui ôte tout moyen de se promener dans l'arborescence. Le bit de groupe du home est indispensable : Unix retient la première classe applicable sans repli, donc un home en 0701 refuserait la traversée à `www-data` **parce qu'il est membre du groupe** |
 | D52 | Rétention des archives | **14 jours**, purgés par une étape du plan global ; zéro signifie « conserver indéfiniment » et doit être explicite | Une archive contient un dump de base, donc des données de clients : la garder sans terme n'est pas neutre. La purge est une étape annoncée, jamais un effet de bord |
@@ -372,8 +374,8 @@ Deux environnements : `prod` (défaut) et `prep`.
 
 | | Production | Préproduction |
 |---|---|---|
-| Host effectif | `shop.fr` (+ alias) | `shopfr.preprod-pp.net` |
-| Home | `/home/shop.fr` | `/home/shopfr.preprod-pp.net` |
+| Host effectif | `shop.fr` (+ alias) | `shop.preprod-pp.net` |
+| Home | `/home/shop.fr` | `/home/shop.preprod-pp.net` |
 | Identifiant (tout le reste) | `shopfr` | `shopfrprep` |
 | Certificat | propre au projet | wildcard partagé `*.preprod-pp.net` |
 
@@ -386,7 +388,7 @@ environments:
     hostTemplate: "{{.Host}}"                        # host canonique tel que saisi
   prep:
     domain: preprod-pp.net
-    hostTemplate: "{{.Id}}.{{.Domain}}"              # → shopfr.preprod-pp.net
+    hostTemplate: "{{.PrepLabel}}.{{.Domain}}"       # → shop.preprod-pp.net
     idSuffix: prep                                   # → shopfrprep
     certificate: "@wildcard-prep"                    # certificat partagé (§7.7.4)
     robotsNoindex: true
@@ -396,13 +398,21 @@ environments:
 
 Points à noter :
 
-- Le sous-domaine reprend l'identifiant **de production** (`shopfr`), pas celui de la préproduction : le
-  domaine `preprod-pp.net` porte déjà l'information d'environnement, la répéter dans le sous-domaine serait
-  redondant. L'identifiant des ressources système reste `shopfrprep`, seul moyen de faire coexister les deux
-  environnements sur un même serveur.
-- Le home suit la règle invariante `/home/<host effectif>`, donc `/home/shopfr.preprod-pp.net`.
+- Le sous-domaine reprend le host **de production privé de son extension** (`shop.fr` → `shop`, D58) : le
+  domaine `preprod-pp.net` porte déjà l'information d'environnement, et l'extension n'apporte rien à un nom
+  qui vit sur un domaine dédié. Le sous-domaine ne porte donc pas l'identifiant de la préproduction :
+  celui des ressources système reste `shopfrprep`, seul moyen de faire coexister les deux environnements
+  sur un même serveur.
+- Le home suit la règle invariante `/home/<host effectif>`, donc `/home/shop.preprod-pp.net`.
 - Le host de préproduction n'est **jamais** soumis à la dérivation du §3.3.1 : il est construit, pas dérivé.
   L'identifiant reste calculé depuis le host canonique de production, ce qui évite toute circularité.
+- Un host **déjà posé** sur le domaine de préproduction est pris tel quel (D58), et lui seul dérive alors
+  l'identifiant : `jardindeco.preprod-pp.net --env prep` donne le host inchangé, le home
+  `/home/jardindeco.preprod-pp.net` et l'identifiant `jardindecoprep`. C'est l'unique cas où l'identifiant
+  ne vient pas d'un host de production, faute qu'il en existe un.
+- Deux hosts ne différant que par leur extension (`shop.fr` et `shop.com`) revendiquent le même
+  sous-domaine de préproduction. La collision est refusée par le contrôle d'unicité du host effectif
+  (§3.3.6) ; l'un des deux doit alors employer `--host`.
 - `--host` permet de forcer un host de préproduction hors convention (client exigeant son propre
   sous-domaine) ; le certificat partagé ne s'applique alors plus et un certificat propre est émis.
 
@@ -469,7 +479,13 @@ explicite :
   courts doivent être détectées et rejetées.
 - **Empiètement sur le domaine de préproduction** : un projet de production dont le host canonique se
   termine par `.preprod-pp.net` est refusé, ce domaine étant réservé à l'espace de noms de préproduction
-  (§3.3.3).
+  (§3.3.3). En préproduction, le même host est au contraire pris tel quel (D58) : c'est le domaine, non
+  l'environnement, qui décide, et le message de refus indique de déclarer le projet avec `--env prep`.
+- **Collision entre extensions en préproduction** : `shop.fr` et `shop.com` déclarés tous deux en `prep`
+  revendiquent `shop.preprod-pp.net`. La clé d'unicité « host effectif » les sépare. Elle est lue sur le
+  domaine primaire de la déclaration et seulement calculée à défaut : un projet déclaré avant un changement
+  de convention sert toujours le nom inscrit dans son fichier, et le recalculer inventerait des conflits
+  entre des vhosts qui n'en ont aucun.
 
 ---
 
@@ -769,6 +785,32 @@ nettoyage manuel, et renvoie le code 1. Aucune tentative silencieuse.
   et **avant** reload. En cas d'échec, le fichier précédent est restauré et l'étape échoue.
 - Reload groupé : les intentions de reload sont dédupliquées et exécutées une seule fois en fin d'apply
   (un `systemctl daemon-reload`, un reload par version de PHP-FPM concernée, un reload du serveur web).
+- **Le rechargement du serveur web revalide juste avant d'agir**, et pas seulement à l'écriture. Les deux
+  moments sont séparés — les intentions sont groupées en fin d'apply — et ce qui était valide à l'écriture
+  peut ne plus l'être : un fichier référencé a pu disparaître entre-temps. L'enjeu est disproportionné,
+  `apachectl graceful` ne testant rien de lui-même : un maître Apache qui relit une configuration invalide
+  **meurt**, emportant tous les sites du serveur, pas seulement celui qu'on installe. Un rechargement refusé
+  laisse au contraire le serveur servir la configuration qu'il a déjà en mémoire.
+- **L'état du serveur est constaté après le rechargement**, et le service relevé s'il s'est arrêté. Le
+  compteur d'échecs est acquitté avant toute relance (`systemctl reset-failed`) : au-delà de
+  `StartLimitBurst` — cinq démarrages en dix secondes par défaut — systemd refuse de relancer et rend
+  « start request repeated too quickly », si bien qu'un serveur resterait mort alors que la cause vient
+  d'être levée. Aucune
+  vérification en amont ne couvre tous les cas : un service dont l'unité porte `ProtectHome` voit `/home` en
+  lecture seule **dans son seul espace de noms**, où ogs ne peut pas se placer — `mount` affiche `rw`, et le
+  serveur meurt pourtant sur l'ouverture d'un journal. Le fait est signalé dans tous les cas, même quand le
+  redémarrage réussit : un serveur qui meurt à chaque rechargement est un incident, non un désagrément.
+- **Un vhost dont le journal est hors d'atteinte du moteur n'est pas écrit** (§7.6, D59) : la vérification
+  lit `ProtectHome` et `ReadWritePaths` effectifs de l'unité — ceux que systemd applique après l'unité et
+  tous ses compléments — et non le fichier d'unité seul. Écrire depuis ogs ne prouve rien : root écrit là où
+  le service ne peut pas.
+- **Les journaux des vhosts sont éprouvés avant le même rechargement.** La validation syntaxique ne les
+  ouvre pas, alors que le maître ouvre tous les journaux de tous les vhosts et s'arrête si un seul résiste :
+  `AH00019: Unable to open logs, exiting`. Un unique projet dont le journal est inaccessible emporte donc le
+  serveur entier — le cas s'est produit sur un `/home` remonté en lecture seule après une erreur disque, avec
+  une configuration par ailleurs valide. Seuls les vhosts portant la marque d'ogs sont examinés, mais tous
+  le sont, pas seulement ceux du projet en cours : un rechargement est global, et c'est un tiers qui en fait
+  les frais. `doctor` porte le même contrôle, pour le découvrir avant le prochain rechargement.
 
 ---
 
@@ -910,8 +952,8 @@ support des ACL si `webAccess: acl` est utilisé, et cohérence des modes de l'a
 `ogs site create shop.fr --env prep` produit un projet distinct et complet :
 
 ```
-host effectif   shopfr.preprod-pp.net
-home            /home/shopfr.preprod-pp.net
+host effectif   shop.preprod-pp.net
+home            /home/shop.preprod-pp.net
 identifiant     shopfrprep
 user + groupe   shopfrprep
 base            shopfrprep      user de base   shopfrprep
@@ -919,7 +961,7 @@ vhost AMQP      shopfrprep      user AMQP      shopfrprep
 pool PHP        shopfrprep      socket         /run/php/php8.5-fpm-18502-shopfrprep.sock
 vhost web       shopfrprep.conf certificat     *.preprod-pp.net (partagé)
 unités          ogs-shopfrprep-*.service        cron  /etc/cron.d/ogs-shopfrprep
-logs            /home/shopfr.preprod-pp.net/logs/     interpréteur  .bin/php
+logs            /home/shop.preprod-pp.net/logs/       interpréteur  .bin/php
 sudoers         /etc/sudoers.d/ogs-shopfrprep
 ```
 
@@ -1001,13 +1043,20 @@ retrait de `www-data` du groupe. Refus de supprimer un utilisateur non créé pa
 d'état et sans marqueur `ogs=` dans le champ commentaire) sans `--force`. Le marqueur ne peut contenir ni `:`,
 séparateur de champs de `/etc/passwd`, ni `,`, séparateur de sous-champs du GECOS.
 
+Un `userdel` en échec ne fait pas abandonner l'arborescence : le home part quand même, et le compte restant
+est signalé avec la liste des processus qui le tiennent — lue dans `/proc`, `userdel` ne nommant que le
+premier PID — et la commande à passer pour finir. La suppression rend alors le code 6 (§13).
+
 #### 7.1.7 Garde-fous
 
 - Refus des noms réservés (`root`, `daemon`, `www-data`, `mysql`, `postgres`, `rabbitmq`, `nobody`…) et de
   tout identifiant déjà présent dans `/etc/passwd` ou `/etc/group` mais inconnu de la base d'état.
 - Refus d'un home hors de `/home` (ou de la racine configurée), refus d'un home existant non vide lors
   d'une création.
-- Vérification qu'aucun processus ne tourne sous l'utilisateur avant suppression.
+- Aucun processus ne doit tourner sous l'utilisateur au moment de sa suppression. Le rechargement des
+  serveurs, ordonné avant elle (§13, étape 8), y suffit dans le cas courant : c'est lui qui libère les
+  workers FPM du projet. Ce qui subsiste malgré tout est énuméré, jamais tué — ogs n'interrompt pas un
+  processus qu'il n'a pas déclaré.
 - Refus de générer un fichier sudoers pour un utilisateur qui n'est pas celui d'un projet géré, et refus
   d'écrire sous `/etc/sudoers.d/` un nom ne commençant pas par `ogs-`.
 - UID laissé au système, plage configurable ; jamais de réutilisation d'un UID libéré tant que des fichiers
@@ -1378,8 +1427,11 @@ Règles :
   par semaine et par domaine enregistré) cesse d'être une contrainte, quel que soit le nombre de sites.
 - Le wildcard impose le challenge DNS-01, donc des credentials en écriture sur la zone `preprod-pp.net`,
   chiffrés dans `/etc/ogs/credentials/dns/`. C'est la seule contrepartie du dispositif.
-- Un wildcard ne couvre qu'**un** niveau de sous-domaine : `shopfr.preprod-pp.net` est couvert,
-  `a.shopfr.preprod-pp.net` ne l'est pas. La validation refuse un host de préproduction à deux niveaux.
+- Un wildcard ne couvre qu'**un** niveau de sous-domaine : `shop.preprod-pp.net` est couvert,
+  `a.shop.preprod-pp.net` ne l'est pas. Un host de préproduction à deux niveaux — atteignable depuis qu'un
+  host peut être saisi tel quel (D58) — n'est pas refusé pour autant : le provider TLS constate que le
+  wildcard ne couvre pas les domaines servis et émet un certificat propre au projet, comme pour un `--host`
+  hors convention.
 - `ogs doctor` alerte à 21 jours de l'expiration d'un certificat partagé, avec une sévérité supérieure à
   celle d'un certificat de projet : son expiration casserait toutes les préproductions à la fois.
 
@@ -2020,9 +2072,9 @@ Variante préproduction — projet entièrement distinct, sans ressource partag�
 
 ```
 ogs site create shop.fr --env prep
-  → host effectif  shopfr.preprod-pp.net
+  → host effectif  shop.preprod-pp.net
   → identifiant    shopfrprep
-  → home           /home/shopfr.preprod-pp.net
+  → home           /home/shop.preprod-pp.net
   → certificat     *.preprod-pp.net (partagé, déjà émis) — aucun appel ACME
 ```
 
@@ -2168,9 +2220,19 @@ l'ensemble.
    configurations générées (vhost, pool, unités, cron), dumps de bases, secrets **chiffrés**, arborescence
    `/home/shop.fr`, et un manifeste JSON décrivant tout ce qui a été supprimé.
 7. Suppression des ressources vivantes : bases et utilisateurs SGBD, vhost et utilisateur AMQP, pool FPM,
-   fichiers de configuration, certificats (révocation si configurée), utilisateur système, arborescence.
-8. Le projet est marqué `archived` en base ; son YAML est déplacé dans `projects/archived/`.
-9. Hook `postDelete`.
+   fichiers de configuration, certificats (révocation si configurée).
+8. **Rechargement des serveurs** — PHP-FPM et le moteur web — puis `daemon-reload`. Cette étape précède
+   impérativement la suivante : les workers du pool tournent sous l'utilisateur du projet, et `userdel`
+   refuse un compte dont un processus vit encore. Un serveur à l'arrêt n'a rien à recharger et ne produit
+   donc aucun avertissement. Le rechargement du moteur web revalide la configuration au préalable (§6.5).
+9. Suppression de l'utilisateur système, du groupe — `www-data` en est d'abord retiré (§7.1.6) — et de
+   l'arborescence.
+10. Le projet est marqué `archived` en base ; son YAML est déplacé dans `projects/archived/`.
+11. Hook `postDelete`.
+
+Une étape en échec n'interrompt pas les suivantes : ce qui peut être démonté l'est, et la commande rend le
+**code 6** en énumérant ce qui subsiste. Une suppression annoncée comme un succès alors qu'elle laisse un
+compte et un home derrière elle est le pire des états possibles.
 
 Options : `--purge` supprime sans archiver (double confirmation, saisie de l'identifiant exigée) ; `--keep-data`
 conserve bases et fichiers en ne désactivant que le service ; `--no-dump` saute l'étape 5.
@@ -2448,11 +2510,11 @@ build multi-architecture. Les tests d'intégration sont obligatoires avant fusio
 | **L7 — TUI** | inspecteur, panneau de détail, actions contextuelles, suivi de logs, wizard de création | Création complète d'un projet depuis la TUI, parité avec la CLI |
 | **L8 — Import** | scan multi-sources, corrélation, adoption interactive, ressources non gérées | Adoption d'un serveur préconfiguré sans régression |
 | **L9 — Applications non-PHP** | types d'application, providers `runtime` (nvm, rbenv, pyenv, venv), templates de service Go/Node/Python/Ruby, vhosts de proxy, attente de disponibilité | Scénarios d'intégration 22 à 25 validés |
-| **L10 — Industrialisation** | hooks de parc et de projet, complétions dynamiques bash/zsh/fish, 96 pages de manuel engendrées, paquet `.deb` (nfpm), CI GitHub Actions, douze scénarios d'intégration conteneurisés (Apache, PHP, nginx, hooks, MariaDB, PostgreSQL, RabbitMQ, ACME, systemd et cron, runtimes, durcissement, paquet), plus un scénario optionnel pour les runtimes qui compilent, documentation d'exploitation | Paquet installable, documentation publiée |
+| **L10 — Industrialisation** | hooks de parc et de projet, complétions dynamiques bash/zsh/fish, 96 pages de manuel engendrées, paquet `.deb` (nfpm), CI GitHub Actions, quatorze scénarios d'intégration conteneurisés (Apache, PHP, nginx, hooks, MariaDB, PostgreSQL, RabbitMQ, ACME, systemd et cron, runtimes, durcissement, paquet, suppression, moteur web durci), plus un scénario optionnel pour les runtimes qui compilent, documentation d'exploitation | Paquet installable, documentation publiée |
 
 ### Ce que les essais sur système réel ont corrigé
 
-Les scénarios conteneurisés du lot L10 ont mis au jour vingt-cinq défauts qu'aucun test unitaire ne
+Les scénarios conteneurisés du lot L10 ont mis au jour vingt-huit défauts qu'aucun test unitaire ne
 pouvait voir, parce que tous supposaient un interlocuteur simulé :
 
 | Défaut | Conséquence en exploitation |

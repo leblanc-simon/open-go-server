@@ -91,7 +91,37 @@ func BaseID(host string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	id := reNotKept.ReplaceAllString(h, "")
+	return slug(h, host)
+}
+
+// PrepLabel dérive le label de sous-domaine d'une préproduction : l'identifiant du
+// host canonique **privé de son dernier label**, l'extension n'apportant rien à un
+// nom qui vit sur un domaine dédié (D58).
+//
+//	jardindeco.fr     → jardindeco
+//	api.shop.fr       → apishop
+//	mon-shop.co.uk    → monshopco
+//
+// Le dernier label seul est retiré : reconnaître « co.uk » ou « com.br » exigerait
+// une liste des suffixes publics, hors périmètre (§3.3.3). Deux hosts qui ne
+// diffèrent que par leur extension produisent donc le même label ; la collision est
+// détectée par le contrôle d'unicité du host effectif, jamais silencieuse.
+func PrepLabel(host string) (string, error) {
+	h, err := NormalizeHost(host)
+	if err != nil {
+		return "", err
+	}
+	// NormalizeHost garantit au moins deux labels : le reste n'est jamais vide.
+	labels := strings.Split(h, ".")
+	return slug(strings.Join(labels[:len(labels)-1], "."), host)
+}
+
+// slug applique la mécanique commune à BaseID et PrepLabel : suppression des
+// caractères non retenus, préfixage d'un nom commençant par un chiffre, troncature
+// déterministe. Le hachage porte sur la chaîne dérivée et non sur le host complet :
+// il doit distinguer ce que la troncature confond, ni plus ni moins.
+func slug(s, host string) (string, error) {
+	id := reNotKept.ReplaceAllString(s, "")
 	if id == "" {
 		return "", fmt.Errorf("host %q : aucun caractère exploitable pour un identifiant", host)
 	}
@@ -99,7 +129,7 @@ func BaseID(host string) (string, error) {
 		id = digitPrefix + id
 	}
 	if len(id) > MaxBase {
-		sum := sha256.Sum256([]byte(h))
+		sum := sha256.Sum256([]byte(s))
 		id = id[:truncKeep] + "_" + hex.EncodeToString(sum[:])[:hashLen]
 	}
 	if !reIdentifier.MatchString(id) {
@@ -111,8 +141,13 @@ func BaseID(host string) (string, error) {
 // ID renvoie l'identifiant effectif du projet : l'identifiant de base en
 // production, suffixé de « prep » en préproduction. La troncature portant sur le
 // host, la base reste identique entre les deux environnements.
-func ID(host string, env Env) (string, error) {
-	base, err := BaseID(host)
+//
+// Seule exception : une préproduction déclarée directement sur le domaine de
+// préproduction (D58) n'a pas de host de production dont dériver la base ; elle la
+// tire du host privé de ce domaine, sans quoi jardindeco.preprod-pp.net donnerait
+// l'utilisateur jardindecopreprodppnetprep.
+func ID(host string, env Env, prepDomain string) (string, error) {
+	base, err := baseFor(host, env, prepDomain)
 	if err != nil {
 		return "", err
 	}
@@ -125,24 +160,66 @@ func ID(host string, env Env) (string, error) {
 	return base, nil
 }
 
+// baseFor choisit la chaîne dont l'identifiant de base est dérivé.
+func baseFor(host string, env Env, prepDomain string) (string, error) {
+	h, err := NormalizeHost(host)
+	if err != nil {
+		return "", err
+	}
+	prepDomain = strings.TrimPrefix(prepDomain, ".")
+	if env == EnvPrep && OnPrepDomain(h, prepDomain) {
+		// Le host peut être le domaine de préproduction lui-même : il ne reste alors
+		// rien à dériver, et le host complet fait office de base.
+		if sub := strings.TrimSuffix(h, "."+prepDomain); sub != h && sub != "" {
+			return slug(sub, host)
+		}
+	}
+	return slug(h, host)
+}
+
 // EffectiveHost renvoie le host réellement servi. En préproduction, le host est
-// construit — jamais dérivé — sur le domaine dédié : <identifiant de prod>.<domaine>.
+// construit — jamais dérivé — sur le domaine dédié : <label de prod>.<domaine>.
+//
+// Deux cas particuliers, tous deux dictés par la même règle : le domaine de
+// préproduction appartient à l'espace de noms de la préproduction.
+//
+//   - en préproduction, un host déjà posé sur ce domaine est pris **tel quel** (D58) :
+//     le construire une seconde fois donnerait jardindecopreprodppnet.preprod-pp.net ;
+//   - en production, un tel host est **refusé** (§3.3.6) : il empiéterait sur cet
+//     espace de noms.
 func EffectiveHost(host string, env Env, prepDomain string) (string, error) {
 	h, err := NormalizeHost(host)
 	if err != nil {
 		return "", err
 	}
+	prepDomain = strings.TrimPrefix(prepDomain, ".")
 	if env != EnvPrep {
+		if prepDomain != "" && OnPrepDomain(h, prepDomain) {
+			return "", fmt.Errorf("host %q : le domaine %q est réservé à la préproduction "+
+				"(déclarer le projet avec --env prep)", h, prepDomain)
+		}
 		return h, nil
 	}
 	if prepDomain == "" {
 		return "", fmt.Errorf("domaine de préproduction non configuré (environments.prep.domain)")
 	}
-	base, err := BaseID(host)
+	if OnPrepDomain(h, prepDomain) {
+		return h, nil
+	}
+	label, err := PrepLabel(host)
 	if err != nil {
 		return "", err
 	}
-	return base + "." + strings.TrimPrefix(prepDomain, "."), nil
+	return label + "." + prepDomain, nil
+}
+
+// OnPrepDomain dit si un host canonique appartient déjà au domaine de préproduction.
+func OnPrepDomain(host, prepDomain string) bool {
+	prepDomain = strings.TrimPrefix(prepDomain, ".")
+	if prepDomain == "" {
+		return false
+	}
+	return host == prepDomain || strings.HasSuffix(host, "."+prepDomain)
 }
 
 // ValidateIdentifier vérifie un identifiant fourni à la main (option --id).

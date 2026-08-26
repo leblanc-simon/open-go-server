@@ -36,7 +36,7 @@ func TestBaseIDTruncationIsDeterministicAndBounded(t *testing.T) {
 		t.Errorf("longueur %d, attendu %d (%q)", len(first), MaxBase, first)
 	}
 	// Le suffixe d'environnement doit encore tenir dans la limite dure.
-	prep, err := ID(host, EnvPrep)
+	prep, err := ID(host, EnvPrep, "preprod-pp.net")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,11 +67,11 @@ func TestBaseIDCollisionOnShortHosts(t *testing.T) {
 }
 
 func TestIDPrepSharesBase(t *testing.T) {
-	prod, err := ID("shop.fr", EnvProd)
+	prod, err := ID("shop.fr", EnvProd, "preprod-pp.net")
 	if err != nil {
 		t.Fatal(err)
 	}
-	prep, err := ID("shop.fr", EnvPrep)
+	prep, err := ID("shop.fr", EnvPrep, "preprod-pp.net")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,15 +91,84 @@ func TestEffectiveHost(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if h != "shopfr.preprod-pp.net" {
+	// L'extension du host de production ne participe pas au sous-domaine (D58) :
+	// elle n'apporte rien à un nom qui vit sur un domaine dédié.
+	if h != "shop.preprod-pp.net" {
 		t.Errorf("prep : %q", h)
 	}
 	// Le sous-domaine reprend l'identifiant de production, pas celui de préproduction.
-	if h == "shopfrprep.preprod-pp.net" {
+	if h == "shopprep.preprod-pp.net" {
 		t.Errorf("le suffixe prep ne doit pas apparaître dans le host")
 	}
 	if _, err := EffectiveHost("shop.fr", EnvPrep, ""); err == nil {
 		t.Errorf("un domaine de préproduction absent doit être une erreur")
+	}
+}
+
+func TestPrepLabelIgnoresExtension(t *testing.T) {
+	for host, want := range map[string]string{
+		"jardindeco.fr":  "jardindeco",
+		"api.shop.fr":    "apishop",
+		"mon-shop.co.uk": "monshopco",
+		"1001pneus.fr":   "s1001pneus",
+	} {
+		got, err := PrepLabel(host)
+		if err != nil {
+			t.Fatalf("%s : %v", host, err)
+		}
+		if got != want {
+			t.Errorf("PrepLabel(%q) = %q, attendu %q", host, got, want)
+		}
+	}
+	// Le label reste un label DNS valide, donc borné comme un identifiant.
+	long, err := PrepLabel("ma-boutique-de-vente-en-ligne-de-chaussures.fr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(long) > MaxBase {
+		t.Errorf("label trop long : %q (%d)", long, len(long))
+	}
+}
+
+// Un host déjà posé sur le domaine de préproduction est pris tel quel, et
+// l'identifiant se dérive du seul label : le construire une seconde fois donnait
+// jardindecopreprodppnet.preprod-pp.net et l'utilisateur jardindecopreprodppnetprep.
+func TestPrepHostAlreadyOnPrepDomain(t *testing.T) {
+	const host = "jardindeco.preprod-pp.net"
+	h, err := EffectiveHost(host, EnvPrep, "preprod-pp.net")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h != host {
+		t.Errorf("host effectif %q, attendu %q", h, host)
+	}
+	id, err := ID(host, EnvPrep, "preprod-pp.net")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id != "jardindecoprep" {
+		t.Errorf("identifiant %q, attendu jardindecoprep", id)
+	}
+	// Le domaine de préproduction nu ne laisse rien à dériver : le host entier
+	// fait alors office de base, plutôt qu'une erreur sur un cas inoffensif.
+	if id, err := ID("preprod-pp.net", EnvPrep, "preprod-pp.net"); err != nil || id != "preprodppnetprep" {
+		t.Errorf("domaine nu : %q, %v", id, err)
+	}
+}
+
+// Un projet de production sur le domaine de préproduction est refusé (§3.3.6) :
+// ce domaine est réservé à l'espace de noms de la préproduction.
+func TestProdHostOnPrepDomainRejected(t *testing.T) {
+	if _, err := EffectiveHost("jardindeco.preprod-pp.net", EnvProd, "preprod-pp.net"); err == nil {
+		t.Error("un host de production sur le domaine de préproduction doit être refusé")
+	}
+	if _, err := EffectiveHost("preprod-pp.net", EnvProd, "preprod-pp.net"); err == nil {
+		t.Error("le domaine de préproduction lui-même doit être refusé en production")
+	}
+	// Un host qui n'en est pas un sous-domaine reste accepté : la comparaison
+	// porte sur les labels, pas sur les caractères.
+	if _, err := EffectiveHost("nonpreprod-pp.net", EnvProd, "preprod-pp.net"); err != nil {
+		t.Errorf("host voisin refusé à tort : %v", err)
 	}
 }
 

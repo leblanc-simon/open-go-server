@@ -28,6 +28,9 @@ type Backend interface {
 	RenewCertificate(ctx context.Context, p *model.Project) error
 	// Create déclare un projet depuis les réponses de l'assistant.
 	Create(ctx context.Context, answers WizardAnswers) (string, error)
+	// PrepDomain renvoie le domaine de préproduction configuré, dont l'assistant a
+	// besoin pour annoncer le host qui sera réellement servi.
+	PrepDomain() string
 }
 
 // Snapshot est l'état d'un projet tel que la TUI l'affiche.
@@ -327,7 +330,7 @@ func (m *Model) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case "n":
-		m.wizard = newWizard()
+		m.wizard = newWizard(m.backend.PrepDomain())
 		m.mode = modeWizard
 		return m, nil
 	}

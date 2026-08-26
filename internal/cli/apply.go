@@ -151,6 +151,23 @@ func (a *App) buildPlan(ctx context.Context, provs *providers, p *model.Project)
 	}
 
 	if len(p.Spec.Domains) > 0 {
+		// Le complément d'unité du moteur web précède les vhosts, et non le plan
+		// global qui s'exécute après les projets : un vhost journalisant dans un
+		// répertoire que le moteur ne peut pas atteindre arrête le serveur au
+		// rechargement, donc avant que le plan global n'ait eu son tour. Il énumère
+		// les journaux de tout le parc, l'unité étant partagée.
+		all, err := a.loadProjects()
+		if err != nil {
+			return nil, err
+		}
+		dropIn, err := provs.Web.PlanDropIn(ctx, withProject(all, p))
+		if err != nil {
+			return nil, wrap(CodeError, err)
+		}
+		for _, s := range dropIn {
+			plan.Add(s)
+		}
+
 		webObs, err := provs.Web.Observe(ctx, p)
 		if err != nil {
 			return nil, wrap(CodeError, err)
@@ -640,11 +657,21 @@ func (a *App) recordState(p *model.Project) error {
 	return wrap(CodeError, a.Store.UpsertProject(row))
 }
 
-func effectiveHostOf(p *model.Project) string {
-	for _, d := range p.Spec.Domains {
-		if d.Role == "" || d.Role == "primary" {
-			return d.Name
+// withProject garantit la présence du projet courant dans la liste du parc : lors
+// d'une création, sa déclaration peut n'être pas encore sur le disque, et son
+// répertoire de journaux serait alors le seul absent du complément d'unité.
+func withProject(all []*model.Project, p *model.Project) []*model.Project {
+	for _, other := range all {
+		if other.ID() == p.ID() {
+			return all
 		}
+	}
+	return append(all, p)
+}
+
+func effectiveHostOf(p *model.Project) string {
+	if d := p.PrimaryDomain(); d != "" {
+		return d
 	}
 	return p.Metadata.Host
 }

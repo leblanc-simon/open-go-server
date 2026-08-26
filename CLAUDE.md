@@ -12,8 +12,8 @@ Les commits ne mentionnent jamais l'assistance d'un outil d'IA.
 
 ## La référence
 
-[`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md) fait autorité : 57 décisions d'architecture
-arbitrées (D1–D55, tableau §2), spécification par module, plan de tests, découpage en lots. **Consulter le
+[`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md) fait autorité : 59 décisions d'architecture
+arbitrées (D1–D59, tableau §2), spécification par module, plan de tests, découpage en lots. **Consulter le
 tableau des décisions avant de proposer une architecture** — la plupart des questions « pourquoi pas
 plutôt… ? » y sont déjà tranchées, avec leur raison. Toute décision nouvelle s'y ajoute.
 
@@ -43,12 +43,12 @@ make dev-demo                                   # crée ./dev, deux projets, pla
 
 ### Essais sur système réel
 
-Douze scénarios conteneurisés éprouvent ce que les tests unitaires ne peuvent pas voir. Ils ont mis au jour
+Quatorze scénarios conteneurisés éprouvent ce que les tests unitaires ne peuvent pas voir. Ils ont mis au jour
 plus de trente défauts invisibles autrement (§18 du cahier des charges) : **y recourir avant de déclarer un
 provider fonctionnel**.
 
 ```sh
-make integration-all       # les douze, à la suite
+make integration-all       # les quatorze, à la suite
 make integration-nginx     # un seul (voir SCENARIOS dans le Makefile)
 
 # Hors série : rbenv et pyenv compilent depuis les sources (un quart d'heure).
@@ -174,6 +174,32 @@ Ils ont tous coûté un défaut réel ; les tests unitaires ne les voyaient pas.
   sans quoi il rendrait les hooks inexécutables donc refusés par ogs lui-même. `/etc/php` reste ouvert :
   le PHP en ligne de commande des crons y lit son `php.ini`, et le fermer changerait le comportement de
   PHP sans le moindre message.
+- **Un rechargement du serveur web peut tuer le serveur.** `apachectl graceful` ne teste pas la
+  configuration : un maître Apache qui relit une configuration invalide meurt, et tous les sites tombent.
+  D'où la revalidation dans `web.Provider.Reload`, en plus de celle de l'écriture — les intentions étant
+  groupées en fin d'apply, un fichier référencé a pu disparaître entre les deux.
+- Aucune vérification en amont d'un rechargement ne couvre tout : `ProtectHome` dans une unité fait voir
+  `/home` en lecture seule **au seul service**, là où ogs écrit sans peine. D'où le constat en aval —
+  `web.Provider.Reload` vérifie `is-active` après le rechargement, relève le serveur s'il est mort et le
+  signale même alors.
+- **L'unité du serveur web est durcie par la distribution** : Ubuntu livre `apache2.service` avec
+  `ProtectHome=read-only`, qui montre `/home` en lecture seule **au seul service** — `mount` affiche `rw`,
+  root écrit sans peine, et le maître meurt en ouvrant le journal d'un vhost. D'où le complément d'unité
+  géré (D59), écrit **avant** les vhosts et suivi d'un **redémarrage** : l'espace de noms est établi au
+  démarrage, un `reload` ne le refait pas. Les chemins portent le préfixe `-`, un `ReadWritePaths` absent
+  faisant échouer le service en 226/NAMESPACE.
+- Avant toute relance du moteur, **acquitter le compteur d'échecs** (`systemctl reset-failed`) : passé
+  `StartLimitBurst`, systemd refuse de démarrer et le serveur reste mort alors que la cause est levée.
+- **`apachectl -t` répond « Syntax OK » sans ouvrir un seul journal**, alors que le maître les ouvre tous au
+  (re)démarrage et s'arrête sur le premier qui résiste (`AH00019: Unable to open logs, exiting`). Un `/home`
+  remonté en lecture seule après une erreur disque a ainsi tué un serveur entier, configuration valide à
+  l'appui. `web.Provider.CheckLogs` éprouve les journaux de tous les vhosts gérés avant le rechargement, et
+  `doctor` porte le même contrôle.
+- `userdel` **refuse un compte dont un processus tourne encore**. À la suppression d'un projet, les
+  rechargements de PHP-FPM et du serveur web doivent donc précéder la suppression du compte : ce sont eux
+  qui libèrent les workers du pool. L'ordre inverse laissait compte, groupe et home en place — en annonçant
+  un succès. Le scénario `suppression` le verrouille, et lui seul le voit : en mode simulé, ni `userdel` ni
+  les rechargements n'atteignent le système.
 - Apache a besoin de six modules (`ssl`, `proxy`, `proxy_fcgi`, `proxy_http`, `rewrite`, `headers`) ;
   sans eux la configuration est acceptée puis rend une 500 illisible. `doctor` les énumère.
 - MySQL : le nom de base après `ON` est un motif où `_` est un joker, donc échappé — **et déséchappé à la

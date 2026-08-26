@@ -432,7 +432,14 @@ func Uniqueness(projects []*model.Project, prepDomain string) error {
 		keys  func(*model.Project) []string
 	}{
 		{"identifiant", map[string]int{}, func(p *model.Project) []string { return []string{p.Metadata.Name} }},
+		// Le host effectif est lu sur le domaine primaire, et seulement calculé à
+		// défaut : un projet déclaré avant un changement de convention sert toujours
+		// le nom inscrit dans sa déclaration, et le recalculer inventerait des
+		// conflits entre des vhosts qui n'en ont aucun.
 		{"host effectif", map[string]int{}, func(p *model.Project) []string {
+			if d := p.PrimaryDomain(); d != "" {
+				return []string{d}
+			}
 			h, err := naming.EffectiveHost(p.Metadata.Host, p.Env(), prepDomain)
 			if err != nil {
 				return nil

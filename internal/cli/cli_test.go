@@ -244,17 +244,52 @@ func TestPrepEnvironmentUsesDedicatedDomain(t *testing.T) {
 	h.mustRun("project", "create", "shop.fr", "--kind", "php-symfony")
 	h.mustRun("project", "create", "shop.fr", "--env", "prep", "--kind", "php-symfony")
 	out := h.mustRun("project", "show", "shopfrprep")
-	for _, want := range []string{"shopfrprep", "shopfr.preprod-pp.net"} {
+	for _, want := range []string{"shopfrprep", "shop.preprod-pp.net"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("la préproduction devrait mentionner %q :\n%s", want, out)
 		}
 	}
 	// Les deux environnements cohabitent sans partager de ressource.
 	h.mustRun("apply", "--yes")
-	for _, home := range []string{"shop.fr", "shopfr.preprod-pp.net"} {
+	for _, home := range []string{"shop.fr", "shop.preprod-pp.net"} {
 		if _, err := os.Stat(h.path("home", home)); err != nil {
 			t.Errorf("home %s absent : %v", home, err)
 		}
+	}
+}
+
+// Un host déjà posé sur le domaine de préproduction est pris tel quel : le
+// construire une seconde fois donnait le host jardindecopreprodppnet.preprod-pp.net,
+// le home du même nom et l'utilisateur jardindecopreprodppnetprep.
+func TestPrepHostAlreadyOnPrepDomainIsTakenAsIs(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("project", "create", "jardindeco.preprod-pp.net", "--env", "prep", "--kind", "php-symfony")
+	out := h.mustRun("project", "show", "jardindecoprep")
+	for _, want := range []string{"jardindecoprep", "jardindeco.preprod-pp.net"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("%q attendu :\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "jardindecopreprodppnet") {
+		t.Errorf("le domaine de préproduction ne doit pas être dérivé une seconde fois :\n%s", out)
+	}
+	h.mustRun("apply", "--yes")
+	if _, err := os.Stat(h.path("home", "jardindeco.preprod-pp.net")); err != nil {
+		t.Errorf("home absent : %v", err)
+	}
+}
+
+// En production, le domaine de préproduction est réservé (§3.3.6).
+func TestProdHostOnPrepDomainRefused(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	out, code := h.run("project", "create", "jardindeco.preprod-pp.net")
+	if code == CodeOK {
+		t.Errorf("un host de production sur le domaine de préproduction doit être refusé :\n%s", out)
+	}
+	if !strings.Contains(out, "réservé") {
+		t.Errorf("le message doit dire pourquoi :\n%s", out)
 	}
 }
 
@@ -1558,7 +1593,7 @@ func TestSiteCloneToPrep(t *testing.T) {
 	}
 	// La préproduction est un projet distinct, sur le domaine dédié.
 	shown := h.mustRun("project", "show", "shopfrprep")
-	for _, want := range []string{"shopfrprep", "shopfr.preprod-pp.net"} {
+	for _, want := range []string{"shopfrprep", "shop.preprod-pp.net"} {
 		if !strings.Contains(shown, want) {
 			t.Errorf("le clone doit être en préproduction, %q absent :\n%s", want, shown)
 		}
@@ -1571,7 +1606,7 @@ func TestSiteCloneToPrep(t *testing.T) {
 		t.Error("les ressources doivent porter l'identifiant de préproduction")
 	}
 	// Les deux homes existent.
-	for _, host := range []string{"shop.fr", "shopfr.preprod-pp.net"} {
+	for _, host := range []string{"shop.fr", "shop.preprod-pp.net"} {
 		if _, err := os.Stat(h.path("home", host)); err != nil {
 			t.Errorf("home %s absent : %v", host, err)
 		}
@@ -2025,5 +2060,47 @@ func TestApplicationProjectGetsDelegationAndRuntimeFlag(t *testing.T) {
 	sudoers := h.read(t, filepath.Join("etc", "sudoers.d", "ogs-appfr"))
 	if !strings.Contains(sudoers, "appfr") {
 		t.Errorf("la délégation doit être écrite :\n%s", sudoers)
+	}
+}
+
+// uidMatches lit l'UID réel, le premier des quatre nombres du champ « Uid: » de
+// /proc/<pid>/status : confondre l'UID effectif avec l'UID réel désignerait le
+// mauvais compte pour tout processus setuid.
+func TestUIDMatchesReadsRealUID(t *testing.T) {
+	const status = "Name:\tphp-fpm8.4\nState:\tS (sleeping)\nUid:\t1001\t1001\t1001\t1001\nGid:\t1001\t1001\t1001\t1001\n"
+	if !uidMatches(status, 1001) {
+		t.Error("l'UID 1001 doit correspondre")
+	}
+	if uidMatches(status, 0) {
+		t.Error("l'UID 0 ne doit pas correspondre")
+	}
+	// Un processus dont l'UID réel diffère de l'UID effectif appartient à son UID
+	// réel : c'est lui qui empêche userdel d'aboutir.
+	const setuid = "Name:\tpasswd\nUid:\t1001\t0\t0\t0\n"
+	if !uidMatches(setuid, 1001) || uidMatches(setuid, 0) {
+		t.Error("seul l'UID réel doit être retenu")
+	}
+	if uidMatches("Name:\tsans-uid\n", 0) {
+		t.Error("un status sans champ Uid ne doit correspondre à personne")
+	}
+}
+
+// processesOfUID énumère les processus d'un compte : c'est ce qui permet de dire
+// ce qui tient un compte que userdel refuse de supprimer.
+func TestProcessesOfUIDFindsSelf(t *testing.T) {
+	procs := processesOfUID(os.Getuid())
+	if len(procs) == 0 {
+		t.Skip("/proc illisible sur cette machine")
+	}
+	self := fmt.Sprintf("%d ", os.Getpid())
+	for _, p := range procs {
+		if strings.HasPrefix(p, self) {
+			return
+		}
+	}
+	// La liste est bornée : le processus de test peut en être absent sans que ce
+	// soit un défaut.
+	if len(procs) < maxListedProcesses+1 {
+		t.Errorf("le processus courant devrait figurer parmi %v", procs)
 	}
 }

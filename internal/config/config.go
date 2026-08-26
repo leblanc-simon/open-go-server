@@ -111,7 +111,7 @@ func Default() *Config {
 			string(naming.EnvProd): {HostTemplate: "{{.Host}}"},
 			string(naming.EnvPrep): {
 				Domain:          "preprod-pp.net",
-				HostTemplate:    "{{.ID}}.{{.Domain}}",
+				HostTemplate:    "{{.PrepLabel}}.{{.Domain}}",
 				IDSuffix:        naming.SuffixPrep,
 				Certificate:     "@wildcard-prep",
 				RobotsNoindex:   true,

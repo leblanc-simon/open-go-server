@@ -21,6 +21,9 @@ import (
 // rendrait chaque site lisible par tous les autres.
 const WebUser = "www-data"
 
+// groupdelNoSuchGroup est le code que rend groupdel quand le groupe n'existe pas.
+const groupdelNoSuchGroup = 6
+
 // Provider réconcilie l'utilisateur, le groupe, l'arborescence, la clé de
 // déploiement et le lien d'interpréteur d'un projet.
 type Provider struct {
@@ -115,7 +118,16 @@ func (p *Provider) Plan(_ context.Context, proj *model.Project, obs Observed) ([
 			return err
 		}
 		s.Compensate = func(ctx context.Context) error {
-			_, err := p.Exec.Run(ctx, exec.Command{Name: "groupdel", Args: []string{spec.Group}})
+			// Le groupe a pu partir avec l'utilisateur, la compensation précédente
+			// l'ayant emporté : userdel supprime le groupe primaire dès qu'il n'a plus
+			// d'autre membre. Le code 6 de groupdel — « le groupe n'existe pas » — est
+			// donc le résultat attendu, et non un échec : le rapporter ferait passer un
+			// rollback réussi pour un rollback en échec, et enverrait vérifier un
+			// système intact.
+			res, err := p.Exec.Run(ctx, exec.Command{Name: "groupdel", Args: []string{spec.Group}})
+			if err != nil && res.ExitCode == groupdelNoSuchGroup {
+				return nil
+			}
 			return err
 		}
 		steps = append(steps, s)

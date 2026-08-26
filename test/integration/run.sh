@@ -21,9 +21,11 @@ echo "construction de l'image…"
 docker build -q -f test/integration/Dockerfile -t ogs-integration . >/dev/null
 
 # Les scénarios de runtime et de services exigent un vrai systemd en PID 1 :
-# rien de ce qui suit un « systemctl enable » ne s'éprouve autrement.
+# rien de ce qui suit un « systemctl enable » ne s'éprouve autrement. La
+# suppression en fait partie : c'est le rechargement de PHP-FPM par systemd qui
+# libère les workers du projet, et donc son compte.
 case "$scenario" in
-systemd | runtimes | runtimes-compiles | harden)
+systemd | runtimes | runtimes-compiles | harden | suppression | web-durci)
     nom="ogs-integration-$scenario"
     docker rm -f "$nom" >/dev/null 2>&1 || true
     trap 'docker rm -f '"$nom"' >/dev/null 2>&1' EXIT

@@ -242,6 +242,22 @@ func (a *App) runChecks(ctx context.Context) []check {
 		}
 	}
 
+	// Journaux des vhosts : le serveur les ouvre tous à son (re)démarrage et
+	// s'arrête si l'un résiste, emportant tous les sites. « apachectl -t » n'en dit
+	// rien — il ne teste que la syntaxe — et l'échec ne se découvre qu'au
+	// rechargement suivant, trop tard. Un /home remonté en lecture seule après une
+	// erreur disque suffit à le provoquer.
+	if provs, err := a.buildProviders(); err == nil {
+		defer provs.close()
+		if err := provs.Web.CheckLogs(context.Background()); err != nil {
+			add("journaux des vhosts", "échec",
+				"un rechargement du serveur web l'arrêterait : "+err.Error(),
+				"rétablir l'accès en écriture (montage en lecture seule ? droits du répertoire ?)")
+		} else {
+			add("journaux des vhosts", "ok", "les journaux des vhosts gérés sont inscriptibles", "")
+		}
+	}
+
 	// Versions PHP en fin de support : signalées, jamais bloquantes.
 	projects, err := a.loadProjects()
 	if err != nil {

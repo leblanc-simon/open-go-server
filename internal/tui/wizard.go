@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"fmt"
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -24,8 +25,12 @@ type WizardAnswers struct {
 // construction, un pointeur vers son champ référencerait la structure d'origine,
 // abandonnée — et les réponses seraient silencieusement perdues.
 type step struct {
-	label   string
-	help    string
+	label string
+	help  string
+	// helpOf rend une aide qui dépend des réponses déjà données ; elle l'emporte
+	// sur help. Le host en a besoin : ce qu'il faut saisir dépend de
+	// l'environnement, et le montrer vaut mieux que le décrire.
+	helpOf  func(WizardAnswers, string) string
 	get     func(WizardAnswers) string
 	set     func(*WizardAnswers, string)
 	choices []string
@@ -41,17 +46,27 @@ type wizard struct {
 	input   string
 	err     string
 	done    bool
+	// prepDomain sert l'aide de l'étape du host : annoncer le nom réellement
+	// servi évite la saisie d'un host déjà construit.
+	prepDomain string
 }
 
 // newWizard construit l'assistant. Les valeurs par défaut sont celles de la
 // création en ligne de commande : l'assistant ne doit pas produire un projet
 // différent de « ogs site create ».
-func newWizard() wizard {
-	w := wizard{answers: WizardAnswers{
+func newWizard(prepDomain string) wizard {
+	w := wizard{prepDomain: prepDomain, answers: WizardAnswers{
 		Kind: "php-symfony", AppVersion: "auto", PHPVersion: "8.3", Env: "prod",
 	}}
 	w.steps = []step{
-		{label: "Host du site", help: "exemple : shop.fr",
+		// L'environnement est demandé avant le host : en préproduction, le host
+		// saisi n'est pas celui qui sera servi, et l'annoncer après coup n'aide
+		// personne.
+		{label: "Environnement",
+			get:     func(a WizardAnswers) string { return a.Env },
+			set:     func(a *WizardAnswers, v string) { a.Env = v },
+			choices: []string{"prod", "prep"}},
+		{label: "Host canonique du site", helpOf: hostHelp,
 			get: func(a WizardAnswers) string { return a.Host },
 			set: func(a *WizardAnswers, v string) { a.Host = v }},
 		{label: "Type d'application",
@@ -65,10 +80,6 @@ func newWizard() wizard {
 		{label: "Version PHP", help: "7.4 à 8.5",
 			get: func(a WizardAnswers) string { return a.PHPVersion },
 			set: func(a *WizardAnswers, v string) { a.PHPVersion = v }, optional: true},
-		{label: "Environnement",
-			get:     func(a WizardAnswers) string { return a.Env },
-			set:     func(a *WizardAnswers, v string) { a.Env = v },
-			choices: []string{"prod", "prep"}},
 		{label: "Base de données", help: "vide pour aucune",
 			get:     func(a WizardAnswers) string { return a.Database },
 			set:     func(a *WizardAnswers, v string) { a.Database = v },
@@ -85,6 +96,29 @@ func newWizard() wizard {
 
 // current renvoie l'étape courante.
 func (w *wizard) current() step { return w.steps[w.index] }
+
+// help rend l'aide de l'étape courante.
+func (w *wizard) help() string {
+	s := w.current()
+	if s.helpOf != nil {
+		return s.helpOf(w.answers, w.prepDomain)
+	}
+	return s.help
+}
+
+// hostHelp explique quel host saisir. En préproduction, le host servi est
+// construit sur le domaine dédié : le montrer sur l'exemple est le seul moyen
+// d'éviter la saisie d'un host déjà construit, qui le construirait deux fois.
+func hostHelp(a WizardAnswers, prepDomain string) string {
+	if a.Env != "prep" {
+		return "le host servi, exemple : shop.fr"
+	}
+	domain := prepDomain
+	if domain == "" {
+		domain = "<domaine de préproduction>"
+	}
+	return fmt.Sprintf("host de production, exemple : shop.fr → shop.%s", domain)
+}
 
 // wizardKey traite les touches de l'assistant.
 func (m *Model) wizardKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {

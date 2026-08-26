@@ -67,7 +67,7 @@ package: doc
 # Ils exigent un système complet — serveur web, PHP, comptes — et s'exécutent
 # donc dans un conteneur. Ils ne font pas partie de « make test ».
 # Tous les scénarios, l'un après l'autre.
-SCENARIOS := reload-group site-complet nginx hooks mysql postgres rabbitmq pebble systemd runtimes harden paquet
+SCENARIOS := reload-group site-complet suppression web-durci nginx hooks mysql postgres rabbitmq pebble systemd runtimes harden paquet
 
 integration-all:
 	@for s in $(SCENARIOS); do \
@@ -80,6 +80,12 @@ integration:
 
 integration-php:
 	./test/integration/run.sh site-complet
+
+integration-suppression:
+	./test/integration/run.sh suppression
+
+integration-web-durci:
+	./test/integration/run.sh web-durci
 
 integration-package:
 	./test/integration/run.sh paquet

@@ -2,9 +2,11 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -81,11 +83,24 @@ func newDeleteCommand(app *App) *cobra.Command {
 				return err
 			}
 
+			// Les avertissements sont comptés : une suppression qui laisse une
+			// ressource derrière elle n'est pas un succès, et le code 6 le dit sans
+			// pour autant faire échouer ce qui a bien été démonté.
+			warnings := 0
+			warn := func(format string, args ...any) {
+				warnings++
+				app.printf("⚠ "+format+"\n", args...)
+			}
+
 			// 1. Arrêt des services et retrait des tâches : rien ne doit plus
-			// s'exécuter pendant que l'on démonte le site.
-			app.printf("arrêt des services de %s…\n", p.ID())
-			if err := provs.Unit.Control(cmd.Context(), p, "stop"); err != nil {
-				app.printf("⚠ arrêt des services : %v\n", err)
+			// s'exécuter pendant que l'on démonte le site. Une cible que systemd n'a
+			// pas chargée n'a rien à arrêter : l'annoncer comme un échec ferait
+			// passer pour un défaut le cas d'un projet sans service.
+			if app.unitActive(cmd.Context(), unit.TargetName(p.ID())) {
+				app.printf("arrêt des services de %s…\n", p.ID())
+				if err := provs.Unit.Control(cmd.Context(), p, "stop"); err != nil {
+					warn("arrêt des services : %v", err)
+				}
 			}
 
 			var removed []string
@@ -104,13 +119,13 @@ func newDeleteCommand(app *App) *cobra.Command {
 				if err := os.Remove(file); err == nil {
 					removed = append(removed, file)
 				} else if !os.IsNotExist(err) {
-					app.printf("⚠ %s : %v\n", file, err)
+					warn("%s : %v", file, err)
 				}
 			}
 			// Les instances activées disparaissent avec leur répertoire .wants.
 			if err := os.RemoveAll(filepath.Join(app.Paths.SystemdDir(),
 				unit.TargetName(p.ID())+".wants")); err != nil && !os.IsNotExist(err) {
-				app.printf("⚠ instances : %v\n", err)
+				warn("instances : %v", err)
 			}
 
 			// 3. Ressources vivantes.
@@ -120,22 +135,49 @@ func newDeleteCommand(app *App) *cobra.Command {
 				app.printf("= --keep-data : bases, files et contenu conservés\n")
 			}
 
-			// 4. Compte système et arborescence.
+			// 4. Les serveurs doivent oublier ce qui vient de disparaître : sans
+			// rechargement, le maître PHP-FPM garde le pool du projet en mémoire —
+			// ses workers continuent de tourner et le site reste servi — et le
+			// serveur web conserve un vhost dont les fichiers n'existent plus.
+			//
+			// Ce rechargement précède impérativement la suppression du compte : ces
+			// workers appartiennent à l'utilisateur du projet, et userdel refuse de
+			// supprimer un compte dont un processus tourne encore (« user is
+			// currently used by process »). L'ordre inverse laissait le compte, le
+			// groupe et le home en place tout en annonçant un succès.
+			for _, pool := range p.Spec.PHP.Pools {
+				if err := provs.PHP.Reload(cmd.Context(), pool.Version); err != nil {
+					warn("rechargement de PHP %s : %v", pool.Version, err)
+				}
+			}
+			// Un serveur web à l'arrêt n'a rien à recharger : le signaler comme un
+			// échec accuserait ogs de ce qui est un état légitime du système.
+			if app.unitActive(cmd.Context(), provs.Web.Engine.Unit()) {
+				if err := provs.Web.Reload(cmd.Context()); err != nil {
+					warn("rechargement du serveur web : %v", err)
+				}
+			}
+			if err := app.systemctl(cmd.Context(), "daemon-reload"); err != nil {
+				warn("daemon-reload : %v", err)
+			}
+
+			// 5. Compte système et arborescence, une fois que plus rien ne tourne
+			// sous cette identité.
 			if !keepData {
 				if err := app.removeUser(cmd, provs, p); err != nil {
-					app.printf("⚠ suppression du compte : %v\n", err)
+					warn("suppression du compte : %v", err)
 				} else {
 					removed = append(removed, "utilisateur "+p.Spec.User.Name)
 				}
 			}
 
-			// 5. Le projet quitte l'inventaire actif.
+			// 6. Le projet quitte l'inventaire actif.
 			if purge {
 				if err := os.Remove(app.Paths.ProjectFile(p.ID())); err != nil && !os.IsNotExist(err) {
 					return wrap(CodeError, err)
 				}
 				if err := app.Store.DeleteProject(p.ID()); err != nil {
-					app.printf("⚠ état : %v\n", err)
+					warn("état : %v", err)
 				}
 			} else {
 				archivedPath := filepath.Join(app.Paths.ArchivedDir(), p.ID()+".yaml")
@@ -147,35 +189,27 @@ func newDeleteCommand(app *App) *cobra.Command {
 				}
 				if err := app.Store.SetProjectStatus(p.ID(), "archived"); err != nil &&
 					!strings.Contains(err.Error(), "absent") {
-					app.printf("⚠ état : %v\n", err)
+					warn("état : %v", err)
 				}
-			}
-
-			// Les serveurs doivent oublier ce qui vient de disparaître : sans
-			// rechargement, le maître PHP-FPM garde le pool du projet en mémoire —
-			// ses workers continuent de tourner et le site reste servi — et le
-			// serveur web conserve un vhost dont les fichiers n'existent plus.
-			for _, pool := range p.Spec.PHP.Pools {
-				if err := provs.PHP.Reload(cmd.Context(), pool.Version); err != nil {
-					app.printf("⚠ rechargement de PHP %s : %v\n", pool.Version, err)
-				}
-			}
-			if err := provs.Web.Reload(cmd.Context()); err != nil {
-				app.printf("⚠ rechargement du serveur web : %v\n", err)
-			}
-			if err := app.systemctl(cmd.Context(), "daemon-reload"); err != nil {
-				app.printf("⚠ daemon-reload : %v\n", err)
 			}
 
 			_, _ = app.runHook(cmd.Context(), provs.Hooks, p, hook.PostDelete,
 				hook.Context{Resources: removed, Extra: map[string]string{"archive": archived}})
-			_ = app.Audit.Record(p.ID(), "project", "project.delete", "ok", archived)
-			app.printf("\n✓ %s supprimé (%d ressource(s))\n", p.ID(), len(removed))
+			status, mark := "ok", "✓"
+			if warnings > 0 {
+				status, mark = "avertissement", "⚠"
+			}
+			_ = app.Audit.Record(p.ID(), "project", "project.delete", status, archived)
+			app.printf("\n%s %s supprimé (%d ressource(s))\n", mark, p.ID(), len(removed))
 			if archived != "" {
 				app.printf("  archive : %s\n", archived)
 				app.printf("  restaurer : ogs project restore %s\n", archived)
 			} else {
 				app.printf("  aucune archive : la suppression était définitive.\n")
+			}
+			if warnings > 0 {
+				return exitf(CodePartial, "terminé avec %d avertissement(s) : le projet a été retiré, "+
+					"mais tout n'a pas pu être démonté", warnings)
 			}
 			return nil
 		},
@@ -259,23 +293,125 @@ func (a *App) removeUser(cmd *cobra.Command, provs *providers, p *model.Project)
 		return fmt.Errorf("l'utilisateur %s n'a pas été créé par ogs : le supprimer exige --force",
 			p.Spec.User.Name)
 	}
+	// L'échec du userdel n'interrompt plus la suppression : l'arborescence part
+	// quand même. Laisser le home d'un projet dont la suppression vient d'être
+	// annoncée — définitive, qui plus est — serait le pire des deux états.
+	var accountErr error
 	if !a.Exec.Simulated() {
 		if _, err := a.Exec.Run(cmd.Context(), exec.Command{
 			Name: "userdel", Args: []string{p.Spec.User.Name},
 		}); err != nil {
-			return err
-		}
-		if _, err := a.Exec.Run(cmd.Context(), exec.Command{
-			Name: "groupdel", Args: []string{p.Spec.User.Group},
-		}); err != nil {
-			a.printf("⚠ suppression du groupe : %v\n", err)
+			accountErr = err
+			// userdel ne dit pas ce qui tient le compte, et « currently used by
+			// process 3418 » sans le nom du processus n'apprend rien : la liste est
+			// lue directement dans /proc, d'où la commande à passer pour finir.
+			if u != nil {
+				if procs := processesOfUID(u.UID); len(procs) > 0 {
+					accountErr = fmt.Errorf("%w\n  processus encore actifs sous %s : %s\n"+
+						"  les arrêter puis : userdel %s && groupdel %s",
+						err, p.Spec.User.Name, strings.Join(procs, ", "),
+						p.Spec.User.Name, p.Spec.User.Group)
+				}
+			}
+		} else {
+			// Le serveur web est membre du groupe du projet quand webAccess vaut
+			// « group » : sans l'en retirer, groupdel refuse — « group has other
+			// members » — et le groupe survit à chaque suppression. Le retrait est
+			// tenté sans condition : un gpasswd sur un non-membre échoue sans rien
+			// casser, et l'observation de l'appartenance coûterait plus qu'elle
+			// n'apporte.
+			_, _ = a.Exec.Run(cmd.Context(), exec.Command{
+				Name: "gpasswd", Args: []string{"-d", system.WebUser, p.Spec.User.Group},
+			})
+			if _, err := a.Exec.Run(cmd.Context(), exec.Command{
+				Name: "groupdel", Args: []string{p.Spec.User.Group},
+			}); err != nil {
+				a.printf("⚠ suppression du groupe : %v\n", err)
+			}
 		}
 	}
 	// L'arborescence part en dernier : tout ce qui précède a pu avoir besoin de la lire.
 	if err := os.RemoveAll(p.Spec.Layout.Root); err != nil {
-		return err
+		return errors.Join(accountErr, err)
 	}
-	return os.RemoveAll(a.Paths.ProjectRunDir(p.ID()))
+	if err := os.RemoveAll(a.Paths.ProjectRunDir(p.ID())); err != nil {
+		return errors.Join(accountErr, err)
+	}
+	return accountErr
+}
+
+// unitActive dit si systemd a l'unité active. Une unité inconnue, non chargée ou
+// à l'arrêt répond non : il n'y a alors rien à arrêter ni à recharger, ce qui
+// n'est pas un échec. En mode simulé, tout est réputé actif — c'est ce qui permet
+// aux tests d'observer les commandes qui auraient été passées.
+func (a *App) unitActive(ctx context.Context, name string) bool {
+	if a.Exec.Simulated() {
+		return true
+	}
+	_, err := a.Exec.Run(ctx, exec.Command{
+		Name: "systemctl", Args: []string{"is-active", "--quiet", name},
+	})
+	return err == nil
+}
+
+// processesOfUID énumère les processus tournant sous un UID, « pid nom ». La
+// lecture passe par /proc et non par pgrep : ogs ne dépend d'aucun binaire qui ne
+// soit pas indispensable, et procps peut manquer sur une installation minimale.
+func processesOfUID(uid int) []string {
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		pid, err := strconv.Atoi(e.Name())
+		if err != nil {
+			continue
+		}
+		status, err := os.ReadFile(filepath.Join("/proc", e.Name(), "status"))
+		if err != nil {
+			// Le processus s'est terminé entre-temps : rien d'anormal.
+			continue
+		}
+		if !uidMatches(string(status), uid) {
+			continue
+		}
+		name := "?"
+		if comm, err := os.ReadFile(filepath.Join("/proc", e.Name(), "comm")); err == nil {
+			name = strings.TrimSpace(string(comm))
+		}
+		out = append(out, fmt.Sprintf("%d %s", pid, name))
+		if len(out) == maxListedProcesses {
+			out = append(out, "…")
+			break
+		}
+	}
+	return out
+}
+
+// maxListedProcesses borne l'énumération : un pool FPM chargé peut avoir des
+// centaines de workers, et les lister tous noierait le message.
+const maxListedProcesses = 10
+
+// uidMatches lit l'UID réel dans le champ « Uid: » de /proc/<pid>/status, dont le
+// premier des quatre nombres est l'UID réel.
+func uidMatches(status string, uid int) bool {
+	for _, line := range strings.Split(status, "\n") {
+		rest, ok := strings.CutPrefix(line, "Uid:")
+		if !ok {
+			continue
+		}
+		fields := strings.Fields(rest)
+		if len(fields) == 0 {
+			return false
+		}
+		real, err := strconv.Atoi(fields[0])
+		return err == nil && real == uid
+	}
+	return false
 }
 
 // archiveProject construit l'archive complète du projet.

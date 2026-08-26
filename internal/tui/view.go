@@ -191,8 +191,8 @@ func (m *Model) viewWizard() string {
 	}
 	s := w.current()
 	b.WriteString("\n" + m.styles.title(s.label))
-	if s.help != "" {
-		b.WriteString("  " + m.styles.help("("+s.help+")"))
+	if help := w.help(); help != "" {
+		b.WriteString("  " + m.styles.help("("+help+")"))
 	}
 	b.WriteString("\n")
 	if len(s.choices) > 0 {

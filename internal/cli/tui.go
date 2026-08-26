@@ -44,6 +44,9 @@ type tuiBackend struct {
 	cmd *cobra.Command
 }
 
+// PrepDomain renvoie le domaine de préproduction configuré.
+func (b *tuiBackend) PrepDomain() string { return b.app.Cfg.PrepDomain() }
+
 func (b *tuiBackend) Projects() ([]*model.Project, error) { return b.app.loadProjects() }
 
 func (b *tuiBackend) Snapshot(ctx context.Context, p *model.Project) (tui.Snapshot, error) {

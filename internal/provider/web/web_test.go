@@ -2,6 +2,7 @@ package web
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -503,5 +504,164 @@ func TestProxyVHostReferencesOnlyDefinedVariables(t *testing.T) {
 			continue
 		}
 		t.Errorf("variable %s employée par le vhost mais définie nulle part", mot)
+	}
+}
+
+// logPaths n'extrait que des chemins : le format nommé d'un CustomLog Apache et
+// le « off » de nginx n'en sont pas, et les prendre pour des fichiers ferait
+// refuser tout rechargement.
+func TestLogPathsIgnoresNonPaths(t *testing.T) {
+	const vhost = `# Généré par ogs
+<VirtualHost *:80>
+    ErrorLog /home/shop.fr/logs/apache-error.log
+    CustomLog /home/shop.fr/logs/apache-access.log combined
+    CustomLog "|/usr/bin/rotatelogs /var/log/x" common
+</VirtualHost>
+server {
+    access_log /home/shop.fr/logs/nginx-access.log;
+    error_log  /home/shop.fr/logs/nginx-error.log;
+    access_log off;
+}
+`
+	got := logPaths(vhost)
+	want := []string{
+		"/home/shop.fr/logs/apache-error.log",
+		"/home/shop.fr/logs/apache-access.log",
+		"/home/shop.fr/logs/nginx-access.log",
+		"/home/shop.fr/logs/nginx-error.log",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("chemins extraits : %v, attendu %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("chemin %d : %q, attendu %q", i, got[i], want[i])
+		}
+	}
+}
+
+// Un journal inaccessible doit faire refuser le rechargement : le maître ouvre
+// tous les journaux au redémarrage et s'arrête si l'un résiste, emportant les
+// sites de tout le serveur — ce qu'« apachectl -t » ne voit pas.
+func TestReloadRefusedWhenLogUnwritable(t *testing.T) {
+	p, _ := fixture(t, "apache")
+	logDir := filepath.Join(t.TempDir(), "logs")
+	if err := os.MkdirAll(logDir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(logDir, 0o755) })
+	vhost := "# Généré par ogs — NE PAS MODIFIER À LA MAIN\n<VirtualHost *:80>\n    ErrorLog " +
+		filepath.Join(logDir, "apache-error.log") + "\n</VirtualHost>\n"
+	if err := os.WriteFile(filepath.Join(p.Engine.EnabledDir(), "shopfr.conf"), []byte(vhost), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("root écrit partout : le refus ne peut pas être éprouvé")
+	}
+	err := p.CheckLogs(context.Background())
+	if err == nil {
+		t.Fatal("un journal non inscriptible doit faire refuser le rechargement")
+	}
+	if !strings.Contains(err.Error(), "apache-error.log") {
+		t.Errorf("le message doit nommer le journal fautif : %v", err)
+	}
+
+	// Un vhost qu'ogs n'a pas écrit ne relève pas de lui.
+	if err := os.WriteFile(filepath.Join(p.Engine.EnabledDir(), "shopfr.conf"),
+		[]byte("<VirtualHost *:80>\n    ErrorLog "+filepath.Join(logDir, "autre.log")+
+			"\n</VirtualHost>\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.CheckLogs(context.Background()); err != nil {
+		t.Errorf("un vhost étranger ne doit pas faire refuser le rechargement : %v", err)
+	}
+}
+
+// Un rechargement qui rend 0 mais laisse le serveur mort doit être signalé, et le
+// serveur relevé : systemd journalise « Reloaded » puis la mort du maître, et un
+// parc entier resterait hors ligne sans que rien ne le dise.
+func TestReloadDetectsDeadServer(t *testing.T) {
+	p, _ := fixture(t, "apache")
+	rec := exec.NewRecorder()
+	p.Exec = rec
+	// Le Recorder se dit simulé : Reload court-circuiterait. Le comportement est
+	// éprouvé sur unitActive et sur la commande de relance, qui portent la logique.
+	rec.Errors["systemctl is-active"] = errors.New("exit status 3")
+	if p.unitActive(context.Background()) {
+		t.Error("une unité inactive ne doit pas être vue active")
+	}
+	delete(rec.Errors, "systemctl is-active")
+	if !p.unitActive(context.Background()) {
+		t.Error("une unité active doit être vue active")
+	}
+}
+
+// Le complément d'unité énumère les journaux de tout le parc, chaque chemin
+// facultatif : un ReadWritePaths pointant sur un répertoire absent fait échouer le
+// service en 226/NAMESPACE, et un projet supprimé y reste jusqu'au prochain apply.
+func TestPlanDropInListsLogDirs(t *testing.T) {
+	p, _ := fixture(t, "apache")
+	a := model.New("shop.fr", naming.EnvProd, model.KindStatic)
+	b := model.New("autre.fr", naming.EnvProd, model.KindStatic)
+	for _, proj := range []*model.Project{a, b} {
+		if err := proj.Normalize("/home", "preprod-pp.net"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	steps, err := p.PlanDropIn(context.Background(), []*model.Project{b, a})
+	if err != nil {
+		t.Fatal(err)
+	}
+	step := steps[0]
+	if step.Action != engine.Create {
+		t.Errorf("action %s, attendu une création", step.Action)
+	}
+	if err := step.Apply(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	content, err := os.ReadFile(p.DropInPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(content)
+	for _, want := range []string{
+		"[Service]",
+		"ReadWritePaths=-/home/autre.fr/logs",
+		"ReadWritePaths=-/home/shop.fr/logs",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("%q attendu dans :\n%s", want, got)
+		}
+	}
+	// L'ordre est déterministe, sans quoi le fichier oscillerait entre deux états
+	// et chaque apply redémarrerait le serveur web.
+	if strings.Index(got, "autre.fr") > strings.Index(got, "shop.fr") {
+		t.Error("les répertoires doivent être triés")
+	}
+	// Deuxième passage : le fichier est conforme, donc aucune action — un
+	// redémarrage du moteur à chaque apply serait une coupure gratuite.
+	again, err := p.PlanDropIn(context.Background(), []*model.Project{a, b})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(again) != 1 || again[0].Action != engine.NoOp {
+		t.Errorf("étapes %+v, attendu une seule sans action", again)
+	}
+}
+
+// underHome borne le contrôle au territoire que ProtectHome couvre : refuser un
+// journal sous /var/log au prétexte d'un ProtectHome serait un faux positif.
+func TestUnderHome(t *testing.T) {
+	for path, want := range map[string]bool{
+		"/home/shop.fr/logs/apache-error.log": true,
+		"/root/logs/x.log":                    true,
+		"/run/user/1000/x.log":                true,
+		"/var/log/apache2/error.log":          false,
+		"/homeless/x.log":                     false,
+		"/home":                               true,
+	} {
+		if got := underHome(path); got != want {
+			t.Errorf("underHome(%q) = %v, attendu %v", path, got, want)
+		}
 	}
 }

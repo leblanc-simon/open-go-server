@@ -278,6 +278,19 @@ func (p *Project) Env() naming.Env {
 // ID renvoie l'identifiant du projet.
 func (p *Project) ID() string { return p.Metadata.Name }
 
+// PrimaryDomain renvoie le domaine servi en premier, celui que le vhost porte en
+// ServerName. C'est le host effectif tel qu'il a été matérialisé à la
+// normalisation : le relire vaut mieux que le recalculer, une convention de
+// nommage pouvant changer après qu'un projet a été déclaré.
+func (p *Project) PrimaryDomain() string {
+	for _, d := range p.Spec.Domains {
+		if d.Role == "" || d.Role == "primary" {
+			return d.Name
+		}
+	}
+	return ""
+}
+
 // IsPrep indique si le projet est une préproduction.
 func (p *Project) IsPrep() bool { return p.Env() == naming.EnvPrep }
 
@@ -309,7 +322,7 @@ func (p *Project) Normalize(homeRoot, prepDomain string) error {
 	p.Metadata.Host = host
 
 	if p.Metadata.Name == "" {
-		id, err := naming.ID(host, env)
+		id, err := naming.ID(host, env, prepDomain)
 		if err != nil {
 			return err
 		}
