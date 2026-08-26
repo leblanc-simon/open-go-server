@@ -13,8 +13,8 @@ jobs:
     name: format, analyse et tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: stable
           cache: true
@@ -53,8 +53,8 @@ jobs:
       matrix:
         goarch: [amd64, arm64]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: stable
           cache: true
@@ -75,8 +75,8 @@ jobs:
     name: documentation engendrée
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: stable
           cache: true
@@ -93,7 +93,7 @@ jobs:
               echo "$page :"; echo "$avertissements"; exit 1
             fi
           done
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: documentation
           path: dist/doc
@@ -106,10 +106,10 @@ jobs:
       matrix:
         scenario: [reload-group, site-complet, nginx, hooks, mysql, postgres, rabbitmq, pebble, systemd, runtimes, harden, paquet]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0 # les étiquettes servent à numéroter le paquet
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version: stable
           cache: true
@@ -120,10 +120,10 @@ jobs:
     name: paquet Debian
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version: stable
           cache: true
@@ -135,7 +135,7 @@ jobs:
           dpkg-deb -I dist/*.deb
           # Les avertissements sont affichés ; seules les erreurs font échouer.
           lintian --fail-on error dist/*.deb
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: paquet-deb
           path: dist/*.deb
