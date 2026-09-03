@@ -22,6 +22,7 @@ import (
 	"leblanc.io/open-go-server/internal/provider/cron"
 	"leblanc.io/open-go-server/internal/provider/db"
 	"leblanc.io/open-go-server/internal/provider/logrotate"
+	"leblanc.io/open-go-server/internal/provider/monitoring"
 	"leblanc.io/open-go-server/internal/provider/php"
 	"leblanc.io/open-go-server/internal/provider/runtime"
 	"leblanc.io/open-go-server/internal/provider/sudoers"
@@ -221,6 +222,13 @@ func (a *App) loadProjects() ([]*model.Project, error) {
 // prepare normalise puis valide un projet.
 func (a *App) prepare(p *model.Project) error {
 	homeRoot := a.homeRoot()
+	// Le shell configuré est un défaut de création : il ne s'applique qu'à un
+	// projet qui n'en déclare pas. Le fichier d'un projet existant porte déjà sa
+	// valeur, et c'est lui qui fait autorité — sans quoi un changement de
+	// configuration réécrirait le shell de tout le parc au prochain apply.
+	if p.Spec.User.Shell == "" {
+		p.Spec.User.Shell = a.Cfg.Shell()
+	}
 	if err := p.Normalize(homeRoot, a.Cfg.PrepDomain()); err != nil {
 		return exitf(CodeValidation, "%s", err)
 	}
@@ -240,20 +248,21 @@ func (a *App) homeRoot() string {
 
 // providers assemble les providers actifs pour cette exécution.
 type providers struct {
-	System    *system.Provider
-	TLS       *tlsprov.Provider
-	DB        *db.Provider
-	AMQP      *amqp.Provider
-	App       *appprov.Provider
-	Cron      *cron.Provider
-	Unit      *unit.Provider
-	Sudoers   *sudoers.Provider
-	Runtime   *runtime.Provider
-	Hooks     *hook.Runner
-	PHP       *php.Provider
-	Web       *web.Provider
-	Logrotate *logrotate.Provider
-	Engine    web.Engine
+	System     *system.Provider
+	TLS        *tlsprov.Provider
+	DB         *db.Provider
+	AMQP       *amqp.Provider
+	App        *appprov.Provider
+	Cron       *cron.Provider
+	Unit       *unit.Provider
+	Sudoers    *sudoers.Provider
+	Runtime    *runtime.Provider
+	Hooks      *hook.Runner
+	PHP        *php.Provider
+	Web        *web.Provider
+	Logrotate  *logrotate.Provider
+	Monitoring *monitoring.Provider
+	Engine     web.Engine
 }
 
 // close libère les connexions ouvertes par les providers.
@@ -283,6 +292,7 @@ func (a *App) buildProviders() (*providers, error) {
 		Installer: &appprov.Installer{Exec: a.Exec}}
 	amqpProv := a.amqpProvider()
 	amqpPort := amqpProv.Port
+	dbProv := &db.Provider{Paths: a.Paths, Exec: a.Exec, Store: a.Store, Keys: a.Keys, AMQPPort: amqpPort}
 	certStore := tlsprov.Store{Paths: a.Paths}
 	certs := &tlsprov.Provider{
 		Paths: a.Paths, Cfg: a.Cfg, Store: certStore, DB: a.Store,
@@ -301,7 +311,7 @@ func (a *App) buildProviders() (*providers, error) {
 	return &providers{
 		System: sys,
 		TLS:    certs,
-		DB:     &db.Provider{Paths: a.Paths, Exec: a.Exec, Store: a.Store, Keys: a.Keys, AMQPPort: amqpPort},
+		DB:     dbProv,
 		AMQP:   amqpProv,
 		App:    appProv,
 		Cron: &cron.Provider{Paths: a.Paths, Templates: tmpl,
@@ -318,7 +328,13 @@ func (a *App) buildProviders() (*providers, error) {
 			ProxyTarget: appProv.ProxyTarget,
 		},
 		Logrotate: &logrotate.Provider{Paths: a.Paths, Templates: tmpl, Config: a.Cfg},
-		Engine:    eng,
+		Monitoring: &monitoring.Provider{
+			Paths: a.Paths, Cfg: a.Cfg, Exec: a.Exec, Templates: tmpl,
+			Store: a.Store, Keys: a.Keys,
+			DB: dbProv, AMQP: amqpProv, PHP: php,
+			WebEngine: eng.Name(), WebUnit: eng.Unit(),
+		},
+		Engine: eng,
 	}, nil
 }
 
@@ -336,6 +352,10 @@ func (a *App) amqpProvider() *amqp.Provider {
 		prov.Client = client
 		prov.Host = "127.0.0.1"
 		prov.Port = creds.AMQPPort
+		prov.ManagementURL = creds.URL
+		if prov.ManagementURL == "" {
+			prov.ManagementURL = amqp.DefaultManagementURL
+		}
 	}
 	return prov
 }

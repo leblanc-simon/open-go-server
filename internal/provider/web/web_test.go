@@ -665,3 +665,336 @@ func TestUnderHome(t *testing.T) {
 		}
 	}
 }
+
+// Les surcharges de vhost (D63) : deux contextes par moteur, un répertoire par
+// contexte, et le rendu qui fait foi.
+func TestIncludeDirsPerEngineAndTemplate(t *testing.T) {
+	cas := []struct {
+		moteur, gabarit string
+		kind            model.AppKind
+		contextes       []string
+	}{
+		{"apache", "php-fpm", model.KindSymfony, []string{IncludeDocroot, IncludeVHost}},
+		{"nginx", "php-fpm", model.KindSymfony, []string{IncludeDocroot, IncludeVHost}},
+		{"apache", "static", model.KindStatic, []string{IncludeDocroot, IncludeVHost}},
+		{"nginx", "static", model.KindStatic, []string{IncludeDocroot, IncludeVHost}},
+		// Un vhost de proxy ne sert aucun répertoire : le contexte du docroot
+		// n'existe pas pour lui, et nginx refuserait de toute façon un second
+		// « location / » dans le même server.
+		{"apache", "proxy", model.KindGo, []string{IncludeVHost}},
+		{"nginx", "proxy", model.KindGo, []string{IncludeVHost}},
+	}
+	for _, c := range cas {
+		prov, _ := fixture(t, c.moteur)
+		php := ""
+		if c.kind == model.KindSymfony {
+			php = "8.5"
+		}
+		p := project(t, "shop.fr", c.kind, "", php)
+		if c.kind == model.KindGo {
+			p.Spec.Web.VHosts = prov.vhosts(p)
+			p.Spec.Web.VHosts[0].Options = map[string]any{"proxyTarget": "127.0.0.1:20101"}
+		}
+		bp := buildMain(t, prov, p)
+		var want []string
+		for _, ctxName := range c.contextes {
+			want = append(want, prov.IncludeDir("shopfr", ctxName))
+		}
+		if strings.Join(bp.IncludeDirs, " ") != strings.Join(want, " ") {
+			t.Errorf("%s/%s : répertoires de surcharge %v, attendu %v",
+				c.moteur, c.gabarit, bp.IncludeDirs, want)
+		}
+		// Le masque est ce qui rend l'inclusion facultative : sans lui, un
+		// répertoire absent serait une erreur fatale au démarrage du moteur.
+		for _, dir := range want {
+			if !strings.Contains(string(bp.Content), dir+"/*.conf") {
+				t.Errorf("%s/%s : %s inclus sans masque :\n%s",
+					c.moteur, c.gabarit, dir, bp.Content)
+			}
+		}
+	}
+}
+
+// Le contexte du docroot doit être inclus dans le bloc du répertoire servi, et
+// celui du vhost au niveau du vhost : les confondre changerait la portée des
+// directives déposées — un « add_header » dans un location de nginx annule tous
+// ceux qu'il hérite du server.
+func TestIncludeContextsAreNested(t *testing.T) {
+	prov, _ := fixture(t, "nginx")
+	p := project(t, "shop.fr", model.KindSymfony, "6.4", "8.5")
+	bp := buildMain(t, prov, p)
+	docroot := prov.IncludeDir("shopfr", IncludeDocroot)
+	vus := 0
+	for _, line := range strings.Split(string(bp.Content), "\n") {
+		if !strings.Contains(line, docroot) {
+			continue
+		}
+		vus++
+		// Huit espaces : le second niveau d'indentation, celui d'un location.
+		if !strings.HasPrefix(line, "        include ") {
+			t.Errorf("l'inclusion du docroot n'est pas dans un location : %q", line)
+		}
+	}
+	if vus != 1 {
+		t.Fatalf("%d inclusion(s) du docroot, une seule attendue :\n%s", vus, bp.Content)
+	}
+
+	prov, _ = fixture(t, "apache")
+	bp = buildMain(t, prov, p)
+	c := string(bp.Content)
+	directory := c[strings.Index(c, "<Directory "+p.Spec.Layout.Docroot):]
+	directory = directory[:strings.Index(directory, "</Directory>")]
+	if !strings.Contains(directory, prov.IncludeDir("shopfr", IncludeDocroot)) {
+		t.Errorf("l'inclusion du docroot n'est pas dans le <Directory> :\n%s", directory)
+	}
+	if strings.Contains(directory, prov.IncludeDir("shopfr", IncludeVHost)) {
+		t.Error("l'inclusion du vhost ne doit pas être enfermée dans le <Directory>")
+	}
+}
+
+// Un vhost de redirection n'a rien à personnaliser, et son unique server porte
+// le challenge ACME : un « rewrite » déposé là empêcherait tout renouvellement.
+func TestRedirectVHostHasNoIncludes(t *testing.T) {
+	for _, moteur := range []string{"apache", "nginx"} {
+		prov, _ := fixture(t, moteur)
+		p := project(t, "shop.fr", model.KindSymfony, "6.4", "8.5")
+		p.Spec.Domains = append(p.Spec.Domains,
+			model.Domain{Name: "ancien-shop.fr", Role: "redirect", Target: "shop.fr"})
+		bp, err := prov.Build(p, prov.vhosts(p)[1])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(bp.IncludeDirs) != 0 {
+			t.Errorf("%s : le vhost de redirection ne doit inclure aucune surcharge : %v",
+				moteur, bp.IncludeDirs)
+		}
+	}
+}
+
+// Les répertoires sont créés par l'apply, en 0750 : leur contenu est lu en root
+// par le processus maître.
+func TestIncludeDirsCreatedByApply(t *testing.T) {
+	prov, _ := fixture(t, "nginx")
+	p := project(t, "shop.fr", model.KindSymfony, "6.4", "8.5")
+	ctx := context.Background()
+	apply := func() *engine.Plan {
+		obs, err := prov.Observe(ctx, p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		steps, err := prov.Plan(ctx, p, obs)
+		if err != nil {
+			t.Fatal(err)
+		}
+		plan := &engine.Plan{Project: p.ID()}
+		for _, s := range steps {
+			plan.Add(s)
+		}
+		if _, err := engine.Execute(ctx, plan, engine.Options{}); err != nil {
+			t.Fatal(err)
+		}
+		return plan
+	}
+	apply()
+	for _, ctxName := range []string{IncludeVHost, IncludeDocroot} {
+		dir := prov.IncludeDir("shopfr", ctxName)
+		info, err := os.Stat(dir)
+		if err != nil {
+			t.Fatalf("répertoire de surcharge non créé : %v", err)
+		}
+		if info.Mode().Perm() != 0o750 {
+			t.Errorf("%s en %04o, 0750 attendu", dir, info.Mode().Perm())
+		}
+	}
+
+	// Un fichier déposé ne fait pas dériver le vhost : l'empreinte porte sur le
+	// corps du fichier généré, que la surcharge ne touche pas.
+	surcharge := filepath.Join(prov.IncludeDir("shopfr", IncludeVHost), "10-essai.conf")
+	if err := os.WriteFile(surcharge, []byte("client_max_body_size 200M;\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if plan := apply(); !plan.Empty() {
+		t.Errorf("une surcharge déposée fait dériver le plan :\n%s", plan.String())
+	}
+	if _, err := os.Stat(surcharge); err != nil {
+		t.Errorf("la surcharge a été emportée par l'apply : %v", err)
+	}
+}
+
+// L'audit voit ce qu'aucune vérification de configuration ne voit : un fichier
+// hors de tout contexte, et un répertoire qu'aucun vhost ne référence plus.
+func TestAuditIncludesFindsIgnoredFiles(t *testing.T) {
+	prov, _ := fixture(t, "nginx")
+	p := project(t, "shop.fr", model.KindSymfony, "6.4", "8.5")
+	ctx := context.Background()
+	obs, _ := prov.Observe(ctx, p)
+	steps, err := prov.Plan(ctx, p, obs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := &engine.Plan{Project: p.ID()}
+	for _, s := range steps {
+		plan.Add(s)
+	}
+	if _, err := engine.Execute(ctx, plan, engine.Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := prov.AuditIncludes(); len(got) != 0 {
+		t.Fatalf("audit non vide sur une installation conforme : %+v", got)
+	}
+
+	perdu := filepath.Join(prov.Engine.IncludeRoot(), "shopfr", "perdu.conf")
+	if err := os.WriteFile(perdu, []byte("# jamais chargé\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	orphelin := filepath.Join(prov.Engine.IncludeRoot(), "disparu", IncludeVHost)
+	if err := os.MkdirAll(orphelin, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	var details []string
+	for _, pb := range prov.AuditIncludes() {
+		details = append(details, pb.Detail)
+		if pb.Severe {
+			t.Errorf("un fichier ignoré n'est pas une élévation de privilège : %s", pb.Detail)
+		}
+	}
+	joint := strings.Join(details, "\n")
+	if !strings.Contains(joint, perdu) {
+		t.Errorf("le fichier hors contexte n'est pas signalé :\n%s", joint)
+	}
+	if !strings.Contains(joint, filepath.Dir(orphelin)) {
+		t.Errorf("le répertoire orphelin n'est pas signalé :\n%s", joint)
+	}
+	// Le répertoire entier étant orphelin, ses contextes ne sont pas détaillés :
+	// ce serait répéter la même chose autant de fois qu'il en contient.
+	if strings.Contains(joint, orphelin) {
+		t.Errorf("le contexte d'un répertoire orphelin est détaillé en doublon :\n%s", joint)
+	}
+}
+
+// La suppression d'un projet emporte les répertoires vides et laisse le reste :
+// un fichier déposé là n'a pas été écrit par ogs.
+func TestRemoveIncludesKeepsWhatWasDeposited(t *testing.T) {
+	prov, _ := fixture(t, "apache")
+	root := prov.Engine.IncludeRoot()
+	garni := filepath.Join(root, "shopfr", IncludeVHost)
+	vide := filepath.Join(root, "shopfr", IncludeDocroot)
+	for _, d := range []string{garni, vide} {
+		if err := os.MkdirAll(d, 0o750); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(garni, "10-essai.conf"), []byte("# ici\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	kept := prov.RemoveIncludes("shopfr")
+	if len(kept) != 1 || kept[0] != garni {
+		t.Fatalf("conservés %v, attendu [%s]", kept, garni)
+	}
+	if _, err := os.Stat(vide); !os.IsNotExist(err) {
+		t.Errorf("le répertoire vide devait partir : %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(garni, "10-essai.conf")); err != nil {
+		t.Errorf("le fichier déposé a été emporté : %v", err)
+	}
+	// Rien à supprimer : l'appel doit rester sans effet et sans erreur.
+	if kept := prov.RemoveIncludes("inconnu"); kept != nil {
+		t.Errorf("un vhost sans surcharge ne conserve rien : %v", kept)
+	}
+}
+
+func TestVHostDeSupervisionExposeChaquePoolSansSonSocket(t *testing.T) {
+	for _, engineName := range []string{"apache", "nginx"} {
+		t.Run(engineName, func(t *testing.T) {
+			prov, paths := fixture(t, engineName)
+			shop := project(t, "shop.fr", model.KindSymfony, "6.4", "8.5")
+			steps, err := prov.PlanStatus(context.Background(), []*model.Project{shop},
+				"127.0.0.1:8099", "/ogs-status", true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(steps) == 0 {
+				t.Fatal("aucune étape produite pour le vhost de supervision")
+			}
+			for _, s := range steps {
+				if s.Apply != nil {
+					if err := s.Apply(context.Background()); err != nil {
+						t.Fatalf("%s : %v", s.Resource, err)
+					}
+				}
+			}
+			path := filepath.Join(prov.Engine.AvailableDir(), prov.Engine.FileName(StatusVHostName))
+			content, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			c := string(content)
+			if !strings.Contains(c, "127.0.0.1:8099") {
+				t.Errorf("le vhost doit écouter sur la boucle locale :\n%s", c)
+			}
+			if !strings.Contains(c, "/ogs-status/fpm/shopfr") {
+				t.Errorf("le pool du projet doit être exposé :\n%s", c)
+			}
+			// Le socket figure dans la directive de relais — c'est le serveur web qui
+			// le détient —, mais le pool n'est joignable que par le chemin de statut :
+			// l'agent n'obtient jamais le socket lui-même.
+			if !strings.Contains(c, paths.PHPSocket("8.5", 18501, "shopfr")) {
+				t.Errorf("le relais vers le pool est attendu :\n%s", c)
+			}
+			if !strings.Contains(c, config.PoolStatusPath) {
+				t.Errorf("le chemin de statut du pool est attendu :\n%s", c)
+			}
+		})
+	}
+}
+
+func TestVHostDeSupervisionRetireQuandDesactive(t *testing.T) {
+	prov, _ := fixture(t, "nginx")
+	shop := project(t, "shop.fr", model.KindSymfony, "6.4", "8.5")
+	steps, err := prov.PlanStatus(context.Background(), []*model.Project{shop},
+		"127.0.0.1:8099", "/ogs-status", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range steps {
+		if s.Apply != nil {
+			if err := s.Apply(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	path := filepath.Join(prov.Engine.AvailableDir(), prov.Engine.FileName(StatusVHostName))
+	if _, err := os.Stat(path); err != nil {
+		t.Fatal("le vhost devait être écrit")
+	}
+
+	off, err := prov.PlanStatus(context.Background(), []*model.Project{shop},
+		"127.0.0.1:8099", "/ogs-status", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(off) != 1 {
+		t.Fatalf("une étape de retrait attendue, %d obtenue(s)", len(off))
+	}
+	if err := off[0].Apply(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Error("le vhost de supervision doit disparaître lorsqu'il est désactivé")
+	}
+}
+
+func TestVHostDeSupervisionSansPoolResteValide(t *testing.T) {
+	prov, _ := fixture(t, "apache")
+	steps, err := prov.PlanStatus(context.Background(), nil, "127.0.0.1:8099", "/ogs-status", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range steps {
+		if s.Apply != nil {
+			if err := s.Apply(context.Background()); err != nil {
+				t.Fatalf("un parc sans pool doit produire un vhost valide : %v", err)
+			}
+		}
+	}
+}

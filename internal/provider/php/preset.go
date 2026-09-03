@@ -2,6 +2,7 @@ package php
 
 import (
 	"fmt"
+	"leblanc.io/open-go-server/internal/config"
 	"path/filepath"
 	"sort"
 )
@@ -89,6 +90,12 @@ func baseSettings(root, logDir string) map[string]string {
 		"request_terminate_timeout":          "300s",
 		"catch_workers_output":               "yes",
 		"decorate_workers_output":            "no",
+		// Points d'état du pool, lus par le vhost de supervision (D66). Ils ne sont
+		// atteignables depuis aucun vhost de projet : ceux-ci ne routent vers FPM
+		// que les URI se terminant par « .php ». Le nom est préfixé « ogs- » pour
+		// qu'un chemin applicatif ne puisse pas le recouvrir par accident.
+		"pm.status_path": config.PoolStatusPath,
+		"ping.path":      config.PoolPingPath,
 	}
 }
 

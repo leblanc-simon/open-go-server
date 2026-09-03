@@ -68,8 +68,13 @@ fi
 
 echo
 echo "--- rapport ---"
-ogs harden 2>&1 | head -20
-code=${PIPESTATUS[0]}
+# La sortie est capturée avant d'être tronquée : « ogs harden | head » ferme le
+# tube dès la vingtième ligne, et ogs meurt d'un SIGPIPE — le code observé était
+# alors 141, non celui de la commande. Une cible de plus dans la table suffisait
+# à faire échouer ce contrôle sans que rien n'ait changé au comportement.
+sortie=$(ogs harden 2>&1)
+code=$?
+echo "$sortie" | head -20
 echo "code de retour : $code (6 attendu : il reste à restreindre)"
 if [ "$code" != "6" ]; then
     echo "ÉCHEC : le rapport doit rendre le code 6 tant qu'il reste des droits à restreindre"

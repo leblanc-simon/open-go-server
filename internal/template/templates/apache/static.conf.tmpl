@@ -47,6 +47,7 @@
         AllowOverride {{ if .AllowOverride }}All{{ else }}None{{ end }}
         Require all granted
         Options -Indexes +FollowSymLinks
+        IncludeOptional {{ .IncludeDocroot }}/*.conf
     </Directory>
 {{- if .Noindex }}
 
@@ -59,4 +60,9 @@
     # bloc {{ .Name }}
 {{ indent 4 .Content }}
 {{- end }}
+
+    # Surcharges locales, éditées à la main hors de la gestion d'ogs.
+    # IncludeOptional, et non Include : ni le répertoire ni le moindre fichier
+    # n'ont à exister.
+    IncludeOptional {{ .IncludeVHost }}/*.conf
 {{- end }}

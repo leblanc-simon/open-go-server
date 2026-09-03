@@ -22,8 +22,8 @@ type Command struct {
 	Env   []string
 	Dir   string
 	Stdin []byte
-	// AsUser exécute la commande sous une autre identité. L'utilisateur d'un
-	// projet ayant un shell nologin, l'implémentation force le shell.
+	// AsUser exécute la commande sous une autre identité. L'implémentation force
+	// le shell : le compte d'un projet peut en avoir un fermé (D62).
 	AsUser string
 }
 
@@ -75,7 +75,8 @@ func (l *Local) Simulated() bool { return false }
 func (l *Local) Run(ctx context.Context, cmd Command) (Result, error) {
 	name, args := cmd.Name, cmd.Args
 	if cmd.AsUser != "" {
-		// -s force le shell : l'utilisateur du projet a nologin, ce qui ferait
+		// -s force le shell : le compte du projet peut en avoir un fermé — c'est un
+		// réglage du parc (D62) et un compte adopté porte le sien —, ce qui ferait
 		// échouer un su ordinaire.
 		//
 		// Chaque élément est cité : su attend un script, non un argv, et recoller

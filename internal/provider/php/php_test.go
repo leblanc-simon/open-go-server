@@ -411,3 +411,42 @@ func TestPlanRejectsUninstalledVersion(t *testing.T) {
 		t.Fatalf("une version absente doit être refusée : %v", err)
 	}
 }
+
+func TestPoolExposeSonCheminDeStatut(t *testing.T) {
+	prov, _, _ := fixture(t, "8.5")
+	p := project(t, "shop.fr", model.KindSymfony, "6.4", "8.5")
+	bp, err := prov.Build(p, p.Spec.PHP.Pools[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := string(bp.Content)
+	for _, want := range []string{
+		"pm.status_path = " + config.PoolStatusPath,
+		"ping.path = " + config.PoolPingPath,
+	} {
+		if !strings.Contains(content, want) {
+			t.Errorf("le pool doit exposer son état au vhost de supervision : %q absent", want)
+		}
+	}
+	// Le chemin ne doit pas ressembler à un script : les vhosts de projet ne
+	// routent vers FPM que les URI en « .php », ce qui le rend inatteignable
+	// depuis un site.
+	if strings.HasSuffix(config.PoolStatusPath, ".php") {
+		t.Error("un chemin de statut en .php serait servi par les vhosts de projet")
+	}
+}
+
+func TestSurchargeDuStatutResteAuProjet(t *testing.T) {
+	// Le chemin de statut est un réglage de base : un projet doit pouvoir le
+	// déplacer, comme n'importe quel autre.
+	prov, _, _ := fixture(t, "8.5")
+	p := project(t, "shop.fr", model.KindSymfony, "6.4", "8.5")
+	p.Spec.PHP.Pools[0].Settings = map[string]string{"pm.status_path": "/ailleurs"}
+	bp, err := prov.Build(p, p.Spec.PHP.Pools[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(bp.Content), "pm.status_path = /ailleurs") {
+		t.Error("la surcharge du projet doit primer sur le réglage de base")
+	}
+}

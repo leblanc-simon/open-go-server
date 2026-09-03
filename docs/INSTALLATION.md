@@ -154,6 +154,7 @@ non installé : il n'y a rien à faire.
 | `/etc/telegraf` | `0750 root:telegraf`, fichiers `0640` | jetons d'écriture des métriques |
 | `/etc/redis` | `0750 root:redis`, fichiers `0640` | `requirepass` en clair |
 | `/etc/ssl/private` | `0710 root:ssl-cert` | convention Debian ; les services concernés sont dans le groupe |
+| `/etc/fail2ban` | `0750 root:root` | `jail.d` énumère les journaux du parc et les adresses jamais bannies |
 | `/etc/cron.d` | `0750 root:root` | révèle les commandes et les identités de chaque projet |
 | `/etc/logrotate.d` | `0750 root:root` | révèle l'emplacement des journaux du parc |
 | `/etc/sudoers.d` | `0750 root:root` | révèle les délégations accordées |
@@ -203,6 +204,73 @@ secret et plusieurs outils d'exploitation les lisent — ni `/etc/php` au-delà 
 descend pas non plus dans les fichiers d'un répertoire dont la cible ne fixe pas de `fileMode` : fermer un
 répertoire suffit à rendre son contenu inatteignable, et modifier chaque fichier multiplierait les risques
 sans rien apporter.
+
+## Supervision : fail2ban et Telegraf
+
+`ogs` n'installe ni fail2ban ni Telegraf. Quand ils sont là, il leur écrit ce qu'ils ne peuvent pas
+deviner : quels journaux appartiennent à un projet, quels pools tournent sous quelle version, quels
+moteurs de bases sont en service. Deux fichiers, recalculés en entier à chaque `apply`, et rien d'autre.
+
+```sh
+ogs apply                       # les deux fichiers suivent le parc
+ogs secrets list @parc          # les comptes de supervision, sans leur valeur
+ogs doctor                      # journaux disparus, droits du fragment, mod_status
+```
+
+| Fichier | Ce qu'ogs y met | Ce qu'il n'y met pas |
+|---|---|---|
+| `/etc/telegraf/telegraf.d/ogs.conf` | les entrées : moteur web, un pool PHP-FPM par pool, les processus de chaque projet, MySQL, PostgreSQL, RabbitMQ | **aucune destination** — la base de métriques, son organisation et son jeton restent dans votre `telegraf.conf` |
+| `/etc/fail2ban/jail.d/ogs.conf` | les prisons, toutes préfixées `ogs-`, avec les journaux du parc | **aucun filtre** — ceux de la distribution sont employés tels quels ; votre `jail.local` n'est pas touché |
+
+**Le fragment de Telegraf porte des mots de passe** — ceux des comptes de supervision — et il est donc écrit
+en `0640`, groupe de l'agent. Si l'agent ne peut pas le lire, il démarre, ne collecte rien et **ne dit
+rien** : `ogs doctor` le signale à sa place.
+
+### L'état des pools passe par un vhost local
+
+`ogs` pose un vhost `ogs-status` qui n'écoute que sur `127.0.0.1:8099` et relaie l'état du serveur web et
+de chaque pool. Toute autre adresse d'écoute est refusée au chargement de la configuration.
+
+La raison est simple : le seul autre moyen de donner l'état d'un pool à l'agent serait de lui donner le
+socket FPM. Or parler à ce socket, c'est pouvoir y faire exécuter du code sous l'identité du projet — le
+protocole FastCGI n'authentifie personne. Le serveur web détient déjà ces sockets ; il sert
+d'intermédiaire, et l'agent n'obtient que ce que le pool rend sur son chemin de statut.
+
+Sous Apache, `mod_status` doit être activé (`a2enmod status`) : sans lui, le vhost sert une page vide sans
+que rien ne s'en plaigne.
+
+### Les comptes de supervision
+
+Ils appartiennent au parc, non à un projet, et ne peuvent atteindre aucune base de projet.
+
+| Moteur | Privilèges | Authentification |
+|---|---|---|
+| MySQL / MariaDB | `PROCESS`, `REPLICATION CLIENT`, lecture du `performance_schema` | mot de passe scellé au keystore |
+| PostgreSQL | `pg_monitor` | `peer` par le socket local, **sans mot de passe** |
+| RabbitMQ | tag `monitoring` seul | mot de passe scellé au keystore |
+
+Le rôle PostgreSQL porte le nom de l'utilisateur système de l'agent — `telegraf` par défaut —, parce que
+l'authentification « peer » compare l'utilisateur du système. Changer `monitoring.telegraf.user` change donc
+le nom du rôle.
+
+### Un piège à connaître
+
+**Une prison dont fail2ban ne trouve aucun journal l'empêche de démarrer, et il s'arrête alors tout
+entier** : les prisons valides tombent avec elle. `ogs` n'écrit donc que des chemins qui existaient au
+moment de l'`apply`, recalcule le fichier quand un projet est supprimé, et `ogs doctor` nomme les journaux
+disparus — avant qu'un redémarrage ne les découvre.
+
+Pour désactiver l'un ou l'autre, ou une prison précise :
+
+```yaml
+# /etc/ogs/config.yaml
+monitoring:
+  fail2ban:
+    enabled: false          # ou : jails: { web-badbots: false }
+  telegraf:
+    inputs:
+      rabbitmq: false
+```
 
 ## Archives et rétention
 

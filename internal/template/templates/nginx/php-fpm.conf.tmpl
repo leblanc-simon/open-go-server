@@ -45,6 +45,7 @@ server {
     # fonctionnel (images, pages de catégorie, API).
     location / {
         try_files $uri $uri/ /{{ .FrontController }}$is_args$args;
+        include {{ .IncludeDocroot }}/*.conf;
     }
     rewrite ^/api/?(.*)$ /webservice/dispatcher.php?url=$1 last;
     rewrite ^/([0-9])(-[\w-]+)?/(.+)\.(jpg|webp|png|avif)$ /img/p/$1/$1$2.$4 last;
@@ -60,6 +61,7 @@ server {
     # Front controller unique : tout passe par {{ .FrontController }}.
     location / {
         try_files $uri /{{ .FrontController }}$is_args$args;
+        include {{ .IncludeDocroot }}/*.conf;
     }
 {{- end }}
 
@@ -83,4 +85,9 @@ server {
     # bloc {{ .Name }}
 {{ indent 4 .Content }}
 {{- end }}
+
+    # Surcharges locales, éditées à la main hors de la gestion d'ogs. Le masque
+    # rend l'inclusion facultative : un répertoire absent ou vide ne fait pas
+    # broncher nginx, là où un chemin littéral introuvable serait fatal.
+    include {{ .IncludeVHost }}/*.conf;
 }

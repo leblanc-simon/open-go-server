@@ -1,0 +1,49 @@
+# Vhost de supervision, de portée serveur. Il n'écoute que sur la boucle locale
+# et ne sert que des chemins d'état : ogs refuse toute autre adresse à
+# l'écriture de la configuration.
+#
+# Il existe pour éviter de donner les sockets FPM à l'agent de métriques : parler
+# au socket d'un pool, c'est pouvoir y faire exécuter du code sous l'identité du
+# projet. Le serveur web a déjà ces sockets ; il sert d'intermédiaire, et l'agent
+# n'obtient que ce que le pool rend sur son chemin de statut.
+server {
+    listen {{ .Listen }};
+    server_name _;
+
+    # Une collecte toutes les quelques secondes par pool remplirait le journal
+    # d'accès sans rien apprendre. Le journal d'erreurs, lui, reste actif : c'est
+    # lui qui dirait un refus.
+    access_log off;
+
+    allow 127.0.0.1;
+    allow ::1;
+    deny all;
+
+    location = {{ .Prefix }}/nginx {
+        stub_status;
+    }
+{{- range .Pools }}
+
+    # pool {{ .Name }} — projet {{ .Project }}
+    location = {{ $.Prefix }}/fpm/{{ .Name }} {
+        fastcgi_pass {{ .Pass }};
+        include fastcgi_params;
+        # Après l'include, jamais avant : fastcgi_params fixe SCRIPT_NAME depuis
+        # l'URI demandée, et FPM compare ce nom à son pm.status_path.
+        fastcgi_param SCRIPT_NAME {{ $.PoolStatus }};
+        fastcgi_param SCRIPT_FILENAME {{ $.PoolStatus }};
+        fastcgi_param QUERY_STRING $query_string;
+    }
+
+    location = {{ $.Prefix }}/ping/{{ .Name }} {
+        fastcgi_pass {{ .Pass }};
+        include fastcgi_params;
+        fastcgi_param SCRIPT_NAME {{ $.PoolPing }};
+        fastcgi_param SCRIPT_FILENAME {{ $.PoolPing }};
+    }
+{{- end }}
+
+    location / {
+        return 404;
+    }
+}

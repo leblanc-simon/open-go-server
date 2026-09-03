@@ -8,9 +8,11 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
+	"leblanc.io/open-go-server/internal/model"
 	"leblanc.io/open-go-server/internal/secret"
 	"leblanc.io/open-go-server/internal/store"
 )
@@ -88,7 +90,7 @@ func (h *harness) simulateSystemEffects(id, host string, uid int) {
 	if err := os.MkdirAll(h.path("etc"), 0o755); err != nil {
 		h.t.Fatal(err)
 	}
-	passwd := fmt.Sprintf("%s:x:%d:%d:ogs=%s:%s:/usr/sbin/nologin\n", id, uid, uid, id, home)
+	passwd := fmt.Sprintf("%s:x:%d:%d:ogs=%s:%s:%s\n", id, uid, uid, id, home, model.DefaultShell)
 	if err := os.WriteFile(h.path("etc", "passwd"), []byte(passwd), 0o644); err != nil {
 		h.t.Fatal(err)
 	}
@@ -132,6 +134,58 @@ func TestInitIsIdempotent(t *testing.T) {
 	after, _ := os.ReadFile(h.path("etc", "ogs", "master.key"))
 	if string(before) != string(after) {
 		t.Error("init a régénéré la clé maître : les secrets existants deviendraient illisibles")
+	}
+}
+
+func TestProjectShellComesFromConfig(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+
+	// Le défaut du parc : un shell ouvert (D62).
+	h.mustRun("project", "create", "shop.fr", "--kind", "static")
+	if spec := h.read(t, filepath.Join("etc", "ogs", "projects", "shopfr.yaml")); !strings.Contains(
+		spec, "shell: "+model.DefaultShell) {
+		t.Errorf("le projet devrait porter le shell par défaut :\n%s", spec)
+	}
+
+	// Fermé dans la configuration, le suivant le reçoit fermé — et le premier ne
+	// bouge pas : le fichier d'un projet existant fait autorité, sans quoi un
+	// changement de configuration réécrirait le shell de tout le parc.
+	cfg := h.path("etc", "ogs", "config.yaml")
+	data, err := os.ReadFile(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// « init » écrit la clé : la fermeture du shell se fait en éditant sa valeur,
+	// ce qui vaut mieux qu'un réglage à devenir.
+	setShell := func(shell string) {
+		out := strings.Replace(string(data), "shell: "+model.DefaultShell, "shell: "+shell, 1)
+		if out == string(data) {
+			t.Fatalf("la clé user.shell devrait figurer dans la configuration générée :\n%s", data)
+		}
+		if err := os.WriteFile(cfg, []byte(out), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	setShell("/usr/sbin/nologin")
+	h.mustRun("project", "create", "autre.fr", "--kind", "static")
+	if spec := h.read(t, filepath.Join("etc", "ogs", "projects", "autrefr.yaml")); !strings.Contains(
+		spec, "shell: /usr/sbin/nologin") {
+		t.Errorf("le shell configuré devrait s'appliquer :\n%s", spec)
+	}
+	if spec := h.read(t, filepath.Join("etc", "ogs", "projects", "shopfr.yaml")); !strings.Contains(
+		spec, "shell: "+model.DefaultShell) {
+		t.Errorf("le projet existant ne doit pas suivre le changement de configuration :\n%s", spec)
+	}
+
+	// Un shell relatif est refusé au chargement, non à l'application.
+	setShell("bash")
+	out, code := h.run("plan", "shopfr")
+	if code == CodeOK {
+		t.Errorf("un shell relatif doit être refusé :\n%s", out)
+	}
+	if !strings.Contains(out, "user.shell") {
+		t.Errorf("le message doit nommer la clé fautive :\n%s", out)
 	}
 }
 
@@ -2102,5 +2156,95 @@ func TestProcessesOfUIDFindsSelf(t *testing.T) {
 	// soit un défaut.
 	if len(procs) < maxListedProcesses+1 {
 		t.Errorf("le processus courant devrait figurer parmi %v", procs)
+	}
+}
+
+func TestSupervisionEcritLesFichiersDuParc(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRunPartial("site", "create", "shop.fr", "--kind", "php-symfony", "--php", "8.5", "--yes")
+
+	// Fragment de l'agent : les pools passent par le vhost de supervision, jamais
+	// par leur socket — le donner à l'agent lui donnerait un moyen d'exécution
+	// sous l'identité du projet.
+	fragment := h.read(t, filepath.Join("etc", "telegraf", "telegraf.d", "ogs.conf"))
+	if !strings.Contains(fragment, "[[inputs.phpfpm]]") {
+		t.Errorf("le pool du projet doit être supervisé :\n%s", fragment)
+	}
+	if strings.Contains(fragment, ".sock") {
+		t.Errorf("aucun socket FPM ne doit figurer dans le fragment :\n%s", fragment)
+	}
+	if strings.Contains(fragment, "[[outputs.") {
+		t.Errorf("la destination des métriques reste à l'administrateur :\n%s", fragment)
+	}
+
+	// Prisons : toutes préfixées, aucune ne recouvre celles de l'administrateur.
+	jails := h.read(t, filepath.Join("etc", "fail2ban", "jail.d", "ogs.conf"))
+	for _, want := range []string{"[ogs-sshd]", "ignoreip = 127.0.0.1/8"} {
+		if !strings.Contains(jails, want) {
+			t.Errorf("%q absent du fichier de prisons :\n%s", want, jails)
+		}
+	}
+
+	// Vhost de supervision : boucle locale seulement.
+	vhost := h.read(t, filepath.Join("etc", "apache2", "sites-available", "ogs-status.conf"))
+	if !strings.Contains(vhost, "127.0.0.1:8099") {
+		t.Errorf("le vhost de supervision doit rester sur la boucle locale :\n%s", vhost)
+	}
+}
+
+func TestSupervisionOublieUnProjetSupprime(t *testing.T) {
+	// Une prison dont le journal a disparu empêche fail2ban de démarrer, et toutes
+	// les autres tombent avec elle. La suppression d'un projet doit donc recalculer
+	// les fichiers de parc, non les laisser désigner ce qui n'existe plus.
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRunPartial("site", "create", "shop.fr", "--kind", "php-symfony", "--php", "8.5", "--yes")
+	h.mustRunPartial("site", "create", "boutique.fr", "--kind", "php-prestashop", "--php", "7.4", "--yes")
+
+	h.mustRun("project", "delete", "shopfr", "--yes")
+
+	fragment := h.read(t, filepath.Join("etc", "telegraf", "telegraf.d", "ogs.conf"))
+	if strings.Contains(fragment, "shopfr") {
+		t.Errorf("le projet supprimé subsiste dans les entrées de l'agent :\n%s", fragment)
+	}
+	if !strings.Contains(fragment, "boutiquefr") {
+		t.Errorf("le projet restant doit toujours être supervisé :\n%s", fragment)
+	}
+	vhost := h.read(t, filepath.Join("etc", "apache2", "sites-available", "ogs-status.conf"))
+	if strings.Contains(vhost, "shopfr") {
+		t.Errorf("le vhost de supervision proxifie encore un pool disparu :\n%s", vhost)
+	}
+}
+
+func TestSupervisionDesactivable(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	cfg := h.path("etc", "ogs", "config.yaml")
+	data, err := os.ReadFile(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// « ogs init » écrit déjà la section : elle est remplacée, non dupliquée — un
+	// YAML ne tolère pas deux fois la même clé de premier niveau.
+	desactive := "monitoring:\n  status:\n    enabled: false\n" +
+		"  telegraf:\n    enabled: false\n  fail2ban:\n    enabled: false\n"
+	updated := regexp.MustCompile(`(?s)monitoring:.*$`).ReplaceAllString(string(data), desactive)
+	if updated == string(data) {
+		t.Fatalf("la section monitoring est attendue dans la configuration produite :\n%s", data)
+	}
+	if err := os.WriteFile(cfg, []byte(updated), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	h.mustRunPartial("site", "create", "shop.fr", "--kind", "php-symfony", "--php", "8.5", "--yes")
+
+	for _, rel := range []string{
+		filepath.Join("etc", "telegraf", "telegraf.d", "ogs.conf"),
+		filepath.Join("etc", "fail2ban", "jail.d", "ogs.conf"),
+		filepath.Join("etc", "apache2", "sites-available", "ogs-status.conf"),
+	} {
+		if _, err := os.Stat(h.path(rel)); !os.IsNotExist(err) {
+			t.Errorf("%s ne devrait pas exister : la supervision est désactivée", rel)
+		}
 	}
 }

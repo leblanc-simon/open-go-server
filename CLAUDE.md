@@ -12,8 +12,8 @@ Les commits ne mentionnent jamais l'assistance d'un outil d'IA.
 
 ## La référence
 
-[`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md) fait autorité : 60 décisions d'architecture
-arbitrées (D1–D60, tableau §2), spécification par module, plan de tests, découpage en lots. **Consulter le
+[`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md) fait autorité : 68 décisions d'architecture
+arbitrées (D1–D68, tableau §2), spécification par module, plan de tests, découpage en lots. **Consulter le
 tableau des décisions avant de proposer une architecture** — la plupart des questions « pourquoi pas
 plutôt… ? » y sont déjà tranchées, avec leur raison. Toute décision nouvelle s'y ajoute.
 
@@ -23,7 +23,7 @@ plutôt… ? » y sont déjà tranchées, avec leur raison. Toute décision nouv
 make build            # ./ogs, statique (CGO_ENABLED=0), aucune dépendance C
 make test             # tests unitaires
 make check            # fmt + vet + test
-make cover            # couverture (61,5 % actuellement)
+make cover            # couverture (61,8 % actuellement)
 make doc              # pages de manuel, complétions, référence Markdown → dist/doc
 make package          # paquet Debian → dist/*.deb (nfpm, réseau requis)
 
@@ -43,12 +43,12 @@ make dev-demo                                   # crée ./dev, deux projets, pla
 
 ### Essais sur système réel
 
-Quatorze scénarios conteneurisés éprouvent ce que les tests unitaires ne peuvent pas voir. Ils ont mis au jour
+Quinze scénarios conteneurisés éprouvent ce que les tests unitaires ne peuvent pas voir. Ils ont mis au jour
 plus de trente défauts invisibles autrement (§18 du cahier des charges) : **y recourir avant de déclarer un
 provider fonctionnel**.
 
 ```sh
-make integration-all       # les quatorze, à la suite
+make integration-all       # les quinze, à la suite
 make integration-nginx     # un seul (voir SCENARIOS dans le Makefile)
 
 # Hors série : rbenv et pyenv compilent depuis les sources (un quart d'heure).
@@ -133,6 +133,19 @@ servi par tous les templates de vhost**, pas seulement ceux des sites PHP.
 contenant une espace. Les processus sont placés dans leur propre groupe et l'annulation tue le groupe
 entier. `exec.Recorder` (mode préfixé) simule tout et permet aux tests d'assertion sur les commandes.
 
+### Supervision : deux fichiers dérivés du parc
+
+`internal/provider/monitoring` écrit, dans le plan global, les entrées de Telegraf
+(`/etc/telegraf/telegraf.d/ogs.conf`) et les prisons de fail2ban (`/etc/fail2ban/jail.d/ogs.conf`), plus les
+comptes de supervision des moteurs (D64–D68). ogs n'installe rien et se tait quand l'outil est absent — le
+critère est la présence de son répertoire de fragments. Il n'écrit **aucune destination de métriques** et
+**aucun filtre fail2ban** : le jeton d'écriture ne concerne aucun projet, et un filtre est une expression
+régulière qu'il faudrait maintenir au rythme des changements de format de journal.
+
+L'agent n'atteint jamais un socket FPM. `web.Provider.PlanStatus` pose un vhost `ogs-status` sur la boucle
+locale, qui relaie l'état de chaque pool : **parler au socket d'un pool, c'est pouvoir y faire exécuter du
+code sous l'identité du projet**, le protocole FastCGI n'ayant aucune authentification.
+
 ### Surfaces particulières
 
 - `ogs my <verbe>` : surface déléguée à l'utilisateur d'un projet par une règle sudoers énumérée, sans
@@ -159,6 +172,19 @@ Ils ont tous coûté un défaut réel ; les tests unitaires ne les voyaient pas.
 - Les vhosts de proxy nginx emploient `$connection_upgrade`, fourni par le fragment géré
   `/etc/nginx/conf.d/ogs.conf`. Toute variable employée par un vhost doit être définie quelque part — un
   test unitaire le vérifie.
+- **Les surcharges de vhost sont incluses par un masque, et c'est le masque qui les rend facultatives**
+  (D63) : nginx comme Apache traitent un joker sans correspondance comme un silence, là où un chemin
+  littéral introuvable est fatal — d'où `IncludeOptional` et non `Include`, ce dernier échouant sur un
+  joker vide. Les contextes offerts sont **déduits du vhost rendu**, jamais d'une table : les templates
+  étant surchargeables, une table créerait un répertoire qu'aucun vhost n'inclut, où les fichiers déposés
+  seraient ignorés sans un mot. Trois choses que le moteur ne dit pas et que `doctor` porte : ces fichiers
+  sont lus par le processus **maître, en root** — même régime que les hooks —, un `.conf` posé hors des
+  sous-répertoires de contexte n'est chargé par personne, et un répertoire orphelin garde des fichiers que
+  leur auteur croit actifs. Deux pièges de sémantique exposés du même coup : sur nginx une directive
+  **dupliquée** est fatale, là où Apache retient la dernière, et un `add_header` dans le contexte du
+  docroot **annule tous ceux hérités du `server`** — HSTS compris. Le vhost de redirection n'offre aucun
+  point de surcharge : son unique `server` porte le challenge ACME, qu'un `rewrite` déposé là mettrait par
+  terre.
 - `StartLimitBurst` et `StartLimitIntervalSec` appartiennent à **`[Unit]`** ; dans `[Service]`, systemd les
   ignore en silence.
 - `ReadWritePaths` d'une unité est **facultatif** (préfixe `-`) : `var/` est créé par l'application, et un
@@ -208,8 +234,47 @@ Ils ont tous coûté un défaut réel ; les tests unitaires ne les voyaient pas.
   qui libèrent les workers du pool. L'ordre inverse laissait compte, groupe et home en place — en annonçant
   un succès. Le scénario `suppression` le verrouille, et lui seul le voit : en mode simulé, ni `userdel` ni
   les rechargements n'atteignent le système.
-- Apache a besoin de six modules (`ssl`, `proxy`, `proxy_fcgi`, `proxy_http`, `rewrite`, `headers`) ;
-  sans eux la configuration est acceptée puis rend une 500 illisible. `doctor` les énumère.
+- **Le shell des comptes de projet est ouvert** — `/bin/bash` (D62), réglable par `user.shell` dans
+  `/etc/ogs/config.yaml` et par `spec.user.shell`. Trois points à ne pas défaire : le défaut de la
+  configuration est un défaut **de création**, le fichier du projet faisant autorité ensuite — le propager
+  réécrirait le shell de tout le parc au prochain apply ; le shell déclaré est **réconcilié** par `usermod`,
+  dans la **même étape** que la correction du home, deux étapes de même ressource se marchant dessus dans le
+  plan comme dans l'audit ; et un projet **adopté garde son shell réel**, l'import le reprenant du système.
+  `su -s /bin/bash` reste nécessaire dans `internal/exec` : un parc peut avoir refermé le shell.
+- **Un lien symbolique n'a pas de droits propres** sous Linux : son mode est 0777 et immuable. Le
+  `.ssh/authorized_keys` lié au trousseau commun `/opt/default_authorized_keys` (D61) en dépend
+  entièrement — sshd **résout le lien** avant tout contrôle, donc ce sont les droits de la cible qui
+  décident, et le mode du lien ne peut pas servir de critère de dérive. Trois conséquences : sous
+  `StrictModes`, un trousseau n'appartenant pas à root ou inscriptible au-delà de son propriétaire est ignoré
+  **en silence** ; il est lu sous l'identité de l'utilisateur du projet, donc il doit **lui être lisible**
+  (0644 root:root) ; et c'est `lchown`, jamais `chown`, qui pose le propriétaire du lien — suivre le lien
+  donnerait le trousseau commun à l'utilisateur du dernier projet appliqué. `doctor` porte ces contrôles,
+  qu'aucune vérification de configuration ne voit. Un `authorized_keys` régulier déjà présent n'est **jamais**
+  remplacé : il porte l'accès de quelqu'un.
+- **Une prison fail2ban dont aucun journal n'existe empêche le démon de démarrer**, et il s'arrête alors
+  tout entier — les prisons valides comprises. D'où trois choses : les journaux sont énumérés un à un et
+  filtrés par existence à l'écriture, le fichier est **recalculé à la suppression d'un projet** (sans quoi
+  retirer un site cassait fail2ban au prochain redémarrage, sans un mot), et `doctor` nomme les journaux
+  disparus. Le même raisonnement décide du backend de la prison sshd : `/var/log/auth.log` n'existe plus
+  sur une Debian sans rsyslog, mais le backend `systemd` exige `python3-systemd`, qui n'est qu'une
+  recommandation du paquet — on choisit d'après ce qui existe, en préférant le fichier.
+- **Apache traite les sections `<Location>` dans l'ordre du fichier**, non par spécificité. Un
+  `<Location />  Require all denied` placé en dernier annule les autorisations accordées plus haut : le
+  vhost paraît correct et répond 403 à tout le monde.
+- **`mod_proxy_fcgi` dérive `SCRIPT_NAME` de l'URI demandée**, non du chemin de la cible `fcgi://`. Un
+  `ProxyPass /x unix:…|fcgi://localhost/ogs-fpm-status` ne suffit donc pas : FPM ne reconnaît pas son
+  `pm.status_path`, cherche un fichier et répond « Primary script unknown ». `ProxyFCGISetEnvIf` réécrit la
+  variable. Nginx n'a pas ce problème — mais son `fastcgi_param SCRIPT_NAME` doit venir **après**
+  `include fastcgi_params`, qui le fixe.
+- **MariaDB rend « BINLOG MONITOR » là où MySQL rend « REPLICATION CLIENT »** : le GRANT est accepté sous
+  les deux noms, la relecture n'en rend qu'un. Comparer au seul libellé de MySQL faisait annoncer
+  éternellement une correction qu'on venait d'appliquer.
+- Telegraf n'a **pas d'équivalent d'`apachectl -t`** : son option de test exécute réellement la collecte.
+  Le rechargement se contente d'un constat en aval. Et un fragment que l'agent ne peut pas lire ne produit
+  **aucune erreur** — il démarre, ne collecte rien, et se tait ; d'où le contrôle de `doctor`.
+- Apache a besoin de sept modules (`ssl`, `proxy`, `proxy_fcgi`, `proxy_http`, `rewrite`, `headers`,
+  `status`) ; sans eux la configuration est acceptée puis rend une 500 illisible — ou, pour `status`, une
+  page vide. `doctor` les énumère.
 - MySQL : le nom de base après `ON` est un motif où `_` est un joker, donc échappé — **et déséchappé à la
   relecture**, sans quoi toute base contenant un souligné reste éternellement « en écart ». Le nom
   d'utilisateur, lui, est un littéral.

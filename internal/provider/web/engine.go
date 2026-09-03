@@ -40,6 +40,8 @@ type Engine interface {
 	// SnippetPath est le fichier de réglages de portée serveur, vide si le moteur
 	// n'en a pas besoin.
 	SnippetPath() string
+	// IncludeRoot est la racine des répertoires de surcharge des vhosts (D63).
+	IncludeRoot() string
 }
 
 // apacheEngine implémente Engine pour Apache 2.4 sur Debian et Ubuntu.
@@ -60,6 +62,10 @@ func (a apacheEngine) CommentPrefix() string        { return "#" }
 // SnippetPath : Apache n'a besoin d'aucun réglage de portée serveur, ses vhosts
 // sont autonomes.
 func (a apacheEngine) SnippetPath() string { return "" }
+
+func (a apacheEngine) IncludeRoot() string {
+	return filepath.Join(a.prefix, "/etc/apache2/projects")
+}
 
 func (a apacheEngine) ValidateArgs() (string, []string) {
 	return filepath.Join(a.prefix, "/usr/sbin/apachectl"), []string{"-t"}
@@ -105,6 +111,10 @@ func (n nginxEngine) CommentPrefix() string        { return "#" }
 // hors de tout server. Debian charge tout /etc/nginx/conf.d.
 func (n nginxEngine) SnippetPath() string {
 	return filepath.Join(n.prefix, "/etc/nginx/conf.d/ogs.conf")
+}
+
+func (n nginxEngine) IncludeRoot() string {
+	return filepath.Join(n.prefix, "/etc/nginx/projects")
 }
 
 func (n nginxEngine) ValidateArgs() (string, []string) {

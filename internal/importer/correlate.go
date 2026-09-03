@@ -34,6 +34,10 @@ type Candidate struct {
 	User string `json:"user,omitempty" yaml:"user,omitempty"`
 	// Home est la racine déduite du docroot ou du compte.
 	Home string `json:"home,omitempty" yaml:"home,omitempty"`
+	// Shell est le shell réel du compte repéré. Un projet adopté le garde : le
+	// défaut du parc n'a pas à ouvrir — ni à fermer — l'accès d'un compte qui
+	// existait avant ogs.
+	Shell string `json:"shell,omitempty" yaml:"shell,omitempty"`
 	// Docroot est le répertoire servi.
 	Docroot string `json:"docroot,omitempty" yaml:"docroot,omitempty"`
 	// PHPVersion est la version du pool associé.
@@ -130,6 +134,7 @@ func Correlate(resources []Resource, homeRoot, prepDomain string) ([]Candidate, 
 				continue
 			}
 			candidate.Home = home
+			candidate.Shell = user.Attr("shell")
 			candidate.Resources = append(candidate.Resources, user)
 			claimed[key(user)] = true
 			indices++

@@ -70,7 +70,7 @@ package: doc
 # Ils exigent un système complet — serveur web, PHP, comptes — et s'exécutent
 # donc dans un conteneur. Ils ne font pas partie de « make test ».
 # Tous les scénarios, l'un après l'autre.
-SCENARIOS := reload-group site-complet suppression web-durci nginx hooks mysql postgres rabbitmq pebble systemd runtimes harden paquet
+SCENARIOS := reload-group site-complet suppression web-durci nginx hooks mysql postgres rabbitmq pebble systemd runtimes harden paquet supervision
 
 integration-all:
 	@for s in $(SCENARIOS); do \
@@ -110,6 +110,9 @@ integration-runtimes:
 
 integration-harden:
 	./test/integration/run.sh harden
+
+integration-supervision:
+	./test/integration/run.sh supervision
 
 # Hors de la série ordinaire : rbenv et pyenv compilent depuis les sources, ce
 # qui demande un quart d'heure, du réseau et des dépendances de compilation.

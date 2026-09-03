@@ -19,6 +19,12 @@ const (
 	// MainPoolName est le pool principal : il porte le nom nu du projet, les
 	// autres reçoivent un suffixe de rôle.
 	MainPoolName = "web"
+	// DefaultShell est le shell des comptes de projet lorsque ni le projet ni la
+	// configuration du parc n'en déclarent (D62). C'est un shell ouvert : la
+	// connexion entrante reste décidée par sshd et par les clés autorisées (D61),
+	// non par ogs. Le fermer se fait par « user.shell » dans la configuration, ou
+	// projet par projet par « spec.user.shell ».
+	DefaultShell = "/bin/bash"
 )
 
 // Project est l'état désiré d'un projet, tel qu'il est écrit dans
@@ -356,8 +362,14 @@ func (p *Project) Normalize(homeRoot, prepDomain string) error {
 	if p.Spec.User.Group == "" {
 		p.Spec.User.Group = p.Spec.User.Name
 	}
+	// Le shell n'est pas déduit du parc ici : l'appelant a posé le défaut
+	// configuré avant d'appeler, et ce repli ne sert qu'aux chemins qui n'ont pas
+	// de configuration sous la main — l'importateur, les tests.
 	if p.Spec.User.Shell == "" {
-		p.Spec.User.Shell = "/usr/sbin/nologin"
+		p.Spec.User.Shell = DefaultShell
+	}
+	if !path.IsAbs(p.Spec.User.Shell) {
+		return fmt.Errorf("spec.user.shell doit être un chemin absolu (valeur : %q)", p.Spec.User.Shell)
 	}
 	if p.Spec.User.UID == "" {
 		p.Spec.User.UID = "auto"

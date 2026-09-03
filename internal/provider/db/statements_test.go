@@ -383,3 +383,46 @@ func TestDropRemovesExtraAccounts(t *testing.T) {
 		}
 	}
 }
+
+func TestMonitoringMySQLBorneLesPrivileges(t *testing.T) {
+	stmts, err := MonitoringMySQL("telegraf", "localhost", "motdepasse")
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(stmts, "\n")
+	// Le compte lit l'état du serveur, jamais les données des projets : un agent
+	// de métriques compromis ne doit pas être un accès aux bases de clients.
+	if strings.Contains(joined, "ALL PRIVILEGES") {
+		t.Errorf("privilèges trop larges :\n%s", joined)
+	}
+	for _, want := range []string{
+		"GRANT PROCESS, REPLICATION CLIENT ON *.*",
+		"GRANT SELECT ON `performance_schema`.*",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("%q absent :\n%s", want, joined)
+		}
+	}
+}
+
+func TestMonitoringMySQLRefuseUnNomHorsListeBlanche(t *testing.T) {
+	if _, err := MonitoringMySQL("tele'graf", "localhost", "x"); err == nil {
+		t.Error("un nom d'utilisateur hors liste blanche doit être refusé")
+	}
+}
+
+func TestMonitoringPostgresNaPasDeMotDePasse(t *testing.T) {
+	stmts, err := MonitoringPostgres("telegraf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(stmts, "\n")
+	// La connexion est locale et authentifiée « peer » : un mot de passe serait
+	// un secret de plus à conserver, et à faire tourner, pour rien.
+	if strings.Contains(strings.ToUpper(joined), "PASSWORD") {
+		t.Errorf("le rôle de supervision ne doit pas porter de mot de passe :\n%s", joined)
+	}
+	if !strings.Contains(joined, "GRANT pg_monitor TO") {
+		t.Errorf("pg_monitor est le rôle attendu :\n%s", joined)
+	}
+}

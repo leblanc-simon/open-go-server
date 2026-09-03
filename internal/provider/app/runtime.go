@@ -125,7 +125,7 @@ func (i *Installer) Install(ctx context.Context, proj *model.Project, runtime, v
 }
 
 // runAs exécute un script sous l'identité du projet. « su -s » force le shell :
-// l'utilisateur du projet a nologin, et un su ordinaire échouerait.
+// le compte peut en avoir un fermé (D62), et un su ordinaire échouerait alors.
 func (i *Installer) runAs(ctx context.Context, user, script string) error {
 	if i.Exec == nil || i.Exec.Simulated() {
 		return nil

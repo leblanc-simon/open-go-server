@@ -258,6 +258,36 @@ func (a *App) buildGlobalPlan(provs *providers, projects []*model.Project) (*eng
 	for _, s := range units {
 		plan.Add(s)
 	}
+
+	// Supervision. Le vhost d'état précède les entrées de l'agent, qui s'y
+	// adressent, et le fichier de prisons vient en dernier : fail2ban refuse de
+	// démarrer sur une prison dont aucun journal n'existe, et les journaux des
+	// projets viennent d'être créés par le rechargement du moteur web à la fin de
+	// leurs propres plans.
+	monObs, err := provs.Monitoring.Observe(context.Background())
+	if err != nil {
+		return nil, wrap(CodeError, err)
+	}
+	statusOn, set := a.Cfg.Monitoring.StatusEnabled()
+	if !set {
+		statusOn = monObs.TelegrafPresent
+	}
+	statusSteps, err := provs.Web.PlanStatus(context.Background(), projects,
+		a.Cfg.Monitoring.StatusListen(), a.Cfg.Monitoring.StatusPath(), statusOn)
+	if err != nil {
+		return nil, wrap(CodeError, err)
+	}
+	for _, s := range statusSteps {
+		plan.Add(s)
+	}
+
+	monSteps, err := provs.Monitoring.Plan(context.Background(), projects, monObs)
+	if err != nil {
+		return nil, wrap(CodeError, err)
+	}
+	for _, s := range monSteps {
+		plan.Add(s)
+	}
 	return plan, nil
 }
 
@@ -312,6 +342,12 @@ func (a *App) reloadFunc(provs *providers) func(context.Context, string) error {
 			id := strings.TrimPrefix(target, "systemd:restart-target:")
 			a.printf("  ↻ redémarrage des services de %s\n", id)
 			return a.systemctl(ctx, "restart", unit.TargetName(id))
+		case target == "monitoring:telegraf":
+			a.printf("  ↻ rechargement de telegraf\n")
+			return provs.Monitoring.ReloadTelegraf(ctx)
+		case target == "monitoring:fail2ban":
+			a.printf("  ↻ rechargement de fail2ban\n")
+			return provs.Monitoring.ReloadFail2ban(ctx)
 		case strings.HasPrefix(target, "systemd:enable:"):
 			unit := strings.TrimPrefix(target, "systemd:enable:")
 			a.printf("  ↻ activation de %s\n", unit)

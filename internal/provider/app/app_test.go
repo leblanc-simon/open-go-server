@@ -320,8 +320,8 @@ func TestGoRuntimeHasNoVersionManager(t *testing.T) {
 }
 
 func TestInstallUsesForcedShell(t *testing.T) {
-	// L'utilisateur du projet a nologin : « su -s » force le shell, sans quoi
-	// l'installation échouerait.
+	// Le compte du projet peut avoir un shell fermé (D62) : « su -s » le force,
+	// sans quoi l'installation échouerait.
 	prefix := t.TempDir()
 	rec := exec.NewRecorder()
 	installer := &Installer{Exec: &realExecutor{rec}}

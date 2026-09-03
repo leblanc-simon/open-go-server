@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"leblanc.io/open-go-server/internal/config"
@@ -96,7 +97,7 @@ func statDir(path string) DirState {
 		return DirState{}
 	}
 	st := DirState{Exists: true, Mode: info.Mode().Perm(), UID: -1, GID: -1}
-	if uid, gid, ok := ownerOf(info); ok {
+	if uid, gid, ok := OwnerOf(info); ok {
 		st.UID, st.GID = uid, gid
 	}
 	return st
@@ -169,25 +170,42 @@ func (p *Provider) Plan(_ context.Context, proj *model.Project, obs Observed) ([
 			"(champ commentaire sans marque %q) : l'adopter avec « ogs import » ou choisir un autre identifiant",
 			spec.Name, managedMarker)
 	default:
+		// Home et shell sont corrigés par une seule étape : deux étapes portant la
+		// même ressource se marcheraient dessus dans le plan comme dans l'audit, et
+		// un seul « usermod » suffit à les poser toutes deux.
+		var drifts []string
+		var args, revert []string
 		if obs.User.Home != spec.Home && obs.User.Home != "" {
-			s := engine.NewStep("system/user/"+spec.Name, engine.Update,
-				fmt.Sprintf("utilisateur %s : home %s → %s", spec.Name, obs.User.Home, spec.Home))
-			previous := obs.User.Home
-			s.Apply = func(ctx context.Context) error {
-				_, err := p.Exec.Run(ctx, exec.Command{Name: "usermod",
-					Args: []string{"--home", spec.Home, spec.Name}})
-				return err
-			}
-			s.Compensate = func(ctx context.Context) error {
-				_, err := p.Exec.Run(ctx, exec.Command{Name: "usermod",
-					Args: []string{"--home", previous, spec.Name}})
-				return err
-			}
-			steps = append(steps, s)
-		} else {
+			drifts = append(drifts, fmt.Sprintf("home %s → %s", obs.User.Home, spec.Home))
+			args = append(args, "--home", spec.Home)
+			revert = append(revert, "--home", obs.User.Home)
+		}
+		// Le shell déclaré est réconcilié : sans cela, ouvrir ou fermer l'accès d'un
+		// projet existant demanderait un usermod à la main, et « spec.user.shell »
+		// serait un état désiré que rien n'applique (D62).
+		if obs.User.Shell != spec.Shell && obs.User.Shell != "" {
+			drifts = append(drifts, fmt.Sprintf("shell %s → %s", obs.User.Shell, spec.Shell))
+			args = append(args, "--shell", spec.Shell)
+			revert = append(revert, "--shell", obs.User.Shell)
+		}
+		if len(drifts) == 0 {
 			steps = append(steps, engine.NewStep("system/user/"+spec.Name, engine.NoOp,
 				fmt.Sprintf("utilisateur %s", spec.Name)))
+			break
 		}
+		s := engine.NewStep("system/user/"+spec.Name, engine.Update,
+			fmt.Sprintf("utilisateur %s : %s", spec.Name, strings.Join(drifts, ", ")))
+		s.Apply = func(ctx context.Context) error {
+			_, err := p.Exec.Run(ctx, exec.Command{Name: "usermod",
+				Args: append(append([]string{}, args...), spec.Name)})
+			return err
+		}
+		s.Compensate = func(ctx context.Context) error {
+			_, err := p.Exec.Run(ctx, exec.Command{Name: "usermod",
+				Args: append(append([]string{}, revert...), spec.Name)})
+			return err
+		}
+		steps = append(steps, s)
 	}
 
 	// 3. Appartenance du serveur web au groupe du projet.
@@ -224,6 +242,11 @@ func (p *Provider) Plan(_ context.Context, proj *model.Project, obs Observed) ([
 
 	// 5. Clé de déploiement et lien d'interpréteur, une fois l'arborescence en place.
 	steps = append(steps, p.keyStep(proj))
+	// 6. Clés autorisées, après la clé de déploiement : les deux vivent dans .ssh,
+	// et l'ordre rend l'apply lisible plutôt qu'il ne crée une dépendance.
+	if s := p.authorizedKeysStep(proj); s != nil {
+		steps = append(steps, s)
+	}
 	if s := p.binStep(proj); s != nil {
 		steps = append(steps, s)
 	}

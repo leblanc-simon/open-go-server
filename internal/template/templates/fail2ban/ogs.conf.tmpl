@@ -1,0 +1,30 @@
+# Prisons dérivées du parc. Elles ne remplacent pas jail.local : toutes portent
+# le préfixe « ogs- », de sorte qu'aucune ne recouvre une prison de
+# l'administrateur. Les filtres sont ceux livrés par fail2ban.
+#
+# Un point de vigilance, qui explique la forme de ce fichier : fail2ban refuse de
+# démarrer sur une prison dont aucun journal n'existe, et s'arrête alors
+# entièrement — les prisons valides comprises. Les chemins ci-dessous sont donc
+# énumérés un à un, et seuls ceux qui existaient au moment de l'apply y figurent.
+
+[DEFAULT]
+bantime  = {{ .BanTime }}
+findtime = {{ .FindTime }}
+maxretry = {{ .MaxRetry }}
+ignoreip = {{ join " " .IgnoreIP }}
+{{ range .Jails }}
+[{{ .Name }}]
+enabled  = true
+filter   = {{ .Filter }}
+port     = {{ .Port }}
+backend  = {{ .Backend }}
+maxretry = {{ .MaxRetry }}
+{{- if eq .Name "ogs-recidive" }}
+bantime  = {{ $.RecidiveBanTime }}
+findtime = {{ $.RecidiveFindTime }}
+{{- end }}
+{{- if .LogPaths }}
+logpath  = {{ range $i, $p := .LogPaths }}{{ if $i }}
+           {{ end }}{{ $p }}{{ end }}
+{{- end }}
+{{ end }}

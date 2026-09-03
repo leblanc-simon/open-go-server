@@ -16,6 +16,7 @@ import (
 	"leblanc.io/open-go-server/internal/fs"
 	"leblanc.io/open-go-server/internal/model"
 	"leblanc.io/open-go-server/internal/provider/php"
+	"leblanc.io/open-go-server/internal/provider/system"
 	"leblanc.io/open-go-server/internal/template"
 )
 
@@ -47,6 +48,14 @@ func (p *Provider) now() time.Time {
 	return time.Now()
 }
 
+// Contextes de surcharge d'un vhost (D63). Les noms sont ceux du rôle, non ceux
+// d'un moteur : « vhost » est le server de nginx et le VirtualHost d'Apache,
+// « docroot » le location / de l'un et le Directory du docroot de l'autre.
+const (
+	IncludeVHost   = "vhost"
+	IncludeDocroot = "docroot"
+)
+
 // VHostPlan est le rendu attendu d'un vhost.
 type VHostPlan struct {
 	Name        string
@@ -57,6 +66,8 @@ type VHostPlan struct {
 	Enabled     bool
 	ServerName  string
 	Domains     []string
+	// IncludeDirs énumère les répertoires de surcharge que le vhost référence.
+	IncludeDirs []string
 }
 
 // Observed est l'état réel des vhosts.
@@ -274,10 +285,15 @@ func (p *Provider) Build(proj *model.Project, vh model.VHost) (*VHostPlan, error
 		"Noindex":           proj.IsPrep(),
 		"ClientMaxBodySize": optionString(vh.Options, "clientMaxBodySize", "32M"),
 		"Blocks":            vh.Blocks,
-		"RedirectTarget":    optionString(vh.Options, "target", vh.Domains[0]),
-		"ProxyTarget":       optionString(vh.Options, "proxyTarget", ""),
-		"FPMHandler":        "",
-		"FPMPass":           "",
+		// Répertoires de surcharge (D63) : le template décide lesquels il inclut
+		// réellement, et c'est le rendu qui fait foi — les répertoires créés sont
+		// ceux que le vhost référence, pas ceux qu'une table dirait.
+		"IncludeVHost":   p.IncludeDir(name, IncludeVHost),
+		"IncludeDocroot": p.IncludeDir(name, IncludeDocroot),
+		"RedirectTarget": optionString(vh.Options, "target", vh.Domains[0]),
+		"ProxyTarget":    optionString(vh.Options, "proxyTarget", ""),
+		"FPMHandler":     "",
+		"FPMPass":        "",
 	}
 
 	if at.NeedsPHP {
@@ -325,7 +341,47 @@ func (p *Provider) Build(proj *model.Project, vh model.VHost) (*VHostPlan, error
 	return &VHostPlan{
 		Name: name, Path: path, EnabledPath: enabledPath, Content: content,
 		State: state, Enabled: enabledErr == nil, ServerName: vh.Domains[0], Domains: vh.Domains,
+		IncludeDirs: p.includeDirs(content),
 	}, nil
+}
+
+// IncludeDir est le répertoire de surcharge d'un vhost pour un contexte donné.
+func (p *Provider) IncludeDir(name, context string) string {
+	return filepath.Join(p.Engine.IncludeRoot(), name, context)
+}
+
+// reIncludeDirective reconnaît les inclusions facultatives d'un répertoire de
+// surcharge, dans la syntaxe de l'un ou l'autre moteur. Le masque est exigé :
+// c'est lui qui rend l'inclusion facultative — nginx et Apache traitent
+// l'absence de correspondance comme un silence, là où un chemin littéral absent
+// est une erreur fatale. « include fastcgi_params » n'est pas concerné.
+var reIncludeDirective = regexp.MustCompile(`(?m)^\s*(?:IncludeOptional|include)\s+(/\S+)/\*\.conf`)
+
+// includeDirs énumère les répertoires de surcharge qu'un vhost référence.
+//
+// La liste est déduite du rendu, et non d'une table associant un template à ses
+// contextes : les templates sont surchargeables, et une table finirait par
+// mentir — ogs créerait un répertoire que le vhost n'inclut pas, où les fichiers
+// déposés seraient ignorés en silence. Seuls les chemins sous la racine du
+// moteur sont retenus : un include que l'exploitant ajoute ailleurs ne relève
+// pas d'ogs.
+func (p *Provider) includeDirs(content []byte) []string {
+	root := p.Engine.IncludeRoot()
+	var out []string
+	seen := map[string]bool{}
+	for _, m := range reIncludeDirective.FindAllStringSubmatch(string(content), -1) {
+		dir := filepath.Clean(m[1])
+		if dir != root && !strings.HasPrefix(dir, root+string(filepath.Separator)) {
+			continue
+		}
+		if seen[dir] {
+			continue
+		}
+		seen[dir] = true
+		out = append(out, dir)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // poolFor retrouve le pool associé à un vhost, afin d'en tirer le point d'écoute.
@@ -372,6 +428,13 @@ func (p *Provider) vhostStep(proj *model.Project, bp *VHostPlan) []*engine.Step 
 	summary := fmt.Sprintf("vhost %s %s (%s)", p.Engine.Name(), bp.Name, strings.Join(bp.Domains, ", "))
 	var steps []*engine.Step
 
+	// Les répertoires de surcharge d'abord : le vhost les référence dès son
+	// écriture. Leur absence n'empêcherait rien — le masque est facultatif — mais
+	// un exploitant qui lit le vhost doit trouver le répertoire annoncé.
+	if s := p.includeStep(bp); s != nil {
+		steps = append(steps, s)
+	}
+
 	switch bp.State {
 	case fs.StateCurrent:
 		steps = append(steps, engine.NewStep(resource, engine.NoOp, summary))
@@ -408,6 +471,62 @@ func (p *Provider) vhostStep(proj *model.Project, bp *VHostPlan) []*engine.Step 
 			fmt.Sprintf("vhost %s actif", bp.Name)))
 	}
 	return steps
+}
+
+// includeStep crée les répertoires de surcharge d'un vhost (D63), ou constate
+// qu'ils sont là. Nil si le vhost n'en référence aucun — un vhost de
+// redirection n'a rien à personnaliser, et son unique server porte le challenge
+// ACME.
+//
+// Les répertoires sont en 0750 root:root, comme le reste de /etc/nginx après
+// « ogs harden » : leur contenu est lu par le processus maître, **en root**. Un
+// fichier que le compte d'un projet pourrait écrire lui donnerait un « root / »
+// ou un « alias » sur ce qu'il veut, donc la lecture de tout le système par HTTP.
+func (p *Provider) includeStep(bp *VHostPlan) *engine.Step {
+	if len(bp.IncludeDirs) == 0 {
+		return nil
+	}
+	resource := "web/vhost/" + bp.Name + "/includes"
+	missing := make([]string, 0, len(bp.IncludeDirs))
+	for _, dir := range bp.IncludeDirs {
+		if info, err := os.Stat(dir); err != nil || !info.IsDir() {
+			missing = append(missing, dir)
+		}
+	}
+	base := filepath.Join(p.Engine.IncludeRoot(), bp.Name)
+	if len(missing) == 0 {
+		return engine.NewStep(resource, engine.NoOp, "surcharges du vhost "+bp.Name+" ("+base+")")
+	}
+	s := engine.NewStep(resource, engine.Create,
+		fmt.Sprintf("répertoires de surcharge du vhost %s (%s)", bp.Name, base))
+	// Non critique : un vhost parfaitement servi ne doit pas être défait parce
+	// qu'un répertoire d'agrément n'a pas pu être créé.
+	s.Critical = false
+	s.Apply = func(context.Context) error {
+		for _, dir := range missing {
+			if err := fs.EnsureDir(p.Engine.IncludeRoot(), 0o750, fs.KeepOwner); err != nil {
+				return err
+			}
+			if err := fs.EnsureDir(filepath.Dir(dir), 0o750, fs.KeepOwner); err != nil {
+				return err
+			}
+			if err := fs.EnsureDir(dir, 0o750, fs.KeepOwner); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	s.Compensate = func(context.Context) error {
+		// Seuls les répertoires vides sont retirés : un fichier déposé entre-temps
+		// porte le travail de quelqu'un. os.Remove refuse un répertoire non vide,
+		// ce qui suffit à s'en assurer.
+		for _, dir := range missing {
+			_ = os.Remove(dir)
+		}
+		_ = os.Remove(base)
+		return nil
+	}
+	return s
 }
 
 // PlanTLS produit la bascule en TLS des vhosts dont le certificat n'était pas
@@ -812,6 +931,197 @@ func (p *Provider) CheckLogs(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// AuditIncludes contrôle les répertoires de surcharge des vhosts (D63) et rend
+// la liste des anomalies, vide si tout est conforme.
+//
+// Trois choses qu'aucune vérification de configuration ne voit :
+//
+//   - un fichier de surcharge est lu par le processus maître, **en root**. S'il
+//     est inscriptible au-delà de son propriétaire, ce compte obtient un
+//     « root / » ou un « alias » vers ce qu'il veut : la lecture de tout le
+//     système par HTTP. Même régime que les hooks, donc, et pour la même raison.
+//   - un fichier .conf déposé à la racine du répertoire du vhost, hors des
+//     sous-répertoires de contexte, n'est chargé par personne. Rien ne le dit :
+//     le site fonctionne, la surcharge est simplement sans effet.
+//   - un répertoire qu'aucun vhost ne référence plus — vhost renommé, projet
+//     supprimé — garde des fichiers que leur auteur croit actifs.
+func (p *Provider) AuditIncludes() []IncludeProblem {
+	root := p.Engine.IncludeRoot()
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		// Aucun répertoire de surcharge : rien à contrôler.
+		return nil
+	}
+	referenced := p.referencedIncludeDirs()
+	var problems []IncludeProblem
+	for _, e := range entries {
+		dir := filepath.Join(root, e.Name())
+		if !e.IsDir() {
+			problems = append(problems, ignored("%s n'est pas un répertoire de vhost", dir))
+			continue
+		}
+		var used bool
+		for ref := range referenced {
+			if ref == dir || strings.HasPrefix(ref, dir+string(filepath.Separator)) {
+				used = true
+				break
+			}
+		}
+		if !used {
+			// Le répertoire entier est orphelin : détailler chacun de ses contextes
+			// répéterait la même chose autant de fois qu'il en contient.
+			problems = append(problems, ignored(
+				"%s ne correspond à aucun vhost géré : ses surcharges ne sont pas chargées", dir))
+		}
+		problems = append(problems, p.auditIncludeDir(dir, referenced, used)...)
+	}
+	sort.Slice(problems, func(i, j int) bool { return problems[i].Detail < problems[j].Detail })
+	return problems
+}
+
+// IncludeProblem est une anomalie relevée dans les répertoires de surcharge.
+type IncludeProblem struct {
+	Detail string
+	// Severe distingue ce qui ouvre une élévation de privilège — un fichier lu en
+	// root qu'un tiers peut écrire — de ce qui n'est qu'inopérant : un fichier
+	// jamais chargé ne casse rien, il ne fait rien.
+	Severe bool
+	// Fix est la commande qui rétablit, vide s'il n'y en a pas d'évidente.
+	Fix string
+}
+
+func ignored(format string, args ...any) IncludeProblem {
+	return IncludeProblem{Detail: fmt.Sprintf(format, args...)}
+}
+
+// auditIncludeDir contrôle un répertoire de vhost et ses contextes.
+func (p *Provider) auditIncludeDir(dir string, referenced map[string]bool, used bool) []IncludeProblem {
+	problems := p.auditIncludePerm(dir)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return append(problems, ignored("%s illisible : %v", dir, err))
+	}
+	for _, e := range entries {
+		path := filepath.Join(dir, e.Name())
+		if !e.IsDir() {
+			if strings.HasSuffix(e.Name(), ".conf") {
+				problems = append(problems, ignored(
+					"%s est hors de tout contexte : le déplacer dans %s/ ou %s/, sinon il reste ignoré",
+					path, IncludeVHost, IncludeDocroot))
+			}
+			continue
+		}
+		problems = append(problems, p.auditIncludePerm(path)...)
+		if !referenced[path] {
+			if used {
+				problems = append(problems, ignored(
+					"%s n'est inclus par aucun vhost : contexte inconnu du moteur %s",
+					path, p.Engine.Name()))
+			}
+			continue
+		}
+		files, err := os.ReadDir(path)
+		if err != nil {
+			continue
+		}
+		for _, f := range files {
+			if f.IsDir() || !strings.HasSuffix(f.Name(), ".conf") {
+				continue
+			}
+			problems = append(problems, p.auditIncludePerm(filepath.Join(path, f.Name()))...)
+		}
+	}
+	return problems
+}
+
+// auditIncludePerm contrôle propriétaire et mode d'un chemin de surcharge. Tout
+// ce qui se juge par rapport à root ne vaut qu'en production : sous préfixe,
+// l'arborescence appartient à qui fait tourner l'essai, et les modes y sont ceux
+// de son umask.
+func (p *Provider) auditIncludePerm(path string) []IncludeProblem {
+	if p.Paths.Prefix() != "" {
+		return nil
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil
+	}
+	var problems []IncludeProblem
+	if info.Mode().Perm()&0o022 != 0 {
+		problems = append(problems, IncludeProblem{
+			Detail: fmt.Sprintf("%s est inscriptible au-delà de son propriétaire (mode %04o) : "+
+				"ce compte dicterait la configuration que %s lit en root",
+				path, info.Mode().Perm(), p.Engine.Unit()),
+			Severe: true,
+			Fix:    "chmod go-w " + path,
+		})
+	}
+	if uid, _, ok := system.OwnerOf(info); ok && uid != 0 {
+		problems = append(problems, IncludeProblem{
+			Detail: fmt.Sprintf("%s appartient à l'uid %d, attendu root", path, uid),
+			Severe: true,
+			Fix:    "chown root:root " + path,
+		})
+	}
+	return problems
+}
+
+// referencedIncludeDirs énumère les répertoires de surcharge que les vhosts
+// activés référencent réellement. C'est le moteur qui décide, non ogs : un vhost
+// écrit depuis un template surchargé peut n'inclure aucun répertoire, ou en
+// inclure d'autres.
+func (p *Provider) referencedIncludeDirs() map[string]bool {
+	out := map[string]bool{}
+	entries, err := os.ReadDir(p.Engine.EnabledDir())
+	if err != nil {
+		return out
+	}
+	for _, e := range entries {
+		content, err := os.ReadFile(filepath.Join(p.Engine.EnabledDir(), e.Name()))
+		if err != nil || !strings.Contains(firstLines(content), fs.Marker) {
+			continue
+		}
+		for _, dir := range p.includeDirs(content) {
+			out[dir] = true
+		}
+	}
+	return out
+}
+
+// RemoveIncludes retire les répertoires de surcharge d'un vhost supprimé, et
+// rend ceux qu'il a fallu laisser en place. Un répertoire vide ne vaut rien ;
+// un répertoire garni porte le travail de quelqu'un et n'est jamais détruit —
+// même règle que l'authorized_keys d'un projet.
+func (p *Provider) RemoveIncludes(name string) []string {
+	base := filepath.Join(p.Engine.IncludeRoot(), name)
+	entries, err := os.ReadDir(base)
+	if err != nil {
+		return nil
+	}
+	var kept []string
+	for _, e := range entries {
+		path := filepath.Join(base, e.Name())
+		// Seuls les répertoires vides sont candidats : un fichier régulier a été
+		// déposé à la main — même mal placé, il est le travail de quelqu'un, et
+		// os.Remove l'emporterait sans broncher.
+		if !e.IsDir() {
+			kept = append(kept, path)
+			continue
+		}
+		// os.Remove refuse un répertoire non vide : c'est le test lui-même.
+		if err := os.Remove(path); err != nil {
+			kept = append(kept, path)
+		}
+	}
+	if len(kept) == 0 {
+		if err := os.Remove(base); err != nil {
+			kept = append(kept, base)
+		}
+	}
+	sort.Strings(kept)
+	return kept
 }
 
 // reachable dit si le moteur web peut atteindre un chemin en écriture depuis son

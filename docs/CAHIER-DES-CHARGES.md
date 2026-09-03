@@ -36,6 +36,8 @@ réconciliation idempotent amène le serveur dans l'état décrit.
 - Clé de déploiement ed25519 par projet.
 - Commandes composites de haut niveau (`site create`) orchestrant l'ensemble.
 - Import assisté d'un serveur existant.
+- **Configuration** de fail2ban et de l'agent de métriques Telegraf, dérivée du parc (D64) : prisons, entrées
+  et comptes de supervision. Ni l'un ni l'autre n'est installé par ogs.
 
 ### 1.3 Hors périmètre
 
@@ -43,7 +45,10 @@ réconciliation idempotent amène le serveur dans l'état décrit.
   `dump`/`restore` ponctuelles existent, utilisées notamment par l'archivage à la suppression.
 - Installation et mise à jour des paquets système (Apache, PHP, MySQL…) : ils sont supposés présents.
   `ogs doctor` se contente de diagnostiquer ce qui manque.
-- DNS, messagerie, pare-feu, monitoring, métriques, alerting.
+- DNS, messagerie, alerting. Le pare-feu et les métriques ne le sont plus tout à fait : ogs **écrit la
+  configuration** de fail2ban et de Telegraf à partir du parc (D64), sans les installer, sans définir de
+  destination de métriques (D65) et sans écrire le moindre filtre. Rien d'autre — ni règles de pare-feu
+  posées directement, ni seuils d'alerte, ni tableaux de bord.
 - **Quotas disque** : hors périmètre, y compris à terme.
 - Compilation et build applicatif (`go build`, `npm run build`, `bundle install`) : relève du déploiement. `ogs` installe le runtime et supervise le processus, il ne construit pas l'application.
 - Déploiement applicatif (git, composer, assets) : relève d'un outil de déploiement dédié.
@@ -83,7 +88,7 @@ Décisions arbitrées et figées pour la v1. Toute remise en cause est une évol
 | D12 | Crons | **`/etc/cron.d/ogs-<id>`** généré, `flock` systématique | Fichier entièrement piloté par l'outil |
 | D13 | systemd | **Unités templatisées** `@.service` + `.target`, instances multiples | `daemon-reload` groupé en fin d'apply |
 | D14 | TUI | **Inspecteur + actions + wizard** (Bubble Tea) | Composant majeur, livré en lot dédié |
-| D15 | Isolation | User dédié, shell `nologin`, **docroot simple**, home `/home/<host effectif>` en 0711 (D51) | Pas de mécanique `releases/` ; `/home` doit rester traversable |
+| D15 | Isolation | User dédié, ~~shell `nologin`~~ (**révisé par D62** : `/bin/bash`, réglable), **docroot simple**, home `/home/<host effectif>` en 0711 (D51) | Pas de mécanique `releases/` ; `/home` doit rester traversable |
 | D16 | Échecs composites | **Rollback avec étapes optionnelles non bloquantes** | Chaque étape déclare sa criticité et sa compensation |
 | D17 | Tests | Unitaires + **intégration en conteneurs systemd** | CI plus lourde mais garanties réelles |
 | D18 | Binaire | **`ogs`**, statique, `.deb` via GoReleaser | CGO désactivé → SQLite en Go pur |
@@ -101,7 +106,7 @@ Décisions arbitrées et figées pour la v1. Toute remise en cause est une évol
 | D30 | Interpréteur | Crons et unités invoquent **`/home/<host>/.bin/php`**, lien géré | Une bascule de version ne réécrit ni cron ni unité |
 | D31 | Transport FPM | **Socket Unix par défaut**, numéroté selon la norme `1<version><incrément>` ; TCP possible mais explicite | Le numéro est un identifiant logique, pas un port ouvert |
 | D32 | Layout | Code applicatif dans **`/home/<host>/www`** ; le docroot dépend du **type d'application** (`www` pour Prestashop, `www/public` pour Symfony) | Un type d'application devient une donnée de premier plan du modèle |
-| D33 | Clé de déploiement | Paire **ed25519 sans passphrase** générée à la création, privée conservée sur le serveur, publique à déclarer en deploy key | Déploiement en **tirage** (le serveur clone) ; aucune surface SSH entrante, `nologin` conservé |
+| D33 | Clé de déploiement | Paire **ed25519 sans passphrase** générée à la création, privée conservée sur le serveur, publique à déclarer en deploy key | Déploiement en **tirage** (le serveur clone) ; aucune clé privée à confier à un tiers. Le volet « aucune surface SSH entrante, `nologin` conservé » est **révisé par D62** : le shell est ouvert par défaut, ce qui ne change rien au sens du déploiement |
 | D34 | Applications non-PHP | **Go, Node, Ruby, Python** supportés : processus supervisé par systemd + vhost en reverse-proxy | Élargit le périmètre à la supervision de runtimes applicatifs |
 | D35 | Runtimes | `nvm`, `rbenv`, `pyenv`/`venv` installés **par utilisateur** dans son home, liens gérés dans `.bin/` | Une copie par site ; intégrité du runtime hors du contrôle de l'inventaire |
 | D36 | Écoute des applications | **Socket Unix** `0660 www-data:<id>` quand le runtime le permet ; sinon port TCP `2<runtime><incrément>` sur **127.0.0.1 exclusivement** | Isolation équivalente à celle des pools PHP |
@@ -129,6 +134,14 @@ Décisions arbitrées et figées pour la v1. Toute remise en cause est une évol
 | D42 | Webroot du challenge | Le client ACME écrit dans `<webroot>/.well-known/acme-challenge/` : **Apache aliase ce répertoire, nginx prend le webroot** et y accole l'URI | Les deux directives n'ont pas la même sémantique ; une seule valeur de template menait fatalement l'un des deux moteurs à un 404 |
 | D43 | TLS dans les templates | **Tous** les templates de vhost servent le HTTPS, non seulement ceux des sites PHP | Un site statique, une application derrière un proxy — donc tous les runtimes non-PHP — et un domaine redirigé ont autant besoin d'être chiffrés |
 | D40 | Hooks | **Deux portées** : un fichier de `/etc/ogs/hooks` nommé d'après l'événement s'applique à tout le parc, `spec.hooks` le remplace pour un projet. Criticité déduite du préfixe : `pre` interrompt, `post` avertit | Un hook s'exécute en root : le script doit vivre sous `/etc/ogs/hooks`, appartenir à root et n'être inscriptible par personne d'autre, sans quoi il est refusé — c'est une escalade de privilèges autrement. Aucun hook en `--dry-run` |
+| D61 | Clés SSH d'administration | Si **`/opt/default_authorized_keys`** existe, `.ssh/authorized_keys` de chaque projet est un **lien symbolique** vers ce fichier, `lchown` à l'utilisateur du projet ; l'étape est **non critique**, elle n'existe pas sans le fichier commun, et un `authorized_keys` **régulier** n'est jamais remplacé | Les opérateurs qui interviennent sur les projets sont les mêmes pour tout le parc : un trousseau unique se met à jour en un endroit, là où une copie par projet exigerait de repasser sur chacun d'eux à chaque arrivée ou départ — et figerait le trousseau au jour de la création du site. Le fichier commun n'est **pas géré par ogs** : l'administrateur le pose et le tient à jour, ogs ne fait que le lier. Quatre points acquis de la mécanique d'OpenSSH : sshd **résout le lien** avant tout contrôle, donc ce sont les droits de la cible qui décident et le mode du lien — 0777 immuable sous Linux — n'a aucun effet, ce qui interdit d'en faire un critère de dérive ; sous `StrictModes`, un fichier qui n'appartient pas à root ou à l'utilisateur, ou inscriptible au-delà de son propriétaire, est ignoré **en silence** ; le fichier est lu sous l'identité de l'utilisateur du projet, donc il doit aussi **lui être lisible** — 0644 root:root ; et `lchown`, non `chown`, sans quoi le trousseau commun passerait à l'utilisateur du dernier projet appliqué. C'est `doctor` qui porte ces contrôles, aucun n'étant visible depuis le plan. Un `authorized_keys` régulier déjà présent — reprise d'un serveur existant, clé posée par l'utilisateur du projet — porte l'accès de quelqu'un : le remplacer par un lien le lui retirerait sans un mot. L'étape échoue donc sans rien détruire, ce qui rend un avertissement et le code 6, et l'exploitant tranche. Le shell des projets étant ouvert par défaut (D62), le trousseau est utile sans réglage supplémentaire ; un parc qui referme le shell garde le lien en place mais inerte, sauf accès restreint à SFTP. Dans les deux cas, poser le lien n'ouvre par lui-même aucune surface : c'est sshd qui décide, et rien ici ne touche à sa configuration |
+| D62 | Shell des comptes de projet | **`/bin/bash`** par défaut, réglable pour tout le parc par **`user.shell`** dans `/etc/ogs/config.yaml` et projet par projet par `spec.user.shell` ; le shell déclaré est **réconcilié** (`usermod`), et un projet **adopté garde le sien** | Révise D15 et D33, qui fermaient le shell. La raison du renversement : un compte fermé rend inutilisables le trousseau de clés d'administration (D61), l'accès SFTP au docroot et tout dépannage à la main — trois usages quotidiens qu'il fallait rouvrir un projet à la fois. Ce que la décision ne change pas : ogs **ne touche pas à sshd**. Un shell ouvert n'ouvre par lui-même aucune connexion — il faut encore une clé autorisée et un sshd qui l'accepte — mais il faut le dire franchement, la surface d'attaque augmente : un compte de projet dont la clé fuite obtient un shell, là où `nologin` l'arrêtait net. D'où trois garde-fous. La valeur est **un réglage**, et la fermer se fait en une ligne pour tout le parc, `user.shell: /usr/sbin/nologin` ; le défaut est **de création**, donc le fichier d'un projet existant fait autorité ensuite — sans quoi un changement de configuration réécrirait le shell de tout le parc au prochain apply ; et un chemin **relatif** est refusé au chargement, `useradd` l'acceptant tel quel pour rendre un compte inutilisable sans un mot, quand `doctor` signale par ailleurs un shell absent du disque. La réconciliation est le corollaire nécessaire : sans elle `spec.user.shell` serait un état désiré que rien n'applique, et ouvrir ou fermer un projet existant demanderait un `usermod` à la main. Elle partage l'étape du compte avec la correction du home — deux étapes de même ressource se marcheraient dessus dans le plan comme dans l'audit. Un projet **adopté** est l'exception : son compte existait avant ogs, et l'import reprend son shell réel plutôt que d'imposer le défaut du parc, comme il garde ses autres noms |
+| D63 | Surcharges de vhost | Chaque vhost inclut **deux répertoires facultatifs** de `/etc/<moteur>/projects/<nom du vhost>/` : `vhost/*.conf` dans le contexte du vhost (`server` de nginx, `<VirtualHost>` d'Apache) et `docroot/*.conf` dans celui du répertoire servi (`location /`, `<Directory>`). Les répertoires sont créés par l'apply en **0750 root:root** et **déduits du rendu**, non d'une table | Un `blocks` de `spec` vit dans le fichier du projet, donc sous le contrôle d'ogs : le modifier demande un apply, et il n'a pas de sens pour un réglage que l'exploitant ajuste à la main. Le répertoire répond à ce besoin sans ouvrir la moindre brèche dans le modèle : ogs ne lit jamais ces fichiers, il ne fait que les faire inclure, et l'empreinte du vhost généré ne dépend pas d'eux — une surcharge déposée ne fait donc jamais dériver le plan. **Le masque est ce qui rend l'inclusion facultative** : nginx et Apache traitent un joker sans correspondance comme un silence, là où un chemin littéral introuvable est fatal — d'où `IncludeOptional` et non `Include`, ce dernier échouant sur un joker vide depuis 2.4. Le nommage suit le **fichier de vhost** (`shopfr`, non `shop.fr`) : un projet porte plusieurs vhosts, et un domaine principal qui change laisserait un répertoire orphelin que rien ne relie plus. La liste des contextes est **déduite du vhost rendu** — les templates sont surchargeables, et une table finirait par mentir : ogs créerait un répertoire que le vhost n'inclut pas, où les fichiers déposés seraient ignorés en silence. Un vhost de **proxy** n'a donc que le contexte du vhost — il ne sert aucun répertoire, et nginx refuse un second `location /` dans le même `server` — et un vhost de **redirection** n'en a aucun : son unique `server` porte le challenge ACME, qu'un `rewrite` déposé là mettrait par terre. Trois points de sécurité et d'exploitation, tous portés par `doctor` : ces fichiers sont lus par le processus **maître, en root**, donc le régime des hooks s'applique — root:root, inscriptible par personne d'autre, sans quoi ce compte dicte la configuration du serveur ; un fichier `.conf` déposé hors des sous-répertoires de contexte n'est chargé par personne et **rien ne le dit** ; un répertoire qu'aucun vhost ne référence plus garde des fichiers que leur auteur croit actifs. La suppression d'un projet emporte les répertoires **vides** et laisse le reste, comme l'`authorized_keys` de D61 : ogs n'a pas écrit ces fichiers. Deux pièges de sémantique que la fonctionnalité expose et qu'aucune vérification de configuration ne voit : sur nginx un `add_header` dans le contexte du docroot **annule** tous ceux hérités du `server` — HSTS et `X-Robots-Tag` compris — et une directive **dupliquée** y est une erreur fatale, là où Apache retient la dernière ; un rechargement refusé arrête donc tout le parc, ce que la revalidation de `web.Provider.Reload` rattrape sans pouvoir l'empêcher |
+| D64 | Supervision du parc | ogs **écrit la configuration** de fail2ban et de l'agent de métriques à partir de ce qu'il sait du parc — un fichier unique par outil, recalculé en entier à chaque apply, comme celui de logrotate. Il n'installe ni ne supervise rien lui-même, et se **tait** quand l'outil est absent : le critère est la présence de son répertoire de fragments, `monitoring.<outil>.enabled` tranchant explicitement | Révise §1.3, qui plaçait pare-feu et métriques hors périmètre. La raison du renversement tient en une phrase : ces deux outils ont besoin de ce qu'eux seuls ne peuvent pas deviner — quels journaux appartiennent à un projet, quels pools tournent sous quelle version, quels moteurs sont réellement en service —, et cette connaissance est exactement celle qu'ogs possède. Ce que la décision **ne fait pas** est aussi net : ogs n'installe aucun paquet (§1.3 reste), ne définit aucune destination de métriques (D65), n'écrit aucun filtre fail2ban — un filtre est une expression régulière appliquée à chaque ligne de journal, et en maintenir un jeu à côté de celui du projet amont serait s'engager à suivre chaque changement de format. Le tri-état de `enabled` est nécessaire : confondre « absent » et « faux » activerait la supervision sur une machine où rien n'est installé, ou l'inverse |
+| D65 | Destination des métriques | ogs écrit les **entrées seules** dans `/etc/telegraf/telegraf.d/ogs.conf` ; la base, l'organisation et le jeton d'écriture restent dans `telegraf.conf`, à la main de l'administrateur | Un jeton d'écriture sur une base de métriques ne concerne aucun projet : ogs n'a pas à en être dépositaire, ni à gérer sa rotation. Le fragment porte en revanche les mots de passe des comptes de supervision, d'où **0640, groupe de l'agent** — le même régime que celui qu'`ogs harden` impose déjà à `/etc/telegraf` (D56). Deux conséquences à connaître : un fragment que l'agent ne peut pas lire ne produit **aucune erreur visible** — Telegraf démarre, ne collecte rien et se tait —, d'où le contrôle de `doctor` ; et il n'existe pas d'équivalent d'`apachectl -t` pour Telegraf, son option de test exécutant réellement la collecte, donc le rechargement se contente d'un **constat en aval** (`is-active`). L'enjeu est moindre qu'ailleurs : un agent mort ne fait tomber aucun site, il fait taire la supervision — encore faut-il le dire |
+| D66 | Accès de l'agent à l'état des pools | Un **vhost de supervision** de portée serveur (`ogs-status`), écoutant sur la **boucle locale seule**, expose l'état du moteur web et celui de chaque pool PHP-FPM ; l'agent l'interroge en HTTP. Toute autre adresse d'écoute est **refusée au chargement de la configuration** | Le seul autre moyen de donner l'état d'un pool à l'agent est de lui donner le socket FPM. Or **parler au socket d'un pool, c'est pouvoir y faire exécuter du code sous l'identité du projet** : le protocole FastCGI n'a aucune authentification, et le pool exécute le script qu'on lui nomme. L'agent deviendrait un moyen d'exécution sur tous les projets à la fois. Le serveur web, lui, détient déjà ces sockets : il sert d'intermédiaire, et l'agent n'obtient que ce que le pool rend sur son chemin de statut. Le refus d'une adresse routable est au **chargement**, non à l'écriture du vhost : une erreur à l'apply laisserait le fichier écrit avant de se plaindre. Les pools exposent `pm.status_path` et `ping.path` sous des noms préfixés `ogs-`, inatteignables depuis un vhost de projet — ceux-ci ne routent vers FPM que les URI en `.php`. Deux pièges de moteur, tous deux invisibles à une vérification de configuration : Apache traite les sections `<Location>` **dans l'ordre du fichier** et non par spécificité, donc le refus par défaut doit venir en premier ; et `mod_proxy_fcgi` dérive `SCRIPT_NAME` de l'URI demandée et non du chemin de la cible `fcgi://`, d'où une réécriture explicite par `ProxyFCGISetEnvIf` — sans elle FPM ne reconnaît pas son chemin de statut, cherche un fichier et répond « Primary script unknown » |
+| D67 | Comptes de supervision | Un compte par moteur, de **portée parc** (scope de keystore `@parc`, impossible à porter par un projet), aux privilèges bornés : MySQL `PROCESS, REPLICATION CLIENT` et la lecture du `performance_schema` ; PostgreSQL le rôle `pg_monitor` **sans mot de passe** ; RabbitMQ le seul tag `monitoring`. Chaque étape est **non critique** | Un agent de métriques compromis ne doit pas être un accès aux données de clients : aucun de ces comptes n'atteint la base d'un projet. Le rôle PostgreSQL porte le **nom de l'utilisateur système de l'agent**, non un nom choisi : la connexion locale est authentifiée « peer », qui compare l'utilisateur du système — c'est la règle de D44, et un rôle nommé autrement serait créé puis refusé à chaque collecte. Le tag `monitoring` de RabbitMQ suffit et se suffit : il donne la lecture de tous les vhosts par l'API d'administration, là où une permission par vhost donnerait le droit de lire les messages des projets. Deux pièges : un moteur **installé mais injoignable** produit un avertissement, un moteur **absent** ne produit rien — une machine sans MySQL n'a pas à voir un avertissement à chaque apply ; et **MariaDB rend « BINLOG MONITOR » là où MySQL rend « REPLICATION CLIENT »**, si bien que comparer au seul libellé de MySQL faisait annoncer éternellement une correction qu'on venait d'appliquer |
+| D68 | Prisons fail2ban | Les prisons sont **préfixées `ogs-`**, leurs journaux **énumérés un à un** et filtrés par existence, et le fichier est **recalculé à la suppression d'un projet** | Trois conséquences d'un même comportement : **une prison dont fail2ban ne trouve aucun journal l'empêche de démarrer, et il s'arrête alors tout entier** — les prisons valides comprises. D'où le filtrage à l'écriture, le recalcul à la suppression — sans lui, retirer un projet cassait fail2ban au prochain redémarrage, sans un mot — et un contrôle de `doctor` qui nomme les journaux disparus avant qu'ils ne bloquent le démon. Le même raisonnement décide du **backend de la prison sshd** : une Debian récente n'installe plus rsyslog, `/var/log/auth.log` peut ne pas exister, mais le backend `systemd` exige les liaisons `python3-systemd` qui ne sont qu'une recommandation du paquet — on choisit donc d'après ce qui existe, en préférant le fichier, qui ne dépend d'aucune liaison. Le préfixe n'est pas décoratif : `jail.d` est un espace partagé avec l'administrateur, et une prison nommée `sshd` recouvrirait la sienne en silence. `doctor` exécute par ailleurs `fail2ban-client -t`, seul contrôle qui couvre filtres, expressions et backend d'un coup |
 
 ---
 
@@ -180,7 +193,7 @@ spec:
     name: shopfr                  # = metadata.name, jamais saisi séparément
     group: shopfr                 # groupe privé du projet (§7.1)
     uid: auto
-    shell: /usr/sbin/nologin
+    shell: /bin/bash                # défaut de « user.shell » (D62) ; /usr/sbin/nologin pour fermer
     home: /home/shop.fr           # = /home/<host effectif>
     webAccess: group              # group | acl | none  (accès de www-data, §7.1)
     authorizedKeys: []            # optionnel
@@ -384,6 +397,8 @@ La préproduction vit sur un **domaine dédié**, configuré globalement et non 
 
 ```yaml
 # /etc/ogs/config.yaml
+user:
+  shell: /bin/bash                                   # défaut des comptes de projet (D62)
 environments:
   prod:
     hostTemplate: "{{.Host}}"                        # host canonique tel que saisi
@@ -547,6 +562,19 @@ Fichiers générés en dehors de l'arborescence `ogs` (toujours marqués par un 
 /etc/systemd/system/ogs-<id>.target
 /etc/cron.d/ogs-<id>
 ```
+
+Répertoires **créés** par ogs mais dont il n'écrit aucun fichier — les surcharges de vhost (D63), en
+0750 root:root, dont le contenu appartient à l'exploitant :
+
+```
+/etc/<moteur>/projects/<name>/vhost/*.conf     contexte du vhost : server, <VirtualHost>
+/etc/<moteur>/projects/<name>/docroot/*.conf   contexte du répertoire servi : location /, <Directory>
+```
+
+Le masque est ce qui rend l'inclusion facultative : un répertoire vide ou absent ne fait broncher aucun
+des deux moteurs, là où un chemin littéral introuvable est fatal. Les contextes existants dépendent du
+template — un vhost de proxy n'a que le premier, un vhost de redirection n'en a aucun — et sont **déduits
+du vhost rendu**, ce qui laisse un template surchargé libre de n'en offrir aucun.
 
 En-tête obligatoire de tout fichier généré :
 
@@ -824,7 +852,7 @@ nettoyage manuel, et renvoie le code 1. Aucune tentative silencieuse.
 
 ```
 groupadd shopfr
-useradd --gid shopfr --home-dir /home/shop.fr --shell /usr/sbin/nologin \
+useradd --gid shopfr --home-dir /home/shop.fr --shell /bin/bash \
         --no-create-home --comment "ogs=shopfr" shopfr
 gpasswd -a www-data shopfr          # si webAccess = group (défaut)
 install -d -o root -g shopfr -m 0710 /home/shop.fr/logs /home/shop.fr/.bin
@@ -844,9 +872,10 @@ adopté ou étranger.
 /home/shop.fr                0711  shopfr:shopfr  le propriétaire seul énumère ; les autres traversent
 ├── www/                     0710  shopfr:shopfr  code applicatif — le groupe traverse, il n'énumère pas
 │   └── public/              0710  shopfr:shopfr  docroot (Symfony) ; pour Prestashop, www/ l'est
-├── .ssh/                    0700  shopfr:shopfr  clé de déploiement (§7.1.7)
+├── .ssh/                    0700  shopfr:shopfr  clé de déploiement (§7.1.5)
 │   ├── id_ed25519           0600  shopfr:shopfr
-│   └── id_ed25519.pub       0644  shopfr:shopfr
+│   ├── id_ed25519.pub       0644  shopfr:shopfr
+│   └── authorized_keys      lien  shopfr:shopfr  → /opt/default_authorized_keys, s'il existe (D61)
 ├── var/                     0700  shopfr:shopfr  cache, sessions, logs applicatifs
 │   ├── tmp/                 0700  shopfr:shopfr  upload_tmp_dir
 │   └── sessions/            0700  shopfr:shopfr  session.save_path
@@ -1017,8 +1046,8 @@ ssh-keygen -t ed25519 -N "" -C "ogs:shopfr@srv1" -f /home/shop.fr/.ssh/id_ed2551
 
 **Sens du déploiement** : le serveur **tire** le code (`git clone`, `git pull`). La clé publique est destinée
 à être déclarée en *deploy key* en lecture seule chez l'hébergeur du dépôt ; la clé privée reste sur la
-machine, sous la seule propriété de l'utilisateur du projet. Aucun accès SSH entrant n'est ouvert et le shell
-`nologin` est conservé (D15, D33).
+machine, sous la seule propriété de l'utilisateur du projet. Le sens du déploiement ne dépend pas du shell du
+compte : il reste le tirage, que le shell soit ouvert (D62, le défaut) ou fermé.
 
 ```
 $ ogs user key show shopfr
@@ -1037,6 +1066,42 @@ ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI… ogs:shopfr@srv1
   `StrictHostKeyChecking` n'est **jamais** désactivé, ni dans le `config` généré ni ailleurs.
 - La clé est incluse dans l'archive de suppression (elle fait partie du home) et restaurée par
   `project restore`, ce qui évite de redéclarer une deploy key après une restauration.
+
+**Clés d'administration entrantes (D61)** — si le fichier `/opt/default_authorized_keys` existe,
+`.ssh/authorized_keys` du projet est un **lien symbolique** vers lui, posé juste après la clé de déploiement
+et `lchown` à l'utilisateur du projet :
+
+```
+/home/shop.fr/.ssh/authorized_keys → /opt/default_authorized_keys
+/opt/default_authorized_keys       0644  root:root   posé par l'administrateur, non géré par ogs
+```
+
+Un lien, non une copie : le trousseau se met à jour en un seul endroit, sans repasser sur chaque projet, là
+où une copie serait figée au jour de la création du site. Le fichier commun n'est pas géré par ogs — aucun
+en-tête, aucune empreinte : l'administrateur le pose et le tient à jour.
+
+Trois comportements à connaître :
+
+- **Sans le fichier commun, aucune étape.** La fonction est facultative, et la disparition du trousseau ne
+  doit pas emporter un `authorized_keys` propre au projet.
+- **Un `authorized_keys` régulier déjà présent n'est jamais remplacé** — reprise d'un serveur existant, clé
+  posée par l'utilisateur du projet. Il porte l'accès de quelqu'un, que le lien lui retirerait sans un mot.
+  L'étape échoue alors sans rien détruire : elle n'est pas critique, l'avertissement dit quoi faire (§13,
+  code 6) et le reste du projet s'applique.
+- **Un lien qui pointe ailleurs est ramené** sur le trousseau commun, l'ancienne cible restant sur le disque.
+
+Ce sont les droits du **trousseau**, non ceux du lien, qui décident : sshd résout le lien avant tout
+contrôle, et le mode d'un lien symbolique n'existe pas sous Linux — toujours 0777, immuable —, ce qui
+interdit d'en faire un critère de dérive. `doctor` contrôle donc le trousseau : propriétaire root, non
+inscriptible au-delà de root (sous `StrictModes`, sshd l'ignorerait **en silence**), lisible par les
+utilisateurs des projets (sshd le lit sous leur identité), et un répertoire parent non inscriptible.
+Le `lchown` du lien est cosmétique et ne l'est pas moins que nécessaire : un `chown` donnerait le trousseau
+commun à l'utilisateur du dernier projet appliqué.
+
+Le shell des projets est ouvert par défaut depuis D62, ce qui rend ce trousseau utile sans réglage
+supplémentaire. Un parc qui referme le shell (`user.shell: /usr/sbin/nologin`) garde le lien en place mais
+**inerte**, sauf accès restreint à SFTP côté sshd. Dans les deux cas, ogs ne touche pas à la configuration de
+sshd : c'est elle, et les clés du trousseau, qui décident de ce qui entre.
 
 #### 7.1.6 Suppression
 
@@ -1345,6 +1410,48 @@ sa configuration.
   n'est pas gérée (les deux peuvent être installés, un seul est piloté).
 - Détection de conflit : refus d'écrire un vhost dont un domaine est déjà servi par une configuration
   existante, gérée ou non.
+
+#### 7.6.1 Surcharges de vhost (D63)
+
+Deux points de personnalisation par vhost, éditables à la main sans passer par un apply :
+
+| Répertoire | Contexte Apache | Contexte nginx |
+|---|---|---|
+| `/etc/<moteur>/projects/<name>/vhost/*.conf` | `<VirtualHost>` du vhost servant | `server` du vhost servant |
+| `/etc/<moteur>/projects/<name>/docroot/*.conf` | `<Directory <docroot>>` | `location /` |
+
+`<name>` est le nom du **fichier de vhost** — `shopfr`, `shopfr_redirect` — et non le domaine : un projet
+en porte plusieurs, et un domaine principal qui change laisserait un répertoire que rien ne relie plus.
+Les fichiers sont lus dans l'ordre alphabétique du masque, d'où l'usage d'un préfixe numérique quand
+l'ordre compte, et **après** les `blocks` de `spec` : la surcharge locale l'emporte sur ce que déclare le
+projet. Le vhost généré nomme les deux répertoires en clair, ce qui les fait découvrir à qui le lit.
+
+Ce que la mécanique ne fait **pas** : ogs ne lit jamais ces fichiers, n'en écrit aucun, et l'empreinte du
+vhost généré ne dépend pas d'eux — un fichier déposé ne fait donc jamais dériver le plan. La liste des
+contextes est déduite du vhost rendu (`web.Provider.includeDirs`), non d'une table associant un template à
+ses contextes : les templates étant surchargeables, une table finirait par créer un répertoire qu'aucun
+vhost n'inclut, où les fichiers déposés seraient ignorés en silence.
+
+**Ce qui n'est pas couvert, et qui doit être dit** — les fichiers sont lus par le processus maître, donc
+en root, et le moteur seul les valide :
+
+- une directive **dupliquée** est fatale sur nginx (`is duplicate`), là où Apache retient la dernière :
+  reposer un `client_max_body_size` déjà présent dans le template fait refuser tout le parc au
+  rechargement suivant. La revalidation de `web.Provider.Reload` le rattrape — le serveur continue de
+  servir sa configuration précédente — mais elle ne l'empêche pas ;
+- sur nginx, un `add_header` dans le contexte du docroot **annule tous ceux hérités du `server`**, HSTS et
+  `X-Robots-Tag` de préproduction compris : une surcharge qui pose un en-tête doit reposer les autres ;
+- un `rewrite … last` déposé dans le contexte du vhost d'un site en clair est évalué **avant** le choix du
+  `location`, donc avant le bloc du challenge ACME : le renouvellement du certificat cesse d'aboutir. Le
+  vhost de redirection n'offre pour cette raison **aucun** point de surcharge.
+
+**Contrôles de `doctor`** : propriétaire root et absence d'écriture par un tiers sur les répertoires comme
+sur les fichiers — même régime que les hooks (D40), et pour la même raison : qui écrit là dicte la
+configuration lue en root ; fichier `.conf` déposé hors des sous-répertoires de contexte, donc chargé par
+personne ; répertoire qu'aucun vhost ne référence plus.
+
+À la suppression d'un projet, les répertoires **vides** partent avec le vhost et le reste est conservé, en
+étant annoncé : ogs n'a pas écrit ces fichiers.
 
 ### 7.7 TLS / ACME
 
@@ -1752,8 +1859,9 @@ Points d'implémentation :
 - `nvm`, `rbenv` et `pyenv` sont des **scripts shell conçus pour un shell interactif** : ils sont
   inutilisables tels quels dans une unité systemd, qui n'en charge aucun profil. Les unités et les crons
   invoquent donc exclusivement les liens de `.bin/` (D30), jamais `nvm use`.
-- L'utilisateur ayant un shell `nologin`, les commandes d'installation sont exécutées par
-  `su -s /bin/bash -c '…' <id>`, qui force le shell indépendamment de `/etc/passwd`.
+- Les commandes d'installation sont exécutées par `su -s /bin/bash -c '…' <id>`, qui **force** le shell
+  indépendamment de `/etc/passwd`. Le forçage reste nécessaire alors même que le shell par défaut est
+  `/bin/bash` (D62) : un parc peut l'avoir refermé, et un compte adopté peut porter n'importe quoi.
 - L'installation télécharge depuis Internet : l'étape est **non critique** (§6.3) et son échec n'annule pas la
   création du site, mais le service applicatif reste alors à l'arrêt avec un message explicite.
 - Pour Python, `pyenv` fournit l'interpréteur et `ogs` crée le venv du projet (`python -m venv www/.venv`) ;
@@ -1877,6 +1985,85 @@ et la commande de reprise, plutôt que de tout annuler.
 
 `ogs app restart|logs|status <id>` est un raccourci vers le service applicatif, et `sudo ogs my restart`
 (§7.9.1) le redémarre au même titre que les autres services du projet.
+
+---
+
+### 7.12 Supervision : prisons et métriques
+
+Deux fichiers de portée parc, recalculés en entier à chaque apply comme celui de logrotate, plus un vhost
+d'état et les comptes que l'agent emploie (D64). ogs n'installe ni fail2ban ni Telegraf, et se tait quand
+l'outil est absent — le critère est la présence de son répertoire de fragments.
+
+#### Configuration
+
+```yaml
+# /etc/ogs/config.yaml
+monitoring:
+  status:
+    enabled: true            # absent : ogs décide (actif dès que l'agent est là)
+    listen: 127.0.0.1:8099   # boucle locale exigée, refusé au chargement sinon
+    path: /ogs-status
+  telegraf:
+    enabled: true            # absent : actif si /etc/telegraf/telegraf.d existe
+    user: telegraf           # compte de l'agent : groupe du fragment, et nom du rôle PostgreSQL
+    account: telegraf        # nom des comptes MySQL et RabbitMQ
+    interval: 30s
+    inputs:                  # une famille absente de la table est activée
+      rabbitmq: false
+  fail2ban:
+    enabled: true            # absent : actif si /etc/fail2ban/jail.d existe
+    banTime: 1h
+    findTime: 10m
+    maxRetry: 5
+    ignoreIP: [203.0.113.0/24]   # la boucle locale y est toujours ajoutée
+    jails:
+      web-badbots: false
+```
+
+#### Fichiers produits
+
+| Fichier | Contenu | Droits |
+|---|---|---|
+| `/etc/telegraf/telegraf.d/ogs.conf` | entrées `apache`/`nginx`, `phpfpm` (un par pool), `procstat` (un par projet), `mysql`, `postgresql`, `rabbitmq` | 0640 root:*agent* |
+| `/etc/fail2ban/jail.d/ogs.conf` | prisons `ogs-web-auth`, `ogs-web-noscript`, `ogs-web-badbots`, `ogs-sshd`, `ogs-recidive` | 0644 root:root |
+| `/etc/<moteur>/sites-available/ogs-status.conf` | vhost d'état sur la boucle locale | 0644 root:root |
+
+Aucune destination de métriques n'est écrite (D65). Aucun filtre fail2ban n'est écrit : ceux de la
+distribution sont employés tels quels.
+
+#### Le vhost d'état
+
+Il expose `<path>/<moteur>` — `stub_status` pour nginx, `server-status` pour Apache — et, pour chaque pool,
+`<path>/fpm/<pool>` et `<path>/ping/<pool>`, relayés vers le socket FPM. Il refuse tout le reste et
+n'écoute que sur la boucle locale (D66). Les pools exposent `pm.status_path` et `ping.path` sous des noms
+préfixés `ogs-`, que les vhosts de projet ne peuvent pas atteindre — ils ne routent vers FPM que les URI
+en `.php`.
+
+#### Comptes de supervision
+
+Portée keystore `@parc`, jamais un projet (D67).
+
+| Moteur | Compte | Privilèges | Authentification |
+|---|---|---|---|
+| MySQL / MariaDB | `monitoring.telegraf.account` | `PROCESS`, `REPLICATION CLIENT`, `SELECT` sur `performance_schema` | mot de passe scellé |
+| PostgreSQL | nom de l'utilisateur système de l'agent | `pg_monitor` | `peer`, sans mot de passe |
+| RabbitMQ | `monitoring.telegraf.account` | tag `monitoring` seul | mot de passe scellé |
+
+`ogs secrets list @parc` et `ogs secrets show @parc mysql/telegraf` les consultent.
+
+#### Rechargements
+
+`monitoring:fail2ban` valide (`fail2ban-client -t`), recharge, puis constate : un rechargement peut arrêter
+le démon, et il est alors relevé — et signalé même si la relève réussit. `monitoring:telegraf` se contente
+du constat en aval, faute d'un contrôle de configuration qui n'exécute pas la collecte (D65).
+
+#### Ce que `doctor` porte
+
+- les journaux référencés par les prisons existent-ils encore (D68) ;
+- `fail2ban-client -t` accepte-t-il la configuration — le seul contrôle qui couvre filtres, expressions et
+  backend d'un coup ;
+- le fragment de l'agent est-il lisible par lui, et par lui seul ;
+- `mod_status` est-il activé sous Apache, sans quoi le vhost d'état sert une page vide sans se plaindre.
 
 ---
 
@@ -2468,6 +2655,16 @@ Scénarios exigés :
     de retour 6, et la reprise après rétablissement du réseau aboutit.
 30. **Clé de déploiement** : générée sans passphrase, permissions correctes, `user key show` n'expose que la
     partie publique, `rotate` remplace la paire, et la clé survit à un cycle archivage/restauration.
+31. **Supervision** : le vhost d'état répond sur la boucle locale pour les **deux moteurs** — `stub_status`
+    et `server-status` ne s'exposent pas de la même façon, et `SCRIPT_NAME` ne parvient pas à FPM par le
+    même chemin —, le statut d'un pool traverse le serveur web jusqu'à FPM, et le vhost refuse tout le
+    reste. Le fragment de l'agent est un TOML valide, lisible par lui seul, sans aucun socket FPM et sans
+    destination de métriques. Le compte MySQL de supervision lit l'état du serveur et le
+    `performance_schema` mais **pas** la base d'un projet ; le rôle PostgreSQL se connecte en « peer »,
+    sans mot de passe, avec `pg_monitor`. `fail2ban-client -t` accepte le fichier de prisons. Un journal
+    déplacé est nommé par `doctor` **et** refusé par fail2ban — le diagnostic est éprouvé contre le démon
+    lui-même. Enfin la suppression d'un projet retire ses entrées de tous les fichiers de parc, et les deux
+    configurations restent valides.
 
 ### 16.3 Intégration continue
 
@@ -2512,7 +2709,7 @@ build multi-architecture. Les tests d'intégration sont obligatoires avant fusio
 | **L7 — TUI** | inspecteur, panneau de détail, actions contextuelles, suivi de logs, wizard de création | Création complète d'un projet depuis la TUI, parité avec la CLI |
 | **L8 — Import** | scan multi-sources, corrélation, adoption interactive, ressources non gérées | Adoption d'un serveur préconfiguré sans régression |
 | **L9 — Applications non-PHP** | types d'application, providers `runtime` (nvm, rbenv, pyenv, venv), templates de service Go/Node/Python/Ruby, vhosts de proxy, attente de disponibilité | Scénarios d'intégration 22 à 25 validés |
-| **L10 — Industrialisation** | hooks de parc et de projet, complétions dynamiques bash/zsh/fish, 96 pages de manuel engendrées, paquet `.deb` (nfpm), CI GitHub Actions, quatorze scénarios d'intégration conteneurisés (Apache, PHP, nginx, hooks, MariaDB, PostgreSQL, RabbitMQ, ACME, systemd et cron, runtimes, durcissement, paquet, suppression, moteur web durci), plus un scénario optionnel pour les runtimes qui compilent, documentation d'exploitation | Paquet installable, documentation publiée |
+| **L10 — Industrialisation** | hooks de parc et de projet, complétions dynamiques bash/zsh/fish, 96 pages de manuel engendrées, paquet `.deb` (nfpm), CI GitHub Actions, quinze scénarios d'intégration conteneurisés (Apache, PHP, nginx, hooks, MariaDB, PostgreSQL, RabbitMQ, ACME, systemd et cron, runtimes, durcissement, paquet, suppression, moteur web durci, supervision), plus un scénario optionnel pour les runtimes qui compilent, documentation d'exploitation | Paquet installable, documentation publiée |
 
 ### Ce que les essais sur système réel ont corrigé
 

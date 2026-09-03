@@ -1,0 +1,75 @@
+# Entrées dérivées du parc. Ce fragment ne décrit **aucune destination** : la
+# base de métriques, son organisation et son jeton d'écriture restent dans
+# telegraf.conf, à la main de l'administrateur. ogs n'a pas à être dépositaire
+# d'un secret qui ne concerne aucun projet.
+#
+# Le fichier porte en revanche les mots de passe des comptes de supervision : il
+# est écrit en 0640, groupe de l'agent.
+{{- if .Web }}
+
+# Moteur web. L'état est lu par le vhost de supervision, qui n'écoute que sur la
+# boucle locale : le moteur ne l'expose sur aucun site.
+[[inputs.{{ .Web.Kind }}]]
+  urls = [{{ quote .Web.URL }}]
+  interval = {{ quote .Interval }}
+{{- end }}
+{{- if .Pools }}
+
+# Pools PHP-FPM. Chaque pool est interrogé par HTTP à travers le vhost de
+# supervision, et non par son socket : donner le socket d'un pool à l'agent lui
+# donnerait le droit d'y faire exécuter du code sous l'identité du projet.
+{{- range .Pools }}
+[[inputs.phpfpm]]
+  urls = [{{ quote .URL }}]
+  interval = {{ quote $.Interval }}
+  [inputs.phpfpm.tags]
+    projet = {{ quote .Project }}
+    pool = {{ quote .Name }}
+    php = {{ quote .Version }}
+{{- end }}
+{{- end }}
+{{- if .Procs }}
+
+# Processus, par utilisateur de projet. Interroger par utilisateur couvre du même
+# geste les workers PHP-FPM, les services déclarés et l'application supervisée,
+# sans avoir à énumérer des instances dont le nombre change.
+{{- range .Procs }}
+[[inputs.procstat]]
+  user = {{ quote .User }}
+  interval = {{ quote $.Interval }}
+  [inputs.procstat.tags]
+    projet = {{ quote .Project }}
+{{- end }}
+{{- end }}
+{{- with .MySQL }}
+
+# MySQL / MariaDB. Le compte n'a que PROCESS, REPLICATION CLIENT et la lecture du
+# performance_schema : aucun accès aux bases des projets.
+[[inputs.mysql]]
+  servers = [{{ quote (printf "%s:%s@unix(%s)/" .User .Password .Socket) }}]
+  interval = {{ quote $.Interval }}
+  gather_process_list = true
+  gather_innodb_metrics = true
+  gather_global_variables = true
+{{- end }}
+{{- range .Postgres }}
+
+# PostgreSQL — cluster {{ .Cluster }}. Pas de mot de passe : la connexion passe
+# par le socket local, où l'authentification « peer » compare l'utilisateur
+# système. Le rôle porte donc le nom du compte de l'agent.
+[[inputs.postgresql]]
+  address = {{ quote (printf "host=%s port=%d user=%s dbname=postgres sslmode=disable" .Socket .Port .Role) }}
+  interval = {{ quote $.Interval }}
+  [inputs.postgresql.tags]
+    cluster = {{ quote .Cluster }}
+{{- end }}
+{{- with .Rabbit }}
+
+# RabbitMQ. Le tag « monitoring » donne la lecture de tous les vhosts par l'API
+# d'administration, sans permission de publication ni de consommation.
+[[inputs.rabbitmq]]
+  url = {{ quote .URL }}
+  username = {{ quote .User }}
+  password = {{ quote .Password }}
+  interval = {{ quote $.Interval }}
+{{- end }}

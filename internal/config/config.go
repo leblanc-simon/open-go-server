@@ -3,10 +3,12 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
 
+	"leblanc.io/open-go-server/internal/model"
 	"leblanc.io/open-go-server/internal/naming"
 	"leblanc.io/open-go-server/internal/provider/hardening"
 )
@@ -19,6 +21,7 @@ type Config struct {
 	Prefix string `yaml:"-"`
 
 	Naming       Naming                 `yaml:"naming"`
+	User         User                   `yaml:"user"`
 	Environments map[string]Environment `yaml:"environments"`
 	Logs         Logs                   `yaml:"logs"`
 	Web          Web                    `yaml:"web"`
@@ -28,6 +31,7 @@ type Config struct {
 	ACME         ACME                   `yaml:"acme"`
 	Archives     Archives               `yaml:"archives"`
 	Hardening    Hardening              `yaml:"hardening"`
+	Monitoring   Monitoring             `yaml:"monitoring"`
 }
 
 // Hardening paramètre la restriction des droits des répertoires sensibles :
@@ -39,6 +43,159 @@ type Hardening struct {
 	// alors y réinscrire. Vide, celle d'ogs s'applique.
 	Targets []hardening.Target `yaml:"targets,omitempty"`
 }
+
+// Monitoring paramètre la supervision du parc (D64) : l'agent de métriques et le
+// garde-fou des tentatives d'intrusion. ogs n'installe ni Telegraf ni fail2ban —
+// il écrit leur configuration à partir de ce qu'il sait du parc, et se tait
+// lorsqu'ils sont absents.
+type Monitoring struct {
+	// Status est le point d'écoute local qui expose l'état des serveurs et des
+	// pools. Il n'a de sens que sur la boucle locale (D66).
+	Status Status `yaml:"status"`
+
+	Telegraf Telegraf `yaml:"telegraf"`
+	Fail2ban Fail2ban `yaml:"fail2ban"`
+}
+
+// Status décrit le vhost de supervision.
+type Status struct {
+	// Enabled force l'écriture du vhost, ou l'interdit. Nil laisse ogs décider :
+	// il l'écrit dès que Telegraf est configuré.
+	Enabled *bool `yaml:"enabled,omitempty"`
+	// Listen est l'adresse d'écoute. Une adresse hors boucle locale est refusée :
+	// le vhost expose l'état de tous les pools du parc sans authentification.
+	Listen string `yaml:"listen,omitempty"`
+	// Path est le préfixe des chemins exposés.
+	Path string `yaml:"path,omitempty"`
+}
+
+// Telegraf paramètre le fragment d'entrées écrit dans /etc/telegraf/telegraf.d.
+// Seules les entrées sont générées : la destination des métriques — base, jeton,
+// organisation — reste à l'administrateur, dans telegraf.conf (D65).
+type Telegraf struct {
+	// Enabled force la génération, ou l'interdit. Nil : ogs génère si le
+	// répertoire telegraf.d existe.
+	Enabled *bool `yaml:"enabled,omitempty"`
+	// User est le compte système de l'agent. Il donne le groupe propriétaire du
+	// fragment, qui porte les mots de passe de supervision.
+	User string `yaml:"user,omitempty"`
+	// Interval est la période de collecte, reprise dans chaque entrée.
+	Interval string `yaml:"interval,omitempty"`
+	// Account est le nom des comptes de supervision créés sur MySQL, PostgreSQL
+	// et RabbitMQ. Un seul nom pour les trois : ils ont la même finalité, et un
+	// nom par moteur ne ferait qu'obscurcir les journaux d'authentification.
+	Account string `yaml:"account,omitempty"`
+	// Inputs désactive une famille d'entrées : mysql, postgres, rabbitmq, phpfpm,
+	// web, procstat, disk. Une famille absente de la table est activée.
+	Inputs map[string]bool `yaml:"inputs,omitempty"`
+}
+
+// Fail2ban paramètre le fichier de prisons écrit dans /etc/fail2ban/jail.d.
+type Fail2ban struct {
+	// Enabled force la génération, ou l'interdit. Nil : ogs génère si le
+	// répertoire jail.d existe.
+	Enabled *bool `yaml:"enabled,omitempty"`
+	// BanTime, FindTime et MaxRetry sont les réglages communs à toutes les
+	// prisons générées ; une prison peut les redéfinir.
+	BanTime  string `yaml:"banTime,omitempty"`
+	FindTime string `yaml:"findTime,omitempty"`
+	MaxRetry int    `yaml:"maxRetry,omitempty"`
+	// IgnoreIP énumère les adresses jamais bannies. La boucle locale y est
+	// toujours ajoutée : se bannir soi-même coupe la supervision.
+	IgnoreIP []string `yaml:"ignoreIP,omitempty"`
+	// Jails désactive une prison nommée (sshd, recidive, web-auth, web-badbots,
+	// web-noscript). Une prison absente de la table est activée.
+	Jails map[string]bool `yaml:"jails,omitempty"`
+}
+
+// TelegrafEnabled, Fail2banEnabled et StatusEnabled traduisent le tri-état des
+// champs « enabled » : une valeur explicite l'emporte, l'absence laisse le
+// provider décider d'après ce qui est installé.
+func (m Monitoring) TelegrafEnabled() (bool, bool) { return deref(m.Telegraf.Enabled) }
+func (m Monitoring) Fail2banEnabled() (bool, bool) { return deref(m.Fail2ban.Enabled) }
+func (m Monitoring) StatusEnabled() (bool, bool)   { return deref(m.Status.Enabled) }
+
+func deref(b *bool) (value, set bool) {
+	if b == nil {
+		return false, false
+	}
+	return *b, true
+}
+
+// TelegrafUser renvoie le compte système de l'agent, défaut appliqué.
+func (m Monitoring) TelegrafUser() string {
+	if m.Telegraf.User == "" {
+		return DefaultTelegrafUser
+	}
+	return m.Telegraf.User
+}
+
+// TelegrafAccount renvoie le nom des comptes de supervision, défaut appliqué.
+func (m Monitoring) TelegrafAccount() string {
+	if m.Telegraf.Account == "" {
+		return DefaultTelegrafAccount
+	}
+	return m.Telegraf.Account
+}
+
+// TelegrafInterval renvoie la période de collecte, défaut appliqué.
+func (m Monitoring) TelegrafInterval() string {
+	if m.Telegraf.Interval == "" {
+		return DefaultTelegrafInterval
+	}
+	return m.Telegraf.Interval
+}
+
+// InputEnabled indique si une famille d'entrées est retenue.
+func (m Monitoring) InputEnabled(name string) bool {
+	if v, ok := m.Telegraf.Inputs[name]; ok {
+		return v
+	}
+	return true
+}
+
+// JailEnabled indique si une prison est retenue.
+func (m Monitoring) JailEnabled(name string) bool {
+	if v, ok := m.Fail2ban.Jails[name]; ok {
+		return v
+	}
+	return true
+}
+
+// StatusListen renvoie l'adresse d'écoute du vhost de supervision, défaut appliqué.
+func (m Monitoring) StatusListen() string {
+	if m.Status.Listen == "" {
+		return DefaultStatusListen
+	}
+	return m.Status.Listen
+}
+
+// StatusPath renvoie le préfixe des chemins de supervision, défaut appliqué.
+func (m Monitoring) StatusPath() string {
+	if m.Status.Path == "" {
+		return DefaultStatusPath
+	}
+	return strings.TrimSuffix(m.Status.Path, "/")
+}
+
+// Défauts de la supervision.
+const (
+	DefaultTelegrafUser     = "telegraf"
+	DefaultTelegrafAccount  = "telegraf"
+	DefaultTelegrafInterval = "30s"
+	// DefaultStatusListen n'écoute que la boucle locale. Le port est au-dessus de
+	// 8000 pour ne heurter aucun service courant, et le vhost refuse de s'écrire
+	// sur une adresse routable.
+	DefaultStatusListen = "127.0.0.1:8099"
+	DefaultStatusPath   = "/ogs-status"
+	// PoolStatusPath est le chemin de statut d'un pool PHP-FPM. Il n'est pas
+	// atteignable depuis un vhost de projet : ceux-ci ne routent vers FPM que les
+	// URI se terminant par « .php ».
+	PoolStatusPath = "/ogs-fpm-status"
+	// PoolPingPath répond « pong » sans charger l'application : il distingue un
+	// pool vivant d'un pool saturé.
+	PoolPingPath = "/ogs-fpm-ping"
+)
 
 // Archives paramètre le sort des archives de projets supprimés.
 type Archives struct {
@@ -61,6 +218,16 @@ type ACME struct {
 // Naming regroupe les réglages de nommage et d'emplacement des projets.
 type Naming struct {
 	HomeRoot string `yaml:"homeRoot"` // racine des homes, /home par défaut
+}
+
+// User porte les défauts des comptes de projet. Ce sont des défauts **à la
+// création** : le fichier d'un projet existant porte déjà sa valeur, et c'est lui
+// qui fait autorité ensuite — le changer ici ne rétroagit sur aucun projet, mais
+// « spec.user.shell » édité puis appliqué, si.
+type User struct {
+	// Shell est le shell des comptes de projet (D62). Vide, le défaut du modèle
+	// s'applique — /bin/bash. Le fermer se fait ici, en une ligne pour tout le parc.
+	Shell string `yaml:"shell,omitempty"`
 }
 
 // Environment décrit un environnement (prod, prep).
@@ -109,6 +276,7 @@ type SharedCert struct {
 func Default() *Config {
 	return &Config{
 		Naming: Naming{HomeRoot: "/home"},
+		User:   User{Shell: model.DefaultShell},
 		Environments: map[string]Environment{
 			string(naming.EnvProd): {HostTemplate: "{{.Host}}"},
 			string(naming.EnvPrep): {
@@ -136,6 +304,14 @@ func Default() *Config {
 	}
 }
 
+// Shell renvoie le shell des comptes de projet, défaut du modèle appliqué.
+func (c *Config) Shell() string {
+	if c.User.Shell == "" {
+		return model.DefaultShell
+	}
+	return c.User.Shell
+}
+
 // PrepDomain renvoie le domaine de préproduction configuré.
 func (c *Config) PrepDomain() string {
 	return c.Environments[string(naming.EnvPrep)].Domain
@@ -145,6 +321,11 @@ func (c *Config) PrepDomain() string {
 func (c *Config) Validate() error {
 	if c.Naming.HomeRoot == "" || !filepath.IsAbs(c.Naming.HomeRoot) {
 		return fmt.Errorf("naming.homeRoot doit être un chemin absolu (valeur : %q)", c.Naming.HomeRoot)
+	}
+	// Un shell relatif serait pris tel quel par useradd et rendrait le compte
+	// inutilisable sans un mot : le refuser au chargement, non à l'application.
+	if c.User.Shell != "" && !filepath.IsAbs(c.User.Shell) {
+		return fmt.Errorf("user.shell doit être un chemin absolu (valeur : %q)", c.User.Shell)
 	}
 	switch c.Sudo.Style {
 	case "", "ogs", "systemctl", "none":
@@ -164,6 +345,39 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("archives.retentionDays ne peut pas être négatif (valeur : %d)",
 			c.Archives.RetentionDays)
 	}
+	if err := validateStatusListen(c.Monitoring.StatusListen()); err != nil {
+		return err
+	}
+	if p := c.Monitoring.StatusPath(); p != "" && !strings.HasPrefix(p, "/") {
+		return fmt.Errorf("monitoring.status.path doit commencer par « / » (valeur : %q)", p)
+	}
+	return nil
+}
+
+// validateStatusListen refuse une écoute hors de la boucle locale. Le vhost de
+// supervision expose, sans la moindre authentification, l'état de tous les pools
+// du parc et l'adresse de chaque client en cours de traitement : l'ouvrir sur une
+// interface routable publierait la carte du serveur. Le refus est au chargement
+// de la configuration, non à l'écriture du vhost : une erreur au moment de
+// l'apply laisserait le fichier écrit avant de se plaindre.
+func validateStatusListen(listen string) error {
+	host, port, err := net.SplitHostPort(listen)
+	if err != nil {
+		return fmt.Errorf("monitoring.status.listen doit être de la forme adresse:port (valeur : %q) : %w",
+			listen, err)
+	}
+	if port == "" {
+		return fmt.Errorf("monitoring.status.listen : port manquant (valeur : %q)", listen)
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return fmt.Errorf("monitoring.status.listen : %q n'est pas une adresse IP — "+
+			"un nom d'hôte se résoudrait différemment selon le moteur", host)
+	}
+	if !ip.IsLoopback() {
+		return fmt.Errorf("monitoring.status.listen : %s n'est pas une adresse de boucle locale — "+
+			"le vhost de supervision expose l'état de tous les pools sans authentification", host)
+	}
 	return nil
 }
 
@@ -181,6 +395,17 @@ const (
 	tmpfilesDir  = "/etc/tmpfiles.d"
 	systemdDir   = "/etc/systemd/system"
 	cronDir      = "/etc/cron.d"
+
+	telegrafDir     = "/etc/telegraf/telegraf.d"
+	fail2banJailDir = "/etc/fail2ban/jail.d"
+	fail2banLog     = "/var/log/fail2ban.log"
+	authLog         = "/var/log/auth.log"
+
+	// defaultAuthorizedKeysFile est le trousseau commun du parc : s'il existe, le
+	// .ssh/authorized_keys de chaque projet y est lié (D61). Il n'est pas un
+	// fichier géré par ogs — c'est l'administrateur qui le pose et le tient à
+	// jour ; ogs ne fait que le lier, et « doctor » en contrôle les droits.
+	defaultAuthorizedKeysFile = "/opt/default_authorized_keys"
 )
 
 // NewPaths construit les chemins pour un préfixe donné.
@@ -206,6 +431,10 @@ func (p Paths) StateDB() string       { return p.join(libDir, "state.db") }
 func (p Paths) ACMEDir() string       { return p.join(libDir, "acme") }
 func (p Paths) ACMEChallenge() string { return p.join(libDir, "acme-challenge") }
 
+// DefaultAuthorizedKeys renvoie le trousseau de clés commun du parc, lié dans le
+// .ssh de chaque projet lorsqu'il est présent.
+func (p Paths) DefaultAuthorizedKeys() string { return p.join(defaultAuthorizedKeysFile) }
+
 // ACMEChallengeTokens est le répertoire où les jetons sont réellement déposés :
 // le client ACME ajoute « .well-known/acme-challenge » au webroot qu'on lui
 // confie. C'est donc là que l'alias d'Apache doit pointer, tandis que le « root »
@@ -227,6 +456,26 @@ func (p Paths) GlobalLock() string        { return p.join(runDir, "ogs.lock") }
 func (p Paths) SudoersDir() string        { return p.join(sudoersDir) }
 func (p Paths) LogrotateFile() string     { return p.join(logrotateDir, "ogs") }
 func (p Paths) TmpfilesFile() string      { return p.join(tmpfilesDir, "ogs.conf") }
+
+// TelegrafDir est le répertoire de fragments de l'agent de métriques, et
+// TelegrafFile le seul fichier qu'ogs y écrit. Un fichier unique, comme pour
+// logrotate : cent projets ne doivent pas produire cent fragments à relire.
+func (p Paths) TelegrafDir() string  { return p.join(telegrafDir) }
+func (p Paths) TelegrafFile() string { return filepath.Join(p.TelegrafDir(), "ogs.conf") }
+
+// Fail2banJailDir est le répertoire de prisons, et Fail2banJailFile le fichier
+// géré. Il ne remplace pas jail.local : l'administrateur garde le sien, et les
+// prisons d'ogs portent toutes le préfixe « ogs- » pour ne recouvrir aucune des
+// siennes.
+func (p Paths) Fail2banJailDir() string  { return p.join(fail2banJailDir) }
+func (p Paths) Fail2banJailFile() string { return filepath.Join(p.Fail2banJailDir(), "ogs.conf") }
+
+// Fail2banLog est le journal de fail2ban, que la prison de récidive relit.
+func (p Paths) Fail2banLog() string { return p.join(fail2banLog) }
+
+// AuthLog est le journal d'authentification du système. Il n'existe plus sur une
+// Debian récente sans rsyslog : son absence décide du backend de la prison sshd.
+func (p Paths) AuthLog() string { return p.join(authLog) }
 
 // SystemdDir renvoie le répertoire des unités systemd générées.
 func (p Paths) SystemdDir() string { return p.join(systemdDir) }

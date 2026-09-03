@@ -1,0 +1,56 @@
+# Vhost de supervision, de portée serveur. Il n'écoute que sur la boucle locale
+# et ne sert que des chemins d'état : ogs refuse toute autre adresse à
+# l'écriture de la configuration.
+#
+# Il existe pour éviter de donner les sockets FPM à l'agent de métriques : parler
+# au socket d'un pool, c'est pouvoir y faire exécuter du code sous l'identité du
+# projet. Le serveur web a déjà ces sockets ; il sert d'intermédiaire, et l'agent
+# n'obtient que ce que le pool rend sur son chemin de statut.
+#
+# « Listen » figure ici et nulle part ailleurs : Apache traite une adresse écoutée
+# deux fois comme une erreur fatale.
+Listen {{ .Listen }}
+
+<VirtualHost {{ .Listen }}>
+    ServerName ogs-status
+
+    # Une collecte toutes les quelques secondes par pool remplirait le journal
+    # d'accès sans rien apprendre. Le journal d'erreurs, lui, reste celui du
+    # serveur : c'est lui qui dirait un refus.
+    CustomLog /dev/null combined
+
+    # Refus par défaut, en premier : Apache traite les sections <Location> dans
+    # l'ordre du fichier et non par spécificité — placée en dernier, celle-ci
+    # annulerait les autorisations accordées plus haut, et le vhost répondrait 403
+    # à l'agent tout en paraissant correct.
+    <Location />
+        Require all denied
+    </Location>
+
+    <Location {{ .Prefix }}/{{ .Engine }}>
+        SetHandler server-status
+        Require local
+    </Location>
+{{- range .Pools }}
+
+    # pool {{ .Name }} — projet {{ .Project }}.
+    #
+    # SCRIPT_NAME est réécrit explicitement : mod_proxy_fcgi le dérive de l'URI
+    # demandée, non du chemin de la cible fcgi://, et FPM compare cette variable à
+    # son pm.status_path. Sans cette réécriture, il ne reconnaît pas le chemin de
+    # statut, cherche un fichier, et répond « Primary script unknown » — une 404
+    # que rien dans la configuration ne laisse prévoir.
+    <Location {{ $.Prefix }}/fpm/{{ .Name }}>
+        Require local
+        ProxyFCGISetEnvIf "true" SCRIPT_NAME "{{ $.PoolStatus }}"
+        ProxyFCGISetEnvIf "true" SCRIPT_FILENAME "{{ $.PoolStatus }}"
+        ProxyPass {{ .Pass }}{{ $.PoolStatus }}
+    </Location>
+    <Location {{ $.Prefix }}/ping/{{ .Name }}>
+        Require local
+        ProxyFCGISetEnvIf "true" SCRIPT_NAME "{{ $.PoolPing }}"
+        ProxyFCGISetEnvIf "true" SCRIPT_FILENAME "{{ $.PoolPing }}"
+        ProxyPass {{ .Pass }}{{ $.PoolPing }}
+    </Location>
+{{- end }}
+</VirtualHost>

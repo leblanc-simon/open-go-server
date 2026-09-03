@@ -168,6 +168,112 @@ if [[ "$cible" != *"ancien.test/page"* ]]; then
 fi
 
 echo
+echo "--- surcharges de vhost : les deux contextes prennent effet (D63) ---"
+# Ce qu'aucun test unitaire ne voit : nginx charge-t-il réellement ces fichiers,
+# et dans le contexte annoncé ?
+surcharges=/etc/nginx/projects/statictest
+if [ ! -d "$surcharges/vhost" ] || [ ! -d "$surcharges/docroot" ]; then
+    echo "ÉCHEC : les répertoires de surcharge n'ont pas été créés"
+    ls -la /etc/nginx/projects/ 2>&1 | head -5
+    exit 1
+fi
+stat -c '%a %U:%G %n' "$surcharges/vhost" "$surcharges/docroot"
+
+# Contexte du vhost : un location de premier niveau. S'il était inclus dans le
+# « location / » d'ogs, ce chemin ne serait jamais atteint — nginx choisit le
+# location de premier niveau avant d'examiner les imbriqués.
+cat > "$surcharges/vhost/10-essai.conf" <<'CONF'
+location = /surcharge-vhost {
+    default_type "text/plain";
+    return 200 "surcharge vhost\n";
+}
+CONF
+# Contexte du répertoire servi. L'en-tête doit apparaître, et le HSTS du server
+# doit disparaître sur ce seul chemin : un add_header dans un location **annule**
+# tous ceux qu'il hérite, ce qui prouve que l'inclusion est bien dans le location
+# et non au niveau du server.
+cat > "$surcharges/docroot/10-essai.conf" <<'CONF'
+add_header X-Ogs-Docroot oui always;
+CONF
+if ! nginx -t >/dev/null 2>&1; then
+    echo "ÉCHEC : les surcharges rendent la configuration invalide"
+    nginx -t 2>&1 | tail -3
+    exit 1
+fi
+systemctl reload nginx
+sleep 1
+
+recu=$(curl -sk --resolve static.test:443:127.0.0.1 https://static.test/surcharge-vhost)
+echo "contexte vhost   : $recu"
+if [ "$recu" != "surcharge vhost" ]; then
+    echo "ÉCHEC : la surcharge du contexte vhost n'est pas chargée"
+    exit 1
+fi
+entetes=$(curl -skI --resolve static.test:443:127.0.0.1 https://static.test/index.html)
+if ! echo "$entetes" | grep -qi "X-Ogs-Docroot: oui"; then
+    echo "ÉCHEC : la surcharge du contexte docroot n'est pas chargée"
+    echo "$entetes" | head -8
+    exit 1
+fi
+echo "contexte docroot : X-Ogs-Docroot présent"
+if echo "$entetes" | grep -qi "Strict-Transport-Security"; then
+    echo "ÉCHEC : le HSTS survit à un add_header du location — l'inclusion du"
+    echo "        contexte docroot n'est donc pas dans le location, ou nginx a"
+    echo "        changé de sémantique (les add_header cumuleraient)"
+    exit 1
+fi
+echo "le HSTS du server est bien annulé par l'add_header du location, comme"
+echo "documenté : une surcharge du docroot doit reposer les en-têtes du vhost"
+
+echo
+echo "--- le masque rend l'inclusion facultative : rien n'a à exister ---"
+# C'est tout l'intérêt de la forme « /*.conf » : un répertoire vide, puis retiré
+# à la main, ne doit pas empêcher nginx de recharger. Un chemin littéral
+# introuvable serait fatal, et tous les sites tomberaient.
+rm -f "$surcharges/vhost/10-essai.conf" "$surcharges/docroot/10-essai.conf"
+if ! nginx -t >/dev/null 2>&1; then
+    echo "ÉCHEC : un répertoire de surcharge vide est refusé"
+    exit 1
+fi
+rm -rf "$surcharges"
+if ! nginx -t >/dev/null 2>&1; then
+    echo "ÉCHEC : un répertoire de surcharge absent est refusé — l'inclusion"
+    echo "        n'est pas facultative, et tout le parc en dépend"
+    nginx -t 2>&1 | tail -3
+    exit 1
+fi
+systemctl reload nginx
+sleep 1
+code=$(curl -sk -o /dev/null -w '%{http_code}' --resolve static.test:443:127.0.0.1 https://static.test/index.html)
+echo "répertoire absent : nginx accepte, le site rend HTTP $code"
+if [ "$code" != "200" ]; then
+    echo "ÉCHEC : le site n'est plus servi"
+    exit 1
+fi
+
+echo
+echo "--- doctor voit ce que nginx ne dit pas ---"
+ogs apply statictest --yes >/dev/null 2>&1
+# Un fichier hors des sous-répertoires de contexte : chargé par personne, et
+# rien ne le signale — le site fonctionne, la surcharge est sans effet.
+echo '# jamais lu' > /etc/nginx/projects/statictest/perdu.conf
+# Un fichier inscriptible par tous, lu en root par le maître : quiconque peut
+# l'écrire dicte la configuration du serveur.
+echo 'add_header X-Ogs-Essai oui always;' > /etc/nginx/projects/statictest/vhost/20-ouvert.conf
+chmod 0666 /etc/nginx/projects/statictest/vhost/20-ouvert.conf
+sortie=$(ogs doctor 2>&1)
+echo "$sortie" | grep -i "surcharge" | sed 's/  */ /g' | head -4
+if ! echo "$sortie" | grep -q "perdu.conf"; then
+    echo "ÉCHEC : le fichier hors contexte n'est pas signalé"
+    exit 1
+fi
+if ! echo "$sortie" | grep -q "20-ouvert.conf"; then
+    echo "ÉCHEC : un fichier de surcharge inscriptible par tous n'est pas signalé"
+    exit 1
+fi
+rm -rf /etc/nginx/projects/statictest
+
+echo
 echo "--- un rechargement suffit-il pour l'appartenance de groupe ? ---"
 # La même question que pour Apache, jamais éprouvée sur nginx : les workers
 # rappellent-ils initgroups() au fork ?

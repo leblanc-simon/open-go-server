@@ -45,6 +45,12 @@ func Adopt(c Candidate, homeRoot, prepDomain string) (*model.Project, []string, 
 		p.Spec.User.Name = c.User
 		p.Spec.User.Group = c.User
 	}
+	// Le shell aussi est un nom réel : la normalisation a posé celui du modèle, or
+	// un compte adopté existait avant ogs, et lui ouvrir ou lui fermer l'accès au
+	// premier apply serait un effet de bord que personne n'a demandé.
+	if c.Shell != "" {
+		p.Spec.User.Shell = c.Shell
+	}
 	if c.PHPVersion != "" {
 		p.Spec.PHP.Pools = []model.Pool{{Name: model.MainPoolName, Version: c.PHPVersion}}
 	}

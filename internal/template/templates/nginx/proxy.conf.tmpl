@@ -51,4 +51,9 @@ server {
     # bloc {{ .Name }}
 {{ indent 4 .Content }}
 {{- end }}
+
+    # Surcharges locales, éditées à la main hors de la gestion d'ogs. Le masque
+    # rend l'inclusion facultative : un répertoire absent ou vide ne fait pas
+    # broncher nginx, là où un chemin littéral introuvable serait fatal.
+    include {{ .IncludeVHost }}/*.conf;
 }

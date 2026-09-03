@@ -83,8 +83,8 @@ func TestPlanCreatesGroupUserAndDirs(t *testing.T) {
 	if !rec.Contains("--comment ogs=shopfr") {
 		t.Error("le compte doit porter la marque ogs dans son commentaire")
 	}
-	if !rec.Contains("--shell /usr/sbin/nologin") {
-		t.Error("le compte doit être créé sans shell interactif")
+	if !rec.Contains("--shell " + model.DefaultShell) {
+		t.Errorf("le compte doit être créé avec le shell déclaré : %v", rec.Calls())
 	}
 	// L'arborescence est réellement créée.
 	for _, dir := range []string{"", "www", "var", "logs", ".bin", ".ssh"} {
@@ -133,7 +133,7 @@ func TestPlanIsIdempotent(t *testing.T) {
 	// Le système reflète maintenant l'état désiré.
 	declareKey(t, p)
 	ident.Users["shopfr"] = &UserInfo{Name: "shopfr", UID: 1004, GID: 1004,
-		Home: p.Spec.Layout.Root, Shell: "/usr/sbin/nologin", Managed: true}
+		Home: p.Spec.Layout.Root, Shell: p.Spec.User.Shell, Managed: true}
 	ident.Groups["shopfr"] = &GroupInfo{Name: "shopfr", GID: 1004, Members: []string{WebUser}}
 
 	before := len(rec.Calls())
@@ -190,6 +190,60 @@ func TestPlanCorrectsDriftedMode(t *testing.T) {
 	info, _ := os.Stat(logs)
 	if info.Mode().Perm() != 0o710 {
 		t.Errorf("mode non corrigé : %04o", info.Mode().Perm())
+	}
+}
+
+func TestPlanReconcilesShellDrift(t *testing.T) {
+	// Le shell déclaré est un état désiré : l'éditer puis appliquer doit suffire à
+	// ouvrir ou fermer l'accès d'un projet existant (D62). Sans cette
+	// réconciliation, « spec.user.shell » serait une déclaration sans effet.
+	p, prov, rec, ident := fixture(t)
+	apply(t, prov, p)
+	declareKey(t, p)
+	ident.Users["shopfr"] = &UserInfo{Name: "shopfr", UID: 1004, GID: 1004,
+		Home: p.Spec.Layout.Root, Shell: "/usr/sbin/nologin", Managed: true}
+	ident.Groups["shopfr"] = &GroupInfo{Name: "shopfr", GID: 1004, Members: []string{WebUser}}
+
+	report := apply(t, prov, p)
+	if report.RolledBack {
+		t.Fatal("la correction du shell ne doit pas dérouler la saga")
+	}
+	if !rec.Contains("usermod --shell " + model.DefaultShell + " shopfr") {
+		t.Errorf("le shell doit être corrigé par usermod : %v", rec.Calls())
+	}
+}
+
+func TestPlanCorrectsHomeAndShellInOneStep(t *testing.T) {
+	// Deux étapes portant la même ressource se marcheraient dessus dans le plan
+	// comme dans l'audit : un seul usermod pose les deux corrections.
+	p, prov, rec, ident := fixture(t)
+	apply(t, prov, p)
+	declareKey(t, p)
+	ident.Users["shopfr"] = &UserInfo{Name: "shopfr", UID: 1004, GID: 1004,
+		Home: "/home/ancien", Shell: "/usr/sbin/nologin", Managed: true}
+	ident.Groups["shopfr"] = &GroupInfo{Name: "shopfr", GID: 1004, Members: []string{WebUser}}
+
+	ctx := context.Background()
+	obs, err := prov.Observe(ctx, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	steps, err := prov.Plan(ctx, p, obs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for _, s := range steps {
+		if s.Resource == "system/user/shopfr" && s.Mutates() {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Errorf("%d étapes pour le compte, attendu une seule", n)
+	}
+	apply(t, prov, p)
+	if !rec.Contains("usermod --home " + p.Spec.Layout.Root + " --shell " + model.DefaultShell + " shopfr") {
+		t.Errorf("home et shell doivent être posés ensemble : %v", rec.Calls())
 	}
 }
 
@@ -279,6 +333,126 @@ func TestDeployKeyIsGeneratedOnceAndNonCritical(t *testing.T) {
 	}
 }
 
+// declareCommonKeys pose le trousseau commun sous le préfixe du provider, comme
+// l'administrateur le ferait dans /opt.
+func declareCommonKeys(t *testing.T, prov *Provider) string {
+	t.Helper()
+	path := prov.Paths.DefaultAuthorizedKeys()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("ssh-ed25519 AAAA opérateur\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestAuthorizedKeysLinkedToCommonKeyring(t *testing.T) {
+	p, prov, _, _ := fixture(t)
+	source := declareCommonKeys(t, prov)
+	apply(t, prov, p)
+
+	link := AuthorizedKeysPath(p.Spec.Layout.Root)
+	target, err := os.Readlink(link)
+	if err != nil {
+		t.Fatalf("le lien des clés autorisées est absent : %v", err)
+	}
+	if target != source {
+		t.Errorf("cible du lien %q, attendue %q", target, source)
+	}
+	// Un lien, non une copie : le trousseau doit rester la seule source.
+	if info, lerr := os.Lstat(link); lerr != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Error("les clés autorisées doivent être un lien, une copie figerait le trousseau")
+	}
+
+	// Idempotence : l'étape disparaît du plan une fois le lien posé.
+	obs, _ := prov.Observe(context.Background(), p)
+	steps, _ := prov.Plan(context.Background(), p, obs)
+	for _, s := range steps {
+		if s.Resource == "system/authorized-keys/shopfr" && s.Mutates() {
+			t.Errorf("le lien déjà conforme ne doit pas être réécrit : %s", s)
+		}
+	}
+}
+
+func TestAuthorizedKeysAbsentWithoutCommonKeyring(t *testing.T) {
+	// Sans trousseau commun, aucune étape : la fonction est facultative, et rien
+	// ne doit apparaître dans le plan de tous les parcs qui ne s'en servent pas.
+	p, prov, _, _ := fixture(t)
+	apply(t, prov, p)
+
+	if _, err := os.Lstat(AuthorizedKeysPath(p.Spec.Layout.Root)); err == nil {
+		t.Error("aucun authorized_keys ne doit être créé sans trousseau commun")
+	}
+	obs, _ := prov.Observe(context.Background(), p)
+	steps, _ := prov.Plan(context.Background(), p, obs)
+	for _, s := range steps {
+		if strings.HasPrefix(s.Resource, "system/authorized-keys/") {
+			t.Errorf("étape inattendue : %s", s.Resource)
+		}
+	}
+}
+
+func TestAuthorizedKeysPreservesHandWrittenFile(t *testing.T) {
+	// Un authorized_keys posé à la main porte l'accès de quelqu'un : le remplacer
+	// par un lien le lui retirerait sans un mot. L'étape échoue donc sans rien
+	// détruire, et n'étant pas critique, elle n'annule pas le reste du projet.
+	p, prov, _, _ := fixture(t)
+	declareCommonKeys(t, prov)
+	link := AuthorizedKeysPath(p.Spec.Layout.Root)
+	if err := os.MkdirAll(filepath.Dir(link), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	const propre = "ssh-ed25519 BBBB clé du projet\n"
+	if err := os.WriteFile(link, []byte(propre), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	report := apply(t, prov, p)
+	if report.RolledBack {
+		t.Fatal("l'échec du lien ne doit pas dérouler la saga")
+	}
+	data, err := os.ReadFile(link)
+	if err != nil || string(data) != propre {
+		t.Errorf("le fichier posé à la main a été altéré : %q, %v", string(data), err)
+	}
+	var warned bool
+	for _, o := range report.Outcomes {
+		if o.Step.Resource == "system/authorized-keys/shopfr" && o.Err != nil {
+			warned = true
+			if !strings.Contains(o.Err.Error(), "n'est pas un lien") {
+				t.Errorf("message peu explicite : %v", o.Err)
+			}
+		}
+	}
+	if !warned {
+		t.Error("un authorized_keys posé à la main doit être signalé, non ignoré")
+	}
+}
+
+func TestAuthorizedKeysRedirectsForeignLink(t *testing.T) {
+	// Un lien qui pointe ailleurs — trousseau déplacé, reprise d'un autre outil —
+	// est ramené sur le trousseau commun : rien n'est perdu, la cible existe encore.
+	p, prov, _, _ := fixture(t)
+	source := declareCommonKeys(t, prov)
+	link := AuthorizedKeysPath(p.Spec.Layout.Root)
+	if err := os.MkdirAll(filepath.Dir(link), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("/opt/ancien_trousseau", link); err != nil {
+		t.Fatal(err)
+	}
+
+	apply(t, prov, p)
+	target, err := os.Readlink(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if target != source {
+		t.Errorf("cible du lien %q, attendue %q", target, source)
+	}
+}
+
 func TestBinPHPLink(t *testing.T) {
 	homeRoot := t.TempDir()
 	p := model.New("shop.fr", naming.EnvProd, model.KindSymfony)
@@ -332,5 +506,31 @@ func TestHomeGrantsGroupTraversal(t *testing.T) {
 	}
 	if mode&0o004 != 0 {
 		t.Errorf("le home (%04o) ne doit pas être énumérable par les autres", mode)
+	}
+}
+
+func TestShellDuSystemeEstLuDansPasswd(t *testing.T) {
+	// os/user ne rend pas le shell : sans lecture de /etc/passwd, le shell observé
+	// reste vide sur un système réel et la réconciliation de D62 ne voit jamais de
+	// dérive — alors qu'elle fonctionne en mode préfixé, où la base des comptes est
+	// un fichier. Le défaut ne se voyait qu'en scénario d'intégration.
+	dir := t.TempDir()
+	passwd := filepath.Join(dir, "passwd")
+	if err := os.WriteFile(passwd,
+		[]byte("root:x:0:0:root:/root:/bin/bash\nshopfr:x:1001:1001:ogs=shopfr:/home/shop.fr:/usr/sbin/nologin\n"),
+		0o644); err != nil {
+		t.Fatal(err)
+	}
+	shell, ok := shellFromPasswd(passwd, "shopfr")
+	if !ok || shell != "/usr/sbin/nologin" {
+		t.Errorf("shell lu = %q (trouvé : %v), attendu /usr/sbin/nologin", shell, ok)
+	}
+	// Un compte servi par NSS sans exister dans /etc/passwd garde un shell vide :
+	// ogs n'a pas à lancer un usermod sur un compte défini ailleurs.
+	if _, ok := shellFromPasswd(passwd, "ldapuser"); ok {
+		t.Error("un compte absent de /etc/passwd ne doit pas rendre de shell")
+	}
+	if _, ok := shellFromPasswd(filepath.Join(dir, "absent"), "shopfr"); ok {
+		t.Error("une base de comptes absente ne doit pas rendre de shell")
 	}
 }

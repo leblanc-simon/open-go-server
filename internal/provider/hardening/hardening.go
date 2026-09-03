@@ -135,6 +135,13 @@ func Defaults(homeRoot string) []Target {
 			Risk: "aucun : cron lit en root",
 		},
 		{
+			Path: "/etc/fail2ban", Owner: "root", Group: "root", DirMode: 0o750,
+			Why: "jail.d énumère les journaux de tous les projets, donc le parc, " +
+				"et les adresses jamais bannies",
+			Risk: "aucun : le démon tourne en root ; fail2ban-client est réservé " +
+				"à root de toute façon",
+		},
+		{
 			Path: "/etc/logrotate.d", Owner: "root", Group: "root", DirMode: 0o750,
 			Why:  "révèle l'emplacement des journaux de tous les projets",
 			Risk: "aucun : logrotate tourne en root",

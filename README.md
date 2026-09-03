@@ -26,6 +26,7 @@ C'est la référence : toute contribution s'y adosse.
 | **L8** | Import d'un serveur existant : scan en lecture seule, corrélation, adoption sans renommage | **livré** |
 | **L9** | Applications Go, Node, Ruby et Python : runtimes par projet, service supervisé, écoute sur socket, proxy | **livré** |
 | **L10** | Industrialisation : hooks de parc et de projet, complétions dynamiques, pages de manuel, paquet `.deb`, CI, scénarios d'intégration conteneurisés | **livré** |
+| **L11** | Supervision : prisons fail2ban et entrées Telegraf dérivées du parc, vhost d'état local, comptes de supervision MySQL, PostgreSQL et RabbitMQ | **livré** |
 
 ## Compilation
 
@@ -402,6 +403,12 @@ est transmis par `SOCKET_PATH`, et si le code l'ignore, l'attente de disponibili
   `/etc/php`, où le PHP des crons lit son `php.ini`. La racine des homes passe en 0711 : traversable, donc
   les sites sont servis comme avant, mais plus énumérable — un `ls /home` ne donne plus la carte du parc.
   Le gain est partiel et annoncé comme tel : `/etc/passwd` énumère déjà les homes.
+- **Supervision** : ogs n'installe ni fail2ban ni Telegraf, il leur écrit ce qu'eux seuls ne peuvent pas
+  deviner — quels journaux appartiennent à un projet, quels pools tournent sous quelle version. Aucune
+  destination de métriques, aucun filtre fail2ban : le jeton d'écriture ne concerne aucun projet, et un
+  filtre se maintient au rythme des changements de format de journal. L'état des pools passe par un vhost
+  qui n'écoute que la boucle locale, jamais par le socket FPM — parler à ce socket, c'est pouvoir y faire
+  exécuter du code sous l'identité du projet.
 
 ## Codes de retour
 
@@ -415,7 +422,7 @@ est transmis par `SOCKET_PATH`, et si le code l'ignore, l'attente de disponibili
 
 ## Documentation
 
-- [`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md) — la référence : 60 décisions d'architecture
+- [`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md) — la référence : 68 décisions d'architecture
   arbitrées, spécification par module, plan de tests, découpage en lots.
 - [`docs/INSTALLATION.md`](docs/INSTALLATION.md) — installation, premier démarrage, sauvegarde, mise à jour.
 - [`docs/HOOKS.md`](docs/HOOKS.md) — raccorder l'outil au reste de l'exploitation.

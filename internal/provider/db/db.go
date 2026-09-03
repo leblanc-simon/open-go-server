@@ -42,6 +42,14 @@ func (p *Provider) Close() {
 	p.clients = nil
 }
 
+// EngineClient ouvre le client d'un moteur sans passer par une déclaration de
+// projet. Il sert à la supervision, qui s'adresse au moteur lui-même et non à la
+// base d'un projet : le compte de métriques existe même quand aucun projet n'est
+// encore déclaré.
+func (p *Provider) EngineClient(engine, cluster string) (Client, error) {
+	return p.clientFor(model.Database{Engine: engine, Cluster: cluster})
+}
+
 // clientFor ouvre — ou retrouve — le client d'une déclaration de base.
 func (p *Provider) clientFor(db model.Database) (Client, error) {
 	key := db.Engine

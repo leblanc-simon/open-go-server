@@ -5,7 +5,24 @@ import (
 	"text/tabwriter"
 
 	"github.com/spf13/cobra"
+
+	"leblanc.io/open-go-server/internal/provider/monitoring"
 )
+
+// secretScope traduit l'argument des commandes de secrets en portée de keystore.
+// Les mots de passe des comptes de supervision n'appartiennent à aucun projet :
+// ils vivent sous une portée de parc, dont le nom est volontairement impossible
+// à porter par un projet (voir monitoring.SecretScope).
+func secretScope(app *App, arg string) (string, error) {
+	if arg == monitoring.SecretScope {
+		return monitoring.SecretScope, nil
+	}
+	p, err := app.loadProject(arg)
+	if err != nil {
+		return "", err
+	}
+	return p.ID(), nil
+}
 
 func newSecretsCommand(app *App) *cobra.Command {
 	cmd := &cobra.Command{Use: "secrets", Short: "Consulter et renouveler les secrets"}
@@ -18,22 +35,24 @@ func newSecretsListCommand(app *App) *cobra.Command {
 		Use:     "list <id>",
 		Aliases: []string{"ls"},
 		Short:   "Lister les secrets d'un projet, sans leur valeur",
-		Args:    cobra.ExactArgs(1),
+		Long: "L'identifiant « " + monitoring.SecretScope + " » désigne les secrets de portée parc :\n" +
+			"les mots de passe des comptes de supervision, qui n'appartiennent à aucun projet.",
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			p, err := app.loadProject(args[0])
+			scope, err := secretScope(app, args[0])
 			if err != nil {
 				return err
 			}
 			if err := app.openStore(); err != nil {
 				return err
 			}
-			names, err := app.Store.SecretNames(p.ID())
+			names, err := app.Store.SecretNames(scope)
 			if err != nil {
 				return wrap(CodeError, err)
 			}
 			return wrap(CodeError, app.emit("SecretList", names, nil, func(tw *tabwriter.Writer) {
 				if len(names) == 0 {
-					fmt.Fprintf(app.Out, "aucun secret pour %s\n", p.ID())
+					fmt.Fprintf(app.Out, "aucun secret pour %s\n", scope)
 					return
 				}
 				fmt.Fprintln(tw, "SECRET")
@@ -53,7 +72,7 @@ func newSecretsShowCommand(app *App) *cobra.Command {
 			"secret consulté est consigné à l'audit, jamais sa valeur.",
 		Args: cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			p, err := app.loadProject(args[0])
+			scope, err := secretScope(app, args[0])
 			if err != nil {
 				return err
 			}
@@ -64,15 +83,15 @@ func newSecretsShowCommand(app *App) *cobra.Command {
 				return exitf(CodeDependency, "keystore indisponible : vérifier %s", app.Paths.MasterKey())
 			}
 			name := args[1]
-			nonce, ciphertext, err := app.Store.GetSecret(p.ID(), name)
+			nonce, ciphertext, err := app.Store.GetSecret(scope, name)
 			if err != nil {
 				return exitf(CodeUsage, "%v", err)
 			}
-			plain, err := app.Keys.Open(p.ID(), name, nonce, ciphertext)
+			plain, err := app.Keys.Open(scope, name, nonce, ciphertext)
 			if err != nil {
 				return wrap(CodeError, err)
 			}
-			_ = app.Audit.Record(p.ID(), "secret/"+name, "secrets.show", "ok", "")
+			_ = app.Audit.Record(scope, "secret/"+name, "secrets.show", "ok", "")
 			fmt.Fprintln(app.Out, string(plain))
 			return nil
 		},

@@ -127,6 +127,16 @@ func newDeleteCommand(app *App) *cobra.Command {
 				unit.TargetName(p.ID())+".wants")); err != nil && !os.IsNotExist(err) {
 				warn("instances : %v", err)
 			}
+			// Les répertoires de surcharge des vhosts (D63) partent avec eux, mais
+			// seulement s'ils sont vides : un fichier déposé là porte le travail de
+			// quelqu'un, et ogs ne l'a pas écrit. Ce qui reste est annoncé — sinon
+			// il ne resterait qu'un répertoire orphelin que personne ne relie plus
+			// à un projet disparu.
+			for _, vh := range provs.Web.VHostNames(p) {
+				for _, kept := range provs.Web.RemoveIncludes(vh) {
+					app.printf("= surcharges conservées : %s (non écrites par ogs)\n", kept)
+				}
+			}
 
 			// 3. Ressources vivantes.
 			if !keepData {
@@ -193,6 +203,15 @@ func newDeleteCommand(app *App) *cobra.Command {
 				}
 			}
 
+			// 7. Les fichiers de portée parc énumèrent les projets, et celui-ci n'en
+			// fait plus partie. Le recalcul n'est pas cosmétique : une prison fail2ban
+			// dont le journal a disparu **empêche le démon de démarrer** — toutes les
+			// autres prisons tombent avec elle —, et le vhost de supervision
+			// proxifierait un socket FPM qui n'existe plus.
+			if err := app.refreshGlobal(cmd.Context(), provs); err != nil {
+				warn("mise à jour des fichiers de parc : %v", err)
+			}
+
 			_, _ = app.runHook(cmd.Context(), provs.Hooks, p, hook.PostDelete,
 				hook.Context{Resources: removed, Extra: map[string]string{"archive": archived}})
 			status, mark := "ok", "✓"
@@ -219,6 +238,35 @@ func newDeleteCommand(app *App) *cobra.Command {
 	f.BoolVar(&keepData, "keep-data", false, "conserver bases, files et contenu")
 	f.BoolVar(&noDump, "no-dump", false, "ne pas inclure de sauvegarde de base dans l'archive")
 	return cmd
+}
+
+// refreshGlobal recalcule et applique les fichiers de portée parc après le
+// retrait d'un projet. Le plan est recalculé depuis les fichiers restants : le
+// projet supprimé a déjà quitté /etc/ogs/projects.
+func (a *App) refreshGlobal(ctx context.Context, provs *providers) error {
+	projects, err := a.loadProjects()
+	if err != nil {
+		return err
+	}
+	plan, err := a.buildGlobalPlan(provs, projects)
+	if err != nil {
+		return err
+	}
+	if plan.Empty() {
+		return nil
+	}
+	_, err = engine.Execute(ctx, plan, engine.Options{
+		OnStep: func(s *engine.Step, stepErr error) {
+			if stepErr == nil {
+				a.printf("  ✓ %s\n", s.Summary)
+			}
+		},
+		OnWarning: func(s *engine.Step, stepErr error) {
+			a.printf("  ⚠ %s : %v\n", s.Summary, stepErr)
+		},
+		Reload: a.reloadFunc(provs),
+	})
+	return err
 }
 
 // generatedFiles énumère les fichiers produits par ogs pour un projet, dans

@@ -32,7 +32,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         cron \
         python3-minimal \
         python3-pika \
-    && a2enmod proxy proxy_fcgi proxy_http rewrite headers setenvif ssl \
+        fail2ban \
+        python3-systemd \
+        iptables \
+    && a2enmod proxy proxy_fcgi proxy_http rewrite headers setenvif ssl status \
     && rm -rf /var/lib/apt/lists/*
 
 # Sans init dans le conteneur, systemctl est inopérant : un substitut dispatche

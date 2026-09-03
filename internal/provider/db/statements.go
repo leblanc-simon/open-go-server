@@ -431,3 +431,59 @@ func DropPostgres(database, role string, extra []string, supportsForce bool) ([]
 	}
 	return out, nil
 }
+
+// MonitoringMySQL produit les requêtes du compte de supervision. Les privilèges
+// sont ceux dont l'agent a besoin et rien de plus : PROCESS pour la liste des
+// connexions, REPLICATION CLIENT pour la position des journaux, et la lecture du
+// performance_schema d'où viennent presque toutes les métriques. Aucun accès aux
+// bases des projets : un agent de métriques compromis ne doit pas être un accès
+// aux données de clients.
+func MonitoringMySQL(user, host, password string) ([]string, error) {
+	if err := checkIdentifier("utilisateur de supervision", user); err != nil {
+		return nil, err
+	}
+	if host == "" {
+		host = "localhost"
+	}
+	account := fmt.Sprintf("%s@%s", quoteLiteral(user), quoteLiteral(host))
+	return []string{
+		fmt.Sprintf("CREATE USER IF NOT EXISTS %s IDENTIFIED BY %s", account, quoteLiteral(password)),
+		fmt.Sprintf("ALTER USER %s IDENTIFIED BY %s", account, quoteLiteral(password)),
+		fmt.Sprintf("GRANT PROCESS, REPLICATION CLIENT ON *.* TO %s", account),
+		fmt.Sprintf("GRANT SELECT ON `performance_schema`.* TO %s", account),
+	}, nil
+}
+
+// MonitoringMySQLGrants énumère les privilèges attendus tels qu'ils ressortent
+// d'un SHOW GRANTS, chaque entrée donnant les orthographes acceptées.
+//
+// Il en faut plusieurs : **MariaDB rend « BINLOG MONITOR » là où MySQL rend
+// « REPLICATION CLIENT »**. Le GRANT est accepté sous les deux noms, mais la
+// relecture ne rend que le nom propre au moteur — comparer au seul libellé de
+// MySQL faisait voir un privilège manquant à chaque observation, et le plan
+// annonçait éternellement une correction qu'il venait d'appliquer.
+var MonitoringMySQLGrants = [][]string{
+	{"PROCESS"},
+	{"REPLICATION CLIENT", "BINLOG MONITOR"},
+}
+
+// MonitoringPostgres produit les requêtes du rôle de supervision. Il n'a pas de
+// mot de passe : l'agent se connecte par le socket local, où PostgreSQL
+// authentifie « peer » — il compare l'utilisateur système. C'est la même règle
+// que pour le rôle d'administration d'ogs (D44), et la conséquence est la même :
+// le rôle porte le nom de l'utilisateur système de l'agent, pas un nom choisi.
+func MonitoringPostgres(role string) ([]string, error) {
+	if err := checkIdentifier("rôle de supervision", role); err != nil {
+		return nil, err
+	}
+	ident := quotePGIdent(role)
+	return []string{
+		fmt.Sprintf("DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = %s) "+
+			"THEN CREATE ROLE %s LOGIN; END IF; END $$", quoteLiteral(role), ident),
+		fmt.Sprintf("ALTER ROLE %s LOGIN", ident),
+		// pg_monitor agrège pg_read_all_settings, pg_read_all_stats et
+		// pg_stat_scan_tables : c'est exactement la lecture des statistiques, sans
+		// aucun droit sur les données.
+		fmt.Sprintf("GRANT pg_monitor TO %s", ident),
+	}, nil
+}

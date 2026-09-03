@@ -27,6 +27,9 @@ type Provider struct {
 	// Endpoint porte l'hôte et le port AMQP, pour les chaînes de connexion.
 	Host string
 	Port int
+	// ManagementURL est l'adresse de l'API d'administration. La supervision en a
+	// besoin : c'est par elle que les métriques du broker sont lues.
+	ManagementURL string
 }
 
 // Name identifie le provider.

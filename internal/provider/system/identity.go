@@ -62,10 +62,41 @@ func (s *SystemIdentity) LookupUser(name string) (*UserInfo, error) {
 	}
 	uid, _ := strconv.Atoi(u.Uid)
 	gid, _ := strconv.Atoi(u.Gid)
-	return &UserInfo{
+	info := &UserInfo{
 		Name: u.Username, UID: uid, GID: gid, Home: u.HomeDir,
 		Managed: strings.HasPrefix(u.Name, managedMarker),
-	}, nil
+	}
+	// os/user ne rend pas le shell : sa structure n'a pas le champ, quelle que
+	// soit la source. Il faut donc le lire dans /etc/passwd, sans quoi le shell
+	// observé reste vide — et la réconciliation de D62 ne voit jamais de dérive
+	// sur un système réel, alors qu'elle fonctionne en mode préfixé, où la base
+	// des comptes est justement un fichier. Le défaut ne se voyait qu'en scénario.
+	//
+	// Un compte servi par NSS sans exister dans /etc/passwd — annuaire LDAP,
+	// domaine — garde un shell vide, et c'est voulu : ogs n'a pas à lancer un
+	// usermod sur un compte dont la définition ne vit pas sur cette machine.
+	if shell, ok := shellFromPasswd(defaultPasswdPath, u.Username); ok {
+		info.Shell = shell
+	}
+	return info, nil
+}
+
+// shellFromPasswd lit le seul champ que os/user ne rend pas.
+func shellFromPasswd(path, name string) (string, bool) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", false
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		fields := strings.Split(sc.Text(), ":")
+		if len(fields) < 7 || fields[0] != name {
+			continue
+		}
+		return fields[6], true
+	}
+	return "", false
 }
 
 // LookupGroup cherche un groupe.
@@ -93,8 +124,9 @@ const (
 	// managedMarker est inscrit dans le champ commentaire (GECOS) du compte. Il ne
 	// peut contenir ni « : » (séparateur de champs de /etc/passwd) ni « , »
 	// (séparateur de sous-champs du GECOS).
-	managedMarker    = "ogs="
-	defaultGroupPath = "/etc/group"
+	managedMarker     = "ogs="
+	defaultGroupPath  = "/etc/group"
+	defaultPasswdPath = "/etc/passwd"
 )
 
 func (s *SystemIdentity) lookupUserFile(name string) (*UserInfo, error) {
