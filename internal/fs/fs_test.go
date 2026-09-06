@@ -3,6 +3,7 @@ package fs
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -89,13 +90,14 @@ func TestWriteAtomicSetsModeAndLeavesNoTemp(t *testing.T) {
 	}
 }
 
-func TestBackup(t *testing.T) {
+func TestBackupNommeLaCopieParSonHorodatage(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "conf")
 	if err := os.WriteFile(path, []byte("original\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	dst, err := Backup(path, time.Date(2026, 8, 23, 3, 4, 5, 0, time.UTC))
+	dst, err := BackupTo(path, filepath.Join(t.TempDir(), "backups"),
+		time.Date(2026, 8, 23, 3, 4, 5, 0, time.UTC))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -105,6 +107,54 @@ func TestBackup(t *testing.T) {
 	data, _ := os.ReadFile(dst)
 	if string(data) != "original\n" {
 		t.Errorf("contenu sauvegardé %q", data)
+	}
+}
+
+func TestBackupToSortDuRepertoireDOrigine(t *testing.T) {
+	// Un répertoire lu en entier par son démon — /etc/logrotate.d — ne doit pas
+	// recevoir la copie : elle y deviendrait une seconde configuration.
+	src := t.TempDir()
+	path := filepath.Join(src, "ogs")
+	if err := os.WriteFile(path, []byte("original\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(t.TempDir(), "backups")
+	dst, err := BackupTo(path, dir, time.Date(2026, 8, 23, 3, 4, 5, 0, time.UTC))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filepath.Dir(dst) != dir {
+		t.Errorf("sauvegarde déposée dans %s, attendue dans %s", filepath.Dir(dst), dir)
+	}
+	if filepath.Base(dst) != "ogs.ogs-bak-20260823-030405" {
+		t.Errorf("nom de sauvegarde inattendu : %s", dst)
+	}
+	entries, _ := os.ReadDir(src)
+	if len(entries) != 1 || entries[0].Name() != "ogs" {
+		t.Errorf("le répertoire d'origine ne doit contenir que l'original, il contient %v", entries)
+	}
+	if data, _ := os.ReadFile(dst); string(data) != "original\n" {
+		t.Errorf("contenu sauvegardé %q", data)
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o700 {
+		t.Errorf("mode du répertoire de sauvegarde %v, attendu 0700", info.Mode().Perm())
+	}
+}
+
+func TestBackupToNeCreeRienSurUnOriginalAbsent(t *testing.T) {
+	// L'appelant passe outre sur os.IsNotExist : le répertoire de sauvegarde ne
+	// doit pas être créé pour rien.
+	dir := filepath.Join(t.TempDir(), "backups")
+	_, err := BackupTo(filepath.Join(t.TempDir(), "absent"), dir, time.Now())
+	if !os.IsNotExist(err) {
+		t.Fatalf("erreur attendue « fichier absent », obtenu : %v", err)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Errorf("le répertoire de sauvegarde n'avait pas lieu d'être créé")
 	}
 }
 
@@ -170,5 +220,131 @@ func TestInspectIgnoresTheHeaderTimestamp(t *testing.T) {
 	}
 	if state != StateOutdated {
 		t.Errorf("état = %s, attendu à mettre à jour", state)
+	}
+}
+
+func TestInspectSupporteUnCorpsCommencantParUnCommentaire(t *testing.T) {
+	// Cinq fichiers de portée parc commencent leur corps par un commentaire — vhost
+	// de supervision, fragments Telegraf et fail2ban, extrait nginx — et toute
+	// surcharge de template peut faire de même. Les compter comme en-tête amputait
+	// le corps : l'empreinte recalculée ne valait jamais celle annoncée, le fichier
+	// passait pour modifié à la main, et chaque apply le réécrivait en rechargeant
+	// le moteur au passage.
+	corps := map[string][]byte{
+		"commentaire":   []byte("# Entrées dérivées du parc.\n# suite\n<VirtualHost 127.0.0.1:8099>\n</VirtualHost>\n"),
+		"vide":          nil,
+		"ligne vide":    []byte("\n"),
+		"point-virgule": []byte("; Pool dérivé du parc.\n[shopfr]\nuser = shopfr\n"),
+	}
+	for nom, body := range corps {
+		t.Run(nom, func(t *testing.T) {
+			commentaire := "#"
+			if nom == "point-virgule" {
+				commentaire = ";"
+			}
+			dir := t.TempDir()
+			path := filepath.Join(dir, "fragment.conf")
+			h := Header{Project: "", Resource: "monitoring/telegraf",
+				Generated: time.Date(2026, 8, 24, 10, 0, 0, 0, time.UTC)}
+
+			if err := os.WriteFile(path, Render(h, body, commentaire), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			// Même corps, rendu une minute plus tard : seul l'horodatage diffère.
+			plusTard := h
+			plusTard.Generated = h.Generated.Add(time.Minute)
+			state, err := Inspect(path, Render(plusTard, body, commentaire))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if state != StateCurrent {
+				t.Errorf("état = %s, attendu conforme", state)
+			}
+
+			// Une vraie modification manuelle doit rester détectée.
+			edite := append([]byte{}, Render(h, body, commentaire)...)
+			edite = append(edite, []byte(commentaire+" ajout manuel\n")...)
+			if err := os.WriteFile(path, edite, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			state, err = Inspect(path, Render(plusTard, body, commentaire))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if state != StateHandEdited {
+				t.Errorf("état = %s, attendu modifié à la main", state)
+			}
+		})
+	}
+}
+
+func TestSplitHeaderNeConsommeQueLEnTete(t *testing.T) {
+	// La troisième ligne d'en-tête n'est écrite que si le template est
+	// surchargeable : splitHeader doit la reconnaître, et elle seule.
+	body := []byte("# commentaire du corps\nServerName shop.fr\n")
+
+	avec := Render(header(), body, "#")
+	fp, extrait := splitHeader(avec)
+	if fp != Fingerprint(body) {
+		t.Errorf("empreinte %q, attendue %q", fp, Fingerprint(body))
+	}
+	if string(extrait) != string(body) {
+		t.Errorf("corps extrait %q, attendu %q", extrait, body)
+	}
+
+	sans := header()
+	sans.Template = ""
+	fp, extrait = splitHeader(Render(sans, body, "#"))
+	if fp != Fingerprint(body) {
+		t.Errorf("sans template : empreinte %q, attendue %q", fp, Fingerprint(body))
+	}
+	if string(extrait) != string(body) {
+		t.Errorf("sans template : corps extrait %q, attendu %q", extrait, body)
+	}
+
+	// Un corps qui imite la ligne d'empreinte ne doit pas se faire passer pour
+	// l'en-tête : c'est la première ligne qui la porte qui fait foi.
+	piege := []byte("# empreinte: sha256:" + strings.Repeat("0", 64) + "\nServerName shop.fr\n")
+	fp, extrait = splitHeader(Render(sans, piege, "#"))
+	if fp != Fingerprint(piege) {
+		t.Errorf("leurre : empreinte %q, attendue %q", fp, Fingerprint(piege))
+	}
+	if string(extrait) != string(piege) {
+		t.Errorf("leurre : corps extrait %q, attendu %q", extrait, piege)
+	}
+}
+
+func TestEnsureDirRefuseUnLienSymbolique(t *testing.T) {
+	// Les répertoires d'un projet vivent sous un home que son utilisateur écrit :
+	// il peut en retirer un et poser à sa place un lien vers un répertoire du
+	// système. Suivre ce lien poserait le mode et le propriétaire du projet sur la
+	// cible — escalade vers root.
+	base := t.TempDir()
+	cible := filepath.Join(base, "cible")
+	if err := os.Mkdir(cible, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	lien := filepath.Join(base, "www")
+	if err := os.Symlink(cible, lien); err != nil {
+		t.Fatal(err)
+	}
+
+	err := EnsureDir(lien, 0o710, KeepOwner)
+	if err == nil {
+		t.Fatal("un lien symbolique a été suivi sans un mot")
+	}
+	if !strings.Contains(err.Error(), "lien symbolique") {
+		t.Errorf("erreur peu explicite : %v", err)
+	}
+	info, statErr := os.Stat(cible)
+	if statErr != nil {
+		t.Fatal(statErr)
+	}
+	if info.Mode().Perm() != 0o755 {
+		t.Errorf("mode de la cible = %v, attendu 0755 : le lien a été suivi", info.Mode().Perm())
+	}
+	if fi, err := os.Lstat(lien); err != nil || fi.Mode()&os.ModeSymlink == 0 {
+		t.Errorf("le lien a été altéré : %v, %v", fi, err)
 	}
 }

@@ -395,3 +395,152 @@ func containsSubstring(items []string, want string) bool {
 	}
 	return false
 }
+
+func TestCorrelateNeRevendiquePasDeuxFoisLeMemeCompte(t *testing.T) {
+	// Deux sites servis sous le home d'un même compte : ce home ne désigne
+	// personne. Le premier vhost rencontré s'appropriait le compte et la racine,
+	// et l'apply chownait le répertoire parent des deux sites à un seul projet.
+	resources := []Resource{
+		{Kind: KindVHost, Name: "a.fr", Attributes: map[string]string{
+			"domains": "a.fr", "docroot": "/var/www/a"}},
+		{Kind: KindVHost, Name: "b.fr", Attributes: map[string]string{
+			"domains": "b.fr", "docroot": "/var/www/b"}},
+		{Kind: KindUser, Name: "www", Attributes: map[string]string{
+			"home": "/var/www", "shell": "/bin/bash"}},
+	}
+	candidates, _ := Correlate(resources, "/home", "preprod-pp.net")
+	if len(candidates) != 2 {
+		t.Fatalf("%d candidats, 2 attendus : %+v", len(candidates), candidates)
+	}
+	porteurs := 0
+	for _, c := range candidates {
+		if c.User == "www" {
+			porteurs++
+			if c.Home != "/var/www" {
+				t.Errorf("le porteur du compte doit garder son home : %q", c.Home)
+			}
+		} else if c.Home == "/var/www" {
+			t.Errorf("%s hérite de la racine partagée sans porter le compte", c.Host)
+		}
+	}
+	if porteurs != 1 {
+		t.Errorf("%d candidats revendiquent le compte www, 1 au plus attendu", porteurs)
+	}
+}
+
+func TestCorrelateExigeUneFrontiereDeChemin(t *testing.T) {
+	// « /var/www » n'est pas un ancêtre de « /var/www2/site » : le préfixe brut
+	// les rapprochait, et le candidat héritait d'un compte étranger.
+	resources := []Resource{
+		{Kind: KindVHost, Name: "site.fr", Attributes: map[string]string{
+			"domains": "site.fr", "docroot": "/var/www2/site/public"}},
+		{Kind: KindUser, Name: "www", Attributes: map[string]string{
+			"home": "/var/www", "shell": "/bin/bash"}},
+	}
+	candidates, unmanaged := Correlate(resources, "/home", "preprod-pp.net")
+	if len(candidates) != 1 {
+		t.Fatalf("%d candidats, 1 attendu : %+v", len(candidates), candidates)
+	}
+	if candidates[0].User != "" {
+		t.Errorf("compte %q rapproché à tort par un faux préfixe", candidates[0].User)
+	}
+	var noms []string
+	for _, r := range unmanaged {
+		noms = append(noms, r.Name)
+	}
+	if !contains(noms, "www") {
+		t.Errorf("le compte non rapproché doit rester non géré : %v", noms)
+	}
+}
+
+func TestCorrelateCompteDevineParLeHomeResteMoyen(t *testing.T) {
+	// La confiance élevée est réservée aux trois sources concordantes — vhost,
+	// pool désigné par son socket, compte système. Un compte deviné par son home
+	// est un seul indice, et il doit s'annoncer comme une supposition.
+	resources := []Resource{
+		{Kind: KindVHost, Name: "vitrine.fr", Attributes: map[string]string{
+			"domains": "vitrine.fr", "docroot": "/var/www/vitrine/public"}},
+		{Kind: KindUser, Name: "vitrine", Attributes: map[string]string{
+			"home": "/var/www/vitrine", "shell": "/bin/bash"}},
+	}
+	candidates, _ := Correlate(resources, "/home", "preprod-pp.net")
+	if len(candidates) != 1 {
+		t.Fatalf("%d candidats, 1 attendu : %+v", len(candidates), candidates)
+	}
+	c := candidates[0]
+	if c.Confidence != ConfidenceMedium {
+		t.Errorf("confiance %q, « moyenne » attendue", c.Confidence)
+	}
+	annonce := false
+	for _, u := range c.Uncertain {
+		if strings.Contains(u, "rapproché par le home") {
+			annonce = true
+		}
+	}
+	if !annonce {
+		t.Errorf("le rapprochement par le home doit être annoncé : %v", c.Uncertain)
+	}
+}
+
+func TestScanIgnoreLesSauvegardesDeVhost(t *testing.T) {
+	// Un serveur repris porte l'héritage des versions antérieures d'ogs, qui
+	// déposaient la copie d'un écrasement forcé à côté du vhost écrasé. Elle en
+	// garde le ServerName : lue comme un vhost, elle propose d'adopter une
+	// seconde fois un site déjà géré.
+	scanner, _ := legacyServer(t)
+	copie := filepath.Join(scanner.Engine.AvailableDir(),
+		"dejagere.conf.ogs-bak-20260905-141203")
+	if err := os.WriteFile(copie,
+		[]byte("<VirtualHost *:80>\n  ServerName dejagere.fr\n</VirtualHost>\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	resources, err := scanner.Scan(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range resources {
+		if r.Path == copie {
+			t.Errorf("la sauvegarde est prise pour une ressource : %s", r)
+		}
+	}
+	candidates, unmanaged := Correlate(resources, "/home", "preprod-pp.net")
+	for _, c := range candidates {
+		if c.Host == "dejagere.fr" {
+			t.Errorf("un site déjà géré est proposé à l'adoption : %+v", c)
+		}
+	}
+	for _, r := range unmanaged {
+		if r.Path == copie {
+			t.Errorf("la sauvegarde figure parmi les ressources non gérées : %s", r)
+		}
+	}
+}
+
+func TestCorrelateRetientLeCompteAuHomeLePlusProfond(t *testing.T) {
+	// Deux comptes englobent le docroot : celui du site et celui qui possède la
+	// racine commune. Retenir le premier venu — l'ordre est alphabétique —
+	// donnait au projet le compte du voisin et sa racine, que l'apply aurait
+	// chownée.
+	resources := []Resource{
+		{Kind: KindVHost, Name: "zoe.fr", Attributes: map[string]string{
+			"domains": "zoe.fr", "docroot": "/var/www/zoe/public"}},
+		{Kind: KindUser, Name: "hebergeur", Attributes: map[string]string{
+			"home": "/var/www", "shell": "/usr/sbin/nologin"}},
+		{Kind: KindUser, Name: "zoe", Attributes: map[string]string{
+			"home": "/var/www/zoe", "shell": "/bin/bash"}},
+	}
+	candidates, _ := Correlate(resources, "/home", "preprod-pp.net")
+	if len(candidates) != 1 {
+		t.Fatalf("%d candidats, 1 attendu : %+v", len(candidates), candidates)
+	}
+	c := candidates[0]
+	if c.User != "zoe" {
+		t.Errorf("compte retenu %q, « zoe » attendu", c.User)
+	}
+	if c.Home != "/var/www/zoe" {
+		t.Errorf("racine retenue %q, « /var/www/zoe » attendue", c.Home)
+	}
+	if c.Shell != "/bin/bash" {
+		t.Errorf("shell retenu %q : c'est celui du compte du voisin", c.Shell)
+	}
+}

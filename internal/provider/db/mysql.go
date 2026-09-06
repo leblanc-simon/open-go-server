@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -55,12 +56,19 @@ func (c *mysqlClient) Users(ctx context.Context) (map[string]bool, error) {
 
 // Grants lit les privilèges observés d'un compte et les normalise par base, afin
 // de pouvoir les comparer à l'état désiré.
+//
+// Les privilèges **globaux** — ceux accordés « ON *.* » — sont lus à part et
+// rendus sous GlobalGrantKey. SCHEMA_PRIVILEGES est alimentée par la seule
+// mysql.db : elle ignore tout ce qui a été accordé globalement, et les y chercher
+// serait ne jamais les voir. Un compte n'ayant que des privilèges globaux — celui
+// de la supervision — n'était alors jamais vu conforme, et le plan annonçait
+// éternellement une correction déjà appliquée.
 func (c *mysqlClient) Grants(ctx context.Context, user, host string) (map[string]string, error) {
+	grantee := fmt.Sprintf("'%s'@'%s'", user, host)
 	rows, err := c.db.QueryContext(ctx,
 		`SELECT TABLE_SCHEMA, GROUP_CONCAT(DISTINCT PRIVILEGE_TYPE ORDER BY PRIVILEGE_TYPE)
 		 FROM information_schema.SCHEMA_PRIVILEGES
-		 WHERE GRANTEE = ? GROUP BY TABLE_SCHEMA`,
-		fmt.Sprintf("'%s'@'%s'", user, host))
+		 WHERE GRANTEE = ? GROUP BY TABLE_SCHEMA`, grantee)
 	if err != nil {
 		return nil, err
 	}
@@ -75,7 +83,21 @@ func (c *mysqlClient) Grants(ctx context.Context, user, host string) (map[string
 		// ramener au nom réel pour pouvoir le comparer à l'état désiré.
 		out[naming.UnescapeMySQLPattern(schema)] = privs
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	var global sql.NullString
+	if err := c.db.QueryRowContext(ctx,
+		`SELECT GROUP_CONCAT(DISTINCT PRIVILEGE_TYPE ORDER BY PRIVILEGE_TYPE)
+		 FROM information_schema.USER_PRIVILEGES WHERE GRANTEE = ?`,
+		grantee).Scan(&global); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return nil, err
+	}
+	if global.Valid && global.String != "" {
+		out[GlobalGrantKey] = global.String
+	}
+	return out, nil
 }
 
 // Extensions n'a pas d'équivalent MySQL.

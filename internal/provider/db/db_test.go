@@ -3,12 +3,14 @@ package db
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"leblanc.io/open-go-server/internal/config"
+	"leblanc.io/open-go-server/internal/engine"
 	"leblanc.io/open-go-server/internal/exec"
 	"leblanc.io/open-go-server/internal/model"
 	"leblanc.io/open-go-server/internal/naming"
@@ -132,6 +134,237 @@ func TestPlanUnavailableEngineIsNonCritical(t *testing.T) {
 	}
 	if err := steps[0].Apply(context.Background()); err == nil {
 		t.Error("l'application doit échouer avec le motif d'indisponibilité")
+	}
+}
+
+// stubClient est un moteur simulé : il permet d'éprouver l'observation et la
+// réconciliation sans serveur. Il est branché en peuplant le cache de clients,
+// que clientFor consulte avant d'ouvrir quoi que ce soit.
+type stubClient struct {
+	databases map[string]bool
+	users     map[string]bool
+	grants    map[string]string
+	// grantsPar distingue les comptes : les privilèges d'un compte additionnel ne
+	// sont pas ceux du compte principal, et c'est justement l'écart entre les deux
+	// qu'il faut pouvoir éprouver.
+	grantsPar map[string]map[string]string
+	failOn    string
+}
+
+func (c *stubClient) fail(what string) error {
+	if c.failOn == what {
+		return fmt.Errorf("%w : lecture interrompue", ErrUnavailable)
+	}
+	return nil
+}
+
+func (c *stubClient) Endpoint(context.Context) (Endpoint, error) {
+	return Endpoint{Engine: "mysql", Host: "127.0.0.1", Port: 3306, Version: "8.0"}, c.fail("endpoint")
+}
+
+func (c *stubClient) Databases(context.Context) (map[string]bool, error) {
+	return c.databases, c.fail("databases")
+}
+
+func (c *stubClient) Users(context.Context) (map[string]bool, error) {
+	return c.users, c.fail("users")
+}
+
+func (c *stubClient) Grants(_ context.Context, user, _ string) (map[string]string, error) {
+	if g, ok := c.grantsPar[user]; ok {
+		return g, c.fail("grants")
+	}
+	return c.grants, c.fail("grants")
+}
+
+func (c *stubClient) Extensions(context.Context, string) (map[string]bool, error) {
+	return map[string]bool{}, nil
+}
+func (c *stubClient) Exec(context.Context, string) error           { return nil }
+func (c *stubClient) ExecIn(context.Context, string, string) error { return nil }
+func (c *stubClient) Close() error                                 { return nil }
+
+func withStub(p *Provider, c Client) { p.clients = map[string]Client{"mysql": c} }
+
+func TestObserveNechouePasSurUneLectureInterrompue(t *testing.T) {
+	// Un broker ou un moteur qui tombe entre deux requêtes rendait l'erreur à
+	// l'appelant, qui abandonnait la construction du plan entier : ni utilisateur
+	// système, ni vhost web, ni certificat — pour une cause que la conception
+	// déclare non bloquante.
+	for _, étape := range []string{"databases", "users"} {
+		prov, proj := fixture(t)
+		proj.Spec.Databases = []model.Database{DefaultDatabase(proj, "mysql")}
+		withStub(prov, &stubClient{failOn: étape})
+
+		obs, err := prov.Observe(context.Background(), proj)
+		if err != nil {
+			t.Fatalf("%s : l'observation ne doit pas échouer : %v", étape, err)
+		}
+		if len(obs.States) != 1 || obs.States[0].Unavailable == nil {
+			t.Fatalf("%s : l'indisponibilité doit être rapportée : %+v", étape, obs.States)
+		}
+		steps, err := prov.Plan(context.Background(), proj, obs)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(steps) != 1 || steps[0].Critical {
+			t.Errorf("%s : une seule étape non critique attendue : %+v", étape, steps)
+		}
+	}
+}
+
+func TestPlanDetecteUneReductionDePrivileges(t *testing.T) {
+	// Un passage de « all » à « readonly » doit produire une étape, et la
+	// révocation doit précéder le grant : le GRANT de MySQL est additif, sans quoi
+	// INSERT, UPDATE et DROP resteraient en place.
+	prov, proj := fixture(t)
+	decl := DefaultDatabase(proj, "mysql")
+	decl.Privileges = string(PrivReadOnly)
+	proj.Spec.Databases = []model.Database{decl}
+	withStub(prov, &stubClient{
+		databases: map[string]bool{"shopfr": true},
+		users:     map[string]bool{"shopfr@localhost": true},
+		grants:    map[string]string{"shopfr": "ALTER,CREATE,DELETE,DROP,INDEX,INSERT,SELECT,SHOW VIEW,UPDATE"},
+	})
+
+	obs, err := prov.Observe(context.Background(), proj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	steps, err := prov.Plan(context.Background(), proj, obs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(steps) != 1 || steps[0].Action == engine.NoOp {
+		t.Fatalf("une étape de correction attendue : %+v", steps)
+	}
+	diff, err := steps[0].Diff()
+	if err != nil {
+		t.Fatal(err)
+	}
+	revoke := strings.Index(diff, "REVOKE ALL PRIVILEGES ON `shopfr`.* FROM 'shopfr'@'localhost'")
+	grant := strings.Index(diff, "GRANT SELECT, SHOW VIEW ON `shopfr`.* TO 'shopfr'@'localhost'")
+	if revoke < 0 || grant < 0 || revoke > grant {
+		t.Errorf("révocation puis grant attendus :\n%s", diff)
+	}
+}
+
+func TestPlanNoscillePasSurUnJeuAllDejaAccorde(t *testing.T) {
+	// L'inverse du défaut précédent : « all » se relit développé, et la liste
+	// diffère d'un moteur à l'autre. Exiger l'égalité ferait annoncer
+	// éternellement une correction qu'on vient d'appliquer, et un REVOKE avec.
+	prov, proj := fixture(t)
+	decl := DefaultDatabase(proj, "mysql")
+	proj.Spec.Databases = []model.Database{decl}
+	withStub(prov, &stubClient{
+		databases: map[string]bool{"shopfr": true},
+		users:     map[string]bool{"shopfr@localhost": true},
+		grants: map[string]string{"shopfr": "ALTER,CREATE,CREATE ROUTINE,CREATE VIEW," +
+			"DELETE,DELETE HISTORY,DROP,INDEX,INSERT,SELECT,SHOW VIEW,TRIGGER,UPDATE"},
+	})
+
+	obs, err := prov.Observe(context.Background(), proj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	steps, err := prov.Plan(context.Background(), proj, obs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(steps) != 1 || steps[0].Action != engine.NoOp {
+		t.Fatalf("aucun changement attendu : %+v", steps)
+	}
+}
+
+func TestPlanDetecteUnElargissementDePrivileges(t *testing.T) {
+	// Le sens le plus fréquent en exploitation : l'application se prenait des
+	// « command denied » alors que le plan annonçait la conformité.
+	prov, proj := fixture(t)
+	decl := DefaultDatabase(proj, "mysql")
+	proj.Spec.Databases = []model.Database{decl}
+	withStub(prov, &stubClient{
+		databases: map[string]bool{"shopfr": true},
+		users:     map[string]bool{"shopfr@localhost": true},
+		grants:    map[string]string{"shopfr": "SELECT,SHOW VIEW"},
+	})
+
+	obs, err := prov.Observe(context.Background(), proj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	steps, err := prov.Plan(context.Background(), proj, obs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(steps) != 1 || steps[0].Action == engine.NoOp {
+		t.Fatalf("une étape de correction attendue : %+v", steps)
+	}
+	diff, err := steps[0].Diff()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Aucune révocation : le jeu observé ne déborde pas « all », et un REVOKE sur
+	// un compte qui n'a pas le privilège échouerait (ER_NONEXISTING_GRANT).
+	if strings.Contains(diff, "REVOKE") {
+		t.Errorf("une montée en privilèges ne doit rien révoquer :\n%s", diff)
+	}
+}
+
+func TestPlanJugeAussiLesPrivilegesDesComptesAdditionnels(t *testing.T) {
+	// Un compte additionnel n'était jugé que sur son existence : déclaré
+	// « readonly » et créé jadis en « all », il gardait l'écriture sur la base du
+	// projet et le plan annonçait la conformité. C'est le compte de lecture d'un
+	// outil tiers — celui qu'on borne précisément parce qu'on ne le maîtrise pas.
+	prov, proj := fixture(t)
+	decl := DefaultDatabase(proj, "mysql")
+	decl.ExtraUsers = []model.DBUser{{User: "shopfr_ro", Privileges: "readonly"}}
+	proj.Spec.Databases = []model.Database{decl}
+	stub := &stubClient{
+		databases: map[string]bool{"shopfr": true},
+		users:     map[string]bool{"shopfr@localhost": true, "shopfr_ro@localhost": true},
+		grantsPar: map[string]map[string]string{
+			"shopfr": {"shopfr": "ALTER,CREATE,DELETE,DROP,INDEX,INSERT,SELECT,SHOW VIEW,UPDATE"},
+			"shopfr_ro": {"shopfr": "ALTER,CREATE,DELETE,DROP,INDEX,INSERT," +
+				"SELECT,SHOW VIEW,UPDATE"},
+		},
+	}
+	withStub(prov, stub)
+
+	obs, err := prov.Observe(context.Background(), proj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	steps, err := prov.Plan(context.Background(), proj, obs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(steps) != 1 || steps[0].Action == engine.NoOp {
+		t.Fatalf("une étape de correction attendue : %+v", steps)
+	}
+	diff, err := steps[0].Diff()
+	if err != nil {
+		t.Fatal(err)
+	}
+	revoke := strings.Index(diff, "REVOKE ALL PRIVILEGES ON `shopfr`.* FROM 'shopfr_ro'@'localhost'")
+	grant := strings.Index(diff, "GRANT SELECT, SHOW VIEW ON `shopfr`.* TO 'shopfr_ro'@'localhost'")
+	if revoke < 0 || grant < 0 || revoke > grant {
+		t.Errorf("révocation puis grant attendus sur le compte additionnel :\n%s", diff)
+	}
+	// Le compte principal, lui, est conforme : rien à révoquer de son côté.
+	if strings.Contains(diff, "FROM 'shopfr'@'localhost'") {
+		t.Errorf("le compte principal ne doit rien perdre :\n%s", diff)
+	}
+
+	// Une fois borné, le compte additionnel ne doit plus rien faire annoncer.
+	stub.grantsPar["shopfr_ro"] = map[string]string{"shopfr": "SELECT,SHOW VIEW"}
+	if obs, err = prov.Observe(context.Background(), proj); err != nil {
+		t.Fatal(err)
+	}
+	if steps, err = prov.Plan(context.Background(), proj, obs); err != nil {
+		t.Fatal(err)
+	}
+	if len(steps) != 1 || steps[0].Action != engine.NoOp {
+		t.Errorf("aucun changement attendu : %+v", steps)
 	}
 }
 

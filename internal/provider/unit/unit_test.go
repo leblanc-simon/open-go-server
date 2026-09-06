@@ -546,3 +546,129 @@ func TestChangedUnitRequestsRestart(t *testing.T) {
 		}
 	}
 }
+
+func TestUniteModifieeALaMainNEstPasEcraseeEnSilence(t *testing.T) {
+	// Une unité éditée à la main porte une intention d'exploitation — une limite
+	// mémoire posée après un incident. L'écraser la perdait sans un mot, et le
+	// redémarrage groupé des instances suivait dans la foulée (§6.4).
+	prov, proj := fixture(t)
+	proj.Spec.Services = []model.Service{{
+		Name: "veille", Template: "worker",
+		Params: map[string]string{"command": "/usr/bin/true"},
+	}}
+	apply(t, prov, proj)
+
+	path := filepath.Join(prov.Paths.SystemdDir(), ServiceName(proj.ID(), "veille"))
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, append(data, []byte("MemoryMax=512M\n")...), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	obs := Observed{Enabled: map[string]bool{InstanceName(proj.ID(), "veille", 1): true}}
+	steps, err := prov.Plan(ctx, proj, obs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var refus *engine.Step
+	for _, s := range steps {
+		if strings.Contains(s.Summary, "modifié hors ogs") {
+			refus = s
+		}
+	}
+	if refus == nil {
+		t.Fatalf("la modification manuelle doit être signalée :\n%v", steps)
+	}
+	if err := refus.Apply(ctx); err == nil {
+		t.Error("l'écrasement doit être refusé sans --force")
+	}
+	// Rien n'a été écrit : rien ne doit être rechargé ni redémarré.
+	if len(refus.Reload) != 0 {
+		t.Errorf("le refus ne doit demander aucun rechargement : %v", refus.Reload)
+	}
+	for _, s := range steps {
+		if slices.Contains(s.Reload, RestartTargetIntent(proj.ID())) {
+			t.Errorf("aucun redémarrage des services ne doit être demandé : %s", s.Summary)
+		}
+	}
+	if after, _ := os.ReadFile(path); !strings.Contains(string(after), "MemoryMax=512M") {
+		t.Error("le refus ne doit rien écrire")
+	}
+}
+
+func TestUniteEcraseeAvecForceApresSauvegarde(t *testing.T) {
+	prov, proj := fixture(t)
+	proj.Spec.Services = []model.Service{{
+		Name: "veille", Template: "worker",
+		Params: map[string]string{"command": "/usr/bin/true"},
+	}}
+	apply(t, prov, proj)
+
+	path := filepath.Join(prov.Paths.SystemdDir(), ServiceName(proj.ID(), "veille"))
+	data, _ := os.ReadFile(path)
+	if err := os.WriteFile(path, append(data, []byte("MemoryMax=512M\n")...), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	prov.Force = true
+	ctx := context.Background()
+	obs := Observed{Enabled: map[string]bool{InstanceName(proj.ID(), "veille", 1): true}}
+	steps, err := prov.Plan(ctx, proj, obs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var forcée *engine.Step
+	for _, s := range steps {
+		if strings.Contains(s.Summary, "écrasement forcé") {
+			forcée = s
+		}
+	}
+	if forcée == nil {
+		t.Fatalf("le plan doit annoncer l'écrasement forcé :\n%v", steps)
+	}
+	// L'unité change réellement : le redémarrage groupé reste dû, sans quoi les
+	// instances continueraient de tourner avec l'ancienne définition.
+	if !slices.Contains(forcée.Reload, RestartTargetIntent(proj.ID())) {
+		t.Errorf("l'écrasement forcé doit demander le redémarrage groupé : %v", forcée.Reload)
+	}
+	if err := forcée.Apply(ctx); err != nil {
+		t.Fatalf("l'écrasement forcé doit réussir : %v", err)
+	}
+	if after, _ := os.ReadFile(path); strings.Contains(string(after), "MemoryMax=512M") {
+		t.Error("l'unité doit avoir été réécrite")
+	}
+	// La copie sort de /etc/systemd/system : systemd n'y charge que les suffixes
+	// d'unité qu'il connaît, mais l'importateur y énumère les unités du parc.
+	if restes, _ := filepath.Glob(path + ".ogs-bak-*"); len(restes) != 0 {
+		t.Errorf("aucune sauvegarde ne doit rester dans %s : %v", prov.Paths.SystemdDir(), restes)
+	}
+	baks, _ := filepath.Glob(filepath.Join(prov.Paths.BackupsDir(), filepath.Base(path)+".ogs-bak-*"))
+	if len(baks) != 1 {
+		t.Fatalf("une sauvegarde attendue dans %s, %d trouvée(s)", prov.Paths.BackupsDir(), len(baks))
+	}
+	if saved, _ := os.ReadFile(baks[0]); !strings.Contains(string(saved), "MemoryMax=512M") {
+		t.Error("la sauvegarde doit contenir l'original")
+	}
+}
+
+func TestPlanRemonteUneUniteIllisible(t *testing.T) {
+	// Confondre « illisible » et « rien à faire » faisait annoncer un succès sans
+	// que rien n'ait été vérifié ni écrit.
+	prov, proj := fixture(t)
+	proj.Spec.Services = []model.Service{{
+		Name: "veille", Template: "worker",
+		Params: map[string]string{"command": "/usr/bin/true"},
+	}}
+	path := filepath.Join(prov.Paths.SystemdDir(), ServiceName(proj.ID(), "veille"))
+	// Un répertoire à la place du fichier : fs.Inspect échoue à la lecture.
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	steps, err := prov.Plan(context.Background(), proj, Observed{Enabled: map[string]bool{}})
+	if err == nil {
+		t.Fatalf("une unité illisible doit faire échouer le plan, %d étapes rendues", len(steps))
+	}
+}

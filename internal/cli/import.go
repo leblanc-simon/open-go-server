@@ -11,6 +11,7 @@ import (
 	"leblanc.io/open-go-server/internal/importer"
 	"leblanc.io/open-go-server/internal/provider/db"
 	"leblanc.io/open-go-server/internal/spec"
+	"leblanc.io/open-go-server/internal/validate"
 )
 
 func newImportCommand(app *App) *cobra.Command {
@@ -175,6 +176,18 @@ func newImportAdoptCommand(app *App) *cobra.Command {
 			path := app.Paths.ProjectFile(p.ID())
 			if _, err := os.Stat(path); err == nil {
 				return exitf(CodeConflict, "le projet %s est déjà déclaré (%s)", p.ID(), path)
+			}
+			// L'adoption est une porte d'entrée du parc au même titre que « site
+			// create » et « project create » : sans ce contrôle, deux adoptions
+			// revendiquant le même host, le même home ou la même base sont toutes
+			// deux écrites, et le conflit n'apparaît qu'au premier apply portant sur
+			// tout le parc — bien après que l'exploitant a cru le serveur repris.
+			existing, err := app.loadProjects()
+			if err != nil {
+				return err
+			}
+			if err := validate.Uniqueness(append(existing, p), app.Cfg.PrepDomain()); err != nil {
+				return exitf(CodeConflict, "conflit avec le parc existant :\n%v", err)
 			}
 
 			app.printf("adoption de %s\n", p.ID())

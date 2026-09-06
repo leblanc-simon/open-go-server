@@ -36,6 +36,29 @@ type Provider struct {
 	// ProxyTarget résout la cible d'un vhost de proxy : socket ou adresse locale.
 	ProxyTarget func(*model.Project) (string, bool)
 	Now         func() time.Time
+	// Force autorise l'écrasement d'un fichier qu'ogs n'a pas écrit, après
+	// sauvegarde horodatée (§6.4). Sans lui, le refus n'aurait aucune porte de
+	// sortie : un site adopté, dont le vhost ne porte pas la marque d'ogs, ne
+	// pourrait jamais être appliqué une première fois.
+	Force bool
+}
+
+// refusStep produit l'étape qui refuse d'écraser un fichier qu'ogs n'a pas
+// écrit. Le message nomme la porte de sortie — elle existe désormais — et
+// distingue les deux causes : un fichier « non géré » n'a jamais porté la marque
+// d'ogs, c'est ce que rencontre un site adopté à son premier apply ; un fichier
+// « modifié hors ogs » a été retouché après avoir été généré.
+func refusStep(resource, summary, path, backups string, state fs.State) *engine.Step {
+	libelle, motif := "modifié hors ogs", "a été modifié en dehors d'ogs"
+	if state == fs.StateForeign {
+		libelle, motif = "non géré par ogs", "existe déjà sans porter la marque d'ogs"
+	}
+	s := engine.NewStep(resource, engine.Update, summary+" — fichier "+libelle)
+	s.Apply = func(context.Context) error {
+		return fmt.Errorf("%s %s : relancer avec --force pour l'écraser "+
+			"(l'original sera sauvegardé dans %s)", path, motif, backups)
+	}
+	return s
 }
 
 // Name identifie le provider.
@@ -435,26 +458,62 @@ func (p *Provider) vhostStep(proj *model.Project, bp *VHostPlan) []*engine.Step 
 		steps = append(steps, s)
 	}
 
-	switch bp.State {
+	state, forced := bp.State, false
+	if (state == fs.StateHandEdited || state == fs.StateForeign) && p.Force {
+		// --force : l'étape redevient une mise à jour ordinaire, annoncée comme
+		// telle par « plan » avant qu'« apply » ne l'exécute. La sauvegarde, elle,
+		// n'a lieu qu'à l'application : « plan » et « diff » n'écrivent rien.
+		state, forced = fs.StateOutdated, true
+		summary += " — écrasement forcé (sauvegarde dans " + p.Paths.BackupsDir() + ")"
+	}
+
+	switch state {
 	case fs.StateCurrent:
 		steps = append(steps, engine.NewStep(resource, engine.NoOp, summary))
 	case fs.StateHandEdited, fs.StateForeign:
-		s := engine.NewStep(resource, engine.Update, summary+" — fichier modifié hors ogs")
-		path := bp.Path
-		s.Apply = func(context.Context) error {
-			return fmt.Errorf("%s a été modifié en dehors d'ogs : relancer avec --force pour l'écraser "+
-				"(une sauvegarde horodatée sera créée)", path)
-		}
-		steps = append(steps, s)
+		steps = append(steps, refusStep(resource, summary, bp.Path, p.Paths.BackupsDir(), state))
 	default:
 		action := engine.Create
-		if bp.State == fs.StateOutdated {
+		if state == fs.StateOutdated {
 			action = engine.Update
 		}
 		s := engine.NewStep(resource, action, summary)
 		s.Diff = func() (string, error) { return diffText(bp.Path, bp.Content) }
-		s.Apply = func(ctx context.Context) error { return p.writeVHost(ctx, bp) }
-		s.Compensate = func(context.Context) error { return os.Remove(bp.Path) }
+		// Le corps précédent est relevé à l'application et non au plan : l'état du
+		// disque a pu changer entre les deux.
+		var previous []byte
+		var hadPrevious bool
+		s.Apply = func(ctx context.Context) error {
+			if data, err := os.ReadFile(bp.Path); err == nil {
+				previous, hadPrevious = data, true
+			}
+			if forced {
+				// Écraser le travail d'un exploitant sans en garder trace rend
+				// l'opération irréversible : la sauvegarde précède l'écriture.
+				if _, err := fs.BackupTo(bp.Path, p.Paths.BackupsDir(), p.now()); err != nil && !os.IsNotExist(err) {
+					return err
+				}
+			}
+			return p.writeVHost(ctx, bp)
+		}
+		// La compensation rend le vhost qui était servi. Le supprimer laisserait le
+		// lien de sites-enabled pointer dans le vide : le vhost était déjà actif,
+		// donc l'étape d'activation est un NoOp, donc rien ne la compense et rien ne
+		// retire le lien. Nginx tient l'inclusion d'un lien mort pour fatale — le
+		// moteur ne redémarre plus, tout le parc avec lui — et Apache l'ignore en
+		// silence, perdant le site. Le dégât se révèle au rechargement suivant,
+		// d'où qu'il vienne, alors qu'ogs vient d'annoncer un retour à l'état initial.
+		s.Compensate = func(context.Context) error {
+			if hadPrevious {
+				return fs.WriteAtomic(bp.Path, previous, 0o644, fs.KeepOwner)
+			}
+			// Une compensation en échec arrête tout le déroulage : un fichier déjà
+			// absent n'est pas une erreur.
+			if err := os.Remove(bp.Path); err != nil && !os.IsNotExist(err) {
+				return err
+			}
+			return nil
+		}
 		s.Reload = []string{"web:" + p.Engine.Name()}
 		steps = append(steps, s)
 	}
@@ -577,18 +636,41 @@ func (p *Provider) removeStep(path string) *engine.Step {
 	s := engine.NewStep("web/vhost/"+name, engine.Delete, "vhost obsolète "+path)
 	enabled := filepath.Join(p.Engine.EnabledDir(), filepath.Base(path))
 	var backup []byte
+	// La cible du lien d'activation est relevée avec le corps : rendre le fichier
+	// sans le lien annonce un retour à l'état initial et laisse pourtant le vhost
+	// hors ligne — ni Apache ni nginx ne chargent sites-available, l'inclusion
+	// passe par le lien. Un domaine de redirection retiré puis rétabli par le
+	// déroulage servirait alors le site par défaut du moteur.
+	var cible string
+	var avaitLien bool
 	s.Apply = func(context.Context) error {
 		if data, err := os.ReadFile(path); err == nil {
 			backup = data
+		}
+		if dest, err := os.Readlink(enabled); err == nil {
+			cible, avaitLien = dest, true
 		}
 		_ = os.Remove(enabled)
 		return os.Remove(path)
 	}
 	s.Compensate = func(context.Context) error {
 		if backup == nil {
+			// Sans le corps, rétablir le lien le ferait pointer dans le vide : nginx
+			// tient l'inclusion d'un lien mort pour fatale, tout le parc avec lui.
 			return nil
 		}
-		return fs.WriteAtomic(path, backup, 0o644, fs.KeepOwner)
+		if err := fs.WriteAtomic(path, backup, 0o644, fs.KeepOwner); err != nil {
+			return err
+		}
+		if !avaitLien {
+			return nil
+		}
+		// Une compensation en échec arrête tout le déroulage : un lien déjà en
+		// place n'est pas une erreur.
+		if err := os.Symlink(cible, enabled); err != nil && !os.IsExist(err) {
+			return err
+		}
+		return nil
 	}
 	s.Reload = []string{"web:" + p.Engine.Name()}
 	return s
@@ -696,7 +778,14 @@ func (p *Provider) PlanDropIn(ctx context.Context, projects []*model.Project) ([
 		action = engine.Update
 	}
 	s := engine.NewStep("web/dropin", action, summary)
+	// Le corps précédent est relevé à l'application et non au plan : l'état du
+	// disque a pu changer entre les deux.
+	var previous []byte
+	var hadPrevious bool
 	s.Apply = func(ctx context.Context) error {
+		if data, err := os.ReadFile(path); err == nil {
+			previous, hadPrevious = data, true
+		}
 		if err := fs.EnsureDir(filepath.Dir(path), 0o755, fs.KeepOwner); err != nil {
 			return err
 		}
@@ -710,8 +799,20 @@ func (p *Provider) PlanDropIn(ctx context.Context, projects []*model.Project) ([
 			Name: "systemctl", Args: []string{"daemon-reload"}})
 		return err
 	}
+	// La compensation rend le complément qui était en place. Le supprimer
+	// rendrait au moteur web l'unité durcie par sa distribution — ProtectHome
+	// remonte /home en lecture seule dans le seul espace de noms du service —
+	// donc un maître qui s'arrête en 226/NAMESPACE ou sur AH00019 au prochain
+	// démarrage, tout le parc avec lui, alors qu'ogs vient d'annoncer un retour à
+	// l'état initial. La suppression n'est juste que si le fichier était absent.
 	s.Compensate = func(ctx context.Context) error {
-		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		if hadPrevious {
+			if err := fs.WriteAtomic(path, previous, 0o644, fs.KeepOwner); err != nil {
+				return err
+			}
+		} else if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			// Une compensation en échec arrête tout le déroulage : un fichier déjà
+			// absent n'est pas une erreur.
 			return err
 		}
 		if p.Exec.Simulated() {
@@ -782,12 +883,50 @@ func (p *Provider) PlanSnippet() (*engine.Step, error) {
 	if state == fs.StateCurrent {
 		return engine.NewStep("web/snippet", engine.NoOp, "réglages "+p.Engine.Name()), nil
 	}
+	summary := "réglages " + p.Engine.Name() + " (" + filepath.Base(path) + ")"
+	// Le fragment suit le régime des cinq états comme les vhosts (§6.4). C'est un
+	// fichier de portée serveur, et l'exploitant peut légitimement y avoir ajouté
+	// un réglage : l'écraser en silence lui retirerait sans un mot une
+	// configuration qui vaut pour tout le parc.
+	forced := false
+	if (state == fs.StateHandEdited || state == fs.StateForeign) && p.Force {
+		state, forced = fs.StateOutdated, true
+		summary += " — écrasement forcé (sauvegarde dans " + p.Paths.BackupsDir() + ")"
+	}
+	if state == fs.StateHandEdited || state == fs.StateForeign {
+		return refusStep("web/snippet", summary, path, p.Paths.BackupsDir(), state), nil
+	}
 	action := engine.Create
 	if state != fs.StateAbsent {
 		action = engine.Update
 	}
-	s := engine.NewStep("web/snippet", action, "réglages "+p.Engine.Name()+" ("+filepath.Base(path)+")")
+	s := engine.NewStep("web/snippet", action, summary)
+	// Le corps précédent est relevé à l'application et non au plan : l'état du
+	// disque a pu changer entre les deux.
+	var previous []byte
+	var hadPrevious bool
+	// restaurer rend le corps antérieur, ou retire le fichier s'il n'y en avait
+	// pas. Un fichier déjà absent n'est pas une erreur : une compensation en échec
+	// arrête tout le déroulage.
+	restaurer := func() error {
+		if hadPrevious {
+			return fs.WriteAtomic(path, previous, 0o644, fs.KeepOwner)
+		}
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		return nil
+	}
 	s.Apply = func(ctx context.Context) error {
+		if data, err := os.ReadFile(path); err == nil {
+			previous, hadPrevious = data, true
+		}
+		if forced {
+			// La sauvegarde n'a lieu qu'ici : « plan » et « diff » n'écrivent rien.
+			if _, err := fs.BackupTo(path, p.Paths.BackupsDir(), p.now()); err != nil && !os.IsNotExist(err) {
+				return err
+			}
+		}
 		if err := fs.EnsureDir(filepath.Dir(path), 0o755, fs.KeepOwner); err != nil {
 			return err
 		}
@@ -795,13 +934,22 @@ func (p *Provider) PlanSnippet() (*engine.Step, error) {
 			return err
 		}
 		// La configuration est revalidée : un fragment fautif casserait tous les
-		// sites, pas seulement celui qu'on installe.
+		// sites, pas seulement celui qu'on installe. Et la revalidation porte sur
+		// la configuration entière : elle peut échouer pour une cause étrangère au
+		// fragment, d'où le retour au corps antérieur plutôt que la suppression.
 		if err := validate(ctx, p.Engine, p.Exec); err != nil {
-			_ = os.Remove(path)
+			_ = restaurer()
 			return err
 		}
 		return nil
 	}
+	// La compensation rend le fragment qui était en place. Le supprimer retirerait
+	// la « map $http_upgrade $connection_upgrade » dont dépend tout vhost de proxy
+	// du parc : nginx refuserait alors de démarrer, tout le parc avec lui, alors
+	// qu'ogs vient d'annoncer un retour à l'état initial. La suppression n'est
+	// juste que si le fichier était absent — l'étape figure désormais aussi dans le
+	// plan de chaque projet, donc dans le déroulage de sa saga.
+	s.Compensate = func(context.Context) error { return restaurer() }
 	s.Reload = []string{"web:" + p.Engine.Name()}
 	return s, nil
 }

@@ -30,6 +30,17 @@ type Jail struct {
 	LogPaths []string
 	MaxRetry int
 	Backend  string
+	// BanTime, FindTime et IgnoreIP sont portés par chaque prison, jamais par une
+	// section [DEFAULT] : fail2ban fusionne jail.conf, jail.d/*.conf et jail.local
+	// dans un même analyseur, de sorte qu'une section commune posée dans jail.d
+	// n'est pas locale à son fichier — elle s'imposerait à **toutes** les prisons
+	// de la machine, celles de l'administrateur comprises. Le plus grave est
+	// « ignoreip », qui est remplacé et non complété : la liste blanche
+	// d'administration disparaîtrait, et quelques échecs d'authentification
+	// suffiraient à verrouiller l'administrateur hors de son propre serveur.
+	BanTime  string
+	FindTime string
+	IgnoreIP []string
 }
 
 // Fail2banData est le contexte du fichier de prisons.
@@ -105,6 +116,7 @@ func (p *Provider) BuildFail2ban(projects []*model.Project) Fail2banData {
 		data.Jails = append(data.Jails, Jail{
 			Name: "ogs-" + name, Filter: filter, Port: port,
 			LogPaths: existing, MaxRetry: maxRetry, Backend: "auto",
+			BanTime: data.BanTime, FindTime: data.FindTime, IgnoreIP: data.IgnoreIP,
 		})
 	}
 
@@ -125,7 +137,8 @@ func (p *Provider) BuildFail2ban(projects []*model.Project) Fail2banData {
 		// entier**, emportant les prisons web qui, elles, fonctionnaient. On
 		// choisit donc d'après ce qui existe, en préférant le fichier lorsqu'il est
 		// là : il ne dépend d'aucune liaison.
-		jail := Jail{Name: "ogs-sshd", Filter: "sshd", Port: "ssh", MaxRetry: data.MaxRetry}
+		jail := Jail{Name: "ogs-sshd", Filter: "sshd", Port: "ssh", MaxRetry: data.MaxRetry,
+			BanTime: data.BanTime, FindTime: data.FindTime, IgnoreIP: data.IgnoreIP}
 		if logs := p.existing([]string{p.Paths.AuthLog()}); len(logs) > 0 {
 			jail.Backend, jail.LogPaths = "auto", logs
 		} else {
@@ -135,12 +148,20 @@ func (p *Provider) BuildFail2ban(projects []*model.Project) Fail2banData {
 	}
 	if mon.JailEnabled("recidive") && len(data.Jails) > 0 {
 		// La récidive lit le journal de fail2ban lui-même : elle n'a de sens que
-		// s'il existe au moins une prison pour l'alimenter.
-		data.Jails = append(data.Jails, Jail{
-			Name: "ogs-recidive", Filter: "recidive", Port: "all",
-			LogPaths: p.existing([]string{p.Paths.Fail2banLog()}),
-			MaxRetry: 3, Backend: "auto",
-		})
+		// s'il existe au moins une prison pour l'alimenter — et que si ce journal
+		// existe. Il peut manquer durablement : « logtarget » n'est pas toujours un
+		// fichier, et un démon jamais démarré n'en a écrit aucun. Écrite sans
+		// « logpath », la prison est acceptée par « fail2ban-client -t » et ne
+		// surveille rien : la protection serait annoncée et absente, sans même un
+		// chemin que « doctor » puisse contrôler. On ne bascule pas non plus sur le
+		// backend systemd, qui exige les liaisons python3-systemd (D68).
+		if logs := p.existing([]string{p.Paths.Fail2banLog()}); len(logs) > 0 {
+			data.Jails = append(data.Jails, Jail{
+				Name: "ogs-recidive", Filter: "recidive", Port: "all",
+				LogPaths: logs, MaxRetry: 3, Backend: "auto",
+				BanTime: recidiveBanTime, FindTime: recidiveFindTime, IgnoreIP: data.IgnoreIP,
+			})
+		}
 	}
 	return data
 }
@@ -164,14 +185,11 @@ func (p *Provider) existing(paths []string) []string {
 // planFail2ban produit l'étape d'écriture du fichier de prisons.
 func (p *Provider) planFail2ban(projects []*model.Project) (*engine.Step, error) {
 	data := p.BuildFail2ban(projects)
+	// Les réglages communs ne sont pas passés au gabarit : ils sont recopiés dans
+	// chaque prison, faute de quoi ils déborderaient sur celles que l'administrateur
+	// a écrites (voir le commentaire du champ Jail.IgnoreIP).
 	body, err := p.Templates.Render("fail2ban/ogs.conf", map[string]any{
-		"BanTime":          data.BanTime,
-		"FindTime":         data.FindTime,
-		"MaxRetry":         data.MaxRetry,
-		"IgnoreIP":         data.IgnoreIP,
-		"Jails":            data.Jails,
-		"RecidiveBanTime":  recidiveBanTime,
-		"RecidiveFindTime": recidiveFindTime,
+		"Jails": data.Jails,
 	})
 	if err != nil {
 		return nil, err
@@ -181,8 +199,15 @@ func (p *Provider) planFail2ban(projects []*model.Project) (*engine.Step, error)
 	// 0644 : le fichier ne porte aucun secret, et fail2ban le lit en root. Le
 	// rendre illisible n'apporterait rien qu'« ogs harden » ne fasse déjà sur le
 	// répertoire.
-	return p.fileStep("monitoring/fail2ban", summary, p.Paths.Fail2banJailFile(),
-		content, 0o644, fs.KeepOwner, "monitoring:fail2ban")
+	return p.fileStep(managedFile{
+		resource: "monitoring/fail2ban",
+		summary:  summary,
+		path:     p.Paths.Fail2banJailFile(),
+		content:  content,
+		mode:     0o644,
+		owner:    fs.KeepOwner,
+		reload:   "monitoring:fail2ban",
+	})
 }
 
 func firstNonEmpty(values ...string) string {

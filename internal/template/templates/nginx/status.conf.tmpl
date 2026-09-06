@@ -29,17 +29,19 @@ server {
         fastcgi_pass {{ .Pass }};
         include fastcgi_params;
         # Après l'include, jamais avant : fastcgi_params fixe SCRIPT_NAME depuis
-        # l'URI demandée, et FPM compare ce nom à son pm.status_path.
-        fastcgi_param SCRIPT_NAME {{ $.PoolStatus }};
-        fastcgi_param SCRIPT_FILENAME {{ $.PoolStatus }};
+        # l'URI demandée, et FPM compare ce nom à son pm.status_path. Le chemin
+        # est celui de ce pool-ci, et non celui du parc : un projet peut le
+        # déplacer par ses settings.
+        fastcgi_param SCRIPT_NAME {{ .Status }};
+        fastcgi_param SCRIPT_FILENAME {{ .Status }};
         fastcgi_param QUERY_STRING $query_string;
     }
 
     location = {{ $.Prefix }}/ping/{{ .Name }} {
         fastcgi_pass {{ .Pass }};
         include fastcgi_params;
-        fastcgi_param SCRIPT_NAME {{ $.PoolPing }};
-        fastcgi_param SCRIPT_FILENAME {{ $.PoolPing }};
+        fastcgi_param SCRIPT_NAME {{ .Ping }};
+        fastcgi_param SCRIPT_FILENAME {{ .Ping }};
     }
 {{- end }}
 

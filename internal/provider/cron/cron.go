@@ -23,6 +23,28 @@ type Provider struct {
 	// Owner résout le propriétaire des fichiers de journal.
 	Owner func(proj *model.Project) (uid, gid int, err error)
 	Now   func() time.Time
+	// Force autorise l'écrasement d'un fichier qu'ogs n'a pas écrit, après
+	// sauvegarde horodatée (§6.4). Sans lui, le refus n'aurait aucune porte de
+	// sortie et l'apply du projet resterait bloqué.
+	Force bool
+}
+
+// refusStep produit l'étape qui refuse d'écraser un fichier qu'ogs n'a pas
+// écrit. Le message nomme la porte de sortie — elle existe désormais — et
+// distingue les deux causes : un fichier « non géré » n'a jamais porté la marque
+// d'ogs, c'est ce que rencontre un site adopté à son premier apply ; un fichier
+// « modifié hors ogs » a été retouché après avoir été généré.
+func refusStep(resource, summary, path, backups string, state fs.State) *engine.Step {
+	libelle, motif := "modifié hors ogs", "a été modifié en dehors d'ogs"
+	if state == fs.StateForeign {
+		libelle, motif = "non géré par ogs", "existe déjà sans porter la marque d'ogs"
+	}
+	s := engine.NewStep(resource, engine.Update, summary+" — fichier "+libelle)
+	s.Apply = func(context.Context) error {
+		return fmt.Errorf("%s %s : relancer avec --force pour l'écraser "+
+			"(l'original sera sauvegardé dans %s)", path, motif, backups)
+	}
+	return s
 }
 
 // Name identifie le provider.
@@ -63,9 +85,20 @@ func (p *Provider) Build(proj *model.Project) ([]byte, []job, error) {
 	if len(jobs) == 0 {
 		return nil, nil, nil
 	}
+	// Les tâches sont échappées sur une copie, au seul usage du gabarit : « ogs
+	// cron run » passe job.Command à /bin/sh sans intermédiaire, et le shell, lui,
+	// ne défait pas la contre-oblique entre apostrophes — l'essai rendrait alors
+	// un résultat différent de l'exécution réelle. Les chemins de journal
+	// (créés par Plan) doivent eux aussi rester vrais.
+	rendus := make([]job, len(jobs))
+	for i, j := range jobs {
+		rendus[i] = j
+		rendus[i].Command = echapperPourcent(j.Command)
+		rendus[i].Log = echapperPourcent(j.Log)
+	}
 	body, err := p.Templates.Render("cron/project", map[string]any{
 		"User": proj.Spec.User.Name,
-		"Jobs": jobs,
+		"Jobs": rendus,
 	})
 	if err != nil {
 		return nil, nil, err
@@ -77,6 +110,35 @@ func (p *Provider) Build(proj *model.Project) ([]byte, []job, error) {
 		Template:  p.Templates.OverridePath("cron/project"),
 	}, body, "#")
 	return content, jobs, nil
+}
+
+// echapperPourcent protège les « % » d'une ligne de cron. Dans un fichier de
+// /etc/cron.d, « % » n'est pas un caractère ordinaire : cron le remplace par un
+// saut de ligne et envoie sur l'entrée standard tout ce qui suit le premier. La
+// commande serait tronquée et la redirection vers logs/, écrite après elle par
+// le gabarit, perdue avec la coupure — la tâche échouerait indéfiniment sans
+// laisser la moindre trace. C'est la même raison qui fait refuser un retour à la
+// ligne dans « command ». Un « % » déjà échappé à la main (l'idiome connu
+// « date +\%F ») est laissé tel quel : le redoubler écrirait « \\% », que cron
+// rendrait comme une contre-oblique suivie d'un saut de ligne.
+func echapperPourcent(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '\\':
+			b.WriteByte('\\')
+			if i+1 < len(s) {
+				i++
+				b.WriteByte(s[i])
+			}
+		case '%':
+			b.WriteString(`\%`)
+		default:
+			b.WriteByte(s[i])
+		}
+	}
+	return b.String()
 }
 
 // jobs traduit les déclarations en lignes de cron.
@@ -180,17 +242,22 @@ func (p *Provider) Plan(_ context.Context, proj *model.Project) ([]*engine.Step,
 	}
 	resource := "cron/" + proj.ID()
 	summary := fmt.Sprintf("tâches planifiées (%s)", describeJobs(jobs))
+	forced := false
 	switch state {
 	case fs.StateCurrent:
 		steps = append(steps, engine.NewStep(resource, engine.NoOp, summary))
 		return steps, nil
 	case fs.StateHandEdited, fs.StateForeign:
-		s := engine.NewStep(resource, engine.Update, summary+" — fichier modifié hors ogs")
-		s.Apply = func(context.Context) error {
-			return fmt.Errorf("%s a été modifié en dehors d'ogs : relancer avec --force pour l'écraser", path)
+		if !p.Force {
+			steps = append(steps, refusStep(resource, summary, path, p.Paths.BackupsDir(), state))
+			return steps, nil
 		}
-		steps = append(steps, s)
-		return steps, nil
+		// --force : l'étape redevient une mise à jour ordinaire, annoncée comme
+		// telle par « plan » avant qu'« apply » ne l'exécute. La sauvegarde, elle,
+		// n'a lieu qu'à l'application : « plan » et « diff » n'écrivent rien.
+		forced = true
+		state = fs.StateOutdated
+		summary += " — écrasement forcé (sauvegarde dans " + p.Paths.BackupsDir() + ")"
 	}
 	action := engine.Create
 	if state == fs.StateOutdated {
@@ -208,6 +275,13 @@ func (p *Provider) Plan(_ context.Context, proj *model.Project) ([]*engine.Step,
 	s.Apply = func(context.Context) error {
 		if data, err := os.ReadFile(path); err == nil {
 			previous = data
+		}
+		if forced {
+			// Écraser le travail d'un exploitant sans en garder trace rend
+			// l'opération irréversible : la sauvegarde précède l'écriture.
+			if _, err := fs.BackupTo(path, p.Paths.BackupsDir(), p.now()); err != nil && !os.IsNotExist(err) {
+				return err
+			}
 		}
 		if err := fs.EnsureDir(filepath.Dir(path), 0o755, fs.KeepOwner); err != nil {
 			return err

@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"leblanc.io/open-go-server/internal/engine"
@@ -287,5 +288,223 @@ func TestUnRefusSExplique(t *testing.T) {
 	}
 	if st.Reason == "" {
 		t.Error("un refus doit porter son motif")
+	}
+}
+
+// autreGroupe rend un groupe que le processus de test peut réellement poser, et
+// qui n'est pas déjà celui du fichier : sans lui, le test ne distinguerait pas
+// « groupe posé » de « groupe inchangé ».
+func autreGroupe(t *testing.T, actuel int) int {
+	t.Helper()
+	if os.Geteuid() == 0 {
+		// root pose n'importe quel groupe ; « daemon » (1) existe sur toute Debian.
+		if actuel != 1 {
+			return 1
+		}
+		return 0
+	}
+	groupes, err := os.Getgroups()
+	if err != nil {
+		t.Skipf("groupes du processus illisibles : %v", err)
+	}
+	for _, g := range groupes {
+		if g != actuel {
+			return g
+		}
+	}
+	t.Skip("le processus de test n'appartient qu'à un seul groupe : un chgrp ne s'éprouve pas")
+	return -1
+}
+
+// telegraf pose la cible et son fichier principal, dans le mode et le groupe
+// demandés, et rend le chemin du fichier.
+func telegraf(t *testing.T, mode os.FileMode) (*Provider, string, int) {
+	t.Helper()
+	p, prefix := fixture(t, Target{
+		Path: "/etc/telegraf", Owner: "root", Group: "telegraf",
+		DirMode: 0o750, FileMode: 0o640,
+	})
+	creer(t, filepath.Join(prefix, "etc/telegraf"), 0o750)
+	conf := filepath.Join(prefix, "etc/telegraf/telegraf.conf")
+	if err := os.WriteFile(conf, []byte("[agent]\n"), mode); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(conf, mode); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(conf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gid := autreGroupe(t, fileGID(info))
+	p.LookupIDs = func(_, group string) (int, int, error) {
+		if group != "telegraf" {
+			return -1, -1, os.ErrNotExist
+		}
+		return 0, gid, nil
+	}
+	return p, conf, gid
+}
+
+func TestLesFichiersRecoiventLeGroupeDeLaCible(t *testing.T) {
+	// Fermer telegraf.conf à 0640 sans lui donner le groupe de l'agent le rend
+	// illisible au démon que la restriction prétend protéger : il démarre, ne
+	// collecte rien, et se tait (D56). Le champ Risk de la cible dit « l'agent
+	// tourne sous telegraf, d'où le groupe » — encore faut-il le poser.
+	p, conf, gid := telegraf(t, 0o644)
+
+	states := appliquer(t, p)
+	if len(states[0].Loose) != 1 {
+		t.Fatalf("le fichier trop ouvert doit être relevé : %v", states[0].Loose)
+	}
+	info, err := os.Stat(conf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o640 {
+		t.Errorf("mode = %04o, attendu 0640", got)
+	}
+	if got := fileGID(info); got != gid {
+		t.Errorf("groupe = %d, attendu %d : le fichier fermé à 0640 reste illisible à l'agent",
+			got, gid)
+	}
+	// Rejoué, plus rien à signaler sur les fichiers : sans le groupe dans le
+	// constat, le verdict oscillerait ou mentirait.
+	if loose := p.Observe()[0].Loose; len(loose) != 0 {
+		t.Errorf("second passage : %v", loose)
+	}
+}
+
+func TestUnFichierDejaFermeMaisSansLeGroupeResteSignale(t *testing.T) {
+	// Sur un parc où « harden » a déjà tourné, les fichiers sont en 0640 root:root
+	// et le seul mode les dit conformes : le verdict resterait « conforme » pour
+	// l'éternité, et la correction du groupe ne serait jamais appliquée.
+	p, conf, gid := telegraf(t, 0o640)
+
+	st := p.Observe()[0]
+	if st.Verdict != VerdictRestrict {
+		t.Fatalf("verdict = %s, attendu %s", st.Verdict, VerdictRestrict)
+	}
+	if len(st.Loose) != 1 {
+		t.Fatalf("le fichier sans le groupe de l'agent doit être relevé : %v", st.Loose)
+	}
+	if resume := p.summary(st); !strings.Contains(resume, "telegraf") {
+		t.Errorf("le résumé doit nommer le groupe attendu : %q", resume)
+	}
+	appliquer(t, p)
+	info, err := os.Stat(conf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fileGID(info); got != gid {
+		t.Errorf("groupe = %d, attendu %d", got, gid)
+	}
+}
+
+func TestNeDesserrePasUnFichierPlusStrict(t *testing.T) {
+	// Le fichier retenu pour son seul groupe ne doit pas voir son mode rouvert :
+	// un outil de sécurité qui desserre est une régression de sécurité (D56).
+	p, conf, gid := telegraf(t, 0o600)
+
+	appliquer(t, p)
+	info, err := os.Stat(conf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Errorf("mode = %04o : le fichier a été desserré vers la cible", got)
+	}
+	if got := fileGID(info); got != gid {
+		t.Errorf("groupe = %d, attendu %d", got, gid)
+	}
+}
+
+func TestLooseReleveLeModeCommeLeGroupe(t *testing.T) {
+	// State.Loose n'énumère pas que des fichiers trop permissifs : un fichier plus
+	// fermé que la cible mais privé de son groupe y figure aussi, et c'est alors le
+	// groupe qui est en cause — son mode, lui, restera tel quel. Le champ est le
+	// seul détail que « ogs harden -v » rend à l'exploitant : sa définition doit
+	// être tenue par un test, faute de quoi elle dérive au fil des réécritures.
+	p, prefix := fixture(t, Target{
+		Path: "/etc/telegraf", Owner: "root", Group: "telegraf",
+		DirMode: 0o750, FileMode: 0o640,
+	})
+	dir := filepath.Join(prefix, "etc/telegraf")
+	creer(t, dir, 0o750)
+	ecrire := func(nom string, mode os.FileMode) string {
+		chemin := filepath.Join(dir, nom)
+		if err := os.WriteFile(chemin, []byte("[agent]\n"), mode); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(chemin, mode); err != nil {
+			t.Fatal(err)
+		}
+		return chemin
+	}
+	conforme := ecrire("conforme.conf", 0o640)
+	ferme := ecrire("ferme.conf", 0o600)
+	ouvert := ecrire("ouvert.conf", 0o644)
+
+	info, err := os.Stat(conforme)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gid := autreGroupe(t, fileGID(info))
+	p.LookupIDs = func(_, group string) (int, int, error) {
+		if group != "telegraf" {
+			return -1, -1, os.ErrNotExist
+		}
+		return 0, gid, nil
+	}
+	// Le groupe de la cible sur deux des trois : seul « ferme.conf » le manque, et
+	// c'est par là qu'il est retenu, son mode étant plus strict que la cible.
+	for _, chemin := range []string{conforme, ouvert} {
+		if err := os.Chown(chemin, -1, gid); err != nil {
+			t.Skipf("chgrp impossible ici : %v", err)
+		}
+	}
+
+	loose := p.Observe()[0].Loose
+	attendu := []string{ferme, ouvert}
+	if strings.Join(loose, "\n") != strings.Join(attendu, "\n") {
+		t.Errorf("Loose = %v, attendu %v", loose, attendu)
+	}
+
+	appliquer(t, p)
+
+	info, err = os.Stat(ferme)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Errorf("mode = %04o : le fichier retenu pour son groupe a vu son mode rouvert", got)
+	}
+}
+
+func TestNeReposePasLeBitSetgid(t *testing.T) {
+	// Le chown efface le bit setgid d'un fichier exécutable par son groupe, et le
+	// chmod ne le repose pas : le mode visé ne le porte pas, et un fichier de
+	// configuration n'a que faire de ce bit — le rendre reviendrait à desserrer.
+	// Le commentaire d'« apply » l'annonce ; ce test l'éprouve.
+	p, conf, _ := telegraf(t, 0o644|os.ModeSetgid)
+	info, err := os.Stat(conf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode()&os.ModeSetgid == 0 {
+		t.Skip("le système de fichiers ne conserve pas le bit setgid")
+	}
+
+	appliquer(t, p)
+
+	info, err = os.Stat(conf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode()&os.ModeSetgid != 0 {
+		t.Errorf("mode = %v : le bit setgid a été reposé", info.Mode())
+	}
+	if got := info.Mode().Perm(); got != 0o640 {
+		t.Errorf("mode = %04o, attendu 0640", got)
 	}
 }

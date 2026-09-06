@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"syscall"
 
 	"leblanc.io/open-go-server/internal/engine"
 	"leblanc.io/open-go-server/internal/exec"
@@ -29,45 +30,121 @@ func PublicKeyPath(root string) string { return KeyPath(root) + ".pub" }
 // son absence ne doit pas empêcher la création du site.
 func (p *Provider) keyStep(proj *model.Project) *engine.Step {
 	path := KeyPath(proj.Spec.Layout.Root)
-	if _, err := os.Stat(path); err == nil {
-		return engine.NewStep("system/deploy-key/"+proj.ID(), engine.NoOp, "clé de déploiement")
+	resource := "system/deploy-key/" + proj.ID()
+	// os.Lstat, non os.Stat : .ssh appartient à l'utilisateur du projet, qui en
+	// choisit les entrées. Un os.Stat conclurait « clé absente » sur un lien
+	// pendant, et ssh-keygen — lancé en root, sans O_NOFOLLOW — écrirait la clé
+	// privée dans la cible du lien, que le chown suivant lui donnerait. C'est
+	// l'invariant du §7.1.2 : aucun processus root n'ouvre en écriture un chemin
+	// dont un non-root contrôle le répertoire.
+	for _, f := range []string{path, path + ".pub"} {
+		info, err := os.Lstat(f)
+		if err != nil || info.Mode().IsRegular() {
+			continue
+		}
+		// Un lien, un répertoire, un socket : rien n'est détruit et rien n'est
+		// généré par-dessus. L'étape reste non critique, le reste du projet
+		// s'applique et l'avertissement dit quoi faire.
+		s := engine.NewStep(resource, engine.Update, "clé de déploiement à régénérer")
+		s.Critical = false
+		s.Apply = func(context.Context) error {
+			return fmt.Errorf("%s existe et n'est pas un fichier régulier : le retirer "+
+				"avant de générer la clé de déploiement", f)
+		}
+		return s
 	}
-	s := engine.NewStep("system/deploy-key/"+proj.ID(), engine.Create,
+	if _, err := os.Lstat(path); err == nil {
+		return engine.NewStep(resource, engine.NoOp, "clé de déploiement")
+	}
+	s := engine.NewStep(resource, engine.Create,
 		fmt.Sprintf("clé de déploiement ed25519 (%s)", path))
 	s.Critical = false
-	s.Apply = func(ctx context.Context) error {
-		comment := fmt.Sprintf("ogs=%s@%s", proj.ID(), hostname())
-		if _, err := p.Exec.Run(ctx, exec.Command{
-			Name: "ssh-keygen",
-			// Sans passphrase : la clé est destinée à des déploiements non
-			// interactifs, et sa protection repose sur les permissions du fichier.
-			Args: []string{"-t", "ed25519", "-N", "", "-C", comment, "-f", path},
-		}); err != nil {
-			return err
-		}
-		if p.Exec.Simulated() {
-			return nil
-		}
-		uid, gid, err := p.ResolveOwner(proj, "")
-		if err != nil {
-			return err
-		}
-		for file, mode := range map[string]os.FileMode{path: 0o600, path + ".pub": 0o644} {
-			if err := os.Chmod(file, mode); err != nil {
-				return err
-			}
-			if err := os.Chown(file, uid, gid); err != nil {
-				return err
-			}
-		}
-		return nil
-	}
+	s.Apply = func(ctx context.Context) error { return p.generateKey(ctx, proj, path) }
 	s.Compensate = func(context.Context) error {
 		_ = os.Remove(path)
 		_ = os.Remove(path + ".pub")
 		return nil
 	}
 	return s
+}
+
+// generateKey produit la paire dans un répertoire temporaire appartenant à root,
+// puis l'installe dans .ssh. ssh-keygen ouvre son fichier de sortie en
+// O_WRONLY|O_CREAT|O_TRUNC, sans O_NOFOLLOW : le laisser écrire directement dans
+// un répertoire que l'utilisateur du projet possède lui donnerait une écriture
+// root sur le chemin de son choix, et le chown qui suivait la cible du lien la
+// lui remettait.
+func (p *Provider) generateKey(ctx context.Context, proj *model.Project, path string) error {
+	dir, err := os.MkdirTemp("", "ogs-keygen-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(dir)
+	gen := filepath.Join(dir, KeyName)
+	comment := fmt.Sprintf("ogs=%s@%s", proj.ID(), hostname())
+	if _, err := p.Exec.Run(ctx, exec.Command{
+		Name: "ssh-keygen",
+		// Sans passphrase : la clé est destinée à des déploiements non
+		// interactifs, et sa protection repose sur les permissions du fichier.
+		Args: []string{"-t", "ed25519", "-N", "", "-C", comment, "-f", gen},
+	}); err != nil {
+		return err
+	}
+	if p.Exec.Simulated() {
+		return nil
+	}
+	uid, gid, err := p.ResolveOwner(proj, "")
+	if err != nil {
+		return err
+	}
+	return installKeyPair(gen, path, uid, gid)
+}
+
+// installKeyPair pose la paire générée à sa place définitive, clé publique
+// comprise : elle est tout aussi exposée, un lien à sa place faisant tronquer
+// puis donner au projet le fichier visé.
+func installKeyPair(gen, path string, uid, gid int) error {
+	for _, f := range []struct {
+		src, dst string
+		mode     os.FileMode
+	}{
+		{gen, path, 0o600},
+		{gen + ".pub", path + ".pub", 0o644},
+	} {
+		data, err := os.ReadFile(f.src)
+		if err != nil {
+			return err
+		}
+		if err := installKeyFile(f.dst, data, f.mode, uid, gid); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// installKeyFile écrit un fichier de clé sans jamais suivre de lien. Le chemin
+// est délié d'abord, puis créé en O_CREAT|O_EXCL|O_NOFOLLOW : l'ouverture échoue
+// si quoi que ce soit occupe le chemin entre les deux — un lien reposé par
+// l'utilisateur du projet compris, .ssh étant à lui. Le mode et le propriétaire
+// sont posés sur le descripteur, non sur le chemin, qui peut changer entre deux
+// appels.
+func installKeyFile(path string, data []byte, mode os.FileMode, uid, gid int) error {
+	_ = os.Remove(path)
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, mode)
+	if err != nil {
+		return fmt.Errorf("écriture de %s : %w", path, err)
+	}
+	defer f.Close()
+	if _, err := f.Write(data); err != nil {
+		return err
+	}
+	if err := f.Chmod(mode); err != nil {
+		return err
+	}
+	if err := f.Chown(uid, gid); err != nil {
+		return err
+	}
+	return f.Close()
 }
 
 // AuthorizedKeysPath renvoie le chemin des clés autorisées d'un projet.
@@ -224,19 +301,37 @@ func PublicKey(root string) (string, error) {
 
 // RotateKey régénère la paire de déploiement en conservant l'ancienne clé
 // publique, afin qu'elle puisse être retirée chez l'hébergeur du dépôt.
-func RotateKey(ctx context.Context, ex exec.Executor, proj *model.Project, ident Identity) (old string, err error) {
+//
+// backupDir est le répertoire où atterrit l'ancienne clé privée — jamais le .ssh
+// du projet : c'est lui qui le possède, et le nom horodaté de la copie se devine
+// à la seconde près, si bien qu'un lien posé d'avance à ce nom ferait écrire par
+// root le contenu de la clé là où le projet l'aurait décidé.
+func RotateKey(ctx context.Context, ex exec.Executor, proj *model.Project, ident Identity, backupDir string) (old string, err error) {
 	root := proj.Spec.Layout.Root
-	old, _ = PublicKey(root)
 	path := KeyPath(root)
-	if _, err := fs.Backup(path, nowFunc()); err != nil && !os.IsNotExist(err) {
+	// Le contrôle vient avant toute lecture : la sauvegarde lit par os.ReadFile,
+	// donc à travers un lien, et recopierait le contenu d'un fichier de root dans
+	// un répertoire que le projet lit. Même invariant qu'à la génération (§7.1.2).
+	for _, f := range []string{path, path + ".pub"} {
+		if info, lerr := os.Lstat(f); lerr == nil && !info.Mode().IsRegular() {
+			return "", fmt.Errorf("%s existe et n'est pas un fichier régulier : le retirer "+
+				"avant de renouveler la clé de déploiement", f)
+		}
+	}
+	old, _ = PublicKey(root)
+	if _, err := fs.BackupTo(path, backupDir, nowFunc()); err != nil && !os.IsNotExist(err) {
 		return old, err
 	}
-	_ = os.Remove(path)
-	_ = os.Remove(path + ".pub")
+	dir, err := os.MkdirTemp("", "ogs-keygen-")
+	if err != nil {
+		return old, err
+	}
+	defer os.RemoveAll(dir)
+	gen := filepath.Join(dir, KeyName)
 	comment := fmt.Sprintf("ogs=%s@%s", proj.ID(), hostname())
 	if _, err := ex.Run(ctx, exec.Command{
 		Name: "ssh-keygen",
-		Args: []string{"-t", "ed25519", "-N", "", "-C", comment, "-f", path},
+		Args: []string{"-t", "ed25519", "-N", "", "-C", comment, "-f", gen},
 	}); err != nil {
 		return old, err
 	}
@@ -251,15 +346,7 @@ func RotateKey(ctx context.Context, ex exec.Executor, proj *model.Project, ident
 	if err != nil || g == nil {
 		return old, fmt.Errorf("groupe %s introuvable", proj.Spec.User.Group)
 	}
-	for file, mode := range map[string]os.FileMode{path: 0o600, path + ".pub": 0o644} {
-		if err := os.Chmod(file, mode); err != nil {
-			return old, err
-		}
-		if err := os.Chown(file, u.UID, g.GID); err != nil {
-			return old, err
-		}
-	}
-	return old, nil
+	return old, installKeyPair(gen, path, u.UID, g.GID)
 }
 
 func hostname() string {

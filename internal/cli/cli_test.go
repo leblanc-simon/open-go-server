@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -12,7 +13,9 @@ import (
 	"strings"
 	"testing"
 
+	"leblanc.io/open-go-server/internal/config"
 	"leblanc.io/open-go-server/internal/model"
+	runtimeprov "leblanc.io/open-go-server/internal/provider/runtime"
 	"leblanc.io/open-go-server/internal/secret"
 	"leblanc.io/open-go-server/internal/store"
 )
@@ -1498,13 +1501,16 @@ func TestRuntimeDirectoriesAreDeclared(t *testing.T) {
 	if !strings.Contains(tmpfiles, "0755 root root") {
 		t.Errorf("la racine doit rester traversable :\n%s", tmpfiles)
 	}
-	// Et le répertoire existe immédiatement, sans attendre un redémarrage.
+	// Et le répertoire existe immédiatement, sans attendre un redémarrage — au
+	// mode que le fichier tmpfiles vient de déclarer, jamais à un autre : deux
+	// juges pour un même répertoire le feraient osciller entre deux valeurs à
+	// chaque redémarrage.
 	info, err := os.Stat(h.path("run", "ogs", "shopfr"))
 	if err != nil {
 		t.Fatalf("répertoire d'exécution absent : %v", err)
 	}
-	if info.Mode().Perm() != 0o750 {
-		t.Errorf("mode %04o, attendu 0750", info.Mode().Perm())
+	if info.Mode().Perm() != runtimeprov.ProjectRunMode.Perm() {
+		t.Errorf("mode %04o, attendu %04o", info.Mode().Perm(), runtimeprov.ProjectRunMode.Perm())
 	}
 }
 
@@ -2246,5 +2252,382 @@ func TestSupervisionDesactivable(t *testing.T) {
 		if _, err := os.Stat(h.path(rel)); !os.IsNotExist(err) {
 			t.Errorf("%s ne devrait pas exister : la supervision est désactivée", rel)
 		}
+	}
+}
+
+// Les cinq fichiers de portée parc sont recalculés en entier, jamais complétés :
+// les nourrir de la seule cible d'un « apply <id> » — la commande que « project
+// create » conseille lui-même — effacerait tous les autres projets. Rien ne le
+// dirait : l'en-tête réécrit reste conforme et systemd-tmpfiles ne supprime pas,
+// si bien que la panne n'apparaîtrait qu'au redémarrage suivant, /run étant un
+// tmpfs, quand plus aucun /run/ogs/<id> ne serait recréé et que tous les verrous
+// de tâches échoueraient.
+func TestApplyCiblePreserveLesFichiersDuParc(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("project", "create", "shop.fr", "--kind", "php-symfony", "--php", "8.5")
+	h.mustRun("project", "create", "blog.fr", "--kind", "php-symfony", "--php", "8.5")
+
+	// « plan » partage le calcul de « apply » : le plan de parc porte sur tout le
+	// parc, cible ou non, et ses résumés le disent. L'assertion vient avant tout
+	// apply — après, les fichiers de parc étant conformes, ces étapes sont des NoOp
+	// que « plan » n'imprime pas, et rien ne discriminerait plus.
+	out := h.mustRun("plan", "shopfr")
+	if !strings.Contains(out, "2 projet(s)") {
+		t.Errorf("le plan de parc raisonne sur la seule cible :\n%s", out)
+	}
+
+	h.mustRun("apply", "--yes")
+
+	h.mustRun("apply", "shopfr", "--yes")
+
+	for _, cas := range []struct{ rel, veut string }{
+		{filepath.Join("etc", "logrotate.d", "ogs"), "blog.fr"},
+		{filepath.Join("etc", "tmpfiles.d", "ogs.conf"), "blogfr"},
+		{filepath.Join("etc", "fail2ban", "jail.d", "ogs.conf"), "blog.fr"},
+		{filepath.Join("etc", "telegraf", "telegraf.d", "ogs.conf"), "blogfr"},
+		{filepath.Join("etc", "apache2", "sites-available", "ogs-status.conf"), "blogfr"},
+	} {
+		got := h.read(t, cas.rel)
+		if !strings.Contains(got, cas.veut) {
+			t.Errorf("%s ne cite plus %s après un apply ciblé :\n%s", cas.rel, cas.veut, got)
+		}
+	}
+}
+
+// Le refus d'un fichier de parc retouché à la main (§6.4) est une étape critique :
+// elle arrête la saga. La rotation des journaux — le fichier qu'un exploitant
+// retouche le plus volontiers — passe donc en dernier du plan de parc, faute de
+// quoi un « compress » ajouté à la main emporterait les répertoires d'exécution,
+// donc tous les verrous de tâches au redémarrage suivant, et le timer de
+// renouvellement des certificats.
+func TestUneRotationRetoucheeNEmportePasLInfrastructureDuParc(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("project", "create", "shop.fr", "--kind", "php-symfony", "--php", "8.5")
+
+	// L'infrastructure du parc est posée avant ce qui peut refuser : la rotation
+	// ferme la marche du plan de parc.
+	plan := h.mustRun("plan")
+	if strings.Index(plan, "rotation des journaux") < strings.Index(plan, "répertoires d'exécution") {
+		t.Errorf("la rotation des journaux doit venir après les répertoires d'exécution :\n%s", plan)
+	}
+
+	h.mustRun("apply", "--yes")
+
+	rot := h.path("etc", "logrotate.d", "ogs")
+	if err := os.WriteFile(rot, []byte(h.read(t, filepath.Join("etc", "logrotate.d", "ogs"))+
+		"\n# ajouté à la main\ncompress\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Un second projet, dont ni le répertoire d'exécution ni la prison ne sont
+	// encore posés : c'est ce que le refus emporterait.
+	h.mustRun("project", "create", "blog.fr", "--kind", "php-symfony", "--php", "8.5")
+
+	out, code := h.run("apply", "--yes")
+	// Le refus est dit, et il vaut écart, non panne : code 6.
+	if code != CodePartial {
+		t.Fatalf("un fichier de rotation retouché est un écart (code %d), obtenu %d :\n%s",
+			CodePartial, code, out)
+	}
+	if !strings.Contains(out, "modifié en dehors d'ogs") {
+		t.Errorf("le refus doit nommer sa cause :\n%s", out)
+	}
+	if got := h.read(t, filepath.Join("etc", "tmpfiles.d", "ogs.conf")); !strings.Contains(got, "blogfr") {
+		t.Errorf("les répertoires d'exécution doivent être posés malgré le refus :\n%s", got)
+	}
+	if _, err := os.Stat(h.path("etc", "systemd", "system", "ogs-renew.timer")); err != nil {
+		t.Errorf("le timer de renouvellement doit être posé malgré le refus : %v", err)
+	}
+	// Et le fichier retouché est intact : le refus n'écrase rien.
+	if !strings.Contains(h.read(t, filepath.Join("etc", "logrotate.d", "ogs")), "compress") {
+		t.Error("le refus ne doit pas avoir écrasé le fichier retouché")
+	}
+}
+
+// Même exigence par la porte de « site create » : créer un second site ne doit
+// pas effacer le premier des fichiers de parc.
+func TestCreationDeSitePreserveLesFichiersDuParc(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRunPartial("site", "create", "shop.fr", "--kind", "php-symfony", "--php", "8.5", "--yes")
+	h.mustRunPartial("site", "create", "blog.fr", "--kind", "php-symfony", "--php", "8.5", "--yes")
+
+	rot := h.read(t, filepath.Join("etc", "logrotate.d", "ogs"))
+	if !strings.Contains(rot, "shop.fr") || !strings.Contains(rot, "blog.fr") {
+		t.Errorf("les deux sites doivent être tournés :\n%s", rot)
+	}
+	tmpfiles := h.read(t, filepath.Join("etc", "tmpfiles.d", "ogs.conf"))
+	if !strings.Contains(tmpfiles, "shopfr") || !strings.Contains(tmpfiles, "blogfr") {
+		t.Errorf("les deux répertoires d'exécution doivent être déclarés :\n%s", tmpfiles)
+	}
+}
+
+// Un vhost de proxy nginx emploie $connection_upgrade, que seule la « map » du
+// fragment de portée serveur définit. Le fragment doit donc être écrit dans le
+// plan du projet, avant ses vhosts : dans le plan global, qui ne s'exécute
+// qu'après les projets, il arriverait trop tard — nginx refuserait toute la
+// configuration à l'activation du premier site applicatif d'une machine, la saga
+// déroulerait le projet et le plan global ne serait jamais atteint.
+func TestFragmentNginxPrecedeLesVhosts(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	h.choisirNginx(t)
+	h.mustRun("project", "create", "api.fr", "--kind", "go")
+
+	var rendu struct {
+		Items []planStep `json:"items"`
+	}
+	out := h.mustRun("plan", "apifr", "--output", "json")
+	if err := json.Unmarshal([]byte(out), &rendu); err != nil {
+		t.Fatalf("plan illisible (%v) :\n%s", err, out)
+	}
+	fragment, vhost := -1, -1
+	for i, s := range rendu.Items {
+		if s.Project != "apifr" {
+			continue
+		}
+		if s.Resource == "web/snippet" && fragment < 0 {
+			fragment = i
+		}
+		if strings.HasPrefix(s.Resource, "web/vhost/") && vhost < 0 {
+			vhost = i
+		}
+	}
+	if fragment < 0 {
+		t.Fatalf("le plan du projet doit porter le fragment de portée serveur :\n%s", out)
+	}
+	if vhost < 0 {
+		t.Fatalf("le plan du projet doit porter son vhost :\n%s", out)
+	}
+	if fragment > vhost {
+		t.Errorf("le fragment (%d) doit précéder le vhost (%d) :\n%s", fragment, vhost, out)
+	}
+}
+
+// choisirNginx bascule le moteur web du parc : les vhosts de proxy nginx sont les
+// seuls à dépendre du fragment de portée serveur.
+func (h *harness) choisirNginx(t *testing.T) {
+	t.Helper()
+	cfg := h.path("etc", "ogs", "config.yaml")
+	data, err := os.ReadFile(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated := strings.Replace(string(data), "web:\n  engine: \"\"\n", "web:\n  engine: nginx\n", 1)
+	if updated == string(data) {
+		t.Fatalf("la section web est attendue dans la configuration produite :\n%s", data)
+	}
+	if err := os.WriteFile(cfg, []byte(updated), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Un dump contient l'intégralité des données de l'application : il ne doit
+// jamais être écrit dans un fichier qu'ogs n'a pas créé lui-même. Un fichier
+// planté d'avance garderait son propriétaire et son mode — le 0600 annoncé ne
+// vaut qu'à la création — et l'inode resterait lisible par qui a gardé un
+// descripteur dessus.
+func TestSauvegardeNEcritPasDansUnFichierPreexistant(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("project", "create", "shop.fr", "--kind", "static", "--db", "mysql")
+
+	// Le mode préfixé simule les commandes : il suffit que l'outil et le socket
+	// existent sous le préfixe pour que la sauvegarde aille jusqu'à l'écriture.
+	outil := h.path("usr", "bin", "mysqldump")
+	if err := os.MkdirAll(filepath.Dir(outil), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(outil, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	socket := h.path("run", "mysqld", "mysqld.sock")
+	if err := os.MkdirAll(filepath.Dir(socket), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(socket, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cible := filepath.Join(t.TempDir(), "shopfr.sql")
+	if err := os.WriteFile(cible, []byte("données d'un autre"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Le mode est posé explicitement : un umask ferait dépendre le verdict de la
+	// machine.
+	if err := os.Chmod(cible, 0o666); err != nil {
+		t.Fatal(err)
+	}
+	// Le témoin partage l'inode planté : si ogs y écrit, le dump y est lisible.
+	temoin := filepath.Join(filepath.Dir(cible), "temoin.sql")
+	if err := os.Link(cible, temoin); err != nil {
+		t.Fatal(err)
+	}
+
+	h.mustRun("db", "dump", "shopfr", "--output", cible)
+
+	info, err := os.Stat(cible)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Errorf("mode %v : le dump a réutilisé le fichier planté", info.Mode().Perm())
+	}
+	reste, err := os.ReadFile(temoin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(reste) != "données d'un autre" {
+		t.Errorf("le dump a été écrit dans l'inode planté : %q", reste)
+	}
+}
+
+// Les sauvegardes de passage ne transitent pas par /tmp : le nom y serait
+// déductible et le répertoire est inscriptible par tous, alors que chaque projet
+// a un compte local dont le shell est ouvert (D62).
+func TestRepertoireDeTravailDesSauvegardesHorsTmp(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	app := &App{Prefix: h.prefix, Paths: config.NewPaths(h.prefix)}
+	dir, err := app.dumpWorkDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+	if !strings.HasPrefix(dir, app.Paths.DumpsDir()) {
+		t.Errorf("%s doit être sous %s", dir, app.Paths.DumpsDir())
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o700 {
+		t.Errorf("mode %v : le répertoire doit rester privé à root", info.Mode().Perm())
+	}
+}
+
+// Une interruption demandée par l'exploitant n'est pas une panne du système : les
+// observations de supervision portent désormais le contexte de la commande, et
+// leur échec sur annulation doit rendre le code 9, pas le code 1.
+func TestPlanErrDistingueLAnnulation(t *testing.T) {
+	if code := ExitCode(planErr(context.Canceled)); code != CodeCancelled {
+		t.Errorf("annulation : code %d, %d attendu", code, CodeCancelled)
+	}
+	if code := ExitCode(planErr(fmt.Errorf("moteur injoignable"))); code != CodeError {
+		t.Errorf("panne : code %d, %d attendu", code, CodeError)
+	}
+}
+
+func TestApplyRefuseUnVHostModifieALaMainPuisLEcraseAvecForce(t *testing.T) {
+	// Le message d'erreur annonçait --force depuis toujours, sans que le drapeau
+	// n'atteigne aucun provider : l'apply du projet restait bloqué, et le plan
+	// entier compensait (§6.4).
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("project", "create", "shop.fr", "--kind", "php-symfony", "--app-version", "6.4", "--php", "8.5")
+	h.mustRun("apply", "shopfr", "--yes")
+
+	vhost := h.path("etc", "apache2", "sites-available", "shopfr.conf")
+	data, err := os.ReadFile(vhost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const ajout = "\n# réglage posé à la main\n"
+	if err := os.WriteFile(vhost, append(data, []byte(ajout)...), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Sans --force : refus, et le fichier reste tel quel.
+	out, code := h.run("apply", "shopfr", "--yes")
+	if code == CodeOK {
+		t.Fatalf("l'apply devait être refusé :\n%s", out)
+	}
+	if !strings.Contains(out, "modifié en dehors d'ogs") {
+		t.Errorf("le refus doit nommer la cause :\n%s", out)
+	}
+	if intact := h.read(t, filepath.Join("etc", "apache2", "sites-available", "shopfr.conf")); !strings.Contains(intact, "posé à la main") {
+		t.Error("le refus ne doit rien écrire")
+	}
+	// La copie sort du répertoire de configuration : sites-available est
+	// inventorié — par « import », qui proposerait d'adopter une seconde fois le
+	// même site — et une sauvegarde y serait un vhost de plus.
+	sauvegardes := func() []string {
+		baks, _ := filepath.Glob(h.path("var", "lib", "ogs", "backups", "shopfr.conf.ogs-bak-*"))
+		return baks
+	}
+	if baks := sauvegardes(); len(baks) != 0 {
+		t.Errorf("aucune sauvegarde ne doit être créée par un refus : %v", baks)
+	}
+
+	// Avec --force : l'écrasement a lieu, l'original est conservé.
+	out, code = h.run("apply", "shopfr", "--yes", "--force")
+	if code != CodeOK && code != CodePartial {
+		t.Fatalf("« apply --force » devait aboutir (code %d) :\n%s", code, out)
+	}
+	if !strings.Contains(out, "écrasement forcé") {
+		t.Errorf("l'écrasement forcé doit être annoncé :\n%s", out)
+	}
+	after := h.read(t, filepath.Join("etc", "apache2", "sites-available", "shopfr.conf"))
+	if strings.Contains(after, "posé à la main") {
+		t.Error("le vhost doit avoir été réécrit")
+	}
+	baks := sauvegardes()
+	if len(baks) != 1 {
+		t.Fatalf("une sauvegarde attendue, %d trouvée(s)", len(baks))
+	}
+	saved, _ := os.ReadFile(baks[0])
+	if !strings.Contains(string(saved), "posé à la main") {
+		t.Errorf("la sauvegarde doit contenir l'original :\n%s", saved)
+	}
+
+	// La sauvegarde ne doit pas mettre le projet en conflit avec lui-même :
+	// l'apply suivant reste planifiable.
+	out, code = h.run("apply", "shopfr", "--yes")
+	if code != CodeOK && code != CodePartial {
+		t.Fatalf("l'apply suivant devait aboutir (code %d) :\n%s", code, out)
+	}
+}
+
+func TestApplyRefuseUneUniteModifieeALaMain(t *testing.T) {
+	// L'unité était écrasée en silence, et les services du projet redémarrés dans
+	// la foulée : l'intention de l'exploitant disparaissait sans un mot.
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("project", "create", "shop.fr", "--kind", "php-symfony", "--app-version", "6.4", "--php", "8.5")
+	h.mustRun("service", "add", "shopfr", "veille", "--template", "worker", "--command", "/usr/bin/true")
+	h.mustRun("apply", "shopfr", "--yes")
+
+	unite := h.path("etc", "systemd", "system", "ogs-shopfr-veille@.service")
+	data, err := os.ReadFile(unite)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(unite, append(data, []byte("MemoryMax=512M\n")...), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	out, code := h.run("apply", "shopfr", "--yes")
+	if code == CodeOK {
+		t.Fatalf("l'apply devait être refusé :\n%s", out)
+	}
+	if !strings.Contains(out, "modifié en dehors d'ogs") {
+		t.Errorf("le refus doit nommer la cause :\n%s", out)
+	}
+	if intact := h.read(t, filepath.Join("etc", "systemd", "system", "ogs-shopfr-veille@.service")); !strings.Contains(intact, "MemoryMax=512M") {
+		t.Error("le refus ne doit rien écrire")
+	}
+
+	out, code = h.run("apply", "shopfr", "--yes", "--force")
+	if code != CodeOK && code != CodePartial {
+		t.Fatalf("« apply --force » devait aboutir (code %d) :\n%s", code, out)
+	}
+	after := h.read(t, filepath.Join("etc", "systemd", "system", "ogs-shopfr-veille@.service"))
+	if strings.Contains(after, "MemoryMax=512M") {
+		t.Error("l'unité doit avoir été réécrite")
+	}
+	if baks, _ := filepath.Glob(h.path("var", "lib", "ogs", "backups",
+		"ogs-shopfr-veille@.service.ogs-bak-*")); len(baks) != 1 {
+		t.Fatalf("une sauvegarde attendue, %d trouvée(s)", len(baks))
 	}
 }

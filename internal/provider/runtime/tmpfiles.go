@@ -5,8 +5,10 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/user"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -15,6 +17,51 @@ import (
 	"leblanc.io/open-go-server/internal/fs"
 	"leblanc.io/open-go-server/internal/model"
 )
+
+// ProjectRunMode est le mode du répertoire d'exécution d'un projet : le projet y
+// écrit ses verrous et ses sockets, le groupe traverse jusqu'au socket qu'il
+// connaît sans pouvoir énumérer le reste, personne d'autre n'entre (D51). Il est
+// nommé ici, une seule fois : la ligne tmpfiles et la création immédiate ont
+// divergé, et un répertoire dont deux endroits décident du mode oscille.
+const ProjectRunMode os.FileMode = 0o710
+
+// RunRootMode est le mode de /run/ogs : traversable par tous, sans quoi personne
+// n'atteindrait le répertoire d'un projet.
+const RunRootMode os.FileMode = 0o755
+
+// ProjectRunOwner résout le propriétaire du répertoire d'exécution. Une
+// résolution impossible — compte pas encore créé, mode préfixé sans compte
+// système — laisse le propriétaire en place : c'est systemd-tmpfiles qui
+// corrigera au vidage des intentions.
+func ProjectRunOwner(proj *model.Project) fs.Owner {
+	u, err := user.Lookup(proj.Spec.User.Name)
+	if err != nil {
+		return fs.KeepOwner
+	}
+	g, err := user.LookupGroup(proj.Spec.User.Group)
+	if err != nil {
+		return fs.KeepOwner
+	}
+	uid, errU := strconv.Atoi(u.Uid)
+	gid, errG := strconv.Atoi(g.Gid)
+	if errU != nil || errG != nil {
+		return fs.KeepOwner
+	}
+	return fs.Owner{UID: uid, GID: gid}
+}
+
+// EnsureProjectRunDir pose /run/ogs/<id> avec le mode et le propriétaire que
+// déclare le fichier tmpfiles. Le laisser à root:root, comme le faisait la
+// création immédiate, interdit au projet d'y lier son socket et d'y poser les
+// verrous de ses tâches.
+func EnsureProjectRunDir(path string, proj *model.Project) error {
+	// La racine d'abord, et à son mode à elle : MkdirAll créerait sinon /run/ogs
+	// en 0710 root:root, où plus personne ne passerait.
+	if err := fs.EnsureDir(filepath.Dir(path), RunRootMode, fs.KeepOwner); err != nil {
+		return err
+	}
+	return fs.EnsureDir(path, ProjectRunMode, ProjectRunOwner(proj))
+}
 
 // Provider génère /etc/tmpfiles.d/ogs.conf : les répertoires de /run disparaissent
 // au redémarrage, et c'est systemd-tmpfiles qui les recrée.
@@ -38,7 +85,7 @@ func (p *Provider) Build(projects []*model.Project) []byte {
 	var b strings.Builder
 	b.WriteString("# Répertoires d'exécution : verrous de tâches et sockets applicatifs.\n")
 	b.WriteString("# Type Chemin Mode Propriétaire Groupe Âge\n")
-	fmt.Fprintf(&b, "d %s 0755 root root -\n", p.Paths.RunDir())
+	fmt.Fprintf(&b, "d %s %04o root root -\n", p.Paths.RunDir(), RunRootMode.Perm())
 	ids := make([]string, 0, len(projects))
 	owners := map[string]string{}
 	for _, proj := range projects {
@@ -47,10 +94,7 @@ func (p *Provider) Build(projects []*model.Project) []byte {
 	}
 	sort.Strings(ids)
 	for _, id := range ids {
-		// 0710 : le projet écrit ses verrous et ses sockets, le groupe traverse
-		// jusqu'au socket qu'il connaît sans pouvoir énumérer le reste, personne
-		// d'autre n'entre (D51).
-		fmt.Fprintf(&b, "d %s 0710 %s -\n", p.Paths.ProjectRunDir(id), owners[id])
+		fmt.Fprintf(&b, "d %s %04o %s -\n", p.Paths.ProjectRunDir(id), ProjectRunMode.Perm(), owners[id])
 	}
 	return fs.Render(fs.Header{
 		Project:   fmt.Sprintf("%d projet(s)", len(projects)),
@@ -103,11 +147,11 @@ func (p *Provider) Plan(projects []*model.Project) (*engine.Step, error) {
 
 // ensureNow crée les répertoires sans passer par systemd-tmpfiles.
 func (p *Provider) ensureNow(projects []*model.Project) error {
-	if err := fs.EnsureDir(p.Paths.RunDir(), 0o755, fs.KeepOwner); err != nil {
+	if err := fs.EnsureDir(p.Paths.RunDir(), RunRootMode, fs.KeepOwner); err != nil {
 		return err
 	}
 	for _, proj := range projects {
-		if err := fs.EnsureDir(p.Paths.ProjectRunDir(proj.ID()), 0o750, fs.KeepOwner); err != nil {
+		if err := EnsureProjectRunDir(p.Paths.ProjectRunDir(proj.ID()), proj); err != nil {
 			return err
 		}
 	}

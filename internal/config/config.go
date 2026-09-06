@@ -6,7 +6,10 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
+
+	"github.com/goccy/go-yaml"
 
 	"leblanc.io/open-go-server/internal/model"
 	"leblanc.io/open-go-server/internal/naming"
@@ -304,6 +307,80 @@ func Default() *Config {
 	}
 }
 
+// UnmarshalYAML fusionne le document avec ce que porte déjà la structure — les
+// valeurs de Default(), le chargement partant de là. Le décodeur fusionne de
+// lui-même les champs de structure (logs, sudo, web…), ce qui donne l'impression
+// que le procédé est sûr ; mais il remplace une table entière dès qu'elle est
+// déclarée, et en reconstruit chaque valeur à partir de son zéro. Déclarer
+// « environments » ne serait-ce que pour le domaine de préproduction vidait donc
+// la référence au certificat partagé et faisait disparaître « prod », sans un
+// mot : SharedRef traite une référence vide comme « pas de certificat partagé »
+// et la mutualisation des certificats de préproduction (D26) tombait en silence.
+// D'où la fusion explicite, entrée par entrée et champ par champ.
+func (c *Config) UnmarshalYAML(data []byte) error {
+	// L'alias ne porte pas cette méthode : sans lui, le décodeur la rappellerait
+	// indéfiniment.
+	type sansMéthode Config
+	défauts := *c
+	brut := sansMéthode(*c)
+	brut.Environments, brut.Certificates = nil, nil
+	if err := yaml.Unmarshal(data, &brut); err != nil {
+		return err
+	}
+	// Les tables sont relues à part, sous forme de champs bruts : chaque entrée
+	// déclarée est redécodée par-dessus son défaut, de sorte qu'un champ tu garde
+	// le sien — un « false » écrit l'emporte, un « false » par omission non.
+	var tables struct {
+		Environments map[string]map[string]any `yaml:"environments"`
+		Certificates map[string]map[string]any `yaml:"certificates"`
+	}
+	if err := yaml.Unmarshal(data, &tables); err != nil {
+		return err
+	}
+	envs, err := fusionner(défauts.Environments, tables.Environments, true)
+	if err != nil {
+		return err
+	}
+	// Les certificats partagés sont un catalogue qui appartient à
+	// l'administrateur : une entrée qu'il n'a pas reprise est une entrée retirée,
+	// et la réinsérer ferait demander à l'autorité un domaine qui n'est pas le
+	// sien. Les environnements, eux, sont structurels — naming n'en connaît que
+	// deux, et « prep » absent rend tout host de préproduction indérivable.
+	certs, err := fusionner(défauts.Certificates, tables.Certificates, false)
+	if err != nil {
+		return err
+	}
+	brut.Environments, brut.Certificates = envs, certs
+	*c = Config(brut)
+	return nil
+}
+
+// fusionner complète les entrées déclarées par leur défaut, champ par champ. Les
+// entrées absentes du document sont conservées si garderLesAbsentes, écartées
+// sinon.
+func fusionner[T any](défauts map[string]T, déclarées map[string]map[string]any,
+	garderLesAbsentes bool) (map[string]T, error) {
+	out := map[string]T{}
+	if garderLesAbsentes || len(déclarées) == 0 {
+		for nom, v := range défauts {
+			out[nom] = v
+		}
+	}
+	for nom, champs := range déclarées {
+		// Le défaut sert de point de départ ; l'entrée inconnue part de son zéro.
+		v := défauts[nom]
+		raw, err := yaml.Marshal(champs)
+		if err != nil {
+			return nil, err
+		}
+		if err := yaml.Unmarshal(raw, &v); err != nil {
+			return nil, err
+		}
+		out[nom] = v
+	}
+	return out, nil
+}
+
 // Shell renvoie le shell des comptes de projet, défaut du modèle appliqué.
 func (c *Config) Shell() string {
 	if c.User.Shell == "" {
@@ -341,6 +418,25 @@ func (c *Config) Validate() error {
 				nom, cert.DNSProvider)
 		}
 	}
+	// Une référence qui ne résout pas est aujourd'hui avalée sans un mot :
+	// SharedRequest rend « pas trouvé », SharedRef rend une chaîne vide, et chaque
+	// préproduction se met à demander son propre certificat — au risque d'épuiser
+	// le quota hebdomadaire de l'autorité, alors que la mutualisation est
+	// précisément ce que D26 organise. Le cas s'obtient en déclarant un bloc
+	// « certificates », qui remplace la table livrée : le dire au chargement vaut
+	// mieux que de le découvrir au renouvellement.
+	for nom, env := range c.Environments {
+		if !strings.HasPrefix(env.Certificate, "@") {
+			continue
+		}
+		ref := strings.TrimPrefix(env.Certificate, "@")
+		if _, ok := c.Certificates[ref]; !ok {
+			return fmt.Errorf("environments.%s.certificate référence le certificat partagé %q, "+
+				"déclaré dans aucune entrée de certificates (connus : %s) — un bloc "+
+				"« certificates » remplace la table livrée, wildcard-prep compris",
+				nom, env.Certificate, strings.Join(nomsCertificats(c.Certificates), ", "))
+		}
+	}
 	if c.Archives.RetentionDays < 0 {
 		return fmt.Errorf("archives.retentionDays ne peut pas être négatif (valeur : %d)",
 			c.Archives.RetentionDays)
@@ -360,6 +456,20 @@ func (c *Config) Validate() error {
 // interface routable publierait la carte du serveur. Le refus est au chargement
 // de la configuration, non à l'écriture du vhost : une erreur au moment de
 // l'apply laisserait le fichier écrit avant de se plaindre.
+// nomsCertificats énumère les certificats partagés déclarés, triés, pour que le
+// message d'erreur montre ce qui reste après remplacement de la table.
+func nomsCertificats(certs map[string]SharedCert) []string {
+	noms := make([]string, 0, len(certs))
+	for nom := range certs {
+		noms = append(noms, nom)
+	}
+	sort.Strings(noms)
+	if len(noms) == 0 {
+		return []string{"aucun"}
+	}
+	return noms
+}
+
 func validateStatusListen(listen string) error {
 	host, port, err := net.SplitHostPort(listen)
 	if err != nil {
@@ -448,14 +558,26 @@ func (p Paths) ACMEChallengeTokens() string {
 func (p Paths) RobotsNoindexFile() string { return p.join(libDir, "robots-noindex.txt") }
 func (p Paths) ArchivesDir() string       { return p.join(libDir, "archives") }
 func (p Paths) DumpsDir() string          { return p.join(libDir, "dumps") }
-func (p Paths) LogDir() string            { return p.join(logDir) }
-func (p Paths) AppLog() string            { return p.join(logDir, "ogs.log") }
-func (p Paths) AuditLog() string          { return p.join(logDir, "audit.log") }
-func (p Paths) RunDir() string            { return p.join(runDir) }
-func (p Paths) GlobalLock() string        { return p.join(runDir, "ogs.lock") }
-func (p Paths) SudoersDir() string        { return p.join(sudoersDir) }
-func (p Paths) LogrotateFile() string     { return p.join(logrotateDir, "ogs") }
-func (p Paths) TmpfilesFile() string      { return p.join(tmpfilesDir, "ogs.conf") }
+
+// BackupsDir recueille la copie de tout fichier écrasé par « --force ». Aucune
+// sauvegarde ne reste à côté de son original : les répertoires de configuration
+// sont lus en entier, et par deux sortes de lecteurs. Leur démon d'abord —
+// logrotate charge tout /etc/logrotate.d, et une seconde directive sur les mêmes
+// journaux arrête la rotation du parc. Ogs lui-même ensuite, qui réinventorie
+// /etc/sudoers.d sur le seul préfixe « ogs- » et sites-available pour y
+// reconnaître les vhosts à adopter : la copie y devient un fichier étranger que
+// « doctor » accuse et qu'« import » propose d'adopter, indéfiniment. Un
+// répertoire unique, hors de portée de tous, ne dépend d'aucune liste de
+// suffixes tabous qui peut changer sous nos pieds.
+func (p Paths) BackupsDir() string    { return p.join(libDir, "backups") }
+func (p Paths) LogDir() string        { return p.join(logDir) }
+func (p Paths) AppLog() string        { return p.join(logDir, "ogs.log") }
+func (p Paths) AuditLog() string      { return p.join(logDir, "audit.log") }
+func (p Paths) RunDir() string        { return p.join(runDir) }
+func (p Paths) GlobalLock() string    { return p.join(runDir, "ogs.lock") }
+func (p Paths) SudoersDir() string    { return p.join(sudoersDir) }
+func (p Paths) LogrotateFile() string { return p.join(logrotateDir, "ogs") }
+func (p Paths) TmpfilesFile() string  { return p.join(tmpfilesDir, "ogs.conf") }
 
 // TelegrafDir est le répertoire de fragments de l'agent de métriques, et
 // TelegrafFile le seul fichier qu'ogs y écrit. Un fichier unique, comme pour
@@ -568,6 +690,13 @@ func (p Paths) Dirs() []struct {
 		{p.ACMEChallengeTokens(), 0o755},
 		{p.ArchivesDir(), 0o700},
 		{p.DumpsDir(), 0o700},
+		// 0700 : une sauvegarde porte le contenu d'un fichier de configuration
+		// système — délégation sudo, vhost, unité — que son original n'exposait
+		// qu'à root. Le répertoire est créé ici et non par le premier écrasement
+		// forcé : « ogs init » pose tout le reste, et un répertoire absent au
+		// moment d'un apply forcé ferait dépendre les droits de la copie du umask
+		// ambiant.
+		{p.BackupsDir(), 0o700},
 		{p.LogDir(), 0o750},
 		{p.RunDir(), 0o755},
 	}

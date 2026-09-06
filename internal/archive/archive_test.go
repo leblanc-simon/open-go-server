@@ -1,6 +1,7 @@
 package archive
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -270,5 +271,153 @@ func TestExpiredUsesTheManifestDate(t *testing.T) {
 	// Un répertoire absent n'est pas une erreur : rien n'a encore été archivé.
 	if _, err := Expired(filepath.Join(dir, "absent"), time.Hour, maintenant); err != nil {
 		t.Errorf("répertoire absent : %v", err)
+	}
+}
+
+func TestSecretsPreserventLeDoubleSouligne(t *testing.T) {
+	// Un nom de secret peut porter un double souligné : « shopfr__ro » est un
+	// nom d'utilisateur de base valide (validate.reDBObject), et un projet adopté
+	// garde ses noms réels. Déduire le nom du chemin le rendait « mysql/shopfr/ro »,
+	// et le secret réinjecté sous ce nom faux ne se rouvre plus jamais — sa donnée
+	// associée le lie à son nom.
+	path := filepath.Join(t.TempDir(), "a.tar.zst")
+	w, err := Create(path, Manifest{Project: "shopfr", OGSVersion: "test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	noms := []string{"mysql/shopfr__ro", "amqp/app__worker", "mysql/shopfr"}
+	for _, nom := range noms {
+		if err := w.AddSecret(nom, []byte("nonce-"+nom), []byte("chiffré-"+nom)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	secrets, err := Secrets(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(secrets) != len(noms) {
+		t.Fatalf("%d secrets relus, %d attendus : %v", len(secrets), len(noms), secrets)
+	}
+	for _, nom := range noms {
+		pair, ok := secrets[nom]
+		if !ok {
+			t.Errorf("nom de secret altéré : %q absent de %v", nom, secrets)
+			continue
+		}
+		if string(pair[0]) != "nonce-"+nom || string(pair[1]) != "chiffré-"+nom {
+			t.Errorf("%s : secret restitué %q, %q", nom, pair[0], pair[1])
+		}
+	}
+}
+
+func TestSecretsRelisentLeFormatAnterieur(t *testing.T) {
+	// Les archives déjà produites ne portent pas le nom dans la charge : le
+	// chemin reste le seul repli, avec son ambiguïté sur le double souligné.
+	path := filepath.Join(t.TempDir(), "ancienne.tar.zst")
+	w, err := Create(path, Manifest{Project: "shopfr", OGSVersion: "test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := json.Marshal(map[string][]byte{
+		"nonce": []byte("nonce"), "ciphertext": []byte("chiffré"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.AddBytes("secret", "secrets/mysql__shopfr.json", "", payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	secrets, err := Secrets(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := secrets["mysql/shopfr"]; !ok {
+		t.Fatalf("archive antérieure illisible : %v", secrets)
+	}
+}
+
+func TestNomDeFichierDunSecretResteLuParUnOgsAnterieur(t *testing.T) {
+	// Le codage du nom de fichier a changé sans que la version du format bouge :
+	// un ogs antérieur, qui ne lit que le chemin, restituait « mysql%2Fshopfr » et
+	// réinjectait le secret sous ce nom faux, donc indéchiffrable. Le codage
+	// historique est donc conservé partout où il est réversible, et l'échappement
+	// réservé au seul cas qu'il corrompait — sans que les deux puissent se
+	// confondre.
+	path := filepath.Join(t.TempDir(), "a.tar.zst")
+	w, err := Create(path, Manifest{Project: "shopfr", OGSVersion: "test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	attendus := map[string]string{
+		// Réversible : le codage historique, celui que l'ogs antérieur sait relire.
+		"mysql/shopfr": "secrets/mysql__shopfr.json",
+		// Ambigus : échappés, « _ » compris, sans quoi ces deux-là et le premier se
+		// disputeraient le même fichier.
+		"mysql__shopfr":    "secrets/mysql%5F%5Fshopfr.json",
+		"mysql/shopfr__ro": "secrets/mysql%2Fshopfr%5F%5Fro.json",
+	}
+	for nom := range attendus {
+		if err := w.AddSecret(nom, []byte("nonce"), []byte("chiffré-"+nom)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	manifest, err := w.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	noms := map[string]bool{}
+	for _, e := range manifest.Entries {
+		if e.Kind == "secret" {
+			noms[e.Name] = true
+		}
+	}
+	for nom, fichier := range attendus {
+		if !noms[fichier] {
+			t.Errorf("%q rangé ailleurs que dans %q : %v", nom, fichier, noms)
+		}
+	}
+	if len(noms) != len(attendus) {
+		t.Fatalf("%d noms de fichier pour %d secrets — collision : %v",
+			len(noms), len(attendus), noms)
+	}
+	secrets, err := Secrets(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for nom := range attendus {
+		if string(secrets[nom][1]) != "chiffré-"+nom {
+			t.Errorf("%s : secret restitué %q", nom, secrets[nom][1])
+		}
+	}
+}
+
+func TestArchiveDunFormatPlusRecentEstRefusee(t *testing.T) {
+	// Un ogs qui ne connaît pas le format doit le dire, plutôt que de déduire du
+	// chemin un nom de secret que la charge exprimait autrement : réinjecté sous
+	// un nom faux, le secret ne se rouvre plus jamais.
+	path := filepath.Join(t.TempDir(), "future.tar.zst")
+	w, err := Create(path, Manifest{Project: "shopfr", OGSVersion: "test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.AddSecret("mysql/shopfr", []byte("nonce"), []byte("chiffré")); err != nil {
+		t.Fatal(err)
+	}
+	w.manifest.Version = Version + 1
+	if _, err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReadManifest(path); err == nil ||
+		!strings.Contains(err.Error(), "mettre ogs à jour") {
+		t.Errorf("ReadManifest accepte un format inconnu : %v", err)
+	}
+	if _, err := Secrets(path); err == nil || !strings.Contains(err.Error(), "mettre ogs à jour") {
+		t.Errorf("Secrets accepte un format inconnu : %v", err)
 	}
 }

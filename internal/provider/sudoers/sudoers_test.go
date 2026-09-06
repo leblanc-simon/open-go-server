@@ -68,6 +68,10 @@ func TestValidateRefusesDangerousRules(t *testing.T) {
 		"systemctl sans unité": "shopfr ALL=(root) NOPASSWD: /usr/bin/systemctl daemon-reload\n",
 		"délégation totale":    "shopfr ALL=(ALL) NOPASSWD: /usr/bin/ogs my restart\n",
 		"chemin relatif":       "shopfr ALL=(root) NOPASSWD: ogs my restart\n",
+		// La virgule sépare deux commandes autorisées, le dièse commente la fin de
+		// la ligne : la grammaire reste correcte et visudo n'y voit rien.
+		"seconde commande": "shopfr ALL=(root) NOPASSWD: /usr/bin/systemctl start ogs-shopfr-w@1.service, /bin/bash\n",
+		"fin commentée":    "shopfr ALL=(root) NOPASSWD: /usr/bin/systemctl start ogs-shopfr-w@1.service #\n",
 	}
 	for name, rule := range cases {
 		if err := Validate([]byte(rule)); err == nil {
@@ -248,5 +252,244 @@ func TestAuditDetectsForeignAndLooseFiles(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("l'élargissement manuel doit être détecté : %v", problems)
+	}
+}
+
+func TestBuildRefuseUnNomDeServiceDangereux(t *testing.T) {
+	// Le nom du service atterrit dans une spécification de commande : une virgule
+	// y ouvre une seconde commande et un « # » masque la fin de la ligne. La règle
+	// produite serait syntaxiquement irréprochable, donc acceptée par visudo.
+	prov, proj := fixture(t)
+	proj.Spec.Sudo = &model.Sudo{Style: StyleSystemctl, Verbs: []string{"start"}}
+	for _, nom := range []string{
+		"w@1.service, /bin/bash #",
+		"worker,/bin/sh",
+		"worker #",
+		"../../cron.d/pwn",
+		"",
+	} {
+		proj.Spec.Services = []model.Service{{Name: nom, Instances: 1}}
+		if _, err := prov.Build(proj, nil); err == nil {
+			t.Errorf("nom de service accepté à tort : %q", nom)
+		}
+	}
+	// Un nom ordinaire passe.
+	proj.Spec.Services = []model.Service{{Name: "messenger_async-2", Instances: 1}}
+	if _, err := prov.Build(proj, nil); err != nil {
+		t.Errorf("nom de service légitime refusé : %v", err)
+	}
+}
+
+func TestBuildSuitLaSpecificationEtNonLObserve(t *testing.T) {
+	// La carte observée décrit l'état d'AVANT le plan d'unités : s'y fier laissait
+	// la délégation d'un apply en retard, sans droit sur les instances qui
+	// viennent d'être démarrées.
+	prov, proj := fixture(t)
+	proj.Spec.Sudo = &model.Sudo{Style: StyleSystemctl, Verbs: []string{"restart"}}
+	proj.Spec.Services = []model.Service{{Name: "messenger-async", Instances: 3}}
+	content, err := prov.Build(proj, map[string]int{"messenger-async": 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(content)
+	for i := 1; i <= 3; i++ {
+		want := "/usr/bin/systemctl restart ogs-shopfr-messenger-async@" +
+			string(rune('0'+i)) + ".service"
+		if !strings.Contains(text, want) {
+			t.Errorf("instance %d absente alors qu'elle est déclarée :\n%s", i, text)
+		}
+	}
+}
+
+func TestBuildUnitLObserveTantQueLaDesactivationNAPasEuLieu(t *testing.T) {
+	// À la descente en charge, l'instance retirée peut tourner encore : son
+	// propriétaire doit pouvoir l'arrêter jusqu'à ce qu'elle ait disparu.
+	prov, proj := fixture(t)
+	proj.Spec.Sudo = &model.Sudo{Style: StyleSystemctl, Verbs: []string{"restart"}}
+	proj.Spec.Services = []model.Service{{Name: "messenger-async", Instances: 1}}
+	content, err := prov.Build(proj, map[string]int{"messenger-async": 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(content), "ogs-shopfr-messenger-async@3.service") {
+		t.Errorf("l'instance encore active doit rester pilotable :\n%s", content)
+	}
+	// Une fois la désactivation faite, la délégation suit la spécification.
+	content, err = prov.Build(proj, map[string]int{"messenger-async": 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(content), "messenger-async@2.service") {
+		t.Errorf("l'instance retirée ne doit plus figurer :\n%s", content)
+	}
+}
+
+func TestBuildNeDelegueRienSurUnServiceDesactive(t *testing.T) {
+	// Un service que l'exploitant a coupé ne se pilote plus : l'unité étant un
+	// modèle, « systemctl start » ne relancerait pas l'instance, il la recréerait.
+	prov, proj := fixture(t)
+	disabled := false
+	proj.Spec.Sudo = &model.Sudo{Style: StyleSystemctl, Verbs: []string{"start"}}
+	proj.Spec.Services = []model.Service{
+		{Name: "messenger-async", Instances: 2, Enabled: &disabled},
+	}
+	content, err := prov.Build(proj, map[string]int{"messenger-async": 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(content), "messenger-async@") {
+		t.Errorf("aucune instance d'un service désactivé ne doit être déléguée :\n%s", content)
+	}
+	// La cible du projet reste pilotable : elle ne dépend pas d'un service.
+	if !strings.Contains(string(content), "/usr/bin/systemctl start ogs-shopfr.target") {
+		t.Errorf("la cible doit rester autorisée :\n%s", content)
+	}
+}
+
+func TestDelegationModifieeALaMainNEstPasEcraseeEnSilence(t *testing.T) {
+	// Une règle sudoers retouchée à la main porte une délégation que quelqu'un a
+	// voulue : l'écraser sans un mot la retirerait (§6.4).
+	prov, proj := fixture(t)
+	ctx := context.Background()
+	step, err := prov.Plan(ctx, proj, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := step.Apply(ctx); err != nil {
+		t.Fatal(err)
+	}
+	path := prov.Path(proj.ID())
+	data, _ := os.ReadFile(path)
+	const ajout = "# commentaire ajouté à la main\n"
+	// Le fichier est en 0440 : l'exploitant le rouvre avant d'y toucher.
+	if err := os.Chmod(path, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, append(data, []byte(ajout)...), 0o640); err != nil {
+		t.Fatal(err)
+	}
+
+	step, err = prov.Plan(ctx, proj, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(step.Summary, "modifié hors ogs") {
+		t.Fatalf("la modification manuelle doit être signalée : %s", step.Summary)
+	}
+	if err := step.Apply(ctx); err == nil {
+		t.Error("l'écrasement doit être refusé sans --force")
+	}
+	if intact, _ := os.ReadFile(path); !strings.Contains(string(intact), "à la main") {
+		t.Error("le refus ne doit rien écrire")
+	}
+
+	// --force : écrasement, précédé de la sauvegarde.
+	prov.Force = true
+	step, err = prov.Plan(ctx, proj, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(step.Summary, "écrasement forcé") {
+		t.Fatalf("le plan doit annoncer l'écrasement forcé : %s", step.Summary)
+	}
+	if err := step.Apply(ctx); err != nil {
+		t.Fatalf("l'écrasement forcé doit réussir : %v", err)
+	}
+	if after, _ := os.ReadFile(path); strings.Contains(string(after), "à la main") {
+		t.Error("le fichier doit avoir été réécrit")
+	}
+	if restes, _ := filepath.Glob(path + ".ogs-bak-*"); len(restes) != 0 {
+		t.Errorf("aucune sauvegarde ne doit rester dans %s : %v", prov.Paths.SudoersDir(), restes)
+	}
+	baks, _ := filepath.Glob(filepath.Join(prov.Paths.BackupsDir(), filepath.Base(path)+".ogs-bak-*"))
+	if len(baks) != 1 {
+		t.Fatalf("une sauvegarde attendue dans %s, %d trouvée(s)", prov.Paths.BackupsDir(), len(baks))
+	}
+	if saved, _ := os.ReadFile(baks[0]); !strings.Contains(string(saved), "à la main") {
+		t.Error("la sauvegarde doit contenir l'original")
+	}
+}
+
+func TestLAuditIgnoreLaSauvegardeDUnEcrasementForce(t *testing.T) {
+	// La sauvegarde d'une délégation forcée ne doit pas retomber sous les yeux
+	// d'Audit : elle porte le préfixe « ogs- », donc le filtre du répertoire la
+	// ramasserait, et son contenu est justement celui qu'on vient d'écraser —
+	// l'élargissement à la main que Validate refuse, sous le mode 0640 auquel
+	// l'exploitant a rouvert le fichier. « doctor » accuserait indéfiniment un
+	// fichier qu'ogs a écrit lui-même, avec pour remède de supprimer la seule
+	// copie de la configuration écrasée.
+	prov, proj := fixture(t)
+	ctx := context.Background()
+	step, err := prov.Plan(ctx, proj, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := step.Apply(ctx); err != nil {
+		t.Fatal(err)
+	}
+	path := prov.Path(proj.ID())
+	data, _ := os.ReadFile(path)
+	// Le fichier est en 0440 : l'exploitant le rouvre avant d'y toucher, et la
+	// sauvegarde héritera de ce mode.
+	if err := os.Chmod(path, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	élargie := append(data, []byte("shopfr ALL=(root) NOPASSWD: /usr/bin/systemctl restart ogs-shopfr-*\n")...)
+	if err := os.WriteFile(path, élargie, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if problems, err := prov.Audit(); err != nil || len(problems) == 0 {
+		t.Fatalf("l'élargissement manuel doit être signalé avant l'écrasement : %v (%v)", problems, err)
+	}
+
+	prov.Force = true
+	step, err = prov.Plan(ctx, proj, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := step.Apply(ctx); err != nil {
+		t.Fatalf("l'écrasement forcé doit réussir : %v", err)
+	}
+	problems, err := prov.Audit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(problems) != 0 {
+		t.Errorf("l'audit ne doit plus rien signaler après l'écrasement : %v", problems)
+	}
+}
+
+func TestCompensationRendLaDelegationPrecedente(t *testing.T) {
+	// La compensation supprimait le fichier : sur une mise à jour, le rollback
+	// retirait donc à l'utilisateur du projet un accès qu'il avait déjà.
+	prov, proj := fixture(t)
+	ctx := context.Background()
+	step, err := prov.Plan(ctx, proj, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := step.Apply(ctx); err != nil {
+		t.Fatal(err)
+	}
+	path := prov.Path(proj.ID())
+	avant, _ := os.ReadFile(path)
+
+	proj.Spec.Sudo = &model.Sudo{Style: StyleOGS, Verbs: []string{"restart"}}
+	step, err = prov.Plan(ctx, proj, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := step.Apply(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := step.Compensate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	après, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("la compensation ne doit pas retirer une délégation existante : %v", err)
+	}
+	if string(après) != string(avant) {
+		t.Error("la compensation doit rendre la délégation précédente")
 	}
 }

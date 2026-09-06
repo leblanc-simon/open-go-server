@@ -37,6 +37,10 @@ type Provider struct {
 	Exec      exec.Executor
 	Templates *template.Set
 	Now       func() time.Time
+	// Force autorise l'écrasement d'un fichier qu'ogs n'a pas écrit, après
+	// sauvegarde horodatée (§6.4). Sans lui, le refus n'aurait aucune porte de
+	// sortie et l'apply du projet resterait bloqué.
+	Force bool
 }
 
 // Name identifie le provider.
@@ -242,8 +246,12 @@ func (p *Provider) Plan(_ context.Context, proj *model.Project, obs Observed) ([
 	if err != nil {
 		return nil, err
 	}
-	if s := p.fileStepFor(proj.ID(), "unit/target/"+proj.ID(), targetPath, targetContent,
-		"cible "+TargetName(proj.ID())); s != nil {
+	s, err := p.fileStepFor(proj.ID(), "unit/target/"+proj.ID(), targetPath, targetContent,
+		"cible "+TargetName(proj.ID()))
+	if err != nil {
+		return nil, err
+	}
+	if s != nil {
 		steps = append(steps, s)
 	}
 	steps = append(steps, p.enableTargetStep(proj))
@@ -257,8 +265,12 @@ func (p *Provider) Plan(_ context.Context, proj *model.Project, obs Observed) ([
 			return nil, err
 		}
 		path := filepath.Join(p.Paths.SystemdDir(), ServiceName(proj.ID(), svc.Name))
-		if s := p.fileStepFor(proj.ID(), "unit/service/"+svc.Name, path, content,
-			fmt.Sprintf("unité %s", ServiceName(proj.ID(), svc.Name))); s != nil {
+		s, err := p.fileStepFor(proj.ID(), "unit/service/"+svc.Name, path, content,
+			fmt.Sprintf("unité %s", ServiceName(proj.ID(), svc.Name)))
+		if err != nil {
+			return nil, err
+		}
+		if s != nil {
 			steps = append(steps, s)
 		}
 
@@ -338,10 +350,32 @@ func (p *Provider) cleanupSteps(proj *model.Project, obs Observed) []*engine.Ste
 // déjà conforme.
 // fileStepFor écrit un fichier d'unité. Le projet est nécessaire pour demander,
 // le cas échéant, le redémarrage groupé de ses unités.
-func (p *Provider) fileStepFor(project, resource, path string, content []byte, summary string) *engine.Step {
+func (p *Provider) fileStepFor(project, resource, path string, content []byte, summary string) (*engine.Step, error) {
 	state, err := fs.Inspect(path, content)
-	if err != nil || state == fs.StateCurrent {
-		return nil
+	// Une unité illisible — chemin occupé par un répertoire, droits ôtés — n'est
+	// pas « rien à faire » : confondre les deux faisait annoncer un succès sans
+	// que rien n'ait été vérifié ni écrit.
+	if err != nil {
+		return nil, err
+	}
+	forced := false
+	switch state {
+	case fs.StateCurrent:
+		return nil, nil
+	case fs.StateHandEdited, fs.StateForeign:
+		if !p.Force {
+			// Une unité éditée à la main porte une intention d'exploitation — une
+			// limite mémoire, une variable — que l'écrasement perdrait sans un mot,
+			// en redémarrant les services du projet dans la foulée (§6.4). La
+			// surcharge supportée par systemd reste le drop-in <unité>.d/.
+			return refusStep(resource, summary, path, p.Paths.BackupsDir(), state), nil
+		}
+		// --force : l'étape redevient une mise à jour ordinaire, annoncée comme
+		// telle par « plan » avant qu'« apply » ne l'exécute. La sauvegarde, elle,
+		// n'a lieu qu'à l'application : « plan » et « diff » n'écrivent rien.
+		forced = true
+		state = fs.StateOutdated
+		summary += " — écrasement forcé (sauvegarde dans " + p.Paths.BackupsDir() + ")"
 	}
 	action := engine.Create
 	if state != fs.StateAbsent {
@@ -359,6 +393,13 @@ func (p *Provider) fileStepFor(project, resource, path string, content []byte, s
 	s.Apply = func(context.Context) error {
 		if data, err := os.ReadFile(path); err == nil {
 			previous = data
+		}
+		if forced {
+			// Écraser le travail d'un exploitant sans en garder trace rend
+			// l'opération irréversible : la sauvegarde précède l'écriture.
+			if _, err := fs.BackupTo(path, p.Paths.BackupsDir(), p.now()); err != nil && !os.IsNotExist(err) {
+				return err
+			}
 		}
 		if err := fs.EnsureDir(filepath.Dir(path), 0o755, fs.KeepOwner); err != nil {
 			return err
@@ -378,6 +419,27 @@ func (p *Provider) fileStepFor(project, resource, path string, content []byte, s
 		// nouvelle commande, nouvelle variable, nouvelle limite — resterait écrit
 		// sans jamais prendre effet. La cible les redémarre tous, dans l'ordre.
 		s.Reload = append(s.Reload, RestartTargetIntent(project))
+	}
+	return s, nil
+}
+
+// refusStep produit l'étape qui refuse d'écraser un fichier qu'ogs n'a pas
+// écrit. Le message nomme la porte de sortie — elle existe désormais — et
+// distingue les deux causes : un fichier « non géré » n'a jamais porté la marque
+// d'ogs ; un fichier « modifié hors ogs » a été retouché après avoir été généré.
+// L'étape ne porte aucune intention de rechargement : rien ne doit être
+// redémarré au nom d'une écriture qui n'a pas eu lieu.
+func refusStep(resource, summary, path, backups string, state fs.State) *engine.Step {
+	libelle, motif := "modifié hors ogs", "a été modifié en dehors d'ogs"
+	if state == fs.StateForeign {
+		libelle, motif = "non géré par ogs", "existe déjà sans porter la marque d'ogs"
+	}
+	s := engine.NewStep(resource, engine.Update, summary+" — fichier "+libelle)
+	s.Apply = func(context.Context) error {
+		return fmt.Errorf("%s %s : relancer avec --force pour l'écraser "+
+			"(l'original sera sauvegardé dans %s ; "+
+			"la surcharge supportée par systemd est un drop-in %s.d/)",
+			path, motif, backups, filepath.Base(path))
 	}
 	return s
 }

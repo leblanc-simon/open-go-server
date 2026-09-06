@@ -37,9 +37,7 @@ func (p *Provider) Dump(ctx context.Context, proj *model.Project, decl model.Dat
 	if err != nil {
 		return "", err
 	}
-	// La sortie est écrite avec des permissions restrictives : un dump contient
-	// l'intégralité des données de l'application.
-	f, err := os.OpenFile(output, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	f, err := openDump(output)
 	if err != nil {
 		return "", err
 	}
@@ -56,6 +54,52 @@ func (p *Provider) Dump(ctx context.Context, proj *model.Project, decl model.Dat
 		return "", err
 	}
 	return output, nil
+}
+
+// openDump ouvre la destination d'une sauvegarde, avec des permissions
+// restrictives : un dump contient l'intégralité des données de l'application.
+//
+// Sur un **fichier ordinaire**, le retrait préalable et O_EXCL interdisent
+// d'écrire dans un inode qu'on n'a pas créé soi-même : réutiliser un fichier
+// préexistant lui laisserait son propriétaire et son mode, le 0600 annoncé ici
+// ne s'appliquant qu'à la création — et une course sur le retrait échoue
+// franchement au lieu de livrer les données dans l'inode d'un autre.
+//
+// Ce raisonnement ne vaut que pour le fichier ordinaire, et c'est tout l'objet
+// de la distinction. Sur un périphérique, un tube nommé, un socket ou un lien —
+// « -O /dev/null », « -O /dev/stdout » —, il n'y a ni mode ni propriétaire à
+// assainir : le retrait ne remettrait pas les droits à zéro, il **détruirait**
+// l'objet, sous une commande dont le contrat est d'écrire là où l'exploitant lui
+// dit d'écrire. On écrit alors à travers, sans jamais délier. Un répertoire suit
+// le même chemin et rend EISDIR à l'ouverture, comme avant qu'on ne durcisse.
+func openDump(output string) (*os.File, error) {
+	info, err := os.Lstat(output)
+	if err != nil && !os.IsNotExist(err) {
+		return nil, err
+	}
+	if err == nil && !info.Mode().IsRegular() {
+		// Sans O_CREATE : un lien pendant doit rendre son erreur, non faire écrire
+		// le dump dans le fichier que le lien désigne.
+		f, err := os.OpenFile(output, os.O_WRONLY, 0)
+		if err != nil {
+			return nil, err
+		}
+		// Un lien peut mener à un fichier ordinaire — « -O /dev/stdout » sous une
+		// redirection. L'ouverture sans O_TRUNC y laisserait la queue d'un contenu
+		// plus long ; tronquer n'a de sens que là, un périphérique ou un tube ne se
+		// tronquant pas.
+		if st, err := f.Stat(); err == nil && st.Mode().IsRegular() {
+			if err := f.Truncate(0); err != nil {
+				f.Close()
+				return nil, err
+			}
+		}
+		return f, nil
+	}
+	if err := os.Remove(output); err != nil && !os.IsNotExist(err) {
+		return nil, err
+	}
+	return os.OpenFile(output, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 }
 
 // dumpCommand construit la commande de sauvegarde du moteur.

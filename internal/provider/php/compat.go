@@ -126,11 +126,41 @@ func satisfiesOne(term string, target [3]int) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	// Une version partielle (« 8.1 ») vaut pour toute la mineure.
-	if strings.Count(term, ".") == 1 {
+	switch precision(term) {
+	case 1:
+		// « 8.* » et « 8.x » ne contraignent que la majeure. Un « 8 » nu reste une
+		// version exacte, comme Composer le lit, d'où le contrôle du joker.
+		if strings.ContainsAny(term, "*x") {
+			return target[0] == base[0], nil
+		}
+	case 2:
+		// Une version partielle (« 8.1 », « 8.1.* ») vaut pour toute la mineure.
 		return target[0] == base[0] && target[1] == base[1], nil
 	}
 	return compare(target, base) == 0, nil
+}
+
+// precision rend le nombre de composantes réellement fournies par un terme, le
+// joker exclu : « 8 » et « 8.* » en fournissent une, « 8.1 » et « 8.1.* » deux.
+// Compter les points du terme brut, comme on le faisait, comptait celui du
+// joker : « 8.* » exigeait alors une mineure nulle que « parse » n'avait jamais
+// lue, et n'était donc satisfait par aucune version au-delà de 8.0.
+func precision(term string) int {
+	term = strings.TrimSpace(term)
+	for _, sep := range []string{"-", "+", "@"} {
+		if i := strings.Index(term, sep); i > 0 {
+			term = term[:i]
+		}
+	}
+	term = strings.TrimSuffix(term, ".*")
+	n := 0
+	for _, part := range strings.SplitN(term, ".", 3) {
+		if part == "" || part == "*" || part == "x" {
+			break
+		}
+		n++
+	}
+	return n
 }
 
 func compareTo(term, op string, target [3]int) (bool, error) {

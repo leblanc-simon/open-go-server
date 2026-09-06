@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 )
 
 // Plan est la liste ordonnée des étapes calculées pour un projet.
@@ -190,7 +191,7 @@ func Execute(ctx context.Context, plan *Plan, opts Options) (*Report, error) {
 		}
 		if err := ctx.Err(); err != nil {
 			report.Warnings = append(report.Warnings, "exécution interrompue : "+err.Error())
-			rollback(context.WithoutCancel(ctx), applied, report, opts)
+			compenser(ctx, applied, report, opts)
 			return report, err
 		}
 		var err error
@@ -221,7 +222,7 @@ func Execute(ctx context.Context, plan *Plan, opts Options) (*Report, error) {
 				opts.Audit(s, "échec", err.Error())
 			}
 			report.Outcomes = append(report.Outcomes, outcome)
-			rollback(ctx, applied, report, opts)
+			compenser(ctx, applied, report, opts)
 			return report, fmt.Errorf("étape %s : %w", s.Resource, err)
 		}
 		report.Outcomes = append(report.Outcomes, outcome)
@@ -232,9 +233,42 @@ func Execute(ctx context.Context, plan *Plan, opts Options) (*Report, error) {
 	return report, nil
 }
 
-// rollback compense les étapes appliquées, en ordre inverse. Si une compensation
-// échoue, le déroulage s'arrête : l'état exact atteint est remonté plutôt que
-// masqué par des tentatives supplémentaires.
+// délaiCompensation borne CHAQUE compensation : une compensation bloquée ne doit
+// pas figer le processus après un Ctrl-C, où l'opérateur attend justement la
+// main. La borne est par compensation et non pour le déroulage entier — un
+// budget global expirerait en cours de route et priverait de leur tour les
+// dernières compensées, qui sont les étapes système : les premières appliquées
+// sont les dernières compensées, tandis qu'un « systemctl stop » lent, appliqué
+// tard donc compensé tôt, consomme jusqu'à TimeoutStopSec par instance. Compte,
+// groupe et base resteraient en place sur une saga longue.
+const délaiCompensation = 2 * time.Minute
+
+// délaiDéroulage plafonne malgré tout l'attente totale, sans quoi N compensations
+// lentes multiplieraient le délai par N et l'opérateur ne reprendrait pas la main.
+// Il est assez large pour qu'un déroulage ordinaire aille à son terme.
+const délaiDéroulage = 15 * time.Minute
+
+// compenser déroule les compensations sur un contexte détaché de celui de
+// l'apply, et borné.
+//
+// L'interruption survient bien plus souvent pendant une étape qu'entre deux :
+// le contexte est alors déjà annulé quand l'étape rend son erreur, et
+// osexec.CommandContext refuse de démarrer le moindre processus sur un contexte
+// terminé — groupdel, userdel ou la suppression d'une base échoueraient sans
+// avoir rien fait, laissant compte, groupe et base en place alors que le rapport
+// annonce un déroulage. Détacher inconditionnellement est le seul remède fiable :
+// toutes les erreurs d'annulation ne remontent pas telles quelles, une commande
+// tuée en SIGKILL rendant un *ExitError sans trace du contexte.
+func compenser(ctx context.Context, applied []*Step, report *Report, opts Options) {
+	ctx, annuler := context.WithTimeout(context.WithoutCancel(ctx), délaiDéroulage)
+	defer annuler()
+	rollback(ctx, applied, report, opts)
+}
+
+// rollback compense les étapes appliquées, en ordre inverse. Chacune reçoit son
+// propre délai, pris sur celui du déroulage. Si une compensation échoue, le
+// déroulage s'arrête : l'état exact atteint est remonté plutôt que masqué par des
+// tentatives supplémentaires.
 func rollback(ctx context.Context, applied []*Step, report *Report, opts Options) {
 	if len(applied) == 0 {
 		return
@@ -245,7 +279,10 @@ func rollback(ctx context.Context, applied []*Step, report *Report, opts Options
 		if s.Compensate == nil {
 			continue
 		}
-		if err := s.Compensate(ctx); err != nil {
+		étape, annuler := context.WithTimeout(ctx, délaiCompensation)
+		err := s.Compensate(étape)
+		annuler()
+		if err != nil {
 			report.RollbackErr = fmt.Errorf("compensation de %s : %w", s.Resource, err)
 			if opts.Audit != nil {
 				opts.Audit(s, "compensation en échec", err.Error())

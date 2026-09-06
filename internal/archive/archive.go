@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -25,8 +26,24 @@ const Extension = ".tar.zst"
 // sorte qu'un « tar -tf » ou un « zstdcat | head » le montre immédiatement.
 const ManifestName = "manifest.json"
 
-// Version du format d'archive : elle permettra de relire les archives anciennes.
-const Version = 1
+// Version du format d'archive : elle permet de relire les archives anciennes, et
+// de refuser celles qu'on ne sait pas lire. La 2 porte le nom exact de chaque
+// secret dans sa charge, le chemin ne suffisant pas à le restituer. Une archive
+// de version supérieure est refusée plutôt que relue de travers : un secret
+// réinjecté sous un nom faux ne se rouvre plus jamais, sa donnée associée le
+// liant à son nom (secret.aad).
+const Version = 2
+
+// checkVersion refuse une archive écrite par un ogs plus récent. Le manifeste est
+// le seul endroit qui dise le format ; une version absente est celle des archives
+// antérieures au champ, que le repli sait relire.
+func checkVersion(path string, version int) error {
+	if version > Version {
+		return fmt.Errorf("%s : archive au format %d, cet ogs ne relit que le format %d "+
+			"— mettre ogs à jour avant de restaurer", path, version, Version)
+	}
+	return nil
+}
 
 // Manifest décrit ce que contient l'archive et ce qui a été supprimé.
 type Manifest struct {
@@ -187,14 +204,37 @@ func (w *Writer) AddTree(kind, prefix, root string) error {
 }
 
 // AddSecret ajoute un secret, qui reste chiffré : l'archive ne doit pas être une
-// façon d'exfiltrer en clair ce que le keystore protège.
+// façon d'exfiltrer en clair ce que le keystore protège. Le nom exact voyage dans
+// la charge, et le nom de fichier ne sert plus qu'à l'unicité : le déduire du
+// chemin corrompait tout nom portant déjà un double souligné — « mysql/shopfr__ro »
+// revenait « mysql/shopfr/ro », et un secret réinjecté sous ce nom faux ne
+// s'ouvre plus jamais, sa donnée associée le liant à son nom (secret.aad).
 func (w *Writer) AddSecret(name string, nonce, ciphertext []byte) error {
-	payload, err := json.Marshal(map[string][]byte{"nonce": nonce, "ciphertext": ciphertext})
+	payload, err := json.Marshal(map[string][]byte{
+		"name": []byte(name), "nonce": nonce, "ciphertext": ciphertext,
+	})
 	if err != nil {
 		return err
 	}
 	w.manifest.Secrets++
-	return w.AddBytes("secret", "secrets/"+sanitize(name)+".json", "", payload, 0o600)
+	return w.AddBytes("secret", "secrets/"+secretFileName(name)+".json", "", payload, 0o600)
+}
+
+// secretFileName choisit le codage du nom sous lequel un secret est rangé dans
+// l'archive. La charge fait foi à la relecture ; ce nom de fichier ne sert qu'à
+// l'unicité — et à ce qu'un ogs antérieur, qui ne lit que le chemin, retrouve
+// malgré tout le bon nom après un retour arrière du paquet. D'où le codage
+// historique tant qu'il est réversible, et l'échappement d'URL réservé à ce qu'il
+// corrompait : un nom portant déjà un double souligné.
+func secretFileName(name string) string {
+	if !strings.Contains(name, "__") && !strings.Contains(name, "%") {
+		return sanitize(name)
+	}
+	// Le « % » bascule ici lui aussi : sans quoi les deux codages ne se
+	// distingueraient plus l'un de l'autre. Et url.PathEscape laissant « _ »
+	// intact, on l'échappe à son tour — « mysql__shopfr » et « mysql/shopfr »
+	// prétendraient sinon au même fichier.
+	return strings.ReplaceAll(url.PathEscape(name), "_", "%5F")
 }
 
 // Note enregistre une ressource supprimée du système.
@@ -268,7 +308,7 @@ func ReadManifest(path string) (Manifest, error) {
 		if err := json.NewDecoder(tr).Decode(&manifest); err != nil {
 			return manifest, err
 		}
-		return manifest, nil
+		return manifest, checkVersion(path, manifest.Version)
 	}
 	return manifest, fmt.Errorf("%s : manifeste absent, l'archive est-elle complète ?", path)
 }
@@ -395,6 +435,9 @@ func Secrets(path string) (map[string][2][]byte, error) {
 	defer dec.Close()
 	out := map[string][2][]byte{}
 	tr := tar.NewReader(dec)
+	// Le manifeste est écrit en dernier : la version ne se contrôle qu'une fois
+	// l'archive parcourue, mais rien n'est rendu avant ce contrôle.
+	version := 0
 	for {
 		header, err := tr.Next()
 		if err == io.EOF {
@@ -403,6 +446,14 @@ func Secrets(path string) (map[string][2][]byte, error) {
 		if err != nil {
 			return nil, err
 		}
+		if header.Name == ManifestName {
+			var manifest Manifest
+			if err := json.NewDecoder(tr).Decode(&manifest); err != nil {
+				return nil, err
+			}
+			version = manifest.Version
+			continue
+		}
 		if !strings.HasPrefix(header.Name, "secrets/") {
 			continue
 		}
@@ -410,8 +461,16 @@ func Secrets(path string) (map[string][2][]byte, error) {
 		if err := json.NewDecoder(tr).Decode(&payload); err != nil {
 			return nil, err
 		}
-		name := strings.TrimSuffix(strings.TrimPrefix(header.Name, "secrets/"), ".json")
-		out[unsanitize(name)] = [2][]byte{payload["nonce"], payload["ciphertext"]}
+		name := string(payload["name"])
+		if name == "" {
+			// Archive écrite avant que la charge ne porte le nom : le chemin est
+			// tout ce qui reste, avec l'ambiguïté du double souligné.
+			name = unsanitize(strings.TrimSuffix(strings.TrimPrefix(header.Name, "secrets/"), ".json"))
+		}
+		out[name] = [2][]byte{payload["nonce"], payload["ciphertext"]}
+	}
+	if err := checkVersion(path, version); err != nil {
+		return nil, err
 	}
 	return out, nil
 }
@@ -421,9 +480,13 @@ func FileName(id string, at time.Time) string {
 	return fmt.Sprintf("%s-%s%s", id, at.UTC().Format("20060102-150405"), Extension)
 }
 
-// sanitize rend un nom de secret utilisable comme nom de fichier.
+// sanitize rend un nom de secret utilisable comme nom de fichier. Le codage n'est
+// pas réversible — un nom contenant déjà un double souligné en ressort faussé —,
+// d'où sa réserve aux noms qui n'en portent pas (voir secretFileName).
 func sanitize(name string) string { return strings.ReplaceAll(name, "/", "__") }
 
+// unsanitize relit le nom de fichier, avec l'ambiguïté du double souligné. Il ne
+// sert qu'aux archives antérieures au nom porté dans la charge.
 func unsanitize(name string) string { return strings.ReplaceAll(name, "__", "/") }
 
 func within(root, target string) bool {

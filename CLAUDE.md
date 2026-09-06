@@ -23,7 +23,7 @@ plutôt… ? » y sont déjà tranchées, avec leur raison. Toute décision nouv
 make build            # ./ogs, statique (CGO_ENABLED=0), aucune dépendance C
 make test             # tests unitaires
 make check            # fmt + vet + test
-make cover            # couverture (61,8 % actuellement)
+make cover            # couverture (66,5 % actuellement)
 make doc              # pages de manuel, complétions, référence Markdown → dist/doc
 make package          # paquet Debian → dist/*.deb (nfpm, réseau requis)
 
@@ -87,7 +87,17 @@ ordre qui est une décision, non un détail — système → bases → AMQP → 
 PHP → cron → unités et démarrage des instances → attente de disponibilité → web → TLS → bascule TLS du
 vhost → sudoers. Les services démarrent **avant** le serveur web : un vhost de proxy branché sur une
 application qui n'a pas encore démarré exposerait une 502. `buildGlobalPlan` porte ce qui vaut pour tout le
-parc (logrotate, fragment nginx, tmpfiles, unités de renouvellement).
+parc (logrotate, tmpfiles, unités de renouvellement, vhost de statut, supervision).
+
+**Le plan global lit le parc entier lui-même, jamais la liste des projets visés.** Chacun de ses fichiers
+est recalculé *en entier* : le nourrir d'un sous-ensemble ne les tronque pas, il en efface tous les autres
+projets. `ogs apply shopfr` retirait ainsi les voisins de la rotation des journaux, des prisons fail2ban,
+des entrées Telegraf et de `/etc/tmpfiles.d/ogs.conf` — et comme `systemd-tmpfiles` ne supprime rien, la
+panne restait invisible jusqu'au redémarrage suivant, où plus aucun `/run/ogs/<id>` n'était recréé et où
+tous les verrous de tâches échouaient. Le **fragment nginx**, lui, a fait le chemin inverse : il définit
+`$connection_upgrade`, dont dépend tout vhost de proxy, et le laisser au plan global le posait *après* les
+vhosts qui l'emploient — sur une machine neuve, le premier site applicatif faisait échouer `nginx -t` et
+l'apply n'aboutissait jamais. Il est écrit dans le plan de projet, comme le complément d'unité (D59).
 
 ### Les rechargements, groupés mais pas naïvement
 
@@ -116,6 +126,24 @@ l'unicité dans le parc.
 empreinte, non les octets : l'en-tête contient un horodatage, et comparer les octets ferait passer tout
 fichier « en écart » la seconde suivant son écriture. Cinq états : absent, conforme, à mettre à jour,
 modifié à la main (exige `--force`), non géré par ogs.
+
+Deux corollaires, chacun payé d'un défaut réel :
+
+- **La relecture ne consomme que l'en-tête d'ogs, jamais une ligne du corps.** Sauter « toute ligne de tête
+  vide ou commentée » recalculait l'empreinte sur un corps tronqué dès que le corps commençait lui-même par
+  un commentaire — les deux vhosts de statut, le fragment nginx, Telegraf, fail2ban, logrotate sur parc
+  vide. Les cinq passaient en « modifié à la main » à chaque relecture, donc réécrits à chaque apply, avec
+  rechargement d'Apache, de Telegraf et de fail2ban au passage. Le symptôme ne se voit qu'à la seconde
+  suivante : dans la même seconde, les octets sont identiques et le raccourci masque tout.
+- **Les cinq états se traitent partout de la même façon.** Un provider qui ne distingue pas « modifié à la
+  main » écrase le travail de l'exploitant en silence — et pour une unité systemd, redémarre ses services
+  dans la foulée. `--force` est la porte de sortie (§6.4) ; elle doit être branchée sur *chaque* provider
+  qui porte le refus, sans quoi le message renvoie à un drapeau sans effet.
+
+La sauvegarde de `--force` va dans **`/var/lib/ogs/backups`**, jamais à côté de l'original : tout répertoire
+de configuration est relu en entier par quelqu'un — son démon, ou ogs lui-même, qui inventorie
+`/etc/sudoers.d` et `sites-available`. Et l'horodatage se devine à la seconde près, donc une copie déposée
+dans un répertoire qu'un non-root possède se ferait détourner par un lien posé d'avance à ce nom.
 
 Les templates (`internal/template`, `embed.FS`) sont surchargeables dans `/etc/ogs/templates`. **Le TLS est
 servi par tous les templates de vhost**, pas seulement ceux des sites PHP.
@@ -269,6 +297,19 @@ Ils ont tous coûté un défaut réel ; les tests unitaires ne les voyaient pas.
 - **MariaDB rend « BINLOG MONITOR » là où MySQL rend « REPLICATION CLIENT »** : le GRANT est accepté sous
   les deux noms, la relecture n'en rend qu'un. Comparer au seul libellé de MySQL faisait annoncer
   éternellement une correction qu'on venait d'appliquer.
+- **Un privilège global ne ressort pas de `SCHEMA_PRIVILEGES`** : cette vue est alimentée par `mysql.db` et
+  ne porte que le niveau base. `PROCESS` et `REPLICATION CLIENT`, accordés `ON *.*`, vivent dans
+  `mysql.user` et ne se relisent que par `USER_PRIVILEGES` ou `SHOW GRANTS`. Les chercher dans la mauvaise
+  table rendait le compte de supervision **structurellement** non conforme : le même défaut d'oscillation
+  que ci-dessus, déplacé d'un cran. Corollaire du même endroit : un mot de passe scellé dans le keystore
+  n'est pas un mot de passe posé sur le moteur — les deux ne se comparent pas, donc la création du secret
+  doit forcer l'`ALTER USER`, sans quoi le fragment Telegraf porte un mot de passe que le moteur ignore.
+- **Une section `[DEFAULT]` dans `jail.d` n'est pas locale à son fichier** : fail2ban fusionne `jail.conf`,
+  `jail.d/*.conf` et `jail.local` dans un même analyseur, et la section commune s'impose alors à *toutes*
+  les prisons de la machine, celles de l'administrateur comprises. Le plus grave est `ignoreip`, qui est
+  **remplacé et non complété** : la liste blanche d'administration disparaît, et quelques échecs
+  d'authentification suffisent à verrouiller l'administrateur hors de son propre serveur. Le préfixe
+  `ogs-` protège les noms de prisons, pas les réglages communs — d'où des réglages portés prison par prison.
 - Telegraf n'a **pas d'équivalent d'`apachectl -t`** : son option de test exécute réellement la collecte.
   Le rechargement se contente d'un constat en aval. Et un fragment que l'agent ne peut pas lire ne produit
   **aucune erreur** — il démarre, ne collecte rien, et se tait ; d'où le contrôle de `doctor`.

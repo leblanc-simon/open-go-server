@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"leblanc.io/open-go-server/internal/config"
@@ -50,9 +51,12 @@ type Observed struct {
 // DirState est l'état d'un répertoire du projet.
 type DirState struct {
 	Exists bool
-	Mode   os.FileMode
-	UID    int
-	GID    int
+	// Symlink signale un lien symbolique posé à la place du répertoire. Il n'est
+	// jamais suivi : sa cible a été choisie par l'utilisateur du projet.
+	Symlink bool
+	Mode    os.FileMode
+	UID     int
+	GID     int
 }
 
 // Observe inspecte le système pour un projet donné.
@@ -91,10 +95,20 @@ func (p *Provider) paths(proj *model.Project) []string {
 	return out
 }
 
+// statDir observe sans jamais suivre de lien. Les répertoires du projet vivent
+// sous un home que son utilisateur écrit (0711, §7.1.2) : il peut retirer www/ ou
+// var/ et poser à leur place un lien vers n'importe quel répertoire du système.
+// os.Stat le résoudrait, et la correction qui suit poserait le mode et le
+// propriétaire du projet sur la cible — une écriture root arbitraire, par le
+// chemin même que la propriété root de logs/ ferme ailleurs. C'est la règle que
+// « harden » applique déjà à /etc (D56).
 func statDir(path string) DirState {
-	info, err := os.Stat(path)
+	info, err := os.Lstat(path)
 	if err != nil {
 		return DirState{}
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return DirState{Exists: true, Symlink: true, UID: -1, GID: -1}
 	}
 	st := DirState{Exists: true, Mode: info.Mode().Perm(), UID: -1, GID: -1}
 	if uid, gid, ok := OwnerOf(info); ok {
@@ -272,6 +286,14 @@ func (p *Provider) dirSteps(proj *model.Project, obs Observed) ([]*engine.Step, 
 		targets = append(targets, target{filepath.Join(proj.Spec.Layout.Root, d.Path), mode, d.Owner})
 	}
 
+	// Le propriétaire attendu se lit dans l'état déjà observé, jamais par une
+	// nouvelle résolution : sur une création de projet, le compte et le groupe
+	// n'existent pas encore et ResolveOwner ferait échouer tout le plan, alors que
+	// ce sont les premières étapes qui les créent. Sous préfixe, ensureDir laisse
+	// le propriétaire en place (fs.KeepOwner) : comparer y ferait osciller le plan
+	// sur un écart qu'aucune étape ne corrigerait.
+	checkOwner := !p.Exec.Simulated() && obs.Group != nil
+
 	var steps []*engine.Step
 	for _, t := range targets {
 		t := t
@@ -285,7 +307,40 @@ func (p *Provider) dirSteps(proj *model.Project, obs Observed) ([]*engine.Step, 
 		}
 		desired := fmt.Sprintf("%s (%04o %s)", t.path, t.mode.Perm(), ownerLabel)
 
+		// Le propriétaire est du désiré au même titre que le mode : c'est lui, non
+		// le 0710, qui interdit à l'utilisateur de créer une entrée dans logs/ et
+		// .bin/. Un « chown -R » d'exploitation laisse le mode intact et rouvre la
+		// substitution d'un journal par un lien symbolique, que le maître Apache
+		// ouvre ensuite en root (§7.1.2) : sans cette comparaison, la dérive reste
+		// « conforme » indéfiniment.
+		wantUID, wantGID := -1, -1
+		if checkOwner {
+			wantGID = obs.Group.GID
+			switch {
+			case t.owner == "root":
+				wantUID = 0
+			case obs.User != nil:
+				wantUID = obs.User.UID
+			}
+		}
+		ownerDrift := state.Exists && !state.Symlink && wantUID >= 0 && state.UID >= 0 &&
+			(state.UID != wantUID || state.GID != wantGID)
+
 		switch {
+		case state.Symlink:
+			// Étape critique, et sans correction automatique : la suite du plan écrit
+			// dans ce répertoire — docroot, sessions, clé de déploiement —, et la
+			// cible du lien a été choisie par l'utilisateur du projet. Poser le mode
+			// ou le propriétaire dessus, ou simplement poursuivre, reviendrait à lui
+			// donner un répertoire du système.
+			s := engine.NewStep("system/dir/"+t.path, engine.Update,
+				fmt.Sprintf("répertoire %s : lien symbolique", t.path))
+			s.Apply = func(context.Context) error {
+				return fmt.Errorf("%s est un lien symbolique : ogs ne le suit pas et ne "+
+					"corrige ni son mode ni son propriétaire ; le retirer avant de réappliquer",
+					t.path)
+			}
+			steps = append(steps, s)
 		case !state.Exists:
 			s := engine.NewStep("system/dir/"+t.path, engine.Create, "répertoire "+desired)
 			s.Apply = func(ctx context.Context) error { return p.ensureDir(proj, t.path, t.mode, t.owner) }
@@ -297,18 +352,53 @@ func (p *Provider) dirSteps(proj *model.Project, obs Observed) ([]*engine.Step, 
 				return nil
 			}
 			steps = append(steps, s)
-		case state.Mode != t.mode.Perm():
+		case state.Mode != t.mode.Perm() || ownerDrift:
 			previous := state.Mode
+			prevUID, prevGID := state.UID, state.GID
+			var quoi []string
+			if state.Mode != t.mode.Perm() {
+				quoi = append(quoi, fmt.Sprintf("mode %04o → %04o", previous, t.mode.Perm()))
+			}
+			if ownerDrift {
+				quoi = append(quoi, fmt.Sprintf("propriétaire %d:%d → %s (%d:%d)",
+					prevUID, prevGID, ownerLabel, wantUID, wantGID))
+			}
 			s := engine.NewStep("system/dir/"+t.path, engine.Update,
-				fmt.Sprintf("répertoire %s : mode %04o → %04o", t.path, previous, t.mode.Perm()))
+				fmt.Sprintf("répertoire %s : %s", t.path, strings.Join(quoi, ", ")))
 			s.Apply = func(ctx context.Context) error { return p.ensureDir(proj, t.path, t.mode, t.owner) }
-			s.Compensate = func(context.Context) error { return os.Chmod(t.path, previous) }
+			// Le propriétaire est reposé lui aussi : un rollback qui ne rendrait que
+			// le mode laisserait le chown en place, donc la dérive corrigée à moitié.
+			s.Compensate = func(context.Context) error {
+				return restoreDir(t.path, previous, prevUID, prevGID)
+			}
 			steps = append(steps, s)
 		default:
 			steps = append(steps, engine.NewStep("system/dir/"+t.path, engine.NoOp, "répertoire "+t.path))
 		}
 	}
 	return steps, nil
+}
+
+// restoreDir repose le mode et le propriétaire d'un répertoire sans jamais
+// suivre de lien. Une compensation intervient après coup, et le plan a beau
+// refuser un chemin lié, l'utilisateur du projet — qui écrit dans son home
+// (0711, §7.1.2) — a pu substituer un lien entre l'apply et le rollback :
+// os.Chmod et os.Chown le suivraient, et rendraient à la cible le mode et le
+// propriétaire d'origine du répertoire, c'est-à-dire ceux du projet. Le mode et
+// le propriétaire sont donc posés sur le descripteur, ouvert en O_NOFOLLOW.
+func restoreDir(path string, mode os.FileMode, uid, gid int) error {
+	d, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_DIRECTORY, 0)
+	if err != nil {
+		return fmt.Errorf("ouverture de %s : %w", path, err)
+	}
+	defer d.Close()
+	if err := d.Chmod(mode); err != nil {
+		return err
+	}
+	if uid >= 0 && gid >= 0 {
+		return d.Chown(uid, gid)
+	}
+	return nil
 }
 
 // ensureDir crée ou corrige un répertoire avec le propriétaire attendu.

@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -13,6 +14,7 @@ import (
 	"leblanc.io/open-go-server/internal/exec"
 	"leblanc.io/open-go-server/internal/model"
 	"leblanc.io/open-go-server/internal/naming"
+	runtimeprov "leblanc.io/open-go-server/internal/provider/runtime"
 	"leblanc.io/open-go-server/internal/store"
 	"leblanc.io/open-go-server/internal/template"
 )
@@ -149,12 +151,14 @@ func TestListenPortCanBeForced(t *testing.T) {
 }
 
 func TestBuildUnitPerRuntime(t *testing.T) {
-	cases := map[model.AppKind]string{
-		model.KindNode:   "server.js",
-		model.KindPython: "gunicorn",
-		model.KindRuby:   "puma",
+	cases := map[model.AppKind]struct{ attendu, lien string }{
+		model.KindNode:   {"server.js", LinkName(RuntimeNode)},
+		model.KindPython: {"gunicorn", LinkName(RuntimePython)},
+		// Ruby n'invoque pas son interpréteur mais son lanceur : c'est « bundle »
+		// qui est lié.
+		model.KindRuby: {"puma", LinkBundle},
 	}
-	for kind, want := range cases {
+	for kind, cas := range cases {
 		prov, proj := fixture(t, kind)
 		endpoint, err := prov.Endpoint(proj)
 		if err != nil {
@@ -165,8 +169,8 @@ func TestBuildUnitPerRuntime(t *testing.T) {
 			t.Fatal(err)
 		}
 		text := string(content)
-		if !strings.Contains(text, want) {
-			t.Errorf("%s : commande inattendue, %q absent :\n%s", kind, want, text)
+		if !strings.Contains(text, cas.attendu) {
+			t.Errorf("%s : commande inattendue, %q absent :\n%s", kind, cas.attendu, text)
 		}
 		// Le durcissement et le umask sont systématiques.
 		for _, required := range []string{"UMask=0007", "NoNewPrivileges=true", "ProtectSystem=full"} {
@@ -179,19 +183,13 @@ func TestBuildUnitPerRuntime(t *testing.T) {
 			t.Errorf("%s : le chemin du socket doit être transmis :\n%s", kind, text)
 		}
 		// Le lien géré est employé, jamais un binaire versionné.
-		if !strings.Contains(text, filepath.Join(".bin", LinkName(mustRuntime(t, proj)))) {
+		if !strings.Contains(text, filepath.Join(".bin", cas.lien)) {
 			t.Errorf("%s : le lien géré doit être employé :\n%s", kind, text)
 		}
+		if strings.Contains(text, ".rbenv") || strings.Contains(text, ".nvm") {
+			t.Errorf("%s : aucune version ne doit apparaître dans l'unité :\n%s", kind, text)
+		}
 	}
-}
-
-func mustRuntime(t *testing.T, proj *model.Project) string {
-	t.Helper()
-	at, err := proj.AppType()
-	if err != nil {
-		t.Fatal(err)
-	}
-	return at.Runtime
 }
 
 func TestBuildGoUsesManagedBinaryLink(t *testing.T) {
@@ -236,7 +234,8 @@ func TestPlanInstallsRuntimeThenLinksThenWaits(t *testing.T) {
 	for _, s := range steps {
 		order = append(order, s.Resource)
 	}
-	expected := []string{"app/runtime/node", "app/link/node", "app/unit/shopfr", "app/health/shopfr"}
+	expected := []string{"app/rundir/shopfr", "app/runtime/node", "app/link/node",
+		"app/unit/shopfr", "app/health/shopfr"}
 	if strings.Join(order, ",") != strings.Join(expected, ",") {
 		t.Errorf("ordre des étapes :\n  %v\nattendu :\n  %v", order, expected)
 	}
@@ -401,5 +400,302 @@ func TestWaitReadyMessageNamesLikelyCause(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "SOCKET_PATH") || !strings.Contains(err.Error(), "listen: port") {
 		t.Errorf("le message doit orienter le diagnostic : %v", err)
+	}
+}
+
+// execStart extrait la ligne de commande d'une unité rendue.
+func execStart(t *testing.T, unit string) string {
+	t.Helper()
+	for _, line := range strings.Split(unit, "\n") {
+		if strings.HasPrefix(line, "ExecStart=") {
+			return strings.TrimPrefix(line, "ExecStart=")
+		}
+	}
+	t.Fatalf("aucun ExecStart :\n%s", unit)
+	return ""
+}
+
+func TestCommandeRubyInvoqueLeLanceurEtNonLInterpreteur(t *testing.T) {
+	// « ruby -e bundle » évaluait le mot « bundle » comme un programme d'une
+	// ligne : le service mourait à chaque démarrage sans que puma existe jamais,
+	// et l'attente de disponibilité accusait ensuite le code applicatif.
+	prov, proj := fixture(t, model.KindRuby)
+	proj.Spec.App.Runtime = "3.3.6"
+	endpoint, err := prov.Endpoint(proj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	content, err := prov.Build(proj, endpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	commande := execStart(t, string(content))
+	champs := strings.Fields(commande)
+	if base := filepath.Base(champs[0]); base != LinkBundle && base != "puma" {
+		t.Errorf("l'exécutable doit être un lanceur, obtenu %q :\n%s", base, commande)
+	}
+	if strings.Contains(commande, " -e ") {
+		t.Errorf("« -e » prend son argument pour un programme :\n%s", commande)
+	}
+	if !strings.Contains(commande, "-b unix://"+endpoint.Socket) {
+		t.Errorf("le point d'écoute doit être imposé par la ligne de commande :\n%s", commande)
+	}
+}
+
+func TestEntrypointRubyDesigneLaConfigurationPuma(t *testing.T) {
+	// L'entrypoint déclaré était ignoré sans un mot pour Ruby.
+	prov, proj := fixture(t, model.KindRuby)
+	proj.Spec.App.Runtime = "3.3.6"
+	proj.Spec.App.Entrypoint = "config/puma.rb"
+	endpoint, _ := prov.Endpoint(proj)
+	content, err := prov.Build(proj, endpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	commande := execStart(t, string(content))
+	if !strings.Contains(commande, "-C config/puma.rb") {
+		t.Errorf("l'entrypoint doit devenir la configuration de puma :\n%s", commande)
+	}
+	// Le bind vient après : la ligne de commande l'emporte sur le fichier.
+	if strings.Index(commande, "-C ") > strings.Index(commande, "-b ") {
+		t.Errorf("le bind doit suivre la configuration :\n%s", commande)
+	}
+}
+
+func TestPlanRubyPoseLeLienDuLanceur(t *testing.T) {
+	// L'unité n'invoque que des liens de .bin/ (D30) : le lanceur en exige un
+	// second, à côté de celui de l'interpréteur.
+	prov, proj := fixture(t, model.KindRuby)
+	proj.Spec.App.Runtime = "3.3.6"
+	ctx := context.Background()
+	obs, err := prov.Observe(ctx, proj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	steps, err := prov.Plan(ctx, proj, obs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := &engine.Plan{Project: proj.ID()}
+	for _, s := range steps {
+		plan.Add(s)
+	}
+	if _, err := engine.Execute(ctx, plan, engine.Options{}); err != nil {
+		t.Fatal(err)
+	}
+	cible, err := os.Readlink(filepath.Join(proj.Spec.Layout.Root, ".bin", LinkBundle))
+	if err != nil {
+		t.Fatalf("lien du lanceur absent : %v", err)
+	}
+	if cible != BundlePath(proj.Spec.Layout.Root, "3.3.6") {
+		t.Errorf("cible du lien : %q", cible)
+	}
+	// Le lanceur vit dans le même bin que l'interpréteur.
+	if filepath.Dir(cible) != filepath.Dir(BinaryPath(proj.Spec.Layout.Root, RuntimeRuby, "3.3.6")) {
+		t.Errorf("le lanceur doit être voisin de l'interpréteur : %q", cible)
+	}
+	// Idempotence : le runtime est réputé installé et l'application à l'écoute.
+	binaire := BinaryPath(proj.Spec.Layout.Root, RuntimeRuby, "3.3.6")
+	if err := os.MkdirAll(filepath.Dir(binaire), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(binaire, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	obs, _ = prov.Observe(ctx, proj)
+	obs.Listening = true
+	steps, _ = prov.Plan(ctx, proj, obs)
+	plan2 := &engine.Plan{Project: proj.ID()}
+	for _, s := range steps {
+		plan2.Add(s)
+	}
+	if !plan2.Empty() {
+		t.Errorf("second plan non vide :\n%s", plan2.String())
+	}
+}
+
+func TestPlanCreeLeRepertoireDExecutionAvantLUnite(t *testing.T) {
+	// Le fichier tmpfiles appartient au plan de parc, exécuté après tous les
+	// projets : l'instance aurait démarré avant que le répertoire de son socket
+	// existe, et l'attente de disponibilité aurait accusé le code applicatif.
+	prov, proj := fixture(t, model.KindNode)
+	ctx := context.Background()
+	obs, err := prov.Observe(ctx, proj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	steps, err := prov.Plan(ctx, proj, obs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if steps[0].Resource != "app/rundir/"+proj.ID() {
+		t.Fatalf("le répertoire d'exécution doit venir en premier : %s", steps[0].Resource)
+	}
+	for _, s := range steps {
+		if s.Resource == "app/unit/"+proj.ID() {
+			break
+		}
+		if s.Resource == "app/rundir/"+proj.ID() && s.Action == engine.NoOp {
+			t.Fatal("le répertoire est absent : l'étape ne peut pas être un NoOp")
+		}
+	}
+	plan := &engine.Plan{Project: proj.ID()}
+	for _, s := range steps {
+		plan.Add(s)
+	}
+	if _, err := engine.Execute(ctx, plan, engine.Options{}); err != nil {
+		t.Fatal(err)
+	}
+	runDir := prov.Paths.ProjectRunDir(proj.ID())
+	info, err := os.Stat(runDir)
+	if err != nil {
+		t.Fatalf("répertoire d'exécution absent : %v", err)
+	}
+	// Le mode est celui que déclare le fichier tmpfiles : deux endroits qui en
+	// décideraient feraient osciller le plan.
+	if info.Mode().Perm() != runtimeprov.ProjectRunMode.Perm() {
+		t.Errorf("mode %04o, attendu %04o", info.Mode().Perm(), runtimeprov.ProjectRunMode.Perm())
+	}
+	// Idempotence : le répertoire posé, l'étape ne mute plus.
+	obs, _ = prov.Observe(ctx, proj)
+	steps, _ = prov.Plan(ctx, proj, obs)
+	if steps[0].Action != engine.NoOp {
+		t.Errorf("second plan : %s (%s)", steps[0].Summary, steps[0].Action)
+	}
+}
+
+// ecritUnite applique la seule étape d'unité du plan, pour disposer d'un fichier
+// portant la marque d'ogs.
+func ecritUnite(t *testing.T, prov *Provider, proj *model.Project) string {
+	t.Helper()
+	ctx := context.Background()
+	obs, err := prov.Observe(ctx, proj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	steps, err := prov.Plan(ctx, proj, obs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range steps {
+		if s.Resource == "app/unit/"+proj.ID() {
+			if err := s.Apply(ctx); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	return prov.unitPath(proj)
+}
+
+// planApresRetouche rejoue un plan sur une unité à laquelle un exploitant a
+// ajouté une directive.
+func planApresRetouche(t *testing.T, prov *Provider, proj *model.Project) ([]*engine.Step, string) {
+	t.Helper()
+	path := ecritUnite(t, prov, proj)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, append(data, []byte("MemoryMax=512M\n")...), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	obs, err := prov.Observe(ctx, proj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	steps, err := prov.Plan(ctx, proj, obs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return steps, path
+}
+
+func TestUniteApplicativeEditeeAMainEstRefuseeSansForce(t *testing.T) {
+	// Une application supervisée est un service comme un autre : son unité doit
+	// répondre au même geste que celle du provider d'unités, dans le même
+	// répertoire.
+	prov, proj := fixture(t, model.KindNode)
+	steps, path := planApresRetouche(t, prov, proj)
+
+	var refus *engine.Step
+	for _, s := range steps {
+		if s.Resource == "app/unit/"+proj.ID() {
+			refus = s
+		}
+	}
+	if refus == nil {
+		t.Fatalf("aucune étape d'unité :\n%v", steps)
+	}
+	if !strings.Contains(refus.Summary, "modifié hors ogs") {
+		t.Fatalf("la modification manuelle doit être signalée : %q", refus.Summary)
+	}
+	ctx := context.Background()
+	err := refus.Apply(ctx)
+	if err == nil {
+		t.Fatal("l'écrasement doit être refusé sans --force")
+	}
+	if !strings.Contains(err.Error(), "--force") {
+		t.Errorf("le refus doit nommer la porte de sortie : %v", err)
+	}
+	// Rien n'a été écrit : rien ne doit être rechargé ni redémarré.
+	if len(refus.Reload) != 0 {
+		t.Errorf("le refus ne doit demander aucun rechargement : %v", refus.Reload)
+	}
+	for _, s := range steps {
+		if slices.Contains(s.Reload, RestartTargetIntent(proj.ID())) {
+			t.Errorf("aucun redémarrage des instances ne doit être demandé : %s", s.Summary)
+		}
+	}
+	if after, _ := os.ReadFile(path); !strings.Contains(string(after), "MemoryMax=512M") {
+		t.Error("le refus ne doit rien écrire")
+	}
+}
+
+func TestUniteApplicativeEcraseeAvecForceApresSauvegarde(t *testing.T) {
+	prov, proj := fixture(t, model.KindNode)
+	prov.Force = true
+	steps, path := planApresRetouche(t, prov, proj)
+
+	var forcée *engine.Step
+	for _, s := range steps {
+		if s.Resource == "app/unit/"+proj.ID() {
+			forcée = s
+		}
+	}
+	if forcée == nil || !strings.Contains(forcée.Summary, "écrasement forcé") {
+		t.Fatalf("le plan doit annoncer l'écrasement forcé :\n%v", steps)
+	}
+	// L'unité change réellement : le redémarrage groupé reste dû, sans quoi les
+	// instances continueraient de tourner avec l'ancienne définition.
+	if !slices.Contains(forcée.Reload, RestartTargetIntent(proj.ID())) {
+		t.Errorf("l'écrasement forcé doit demander le redémarrage groupé : %v", forcée.Reload)
+	}
+	ctx := context.Background()
+	if err := forcée.Apply(ctx); err != nil {
+		t.Fatalf("l'écrasement forcé doit réussir : %v", err)
+	}
+	if after, _ := os.ReadFile(path); strings.Contains(string(after), "MemoryMax=512M") {
+		t.Error("l'unité doit avoir été réécrite")
+	}
+	// La copie sort de /etc/systemd/system : l'importateur y énumère les unités du
+	// parc et adopterait la sauvegarde comme une unité de plus.
+	if restes, _ := filepath.Glob(path + ".ogs-bak-*"); len(restes) != 0 {
+		t.Errorf("aucune sauvegarde ne doit rester dans %s : %v", prov.Paths.SystemdDir(), restes)
+	}
+	baks, _ := filepath.Glob(filepath.Join(prov.Paths.BackupsDir(), filepath.Base(path)+".ogs-bak-*"))
+	if len(baks) != 1 {
+		t.Fatalf("une sauvegarde attendue dans %s, %d trouvée(s)", prov.Paths.BackupsDir(), len(baks))
+	}
+	if saved, _ := os.ReadFile(baks[0]); !strings.Contains(string(saved), "MemoryMax=512M") {
+		t.Error("la sauvegarde doit contenir l'original")
+	}
+	// La compensation rend l'unité de l'exploitant, non le vide : une saga
+	// annulée après l'écrasement l'aurait sinon effacée pour de bon.
+	if err := forcée.Compensate(ctx); err != nil {
+		t.Fatalf("compensation : %v", err)
+	}
+	if after, _ := os.ReadFile(path); !strings.Contains(string(after), "MemoryMax=512M") {
+		t.Error("la compensation doit rendre l'unité d'origine")
 	}
 }

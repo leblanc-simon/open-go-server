@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -28,6 +29,16 @@ type Header struct {
 }
 
 var reFingerprint = regexp.MustCompile(`empreinte: sha256:([0-9a-f]{64})`)
+
+// customizeLabel ouvre la troisième ligne d'en-tête, écrite seulement lorsque le
+// template est surchargeable. Le libellé sert à la fois à l'écrire et à la
+// reconnaître à la relecture : deux littéraux se seraient désaccordés.
+const customizeLabel = "Pour personnaliser :"
+
+// reCustomize reconnaît cette troisième ligne. Les seuls préfixes de commentaire
+// rendus sont « # » (web, systemd, cron, sudoers, logrotate, Telegraf, fail2ban)
+// et « ; » (pool PHP).
+var reCustomize = regexp.MustCompile(`^[#;]\s*` + regexp.QuoteMeta(customizeLabel))
 
 // Fingerprint calcule l'empreinte d'un corps de fichier.
 func Fingerprint(body []byte) string {
@@ -47,7 +58,7 @@ func Render(h Header, body []byte, comment string) []byte {
 	fmt.Fprintf(&b, "%s projet: %s  ressource: %s  empreinte: sha256:%s  généré: %s\n",
 		comment, h.Project, h.Resource, fp, h.Generated.UTC().Format(time.RFC3339))
 	if h.Template != "" {
-		fmt.Fprintf(&b, "%s Pour personnaliser : %s\n", comment, h.Template)
+		fmt.Fprintf(&b, "%s %s %s\n", comment, customizeLabel, h.Template)
 	}
 	b.Write(body)
 	return []byte(b.String())
@@ -119,21 +130,43 @@ func Inspect(path string, expected []byte) (State, error) {
 	return StateOutdated, nil
 }
 
-// splitHeader isole l'empreinte annoncée et le corps d'un fichier géré.
+// splitHeader isole l'empreinte annoncée et le corps d'un fichier géré. Il ne
+// consomme que l'en-tête qu'écrit Render : la ligne d'empreinte, puis la ligne
+// « Pour personnaliser » quand elle est là.
+//
+// Sauter au contraire toute ligne de commentaire de tête amputait le corps des
+// fichiers qui commencent eux-mêmes par un commentaire — vhost de supervision,
+// fragments Telegraf et fail2ban, extrait nginx, et toute surcharge de template
+// dont l'auteur a documenté la première ligne. L'empreinte recalculée ne valait
+// alors jamais celle annoncée : le fichier passait pour modifié à la main à
+// chaque relecture, donc réécrit et rechargé à chaque apply, et une vraie
+// modification manuelle y devenait indiscernable.
+//
+// L'empreinte est cherchée ligne à ligne, et non dans tout le fichier : un corps
+// contenant « empreinte: sha256:… » ne doit pas pouvoir se faire passer pour
+// l'en-tête.
 func splitHeader(data []byte) (fingerprint string, body []byte) {
-	m := reFingerprint.FindSubmatch(data)
-	if m != nil {
-		fingerprint = string(m[1])
-	}
 	lines := strings.SplitAfter(string(data), "\n")
+	idx := -1
 	for i, l := range lines {
-		trimmed := strings.TrimSpace(l)
-		if trimmed == "" || strings.HasPrefix(trimmed, "#") || strings.HasPrefix(trimmed, ";") {
-			continue
+		if m := reFingerprint.FindStringSubmatch(l); m != nil {
+			fingerprint, idx = m[1], i
+			break
 		}
-		return fingerprint, []byte(strings.Join(lines[i:], ""))
 	}
-	return fingerprint, nil
+	if idx < 0 {
+		return "", nil
+	}
+	start := idx + 1
+	if start < len(lines) && reCustomize.MatchString(strings.TrimSpace(lines[start])) {
+		start++
+	}
+	if start >= len(lines) {
+		return fingerprint, nil
+	}
+	// SplitAfter conserve les fins de ligne : un corps vide et un corps réduit à
+	// « \n » (logrotate sur un parc vide) sont rendus à l'identique.
+	return fingerprint, []byte(strings.Join(lines[start:], ""))
 }
 
 func firstLines(data []byte, n int) string {
@@ -195,8 +228,39 @@ func WriteAtomic(path string, data []byte, mode os.FileMode, owner Owner) error 
 	return syncDir(dir)
 }
 
-// Backup copie un fichier existant avant écrasement, en horodatant la copie.
-func Backup(path string, now time.Time) (string, error) {
+// BackupTo dépose la sauvegarde dans un répertoire choisi, créé au besoin.
+// C'est par là que passe tout écrasement forcé (§6.4), vers
+// config.Paths.BackupsDir().
+//
+// Un répertoire de configuration est toujours lu en entier par quelqu'un, et la
+// copie qu'on y laisse ment à ce lecteur. Par le démon d'abord : /etc/logrotate.d
+// est chargé tout entier, à l'exception d'une liste de suffixes tabous
+// (« .dpkg-old », « .rpmsave », « .disabled »…) où le nôtre ne figure pas — la
+// sauvegarde y serait une deuxième rotation portant sur les mêmes journaux, et
+// logrotate tient deux directives pour un même chemin pour une erreur : toute la
+// rotation du parc s'arrête. Par ogs ensuite, ce que le seul raisonnement sur les
+// démons manquait : « doctor » énumère /etc/sudoers.d sur le préfixe « ogs- » et
+// accuserait sans fin la copie, l'importateur lit sites-available et proposerait
+// d'adopter une seconde fois un site déjà géré. Sortir du répertoire plutôt que
+// choisir un suffixe ignoré : la liste des tabous appartient à chaque démon et
+// peut changer sous nos pieds, l'emplacement ne dépend de personne.
+//
+// Le répertoire est créé en 0700, et c'est aussi ce qui rend l'écriture sûre :
+// os.WriteFile suit les liens, or l'horodatage se devine à la seconde près. Une
+// copie déposée dans un répertoire qu'un non-root possède — le .ssh d'un projet,
+// pour la rotation de la clé de déploiement — se ferait détourner par un lien
+// posé d'avance à ce nom, et root écrirait le contenu de l'ancienne clé où le
+// projet l'aurait décidé. Aucun appelant ne choisit donc son répertoire : tous
+// passent par config.Paths.BackupsDir(). Le mode est un filet —
+// « ogs init » le pose déjà (config.Paths.Dirs), avec un mode explicite que le
+// umask ambiant ne rabote pas, ce que MkdirAll ne garantit pas. Ses parents sont
+// supposés déjà posés — /var/lib/ogs l'est en 0751 par « ogs init », et le
+// serveur web doit pouvoir le traverser : MkdirAll leur appliquerait sinon le
+// 0700 du dernier composant.
+func BackupTo(path, dir string, now time.Time) (string, error) {
+	// La lecture précède la création du répertoire : un original absent doit
+	// rendre une erreur os.IsNotExist — ce dont les appelants se servent pour
+	// passer outre — sans laisser derrière lui un répertoire vide.
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return "", err
@@ -205,19 +269,45 @@ func Backup(path string, now time.Time) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	dst := fmt.Sprintf("%s.ogs-bak-%s", path, now.UTC().Format("20060102-150405"))
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", err
+	}
+	dst := filepath.Join(dir, backupName(filepath.Base(path), now))
 	if err := os.WriteFile(dst, data, info.Mode().Perm()); err != nil {
 		return "", err
 	}
 	return dst, nil
 }
 
+// backupName construit le nom horodaté d'une sauvegarde. Il n'est pas exposé :
+// personne d'autre n'a de nom à composer, et le plan — seul endroit qui annonce
+// une sauvegarde à l'exploitant — s'affiche avant que l'horodatage existe. Il
+// nomme donc le répertoire, qui lui est connu d'avance. Le format ne s'écrit
+// qu'ici : horodatage en UTC, et trié alphabétiquement donc chronologiquement.
+func backupName(base string, now time.Time) string {
+	return fmt.Sprintf("%s.ogs-bak-%s", base, now.UTC().Format("20060102-150405"))
+}
+
 // EnsureDir crée un répertoire avec le mode et le propriétaire attendus, et les
 // corrige s'ils diffèrent. Les modes sont toujours explicites : ils ne dépendent
 // jamais du umask ambiant.
+//
+// Le dernier composant n'est jamais suivi. Les répertoires d'un projet (www/,
+// var/, .ssh/) vivent sous un home que son utilisateur écrit — 0711, à lui
+// (§7.1.2) : il peut donc en retirer un et poser à sa place un lien vers
+// n'importe quel répertoire du système. os.Stat, os.Chmod et os.Chown résolvent
+// les liens, si bien que le mode et le propriétaire du projet auraient été posés
+// sur la cible — /etc/cron.d, /etc/systemd/system — soit une escalade vers root
+// depuis un compte dont le shell est ouvert (D62). D'où l'ouverture en
+// O_NOFOLLOW|O_DIRECTORY puis le mode et le propriétaire posés sur le
+// descripteur : ce qui est corrigé est le répertoire constaté, jamais la cible
+// d'un lien posé entre l'observation et l'écriture. Même règle que « harden »,
+// qui ne suit aucun lien (D56).
 func EnsureDir(path string, mode os.FileMode, owner Owner) error {
-	info, err := os.Stat(path)
+	info, err := os.Lstat(path)
 	switch {
+	case err == nil && info.Mode()&os.ModeSymlink != 0:
+		return fmt.Errorf("%s est un lien symbolique : ogs ne le suit pas", path)
 	case err == nil && !info.IsDir():
 		return fmt.Errorf("%s existe et n'est pas un répertoire", path)
 	case errors.Is(err, fs.ErrNotExist):
@@ -227,11 +317,20 @@ func EnsureDir(path string, mode os.FileMode, owner Owner) error {
 	case err != nil:
 		return err
 	}
-	if err := os.Chmod(path, mode); err != nil {
+	d, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_DIRECTORY, 0)
+	if err != nil {
+		// ELOOP : le chemin est devenu un lien entre le Lstat et l'ouverture.
+		if errors.Is(err, syscall.ELOOP) {
+			return fmt.Errorf("%s est un lien symbolique : ogs ne le suit pas", path)
+		}
+		return fmt.Errorf("ouverture de %s : %w", path, err)
+	}
+	defer d.Close()
+	if err := d.Chmod(mode); err != nil {
 		return err
 	}
 	if owner.UID >= 0 || owner.GID >= 0 {
-		if err := os.Chown(path, owner.UID, owner.GID); err != nil {
+		if err := d.Chown(owner.UID, owner.GID); err != nil {
 			return fmt.Errorf("attribution du propriétaire de %s : %w", path, err)
 		}
 	}

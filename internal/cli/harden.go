@@ -77,7 +77,11 @@ func newHardenCommand(app *App) *cobra.Command {
 						app.printf("  risque   : %s\n", st.Target.Risk)
 					}
 					for _, f := range st.Loose {
-						app.printf("  fichier trop permissif : %s\n", f)
+						// « à reprendre » et non « trop permissif » : la liste retient aussi
+						// un fichier plus strict que la cible mais privé de son groupe, que
+						// le démon ne peut plus lire. Le nommer trop permissif enverrait
+						// l'exploitant chercher une permissivité qui n'existe pas.
+						app.printf("  fichier à reprendre : %s\n", f)
 					}
 				}
 			}

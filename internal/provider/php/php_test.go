@@ -450,3 +450,110 @@ func TestSurchargeDuStatutResteAuProjet(t *testing.T) {
 		t.Error("la surcharge du projet doit primer sur le réglage de base")
 	}
 }
+
+func TestPlanEcrasePoolAvecForceEtSauvegarde(t *testing.T) {
+	prov, paths, _ := fixture(t, "8.5")
+	p := project(t, "shop.fr", model.KindSymfony, "6.4", "8.5")
+	ctx := context.Background()
+	obs, _ := prov.Observe(ctx, p)
+	steps, _ := prov.Plan(ctx, p, obs)
+	plan := &engine.Plan{Project: p.ID()}
+	for _, s := range steps {
+		plan.Add(s)
+	}
+	if _, err := engine.Execute(ctx, plan, engine.Options{}); err != nil {
+		t.Fatal(err)
+	}
+
+	poolFile := paths.PHPPoolFile("8.5", "shopfr")
+	data, _ := os.ReadFile(poolFile)
+	if err := os.WriteFile(poolFile, append(data, []byte("\npm.max_children = 4\n")...), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// --force rend l'étape mutante : le refus n'est plus une impasse.
+	prov.Force = true
+	obs, _ = prov.Observe(ctx, p)
+	steps, err := prov.Plan(ctx, p, obs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan2 := &engine.Plan{Project: p.ID()}
+	for _, s := range steps {
+		plan2.Add(s)
+	}
+	mutating := plan2.Mutating()
+	if len(mutating) != 1 || !strings.Contains(mutating[0].Summary, "écrasement forcé") {
+		t.Fatalf("le plan doit annoncer l'écrasement forcé :\n%s", plan2.String())
+	}
+	if _, err := engine.Execute(ctx, plan2, engine.Options{}); err != nil {
+		t.Fatalf("l'écrasement forcé doit réussir : %v", err)
+	}
+	after, _ := os.ReadFile(poolFile)
+	if strings.Contains(string(after), "pm.max_children = 4") {
+		t.Error("le pool doit avoir été réécrit")
+	}
+	// La copie sort du répertoire des pools : PHP-FPM n'inclut que les « .conf »,
+	// mais ogs y réinventorie ses pools et l'exploitant y cherche les siens.
+	if restes, _ := filepath.Glob(poolFile + ".ogs-bak-*"); len(restes) != 0 {
+		t.Errorf("aucune sauvegarde ne doit rester dans %s : %v", filepath.Dir(poolFile), restes)
+	}
+	baks, _ := filepath.Glob(filepath.Join(paths.BackupsDir(), filepath.Base(poolFile)+".ogs-bak-*"))
+	if len(baks) != 1 {
+		t.Fatalf("une sauvegarde attendue dans %s, %d trouvée(s)", paths.BackupsDir(), len(baks))
+	}
+	saved, _ := os.ReadFile(baks[0])
+	if !strings.Contains(string(saved), "pm.max_children = 4") {
+		t.Errorf("la sauvegarde doit contenir l'original :\n%s", saved)
+	}
+}
+
+func TestCompensationRendLePoolPrecedent(t *testing.T) {
+	// La compensation d'une mise à jour supprimait le fichier : sur un écrasement
+	// forcé, le rollback détruisait donc ce que la sauvegarde venait de préserver,
+	// et sur une simple mise à jour il retirait un pool qui servait.
+	prov, paths, _ := fixture(t, "8.5")
+	p := project(t, "shop.fr", model.KindSymfony, "6.4", "8.5")
+	ctx := context.Background()
+	obs, _ := prov.Observe(ctx, p)
+	steps, _ := prov.Plan(ctx, p, obs)
+	plan := &engine.Plan{Project: p.ID()}
+	for _, s := range steps {
+		plan.Add(s)
+	}
+	if _, err := engine.Execute(ctx, plan, engine.Options{}); err != nil {
+		t.Fatal(err)
+	}
+	poolFile := paths.PHPPoolFile("8.5", "shopfr")
+	avant, _ := os.ReadFile(poolFile)
+
+	// Un changement quelconque rend le pool obsolète.
+	p.Spec.PHP.Pools[0].Preset = "large"
+	obs, _ = prov.Observe(ctx, p)
+	steps, err := prov.Plan(ctx, p, obs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var step *engine.Step
+	for _, s := range steps {
+		if s.Action == engine.Update {
+			step = s
+		}
+	}
+	if step == nil {
+		t.Fatal("une mise à jour du pool était attendue")
+	}
+	if err := step.Apply(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := step.Compensate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	après, err := os.ReadFile(poolFile)
+	if err != nil {
+		t.Fatalf("la compensation ne doit pas supprimer un pool qui servait : %v", err)
+	}
+	if string(après) != string(avant) {
+		t.Error("la compensation doit rendre le pool précédent")
+	}
+}

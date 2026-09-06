@@ -1,6 +1,9 @@
 package naming
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestBaseID(t *testing.T) {
 	cases := []struct{ host, want string }{
@@ -284,4 +287,57 @@ func TestUnescapeMySQLPatternIsTheInverseOfEscape(t *testing.T) {
 	if got := UnescapeMySQLPattern(`shopfr\_stats`); got != "shopfr_stats" {
 		t.Errorf("motif stocké mal interprété : %q", got)
 	}
+}
+
+func TestEnvsEstExactementCeQueParseEnvAccepte(t *testing.T) {
+	// Le lien qui manquait : la liste publiée — celle dont vit la complétion de
+	// « --env » — et celle que ParseEnv accepte sont la même. Recopiée ailleurs,
+	// elle avait fait proposer « staging », que le chargement refuse (D24).
+	liste := Envs()
+	if len(liste) == 0 {
+		t.Fatal("aucun environnement publié")
+	}
+	for _, e := range liste {
+		got, err := ParseEnv(string(e))
+		if err != nil {
+			t.Errorf("environnement publié %q refusé par ParseEnv : %v", e, err)
+			continue
+		}
+		if got != e {
+			t.Errorf("ParseEnv(%q) = %q", e, got)
+		}
+	}
+	// Le défaut est un environnement de la liste, et non une valeur à part.
+	def, err := ParseEnv("")
+	if err != nil {
+		t.Fatalf("valeur vide refusée : %v", err)
+	}
+	if !contientEnv(liste, def) {
+		t.Errorf("le défaut %q ne figure pas dans la liste publiée %v", def, liste)
+	}
+	// Le message d'erreur énumère la même liste : c'est lui qui guide celui qui
+	// s'est trompé, et il ne doit pas davantage diverger.
+	_, err = ParseEnv("staging")
+	if err == nil {
+		t.Fatal("« staging » accepté alors qu'il n'est pas un environnement de projet")
+	}
+	for _, e := range liste {
+		if !strings.Contains(err.Error(), string(e)) {
+			t.Errorf("le message %q ne nomme pas %q", err, e)
+		}
+	}
+	// La liste publiée est une copie : la modifier ne change pas ce qui est accepté.
+	liste[0] = "staging"
+	if _, err := ParseEnv("staging"); err == nil {
+		t.Error("la liste publiée n'est pas une copie : ParseEnv a suivi sa modification")
+	}
+}
+
+func contientEnv(liste []Env, e Env) bool {
+	for _, x := range liste {
+		if x == e {
+			return true
+		}
+	}
+	return false
 }

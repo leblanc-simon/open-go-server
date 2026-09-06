@@ -283,19 +283,21 @@ func (a *App) buildProviders() (*providers, error) {
 		Exec:      a.Exec,
 		Templates: tmpl,
 		Store:     a.Store,
+		Force:     a.Force,
 	}
 	eng, err := a.webEngine()
 	if err != nil {
 		return nil, err
 	}
 	appProv := &appprov.Provider{Paths: a.Paths, Exec: a.Exec, Templates: tmpl, Store: a.Store,
-		Installer: &appprov.Installer{Exec: a.Exec}}
+		Installer: &appprov.Installer{Exec: a.Exec}, Force: a.Force}
 	amqpProv := a.amqpProvider()
 	amqpPort := amqpProv.Port
 	dbProv := &db.Provider{Paths: a.Paths, Exec: a.Exec, Store: a.Store, Keys: a.Keys, AMQPPort: amqpPort}
 	certStore := tlsprov.Store{Paths: a.Paths}
 	certs := &tlsprov.Provider{
 		Paths: a.Paths, Cfg: a.Cfg, Store: certStore, DB: a.Store,
+		Force: a.Force,
 		Issuer: &tlsprov.ACME{
 			Paths: a.Paths, Store: certStore, Email: a.Cfg.ACME.Email,
 			Directory:      a.Cfg.ACME.Directory,
@@ -314,10 +316,10 @@ func (a *App) buildProviders() (*providers, error) {
 		DB:     dbProv,
 		AMQP:   amqpProv,
 		App:    appProv,
-		Cron: &cron.Provider{Paths: a.Paths, Templates: tmpl,
+		Cron: &cron.Provider{Paths: a.Paths, Templates: tmpl, Force: a.Force,
 			Owner: func(proj *model.Project) (int, int, error) { return sys.ResolveOwner(proj, "") }},
-		Unit:    &unit.Provider{Paths: a.Paths, Exec: a.Exec, Templates: tmpl},
-		Sudoers: &sudoers.Provider{Paths: a.Paths, Exec: a.Exec},
+		Unit:    &unit.Provider{Paths: a.Paths, Exec: a.Exec, Templates: tmpl, Force: a.Force},
+		Sudoers: &sudoers.Provider{Paths: a.Paths, Exec: a.Exec, Force: a.Force},
 		Runtime: &runtime.Provider{Paths: a.Paths},
 		Hooks:   a.hookRunner(),
 		PHP:     php,
@@ -326,13 +328,15 @@ func (a *App) buildProviders() (*providers, error) {
 			CertRef:     certs.CertificateFor,
 			CertDir:     certStore.Dir,
 			ProxyTarget: appProv.ProxyTarget,
+			Force:       a.Force,
 		},
-		Logrotate: &logrotate.Provider{Paths: a.Paths, Templates: tmpl, Config: a.Cfg},
+		Logrotate: &logrotate.Provider{Paths: a.Paths, Templates: tmpl, Config: a.Cfg, Force: a.Force},
 		Monitoring: &monitoring.Provider{
 			Paths: a.Paths, Cfg: a.Cfg, Exec: a.Exec, Templates: tmpl,
 			Store: a.Store, Keys: a.Keys,
 			DB: dbProv, AMQP: amqpProv, PHP: php,
 			WebEngine: eng.Name(), WebUnit: eng.Unit(),
+			Force: a.Force,
 		},
 		Engine: eng,
 	}, nil

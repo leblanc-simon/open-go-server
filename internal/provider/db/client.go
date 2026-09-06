@@ -25,7 +25,9 @@ type Client interface {
 	Databases(ctx context.Context) (map[string]bool, error)
 	// Users renvoie les comptes existants. Pour MySQL, la clé est « user@host ».
 	Users(ctx context.Context) (map[string]bool, error)
-	// Grants renvoie les privilèges observés d'un compte, normalisés.
+	// Grants renvoie les privilèges observés d'un compte, normalisés par base ;
+	// les privilèges de niveau serveur, s'il y en a, sont rendus sous
+	// GlobalGrantKey.
 	Grants(ctx context.Context, user, host string) (map[string]string, error)
 	// Extensions renvoie les extensions installées dans une base (PostgreSQL).
 	Extensions(ctx context.Context, database string) (map[string]bool, error)
@@ -46,6 +48,12 @@ var (
 
 // ErrUnavailable indique qu'un moteur n'est pas joignable.
 var ErrUnavailable = errors.New("moteur indisponible")
+
+// GlobalGrantKey est la clé sous laquelle Grants range les privilèges accordés
+// « ON *.* ». Ce n'est pas un nom de base : la liste blanche des identifiants
+// refuse l'astérisque, donc la réconciliation des comptes de projet, qui
+// interroge la carte par nom de base, ne la rencontre jamais.
+const GlobalGrantKey = "*"
 
 // FindMySQLSocket cherche le socket du serveur MySQL ou MariaDB.
 func FindMySQLSocket(prefix string) (string, bool) {

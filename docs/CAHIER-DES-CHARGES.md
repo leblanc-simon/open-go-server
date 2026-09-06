@@ -803,6 +803,17 @@ nettoyage manuel, et renvoie le code 1. Aucune tentative silencieuse.
 - L'empreinte SHA-256 du dernier contenu écrit est stockée en base. Si le fichier sur disque diverge à la
   fois du rendu attendu et de l'empreinte enregistrée, il a été **modifié à la main** : `apply` refuse et
   exige `--force` (qui sauvegarde l'original en `.ogs-bak-<horodatage>`).
+- La copie est déposée dans **`/var/lib/ogs/backups`** (0700 root), jamais à côté de l'original. Un
+  répertoire de configuration est toujours relu en entier par quelqu'un, et la copie qu'on y laisse ment à
+  ce lecteur : `/etc/logrotate.d` est chargé tout entier hors une liste de suffixes tabous où le nôtre ne
+  figure pas — la sauvegarde y devient une seconde rotation portant sur les mêmes journaux, et deux
+  directives pour un même chemin arrêtent la rotation de tout le parc ; `doctor` énumère `/etc/sudoers.d`
+  sur le préfixe `ogs-` et accuserait sans fin la copie ; l'importateur lit `sites-available` et proposerait
+  d'adopter une seconde fois un site déjà géré. Sortir du répertoire plutôt que choisir un suffixe ignoré :
+  la liste des tabous appartient à chaque démon et peut changer, l'emplacement ne dépend de personne. Le
+  répertoire commun est aussi ce qui rend l'écriture sûre — l'horodatage se devine à la seconde près, et une
+  copie déposée dans un répertoire qu'un non-root possède (le `.ssh` d'un projet, à la rotation de la clé de
+  déploiement) se ferait détourner par un lien posé d'avance à ce nom.
 - Les ressources vivantes (bases, queues, users) sont comparées par leurs attributs observés, pas par une
   simple présence.
 
@@ -1567,7 +1578,7 @@ Règles :
 - **Interpréteur** : toujours `/home/<host>/.bin/php`, jamais un binaire versionné (§7.5). Une bascule de
   version PHP ne réécrit donc aucun fichier cron.
 - **Anti-recouvrement** : `flock -n` par défaut, désactivable par tâche. Les verrous vivent dans
-  `/run/ogs/<id>/`, répertoire propre au projet (`0750 <id>:<id>`) créé par `/etc/tmpfiles.d/ogs.conf`
+  `/run/ogs/<id>/`, répertoire propre au projet (`0710 <id>:<id>`, §7.8) créé par `/etc/tmpfiles.d/ogs.conf`
   afin de survivre au redémarrage. C'est aussi là que vivent les sockets des applications non-PHP
   (§7.11), ce qui donne un seul répertoire d'exécution par projet, inscriptible par lui seul.
 - **Identité** : exécution sous l'utilisateur du projet.

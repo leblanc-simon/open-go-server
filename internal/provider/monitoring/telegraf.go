@@ -103,15 +103,18 @@ func (p *Provider) BuildTelegraf(projects []*model.Project, creds Credentials) (
 	return data, nil
 }
 
-// planTelegraf produit l'étape d'écriture du fragment d'entrées.
+// renderTelegraf rend le fragment d'entrées, et le contexte dont il est tiré.
 //
-// Le fichier porte le mot de passe du compte MySQL et celui du broker : il est
-// écrit en 0640, groupe de l'agent. C'est le même régime que celui qu'« ogs
-// harden » impose à /etc/telegraf (D56), et pour la même raison.
-func (p *Provider) planTelegraf(projects []*model.Project, creds Credentials, obs Observed) (*engine.Step, error) {
-	data, err := p.BuildTelegraf(projects, creds)
+// Les identifiants sont filtrés par sealedCredentials : le fragment ne porte que
+// des mots de passe **scellés**, c'est-à-dire posés sur le moteur. En porter un
+// autre serait doublement faux — l'agent échouerait à chaque collecte avec un mot
+// de passe que le moteur ignore, et, un mot de passe non scellé étant tiré au
+// hasard à chaque planification, le fichier serait réécrit à chaque apply sans
+// jamais converger.
+func (p *Provider) renderTelegraf(projects []*model.Project, creds Credentials) ([]byte, TelegrafData, error) {
+	data, err := p.BuildTelegraf(projects, p.sealedCredentials(creds))
 	if err != nil {
-		return nil, err
+		return nil, data, err
 	}
 	body, err := p.Templates.Render("telegraf/ogs.conf", map[string]any{
 		"Interval": data.Interval,
@@ -123,17 +126,46 @@ func (p *Provider) planTelegraf(projects []*model.Project, creds Credentials, ob
 		"Rabbit":   data.Rabbit,
 	})
 	if err != nil {
+		return nil, data, err
+	}
+	return fs.Render(p.header("monitoring/telegraf", "telegraf/ogs.conf", len(projects)), body, "#"), data, nil
+}
+
+// planTelegraf produit l'étape d'écriture du fragment d'entrées.
+//
+// Le fichier porte le mot de passe du compte MySQL et celui du broker : il est
+// écrit en 0640, groupe de l'agent. C'est le même régime que celui qu'« ogs
+// harden » impose à /etc/telegraf (D56), et pour la même raison.
+//
+// Le corps est **recalculé à l'application**, après les étapes de comptes qui la
+// précèdent dans le plan : c'est là, et là seulement, que le mot de passe d'un
+// compte tout juste créé devient scellé. Sans ce second calcul, l'entrée d'un
+// moteur n'apparaîtrait qu'à l'apply suivant. Le corps annoncé par « plan » est
+// donc celui de l'état courant des secrets — l'entrée d'un compte qui reste à
+// créer n'y figure pas.
+func (p *Provider) planTelegraf(projects []*model.Project, creds Credentials, obs Observed) (*engine.Step, error) {
+	content, data, err := p.renderTelegraf(projects, creds)
+	if err != nil {
 		return nil, err
 	}
-	content := fs.Render(p.header("monitoring/telegraf", "telegraf/ogs.conf", len(projects)), body, "#")
-
 	owner := fs.KeepOwner
 	if obs.TelegrafGroupOK {
 		owner = fs.Owner{UID: 0, GID: obs.TelegrafGroup}
 	}
 	summary := fmt.Sprintf("entrées Telegraf (%d pool(s), %d projet(s))", len(data.Pools), len(projects))
-	return p.fileStep("monitoring/telegraf", summary, p.Paths.TelegrafFile(),
-		content, 0o640, owner, "monitoring:telegraf")
+	return p.fileStep(managedFile{
+		resource: "monitoring/telegraf",
+		summary:  summary,
+		path:     p.Paths.TelegrafFile(),
+		content:  content,
+		mode:     0o640,
+		owner:    owner,
+		reload:   "monitoring:telegraf",
+		refresh: func() ([]byte, error) {
+			body, _, err := p.renderTelegraf(projects, creds)
+			return body, err
+		},
+	})
 }
 
 // PoolStatusPath expose le chemin de statut attendu dans un pool, pour que le

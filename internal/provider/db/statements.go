@@ -62,6 +62,79 @@ func mysqlPrivileges(p Privilege) string {
 	}
 }
 
+// mysqlObservedPrivileges rend le jeu attendu tel qu'il ressort de l'observation,
+// privilège par privilège. Pour « all », c'est un minimum vérifiable et non la
+// liste complète : « ALL PRIVILEGES » se relit développé, et la liste diffère
+// entre MySQL et MariaDB comme d'une version à l'autre — exiger l'égalité
+// rejouerait éternellement un GRANT déjà appliqué (même piège que D67).
+func mysqlObservedPrivileges(p Privilege) []string {
+	switch p {
+	case PrivCRUD:
+		return []string{"SELECT", "INSERT", "UPDATE", "DELETE"}
+	case PrivReadOnly:
+		return []string{"SELECT", "SHOW VIEW"}
+	default:
+		return []string{"SELECT", "INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "ALTER", "INDEX"}
+	}
+}
+
+// parseGrantSet découpe la chaîne rendue par SCHEMA_PRIVILEGES ou
+// USER_PRIVILEGES, où GROUP_CONCAT sépare les privilèges par des virgules.
+func parseGrantSet(observed string) map[string]bool {
+	out := map[string]bool{}
+	for _, p := range strings.Split(observed, ",") {
+		if p = strings.ToUpper(strings.TrimSpace(p)); p != "" {
+			out[p] = true
+		}
+	}
+	return out
+}
+
+// MySQLGrantsSatisfied compare les privilèges observés sur une base au jeu
+// demandé. La seule présence d'un privilège ne suffit pas : un passage de
+// « all » à « readonly » resterait un NoOp éternel, et le plan annoncerait un
+// état qu'il n'a jamais appliqué (§7.2).
+//
+// Les jeux bornés — crud, readonly — se comparent par égalité : tout privilège
+// en trop est un écart, c'est le sens même d'un jeu borné. « all » se compare par
+// inclusion, pour la raison donnée à mysqlObservedPrivileges.
+func MySQLGrantsSatisfied(observed string, p Privilege) bool {
+	if observed == "" {
+		return false
+	}
+	got := parseGrantSet(observed)
+	want := mysqlObservedPrivileges(p)
+	for _, w := range want {
+		if !got[w] {
+			return false
+		}
+	}
+	return p == PrivAll || len(got) == len(want)
+}
+
+// MySQLGrantsOverflow dit si les privilèges observés débordent le jeu demandé.
+// C'est la seule condition qui justifie un REVOKE : le GRANT de MySQL est
+// additif, donc une réduction de privilèges laisserait INSERT, UPDATE et DROP en
+// place — mais révoquer sans débordement ferait échouer la requête
+// (ER_NONEXISTING_GRANT) sur un compte qui n'a encore aucun privilège de base.
+// « all » ne déborde jamais : sa liste observée n'est pas stable d'un moteur à
+// l'autre, et l'y soumettre ferait osciller le plan.
+func MySQLGrantsOverflow(observed string, p Privilege) bool {
+	if observed == "" || p == PrivAll {
+		return false
+	}
+	want := map[string]bool{}
+	for _, w := range mysqlObservedPrivileges(p) {
+		want[w] = true
+	}
+	for g := range parseGrantSet(observed) {
+		if !want[g] {
+			return true
+		}
+	}
+	return false
+}
+
 // quoteMySQLIdent protège un identifiant MySQL. L'identifiant étant déjà passé
 // par la liste blanche, le doublement des accents graves est une précaution
 // supplémentaire plutôt qu'une nécessité.
@@ -105,6 +178,10 @@ type MySQLSpec struct {
 	Password   string
 	Privileges Privilege
 	AuthPlugin string
+	// Revoke fait précéder le GRANT d'une révocation. Il ne se décide pas ici
+	// mais à l'observation : GRANT est additif, et seule une réduction réelle du
+	// jeu demandé justifie de retirer d'abord ce qui est en place.
+	Revoke bool
 }
 
 // normalize complète les valeurs par défaut.
@@ -166,7 +243,17 @@ func CreateMySQL(spec MySQLSpec) (MySQLStatements, error) {
 	if err != nil {
 		return out, err
 	}
-	out.Grants = []string{grant, "FLUSH PRIVILEGES"}
+	if spec.Revoke {
+		// La révocation précède le grant, dans la même étape : elle n'a de sens que
+		// suivie de ce qui doit rester, et les deux requêtes séparées laisseraient
+		// une fenêtre où l'application n'aurait plus aucun droit.
+		revoke, err := RevokeMySQL(spec.Database, spec.User, spec.Host)
+		if err != nil {
+			return out, err
+		}
+		out.Grants = append(out.Grants, revoke)
+	}
+	out.Grants = append(out.Grants, grant, "FLUSH PRIVILEGES")
 	return out, nil
 }
 
@@ -450,21 +537,64 @@ func MonitoringMySQL(user, host, password string) ([]string, error) {
 		fmt.Sprintf("CREATE USER IF NOT EXISTS %s IDENTIFIED BY %s", account, quoteLiteral(password)),
 		fmt.Sprintf("ALTER USER %s IDENTIFIED BY %s", account, quoteLiteral(password)),
 		fmt.Sprintf("GRANT PROCESS, REPLICATION CLIENT ON *.* TO %s", account),
-		fmt.Sprintf("GRANT SELECT ON `performance_schema`.* TO %s", account),
+		// Le nom de base placé après ON est un motif : sans échappement, le
+		// privilège porterait aussi sur « performanceXschema ». Même règle que
+		// GrantMySQL (§3.3.5).
+		fmt.Sprintf("GRANT SELECT ON %s.* TO %s",
+			quoteMySQLIdent(naming.EscapeMySQLPattern(MonitoringMySQLSchema)), account),
 	}, nil
 }
 
-// MonitoringMySQLGrants énumère les privilèges attendus tels qu'ils ressortent
-// d'un SHOW GRANTS, chaque entrée donnant les orthographes acceptées.
+// MonitoringMySQLSchema est la seule base que le compte de supervision peut lire :
+// c'est de là que viennent presque toutes les métriques du moteur.
+const MonitoringMySQLSchema = "performance_schema"
+
+// MonitoringMySQLLegacyRevoke retire le privilège hérité du compte de
+// supervision. Les versions posant « GRANT SELECT ON `performance_schema`.* »
+// sans échappement accordaient un **motif**, où le souligné est un joker : le
+// compte lit aussi une base nommée « performanceXschema », qu'un projet adopté
+// peut porter — l'inverse de ce que promet D67. GRANT étant additif, la ligne de
+// mysql.db survit à tous les apply suivants : seul un REVOKE la retire, et il
+// vise le motif **littéral**, tel qu'il a été stocké.
+//
+// Elle ne figure pas dans MonitoringMySQL, dont chaque requête doit réussir :
+// celle-ci rend ER_NONEXISTING_GRANT partout où la ligne n'existe pas, c'est-à-dire
+// sur toute installation postérieure à l'échappement. Son échec est le cas
+// nominal, et l'appelant doit le traiter comme tel — la ligne héritée ne peut pas
+// être cherchée d'abord, la relecture des privilèges ramenant les deux motifs
+// sous la même clé (voir mysqlClient.Grants).
+func MonitoringMySQLLegacyRevoke(user, host string) (string, error) {
+	if err := checkIdentifier("utilisateur de supervision", user); err != nil {
+		return "", err
+	}
+	if host == "" {
+		host = "localhost"
+	}
+	return fmt.Sprintf("REVOKE SELECT ON %s.* FROM %s@%s",
+		quoteMySQLIdent(MonitoringMySQLSchema), quoteLiteral(user), quoteLiteral(host)), nil
+}
+
+// MonitoringMySQLGrants énumère les privilèges **globaux** attendus du compte de
+// supervision, chaque entrée donnant les orthographes acceptées.
 //
 // Il en faut plusieurs : **MariaDB rend « BINLOG MONITOR » là où MySQL rend
 // « REPLICATION CLIENT »**. Le GRANT est accepté sous les deux noms, mais la
 // relecture ne rend que le nom propre au moteur — comparer au seul libellé de
 // MySQL faisait voir un privilège manquant à chaque observation, et le plan
 // annonçait éternellement une correction qu'il venait d'appliquer.
+//
+// Ils se comparent à la seule entrée GlobalGrantKey de Grants : accordés
+// « ON *.* », ils ne figurent dans aucune ligne par base.
 var MonitoringMySQLGrants = [][]string{
 	{"PROCESS"},
 	{"REPLICATION CLIENT", "BINLOG MONITOR"},
+}
+
+// MonitoringMySQLSchemaGrants énumère les privilèges attendus **par base**. Les
+// chercher dans l'ensemble concaténé rendrait un SELECT accordé sur n'importe
+// quelle base suffisant — y compris celle d'un projet.
+var MonitoringMySQLSchemaGrants = map[string][]string{
+	MonitoringMySQLSchema: {"SELECT"},
 }
 
 // MonitoringPostgres produit les requêtes du rôle de supervision. Il n'a pas de

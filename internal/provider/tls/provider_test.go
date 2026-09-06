@@ -2,6 +2,7 @@ package tls
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -12,6 +13,7 @@ import (
 	"leblanc.io/open-go-server/internal/model"
 	"leblanc.io/open-go-server/internal/naming"
 	"leblanc.io/open-go-server/internal/store"
+	"leblanc.io/open-go-server/internal/template"
 )
 
 func newProvider(t *testing.T) *Provider {
@@ -353,5 +355,129 @@ func TestRenewDoesNotCreateMissingCertificates(t *testing.T) {
 	}
 	if len(done) != 1 {
 		t.Errorf("--force doit émettre : %v", done)
+	}
+}
+
+func TestUniteDeRenouvellementModifieeALaMain(t *testing.T) {
+	// Le timer de renouvellement est la seule chose qui renouvelle les
+	// certificats du parc : une périodicité changée à la main ne doit pas
+	// disparaître sans un mot (§6.4).
+	p := newProvider(t)
+	tmpl := template.New(p.Paths.TemplatesDir())
+	ctx := context.Background()
+	steps, err := p.RenewUnitPlan(tmpl, "/usr/bin/ogs", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range steps {
+		if err := s.Apply(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	path := filepath.Join(p.Paths.SystemdDir(), "ogs-renew.timer")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, append(data, []byte("X-Ajout-Manuel=vrai\n")...), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	steps, err = p.RenewUnitPlan(tmpl, "/usr/bin/ogs", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var refus *engine.Step
+	for _, s := range steps {
+		if strings.Contains(s.Summary, "modifié hors ogs") {
+			refus = s
+		}
+	}
+	if refus == nil {
+		t.Fatalf("la modification manuelle doit être signalée :\n%v", steps)
+	}
+	if err := refus.Apply(ctx); err == nil {
+		t.Error("l'écrasement doit être refusé sans --force")
+	}
+	if intact, _ := os.ReadFile(path); !strings.Contains(string(intact), "X-Ajout-Manuel") {
+		t.Error("le refus ne doit rien écrire")
+	}
+
+	// --force : écrasement, précédé de la sauvegarde.
+	p.Force = true
+	steps, err = p.RenewUnitPlan(tmpl, "/usr/bin/ogs", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var forcée *engine.Step
+	for _, s := range steps {
+		if strings.Contains(s.Summary, "écrasement forcé") {
+			forcée = s
+		}
+	}
+	if forcée == nil {
+		t.Fatalf("le plan doit annoncer l'écrasement forcé :\n%v", steps)
+	}
+	if err := forcée.Apply(ctx); err != nil {
+		t.Fatalf("l'écrasement forcé doit réussir : %v", err)
+	}
+	if after, _ := os.ReadFile(path); strings.Contains(string(after), "X-Ajout-Manuel") {
+		t.Error("l'unité doit avoir été réécrite")
+	}
+	if restes, _ := filepath.Glob(path + ".ogs-bak-*"); len(restes) != 0 {
+		t.Errorf("aucune sauvegarde ne doit rester dans %s : %v", filepath.Dir(path), restes)
+	}
+	baks, _ := filepath.Glob(filepath.Join(p.Paths.BackupsDir(), filepath.Base(path)+".ogs-bak-*"))
+	if len(baks) != 1 {
+		t.Fatalf("une sauvegarde attendue dans %s, %d trouvée(s)", p.Paths.BackupsDir(), len(baks))
+	}
+	if saved, _ := os.ReadFile(baks[0]); !strings.Contains(string(saved), "X-Ajout-Manuel") {
+		t.Error("la sauvegarde doit contenir l'original")
+	}
+}
+
+func TestCompensationRendLUniteDeRenouvellementPrecedente(t *testing.T) {
+	// La compensation supprimait le fichier : sur une mise à jour, le rollback
+	// laissait donc le parc sans rien pour renouveler ses certificats.
+	p := newProvider(t)
+	tmpl := template.New(p.Paths.TemplatesDir())
+	ctx := context.Background()
+	steps, err := p.RenewUnitPlan(tmpl, "/usr/bin/ogs", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range steps {
+		if err := s.Apply(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	path := filepath.Join(p.Paths.SystemdDir(), "ogs-renew.timer")
+	avant, _ := os.ReadFile(path)
+
+	steps, err = p.RenewUnitPlan(tmpl, "/usr/bin/ogs", "*-*-* 04:00:00")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var maj *engine.Step
+	for _, s := range steps {
+		if s.Action == engine.Update && strings.Contains(s.Summary, "timer") {
+			maj = s
+		}
+	}
+	if maj == nil {
+		t.Fatalf("une mise à jour du timer était attendue :\n%v", steps)
+	}
+	if err := maj.Apply(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := maj.Compensate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	après, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("la compensation ne doit pas supprimer un timer en place : %v", err)
+	}
+	if string(après) != string(avant) {
+		t.Error("la compensation doit rendre le timer précédent")
 	}
 }

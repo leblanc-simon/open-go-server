@@ -61,6 +61,17 @@ func BinaryPath(root, runtime, version string) string {
 	return ""
 }
 
+// LinkBundle est le nom du lien vers le lanceur de Ruby. Une unité n'invoque que
+// des liens de .bin/ (D30) : le CDC prévoit déjà ce pluriel pour Node (npm, npx).
+const LinkBundle = "bundle"
+
+// BundlePath renvoie le chemin de « bundle » d'une version de Ruby installée.
+// bundler est une gem par défaut depuis Ruby 2.6 : rbenv le pose dans le même
+// bin que l'interpréteur.
+func BundlePath(root, version string) string {
+	return filepath.Join(filepath.Dir(BinaryPath(root, RuntimeRuby, version)), LinkBundle)
+}
+
 // LinkName renvoie le nom du lien dans .bin pour un runtime.
 func LinkName(runtime string) string {
 	if runtime == RuntimeGo {

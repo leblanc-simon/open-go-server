@@ -10,6 +10,7 @@ import (
 
 	"leblanc.io/open-go-server/internal/config"
 	"leblanc.io/open-go-server/internal/model"
+	"leblanc.io/open-go-server/internal/naming"
 	"leblanc.io/open-go-server/internal/provider/php"
 	"leblanc.io/open-go-server/internal/spec"
 )
@@ -40,7 +41,7 @@ func installCompletions(root *cobra.Command, app *App) {
 			_ = cmd.RegisterFlagCompletionFunc("kind", staticComplete(kinds()))
 		}
 		if f := cmd.Flags().Lookup("env"); f != nil {
-			_ = cmd.RegisterFlagCompletionFunc("env", staticComplete([]string{"prod", "staging"}))
+			_ = cmd.RegisterFlagCompletionFunc("env", staticComplete(envValues()))
 		}
 	}
 }
@@ -198,6 +199,21 @@ func kinds() []string {
 		string(model.KindGo), string(model.KindNode),
 		string(model.KindPython), string(model.KindRuby),
 	}
+}
+
+// envValues énumère les environnements proposés pour « --env ». La liste vient
+// de naming.Envs, que naming.ParseEnv parcourt pour valider (D24) : c'est le
+// seul moyen que la complétion ne dérive pas de ce qui est accepté. Recopiée
+// ici, elle avait fait proposer « staging », que naming.ParseEnv refuse — la
+// complétion suggérait la faute de frappe qu'elle est censée éviter, et cachait
+// « prep », la seule valeur utile à proposer.
+func envValues() []string {
+	envs := naming.Envs()
+	out := make([]string, 0, len(envs))
+	for _, e := range envs {
+		out = append(out, string(e))
+	}
+	return out
 }
 
 func staticComplete(values []string) func(*cobra.Command, []string, string) ([]string, cobra.ShellCompDirective) {

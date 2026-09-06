@@ -33,6 +33,28 @@ type Provider struct {
 	Now func() time.Time
 	// Versions est la liste des versions détectées ; recalculée si nulle.
 	Versions []Version
+	// Force autorise l'écrasement d'un fichier qu'ogs n'a pas écrit, après
+	// sauvegarde horodatée (§6.4). Sans lui, le refus n'aurait aucune porte de
+	// sortie et l'apply du projet resterait bloqué.
+	Force bool
+}
+
+// refusStep produit l'étape qui refuse d'écraser un fichier qu'ogs n'a pas
+// écrit. Le message nomme la porte de sortie — elle existe désormais — et
+// distingue les deux causes : un fichier « non géré » n'a jamais porté la marque
+// d'ogs, c'est ce que rencontre un site adopté à son premier apply ; un fichier
+// « modifié hors ogs » a été retouché après avoir été généré.
+func refusStep(resource, summary, path, backups string, state fs.State) *engine.Step {
+	libelle, motif := "modifié hors ogs", "a été modifié en dehors d'ogs"
+	if state == fs.StateForeign {
+		libelle, motif = "non géré par ogs", "existe déjà sans porter la marque d'ogs"
+	}
+	s := engine.NewStep(resource, engine.Update, summary+" — fichier "+libelle)
+	s.Apply = func(context.Context) error {
+		return fmt.Errorf("%s %s : relancer avec --force pour l'écraser "+
+			"(l'original sera sauvegardé dans %s)", path, motif, backups)
+	}
+	return s
 }
 
 // Name identifie le provider.
@@ -276,25 +298,55 @@ func (p *Provider) PlanStale(_ context.Context, proj *model.Project, obs Observe
 func (p *Provider) poolStep(proj *model.Project, bp *PoolPlan) *engine.Step {
 	resource := "php/pool/" + bp.Name
 	summary := fmt.Sprintf("pool php %s %s (n° %d, %s)", bp.Version, bp.Name, bp.Number, describeListen(bp))
-	switch bp.State {
+	state, forced := bp.State, false
+	if (state == fs.StateHandEdited || state == fs.StateForeign) && p.Force {
+		// --force : l'étape redevient une mise à jour ordinaire, annoncée comme
+		// telle par « plan » avant qu'« apply » ne l'exécute. La sauvegarde, elle,
+		// n'a lieu qu'à l'application : « plan » et « diff » n'écrivent rien.
+		state, forced = fs.StateOutdated, true
+		summary += " — écrasement forcé (sauvegarde dans " + p.Paths.BackupsDir() + ")"
+	}
+	switch state {
 	case fs.StateCurrent:
 		return engine.NewStep(resource, engine.NoOp, summary)
 	case fs.StateHandEdited, fs.StateForeign:
-		s := engine.NewStep(resource, engine.Update, summary+" — fichier modifié hors ogs")
-		s.Apply = func(context.Context) error {
-			return fmt.Errorf("%s a été modifié en dehors d'ogs : relancer avec --force pour l'écraser "+
-				"(une sauvegarde horodatée sera créée)", bp.Path)
-		}
-		return s
+		return refusStep(resource, summary, bp.Path, p.Paths.BackupsDir(), state)
 	}
 	action := engine.Create
-	if bp.State == fs.StateOutdated {
+	if state == fs.StateOutdated {
 		action = engine.Update
 	}
 	s := engine.NewStep(resource, action, summary)
 	s.Diff = func() (string, error) { return diffText(bp.Path, bp.Content) }
-	s.Apply = func(ctx context.Context) error { return p.writePool(ctx, bp) }
-	s.Compensate = func(context.Context) error { return os.Remove(bp.Path) }
+	// Le corps précédent est relevé à l'application et non au plan : l'état du
+	// disque a pu changer entre les deux.
+	var previous []byte
+	var hadPrevious bool
+	s.Apply = func(ctx context.Context) error {
+		if data, err := os.ReadFile(bp.Path); err == nil {
+			previous, hadPrevious = data, true
+		}
+		if forced {
+			// Écraser le travail d'un exploitant sans en garder trace rend
+			// l'opération irréversible : la sauvegarde précède l'écriture.
+			if _, err := fs.BackupTo(bp.Path, p.Paths.BackupsDir(), p.now()); err != nil && !os.IsNotExist(err) {
+				return err
+			}
+		}
+		return p.writePool(ctx, bp)
+	}
+	// La compensation rend le pool qui était servi. Le supprimer serait juste
+	// pour une création, destructeur pour une mise à jour — un écrasement forcé
+	// en particulier, dont le fichier écrasé portait l'intention de quelqu'un.
+	s.Compensate = func(context.Context) error {
+		if hadPrevious {
+			return fs.WriteAtomic(bp.Path, previous, 0o644, fs.KeepOwner)
+		}
+		if err := os.Remove(bp.Path); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		return nil
+	}
 	// Le rechargement est groupé en fin d'application : une seule fois par version.
 	s.Reload = []string{"php:" + bp.Version}
 	return s

@@ -190,7 +190,12 @@ type State struct {
 	// Verdict résume la comparaison : conforme, à restreindre, déjà plus strict,
 	// absent, ou refusé.
 	Verdict string `json:"verdict" yaml:"verdict"`
-	// Loose énumère les fichiers trop permissifs trouvés sous le chemin.
+	// Loose énumère les fichiers à reprendre sous le chemin : ceux dont le mode
+	// est plus permissif que la cible, et ceux qui n'en portent pas le groupe
+	// (cf. looseFiles). Un fichier plus strict que la cible peut donc y figurer —
+	// c'est alors son seul groupe qui est en cause, et son mode restera tel quel :
+	// le nommer « trop permissif » enverrait chercher une permissivité qui
+	// n'existe pas.
 	Loose []string `json:"loose,omitempty" yaml:"loose,omitempty"`
 }
 
@@ -302,8 +307,13 @@ func (p *Provider) observeOne(t Target) State {
 	return st
 }
 
-// looseFiles énumère les fichiers plus permissifs que la cible.
+// looseFiles énumère les fichiers à reprendre : ceux plus permissifs que la
+// cible, et ceux qui n'en portent pas le groupe. Le groupe compte autant que le
+// mode — un fichier déjà en 0640 mais resté root:root est illisible à l'agent qui
+// le lit sous sa propre identité (D56) —, et le juger sur le seul mode le dirait
+// « conforme » à jamais : un parc déjà durci ne serait jamais réparé.
 func (p *Provider) looseFiles(t Target, root string) []string {
+	gid := p.targetGID(t)
 	var out []string
 	walk := func(dir string) {
 		entries, err := os.ReadDir(dir)
@@ -318,7 +328,8 @@ func (p *Provider) looseFiles(t Target, root string) []string {
 			if err != nil {
 				continue
 			}
-			if looser(info.Mode().Perm(), fileTarget(info.Mode().Perm(), t.FileMode)) {
+			if looser(info.Mode().Perm(), fileTarget(info.Mode().Perm(), t.FileMode)) ||
+				(gid >= 0 && fileGID(info) != gid) {
 				out = append(out, filepath.Join(dir, e.Name()))
 			}
 		}
@@ -369,7 +380,11 @@ func (p *Provider) summary(st State) string {
 			OwnerLabel(st.Target)))
 	}
 	if n := len(st.Loose); n > 0 {
-		quoi = append(quoi, fmt.Sprintf("%d fichier(s) → %04o", n, st.Target.FileMode))
+		detail := fmt.Sprintf("%d fichier(s) → %04o", n, st.Target.FileMode)
+		if st.Target.Group != "" {
+			detail += " :" + st.Target.Group
+		}
+		quoi = append(quoi, detail)
 	}
 	return st.Target.Path + " : " + strings.Join(quoi, ", ")
 }
@@ -383,12 +398,37 @@ func (p *Provider) apply(st State) error {
 			return err
 		}
 	}
+	gid := p.targetGID(st.Target)
 	for _, f := range st.Loose {
 		info, err := os.Lstat(f)
 		if err != nil || info.Mode()&os.ModeSymlink != 0 {
 			continue
 		}
-		if err := os.Chmod(f, fileTarget(info.Mode().Perm(), st.Target.FileMode)); err != nil {
+		// Le groupe avant le mode. Fermer un fichier à 0640 sans lui donner le
+		// groupe du service le rend illisible au démon qui le lit sous sa propre
+		// identité : c'est tout l'équilibre de /etc/telegraf, /etc/rabbitmq et
+		// /etc/redis (D56), et telegraf, dans ce cas, démarre, ne collecte rien et
+		// se tait. Le propriétaire, lui, est laissé en place : le prendre à un
+		// service lui retirerait le droit de réécrire sa propre configuration —
+		// redis.conf après un CONFIG REWRITE. Le chown efface au passage le bit
+		// setgid d'un fichier exécutable par son groupe, et ogs ne le repose pas :
+		// fileTarget part d'un Perm() masqué à 0o777, où ni setuid ni setgid ne
+		// figurent, et le mode visé ne les porte pas davantage. C'est voulu — ces
+		// bits n'ont rien à faire sur un fichier de configuration —, et les rendre
+		// reviendrait à desserrer.
+		if gid >= 0 && fileGID(info) != gid {
+			if err := os.Chown(f, -1, gid); err != nil && os.Geteuid() == 0 {
+				return err
+			}
+		}
+		// On ne desserre jamais, ici comme pour les répertoires : un fichier déjà
+		// plus strict que la cible reste tel quel. Sans ce contrôle, un fichier
+		// retenu pour son seul groupe se verrait rouvrir son mode.
+		want := fileTarget(info.Mode().Perm(), st.Target.FileMode)
+		if !looser(info.Mode().Perm(), want) {
+			continue
+		}
+		if err := os.Chmod(f, want); err != nil {
 			return err
 		}
 	}
@@ -415,6 +455,22 @@ func (p *Provider) apply(st State) error {
 // sous /etc/ogs, et les priver de ce bit les ferait refuser par ogs lui-même.
 func fileTarget(current, target os.FileMode) os.FileMode {
 	return target | (current & 0o110)
+}
+
+// targetGID résout le groupe de la cible, ou rend -1. Un groupe vide veut dire
+// « laisser en place » (cf. Target.Group), et un groupe introuvable signifie un
+// service non installé : dans les deux cas il n'y a rien à poser, et le silence
+// est la bonne réponse — c'est aussi le cas du mode préfixé, où les comptes
+// système n'existent pas.
+func (p *Provider) targetGID(t Target) int {
+	if t.Group == "" {
+		return -1
+	}
+	_, gid, err := p.lookup("", t.Group)
+	if err != nil {
+		return -1
+	}
+	return gid
 }
 
 func (p *Provider) lookup(owner, group string) (int, int, error) {

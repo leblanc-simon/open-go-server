@@ -26,6 +26,7 @@ import (
 	"leblanc.io/open-go-server/internal/provider/amqp"
 	"leblanc.io/open-go-server/internal/provider/db"
 	"leblanc.io/open-go-server/internal/provider/php"
+	"leblanc.io/open-go-server/internal/provider/system"
 	"leblanc.io/open-go-server/internal/secret"
 	"leblanc.io/open-go-server/internal/store"
 	"leblanc.io/open-go-server/internal/template"
@@ -56,6 +57,11 @@ type Provider struct {
 	// des projets et l'entrée de statut.
 	WebEngine string
 	WebUnit   string
+
+	// Force autorise l'écrasement d'un fichier modifié à la main (§6.4). Sans
+	// elle, l'apply refuse — les deux fichiers de supervision sont recalculés en
+	// entier, et écraser sans le dire perdrait le travail de l'exploitant.
+	Force bool
 
 	Now func() time.Time
 }
@@ -121,6 +127,12 @@ func (p *Provider) enabled(decide func() (bool, bool), dir string, simulated boo
 
 // Plan calcule les étapes de supervision : d'abord les comptes, dont les mots de
 // passe alimentent le fragment, puis les deux fichiers.
+//
+// Un outil désactivé ne laisse pas derrière lui le fichier d'un apply précédent :
+// il continuerait de s'appliquer — prisons comprises — et ne serait plus jamais
+// recalculé, pas même à la suppression d'un projet, alors même que D68 fait de ce
+// recalcul un invariant. C'est la symétrie du vhost d'état, qui sait déjà se
+// retirer.
 func (p *Provider) Plan(ctx context.Context, projects []*model.Project, obs Observed) ([]*engine.Step, error) {
 	var steps []*engine.Step
 	if obs.TelegrafPresent {
@@ -132,6 +144,10 @@ func (p *Provider) Plan(ctx context.Context, projects []*model.Project, obs Obse
 			return nil, err
 		}
 		steps = append(steps, step)
+	} else if step := p.removeStep("monitoring/telegraf",
+		"retrait des entrées Telegraf (supervision désactivée)",
+		p.Paths.TelegrafFile(), "monitoring:telegraf"); step != nil {
+		steps = append(steps, step)
 	}
 	if obs.Fail2banPresent {
 		step, err := p.planFail2ban(projects)
@@ -139,53 +155,184 @@ func (p *Provider) Plan(ctx context.Context, projects []*model.Project, obs Obse
 			return nil, err
 		}
 		steps = append(steps, step)
+	} else if step := p.removeStep("monitoring/fail2ban",
+		"retrait des prisons fail2ban (supervision désactivée)",
+		p.Paths.Fail2banJailFile(), "monitoring:fail2ban"); step != nil {
+		steps = append(steps, step)
 	}
 	return steps, nil
 }
 
-// fileStep construit l'étape d'écriture d'un fichier géré : même mécanique que
-// pour logrotate — inspection par empreinte, diff unifié, compensation par
-// restauration de l'ancien contenu.
-func (p *Provider) fileStep(resource, summary, path string, content []byte,
-	mode os.FileMode, owner fs.Owner, reload string) (*engine.Step, error) {
-
-	state, err := fs.Inspect(path, content)
+// removeStep retire un fichier de supervision devenu sans objet. Seul le fichier
+// d'ogs est retiré, jamais le répertoire : il appartient à la distribution, et
+// les fichiers voisins à l'administrateur.
+func (p *Provider) removeStep(resource, summary, path, reload string) *engine.Step {
+	info, err := os.Stat(path)
 	if err != nil {
-		return nil, err
+		return nil
 	}
-	if state == fs.StateCurrent {
-		return engine.NewStep(resource, engine.NoOp, summary), nil
-	}
-	action := engine.Create
-	if state != fs.StateAbsent {
-		action = engine.Update
-	}
-	s := engine.NewStep(resource, action, summary)
-	s.Diff = func() (string, error) {
-		current, err := os.ReadFile(path)
-		if err != nil {
-			return "nouveau fichier " + path, nil
-		}
-		return fs.UnifiedDiff(string(current), string(content), path), nil
-	}
+	s := engine.NewStep(resource, engine.Delete, summary)
+	// Non critique, comme le reste de la supervision : un fichier qu'on n'arrive
+	// pas à retirer ne doit pas faire échouer un déploiement.
+	s.Critical = false
+	s.Diff = func() (string, error) { return "suppression de " + path, nil }
+	mode, owner := info.Mode().Perm(), fileOwner(info)
 	var previous []byte
 	s.Apply = func(context.Context) error {
 		if data, err := os.ReadFile(path); err == nil {
 			previous = data
 		}
-		if err := fs.EnsureDir(filepath.Dir(path), 0o755, fs.KeepOwner); err != nil {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 			return err
 		}
-		return fs.WriteAtomic(path, content, mode, owner)
+		return nil
 	}
 	s.Compensate = func(context.Context) error {
 		if previous == nil {
-			return os.Remove(path)
+			return nil
 		}
+		// Mode et propriétaire sont relevés avant le retrait, non redevinés : le
+		// fragment Telegraf est en 0640 groupe de l'agent, et le restaurer en
+		// root:root le rendrait illisible à celui qui doit le lire.
 		return fs.WriteAtomic(path, previous, mode, owner)
 	}
 	s.Reload = []string{reload}
+	return s
+}
+
+// fileOwner relève le propriétaire d'un fichier existant, ou laisse le
+// propriétaire inchangé lorsque le système ne le rend pas.
+func fileOwner(info os.FileInfo) fs.Owner {
+	if uid, gid, ok := system.OwnerOf(info); ok {
+		return fs.Owner{UID: uid, GID: gid}
+	}
+	return fs.KeepOwner
+}
+
+// managedFile décrit un fichier de supervision géré par ogs.
+type managedFile struct {
+	resource string
+	summary  string
+	path     string
+	content  []byte
+	mode     os.FileMode
+	owner    fs.Owner
+	reload   string
+
+	// refresh recalcule le corps au moment de l'application, lorsqu'il dépend de
+	// ce que les étapes précédentes ont fait. Le fragment de l'agent est dans ce
+	// cas : il porte les mots de passe des comptes de supervision, qui ne sont
+	// scellés qu'à l'application de leur étape. Absent, le corps calculé au plan
+	// est écrit tel quel.
+	refresh func() ([]byte, error)
+}
+
+// fileStep construit l'étape d'écriture d'un fichier géré : même mécanique que
+// pour logrotate — inspection par empreinte, diff unifié, compensation par
+// restauration de l'ancien contenu, et refus d'écraser ce qu'un exploitant a
+// retouché (§6.4).
+func (p *Provider) fileStep(f managedFile) (*engine.Step, error) {
+	state, err := fs.Inspect(f.path, f.content)
+	if err != nil {
+		return nil, err
+	}
+	summary, forced := f.summary, false
+	switch state {
+	case fs.StateCurrent:
+		return engine.NewStep(f.resource, engine.NoOp, summary), nil
+	case fs.StateHandEdited, fs.StateForeign:
+		// Ces deux fichiers sont recalculés en entier à chaque apply : une ligne
+		// ajoutée à la main y disparaîtrait sans un mot, et sans copie. C'est
+		// d'autant moins acceptable pour les prisons de fail2ban, où la retouche
+		// porte sur ce qui bannit des adresses.
+		if !p.Force {
+			return refusStep(f.resource, summary, f.path, p.backupPattern(f.path), state), nil
+		}
+		// --force : l'étape redevient une mise à jour ordinaire, annoncée comme
+		// telle par « plan ». La sauvegarde n'a lieu qu'à l'application : « plan »
+		// et « diff » n'écrivent rien.
+		forced = true
+		state = fs.StateOutdated
+		summary += " — écrasement forcé (sauvegarde " + p.backupPattern(f.path) + ")"
+	}
+	action := engine.Create
+	if state != fs.StateAbsent {
+		action = engine.Update
+	}
+	s := engine.NewStep(f.resource, action, summary)
+	s.Diff = func() (string, error) {
+		current, err := os.ReadFile(f.path)
+		if err != nil {
+			return "nouveau fichier " + f.path, nil
+		}
+		return fs.UnifiedDiff(string(current), string(f.content), f.path), nil
+	}
+	var previous []byte
+	s.Apply = func(context.Context) error {
+		content := f.content
+		if f.refresh != nil {
+			refreshed, err := f.refresh()
+			if err != nil {
+				return err
+			}
+			content = refreshed
+		}
+		if data, err := os.ReadFile(f.path); err == nil {
+			previous = data
+		}
+		if forced {
+			// Écraser le travail d'un exploitant sans en garder trace rend
+			// l'opération irréversible : la sauvegarde précède l'écriture, et sort du
+			// répertoire (voir backupDir).
+			if _, err := fs.BackupTo(f.path, p.backupDir(), p.now()); err != nil && !os.IsNotExist(err) {
+				return err
+			}
+		}
+		if err := fs.EnsureDir(filepath.Dir(f.path), 0o755, fs.KeepOwner); err != nil {
+			return err
+		}
+		return fs.WriteAtomic(f.path, content, f.mode, f.owner)
+	}
+	s.Compensate = func(context.Context) error {
+		if previous == nil {
+			return os.Remove(f.path)
+		}
+		return fs.WriteAtomic(f.path, previous, f.mode, f.owner)
+	}
+	s.Reload = []string{f.reload}
 	return s, nil
+}
+
+// refusStep refuse d'écraser un fichier qu'ogs n'a pas écrit lui-même, et dit
+// comment passer outre : §6.4 veut le refus, pas la surprise.
+func refusStep(resource, summary, path, sauvegarde string, state fs.State) *engine.Step {
+	libelle, motif := "modifié hors ogs", "a été modifié en dehors d'ogs"
+	if state == fs.StateForeign {
+		libelle, motif = "non géré par ogs", "existe déjà sans porter la marque d'ogs"
+	}
+	s := engine.NewStep(resource, engine.Update, summary+" — fichier "+libelle)
+	// Non critique, comme le reste de la supervision : un fragment qu'on refuse
+	// d'écraser ne doit pas faire compenser le déploiement d'un site.
+	s.Critical = false
+	s.Apply = func(context.Context) error {
+		return fmt.Errorf("%s %s : relancer avec --force pour l'écraser "+
+			"(l'original sera sauvegardé en %s)", path, motif, sauvegarde)
+	}
+	return s
+}
+
+// backupDir est le répertoire où atterrit la sauvegarde d'un écrasement forcé.
+// Elle ne peut pas rester à côté de l'original : Telegraf et fail2ban lisent
+// leur répertoire de fragments en entier, et la liste des suffixes que chacun
+// ignore lui appartient — elle peut changer sous nos pieds, l'emplacement ne
+// dépend de personne. Une copie chargée serait une seconde configuration, active
+// et invisible : des prisons en double, ou une entrée de collecte de plus.
+func (p *Provider) backupDir() string { return filepath.Join(p.Paths.Lib(), "backups") }
+
+// backupPattern nomme l'emplacement exact de la copie, horodatage excepté :
+// l'exploitant doit retrouver son fichier sans avoir à deviner où il est parti.
+func (p *Provider) backupPattern(path string) string {
+	return filepath.Join(p.backupDir(), filepath.Base(path)) + ".ogs-bak-<horodatage>"
 }
 
 // header compose l'en-tête des fichiers générés.

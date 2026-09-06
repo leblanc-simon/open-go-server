@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -286,5 +287,99 @@ func TestACMEFailureBackoff(t *testing.T) {
 	}
 	if _, paused, _ := s.ACMEPause(key); paused {
 		t.Error("le succès doit lever la suspension")
+	}
+}
+
+// TestOuvertureRestreintLeJournal vérifie que le journal WAL et son index ne sont
+// pas lisibles par tous : ils vivent dans /var/lib/ogs, traversable à dessein
+// (0751, pour le challenge ACME), et portent les pages récemment écrites —
+// inventaire du parc et journal d'audit compris. SQLite calque leur mode sur
+// celui de la base, qu'il faut donc poser avant la première écriture.
+//
+// L'umask est fixé explicitement, et le test ne tourne pas en parallèle : il est
+// global au processus, et un verdict qui en dépendrait ne vaudrait rien.
+func TestOuvertureRestreintLeJournal(t *testing.T) {
+	ancien := syscall.Umask(0o022)
+	defer syscall.Umask(ancien)
+
+	chemin := filepath.Join(t.TempDir(), "state.db")
+	s, err := Open(chemin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	// Une écriture, pour que le journal existe réellement.
+	if err := s.RecordFile("/etc/apache2/sites-available/ogs-shopfr.conf",
+		"", "web/vhost", "abc", "0644"); err != nil {
+		t.Fatal(err)
+	}
+	vu := false
+	for _, suffixe := range []string{"", "-wal", "-shm"} {
+		info, err := os.Stat(chemin + suffixe)
+		if err != nil {
+			continue
+		}
+		if suffixe != "" {
+			vu = true
+		}
+		if info.Mode().Perm() != 0o600 {
+			t.Errorf("%s : mode %04o, 0600 attendu", filepath.Base(chemin+suffixe), info.Mode().Perm())
+		}
+	}
+	if !vu {
+		t.Fatal("aucun fichier annexe créé : le test n'éprouve rien")
+	}
+}
+
+// TestOuvertureRattrapeUnJournalAbandonne : un processus tué laisse son journal
+// derrière lui, avec le mode qu'il avait à sa création ; SQLite le rouvre tel
+// quel et ne le corrige jamais. Le journal est ici recopié pendant que la base
+// est ouverte, puis remis en place après la fermeture : c'est l'état que laisse
+// un arrêt brutal.
+//
+// Le mode du journal fabriqué est posé après l'écriture et vérifié avant
+// l'ouverture : celui que demande os.WriteFile est rogné par l'umask ambiant, et
+// sous un umask 077 — poste durci, unité systemd portant UMask=0077 — le journal
+// naîtrait en 0600, où le test passerait sans rien éprouver.
+func TestOuvertureRattrapeUnJournalAbandonne(t *testing.T) {
+	chemin := filepath.Join(t.TempDir(), "state.db")
+	s, err := Open(chemin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RecordFile("/x", "", "r", "f", "0644"); err != nil {
+		t.Fatal(err)
+	}
+	journal, err := os.ReadFile(chemin + "-wal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(journal) == 0 {
+		t.Fatal("journal vide : le test n'éprouve rien")
+	}
+	s.Close()
+	if err := os.WriteFile(chemin+"-wal", journal, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(chemin+"-wal", 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if info, err := os.Stat(chemin + "-wal"); err != nil {
+		t.Fatal(err)
+	} else if info.Mode().Perm() != 0o644 {
+		t.Fatalf("journal fabriqué en %04o : le test n'éprouve rien", info.Mode().Perm())
+	}
+
+	s2, err := Open(chemin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	info, err := os.Stat(chemin + "-wal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Errorf("journal abandonné : mode %04o, 0600 attendu", info.Mode().Perm())
 	}
 }

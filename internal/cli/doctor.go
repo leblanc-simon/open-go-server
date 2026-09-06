@@ -7,6 +7,7 @@ import (
 	osexec "os/exec"
 	"os/user"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -24,6 +25,10 @@ import (
 	"leblanc.io/open-go-server/internal/provider/system"
 	"leblanc.io/open-go-server/internal/validate"
 )
+
+// sudoersFile est la racine de la politique sudo. Elle n'est pas dérivée du
+// préfixe : le contrôle qui la lit ne vaut que sur un système réel.
+const sudoersFile = "/etc/sudoers"
 
 // check est le résultat d'un contrôle de diagnostic.
 type check struct {
@@ -166,6 +171,30 @@ func (a *App) runChecks(ctx context.Context) []check {
 	} else {
 		add("privilèges", "ok", fmt.Sprintf("uid %d", os.Getuid()), "")
 	}
+
+	// Journaux de la base d'état : le mode est RELEVÉ avant toute ouverture —
+	// store.Open les remet en 0600, et regarder après reviendrait à taire ce que
+	// « doctor » a trouvé sur le disque —, mais le compte rendu vient APRÈS, une
+	// fois su ce que cette exécution a corrigé. Annoncer un échec et un « chmod »
+	// devenu sans effet ferait courir l'exploitant après une anomalie levée, et
+	// donnerait deux verdicts différents à deux exécutions de suite.
+	journaux := a.stateJournalModes()
+
+	// Base d'état : les contrôles qui portent sur les secrets en dépendent, et
+	// elle n'est ouverte nulle part sur le chemin de « doctor ». Elle ne l'est que
+	// si elle existe déjà : store.Open créerait /var/lib/ogs en 0750, là où le
+	// challenge ACME exige 0751 — le diagnostic fabriquerait l'anomalie que le
+	// contrôle suivant rapporte. Son ouverture ratée reste un avertissement :
+	// « doctor » est fait pour tourner sur une installation abîmée, l'absence des
+	// répertoires étant par ailleurs déjà dite plus haut.
+	if _, err := os.Stat(a.Paths.StateDB()); err == nil {
+		if err := a.openStore(); err != nil {
+			add("base d'état", "avertissement",
+				"base d'état illisible : "+firstLine(err.Error())+
+					" — les contrôles qui en dépendent sont omis", "ogs init")
+		}
+	}
+	a.addStateJournalChecks(add, journaux)
 
 	// Arborescence de l'outil.
 	for _, d := range a.Paths.Dirs() {
@@ -380,19 +409,11 @@ func (a *App) runChecks(ctx context.Context) []check {
 		}
 		provs.close()
 	}
-	// « ogs my » identifie l'appelant par SUDO_UID, que sudo ne positionne de
-	// façon fiable que si env_reset est active.
+	// « ogs my » s'exécute dans l'environnement que sudo reconstruit : env_reset
+	// est l'hypothèse sous laquelle la surface déléguée a été taillée (D21/D28).
 	if a.Prefix == "" {
-		if data, err := os.ReadFile("/etc/sudoers"); err == nil {
-			if strings.Contains(string(data), "!env_reset") {
-				add("sudo env_reset", "échec",
-					"env_reset est désactivée : l'appelant contrôle son environnement et « ogs my » "+
-						"ne peut plus l'identifier de façon sûre",
-					"réactiver Defaults env_reset dans /etc/sudoers")
-			} else {
-				add("sudo env_reset", "ok", "active", "")
-			}
-		}
+		status, detail, fix := envResetPolicy(sudoersFile)
+		add("sudo env_reset", status, detail, fix)
 	}
 
 	// Applications : une écoute au-delà de la boucle locale contourne le vhost,
@@ -434,6 +455,66 @@ func (a *App) runChecks(ctx context.Context) []check {
 	return out
 }
 
+// journalEtat est le mode d'un journal de la base d'état tel qu'il a été trouvé
+// sur le disque, avant qu'une ouverture de la base ne puisse le changer.
+type journalEtat struct {
+	path string
+	perm os.FileMode
+}
+
+// stateJournalModes relève les journaux de la base d'état — « state.db-wal » et
+// « state.db-shm ». Par eux passent l'inventaire du parc et le journal d'audit, et
+// SQLite calque leur mode sur celui de la base au moment où il les crée : une base
+// héritée d'une version antérieure, ou un init interrompu avant le chmod, laisse
+// derrière lui un journal en 0644. Il ne se voit nulle part — /var/lib/ogs est
+// traversable à dessein (0751, pour le challenge ACME), donc lisible par le
+// serveur web comme par les comptes des projets — et SQLite ne recrée pas un
+// journal abandonné : il le reprend tel quel, mode compris.
+func (a *App) stateJournalModes() []journalEtat {
+	base := a.Paths.StateDB()
+	var out []journalEtat
+	for _, suffixe := range []string{"-wal", "-shm"} {
+		path := base + suffixe
+		info, err := os.Stat(path)
+		if err != nil {
+			continue
+		}
+		out = append(out, journalEtat{path: path, perm: info.Mode().Perm()})
+	}
+	return out
+}
+
+// addStateJournalChecks rend compte des journaux relevés, une fois la base
+// ouverte. Un journal trop ouvert que store.Open vient de refermer n'est plus une
+// anomalie du système : c'est une exposition passée, que la réparation n'annule
+// pas mais que « chmod 0600 » ne corrige plus. Le dire en avertissement, sans
+// remède, laisse le code de retour utilisable en supervision — là où un échec
+// réclamerait une intervention devenue sans objet. Un journal encore ouvert au
+// moment du compte rendu — base absente, donc jamais ouverte — reste un échec,
+// avec le remède qui vaut.
+func (a *App) addStateJournalChecks(add func(name, status, detail, fix string), journaux []journalEtat) {
+	for _, j := range journaux {
+		if j.perm&0o077 == 0 {
+			add("journal de la base d'état", "ok",
+				fmt.Sprintf("%s (mode %04o)", j.path, j.perm), "")
+			continue
+		}
+		portee := ", alors que l'inventaire du parc et le journal d'audit y transitent"
+		if info, err := os.Stat(j.path); err == nil && info.Mode().Perm()&0o077 == 0 {
+			add("journal de la base d'état", "avertissement",
+				fmt.Sprintf("%s était lisible au-delà de son propriétaire (mode %04o)%s ; "+
+					"l'ouverture de la base l'a remis en %04o pendant ce diagnostic — "+
+					"reste à savoir qui a pu le lire",
+					j.path, j.perm, portee, info.Mode().Perm()), "")
+			continue
+		}
+		add("journal de la base d'état", "échec",
+			fmt.Sprintf("%s (mode %04o) est lisible au-delà de son propriétaire%s",
+				j.path, j.perm, portee),
+			"chmod 0600 "+j.path)
+	}
+}
+
 // monitoringChecks porte ce que ni fail2ban ni Telegraf ne disent d'eux-mêmes.
 //
 // Le premier de ces contrôles est le plus important du lot : **une prison dont
@@ -444,6 +525,33 @@ func (a *App) runChecks(ctx context.Context) []check {
 // effacés à la main entre deux apply.
 func (a *App) monitoringChecks(add func(name, status, detail, fix string)) {
 	mon := a.Cfg.Monitoring
+
+	// Fichier laissé par un outil depuis désactivé. L'apply le retire, mais un
+	// parc qu'on n'a pas appliqué depuis garde une supervision que la
+	// configuration dit éteinte : le fichier continue de s'appliquer — prisons
+	// comprises — et n'est plus jamais recalculé, pas même à la suppression d'un
+	// projet. Seul le refus explicite est examiné : sans valeur déclarée, c'est la
+	// présence du répertoire de fragments qui tranche, et un fichier présent
+	// suppose un répertoire présent.
+	for _, outil := range []struct {
+		nom     string
+		decide  func() (bool, bool)
+		fichier string
+	}{
+		{"entrées telegraf", mon.TelegrafEnabled, a.Paths.TelegrafFile()},
+		{"prisons fail2ban", mon.Fail2banEnabled, a.Paths.Fail2banJailFile()},
+	} {
+		actif, déclaré := outil.decide()
+		if !déclaré || actif {
+			continue
+		}
+		if _, err := os.Stat(outil.fichier); err == nil {
+			add("supervision désactivée", "avertissement",
+				outil.fichier+" est encore en place alors que la configuration désactive cet "+
+					"outil : il s'applique toujours, et plus rien ne le recalcule",
+				"ogs apply (l'étape de retrait supprime le fichier)")
+		}
+	}
 
 	// fail2ban : journaux référencés. Le contrôle n'a de sens que sur un système
 	// réel — en mode simulé, le fichier retient tous les chemins par construction,
@@ -477,6 +585,17 @@ func (a *App) monitoringChecks(add func(name, status, detail, fix string)) {
 		}
 	case !os.IsNotExist(err):
 		add("prisons fail2ban", "avertissement", err.Error(), "")
+	}
+
+	// Prison de récidive : activée en configuration, elle n'est écrite que si le
+	// journal de fail2ban existe (D68). Sinon elle est simplement omise, et rien
+	// ne le dit — ni le fichier, qui reste syntaxiquement correct, ni
+	// « fail2ban-client -t », qui n'a aucune prison à reprocher. La protection est
+	// alors annoncée dans la configuration et absente de la machine.
+	if err == nil && mon.JailEnabled("recidive") {
+		if status, detail, fix := recidiveJailStatus(string(data), a.Paths.Fail2banLog()); status != "" {
+			add("prison de récidive", status, detail, fix)
+		}
 	}
 
 	// Le contrôle de configuration de fail2ban, lorsqu'il est installé. Il couvre
@@ -526,17 +645,263 @@ func (a *App) monitoringChecks(add func(name, status, detail, fix string)) {
 		}
 	}
 
-	// Comptes de supervision : leur mot de passe vit dans le keystore. Un secret
-	// absent alors que le fragment le référence signifie une base d'état
-	// restaurée sans sa clé — l'agent s'authentifiera avec un mot de passe qui
-	// n'est plus celui du moteur.
-	if a.Store != nil {
-		names, err := a.Store.SecretNames(monitoring.SecretScope)
-		if err == nil && len(names) > 0 {
-			add("comptes de supervision", "ok",
-				fmt.Sprintf("%d secret(s) de parc scellé(s) : %s", len(names), strings.Join(names, ", ")), "")
+	// Comptes de supervision : leur mot de passe vit dans le keystore, et le
+	// fragment en porte la copie que l'agent présente au moteur. Un secret que le
+	// fragment référence sans qu'il soit scellé — base d'état restaurée sans ses
+	// secrets — signifie que l'agent s'authentifie avec un mot de passe que le
+	// moteur n'a peut-être jamais reçu ; indéchiffrable, c'est la clé maître qui
+	// manque. Dans les deux cas rien ne le dit : un Telegraf qui n'arrive pas à
+	// collecter démarre quand même et se tait (D65). Le contrôle part du fragment
+	// et non de la configuration : une machine sans MySQL n'a pas d'entrée mysql,
+	// donc pas de secret attendu, donc pas d'échec perpétuel.
+	if fragmentData, err := os.ReadFile(fragment); err == nil {
+		for _, name := range telegrafSecretNames(string(fragmentData)) {
+			a.monitoringSecretCheck(add, name)
 		}
 	}
+}
+
+// recidiveJailStatus confronte la prison de récidive écrite au fichier à celle
+// que la configuration demande. Le chemin du journal est un paramètre pour que le
+// contrôle soit éprouvable sans toucher à /var/log.
+//
+// Un fichier sans aucune prison d'ogs ne dit rien de la récidive : elle lit le
+// journal que les autres alimentent, et n'aurait rien à surveiller.
+func recidiveJailStatus(content, logPath string) (status, detail, fix string) {
+	if !strings.Contains(content, "[ogs-") {
+		return "", "", ""
+	}
+	if strings.Contains(content, "[ogs-recidive]") {
+		return "ok", "écrite, adossée à " + logPath, ""
+	}
+	if _, err := os.Stat(logPath); err != nil {
+		return "avertissement",
+			"la prison de récidive est activée en configuration mais absente du fichier : " +
+				logPath + " n'existe pas, et une prison sans journal ne surveille rien — " +
+				"la protection est annoncée, pas rendue",
+			"vérifier « logtarget » dans la configuration de fail2ban — SYSLOG et STDOUT n'écrivent " +
+				"aucun fichier —, démarrer le démon, puis « ogs apply »"
+	}
+	return "avertissement",
+		"la prison de récidive est activée en configuration mais absente du fichier, alors que " +
+			logPath + " existe : le fichier date d'avant l'activation",
+		"ogs apply (le fichier de prisons est recalculé en entier)"
+}
+
+// monitoringSecretCheck éprouve un secret de parc référencé par le fragment.
+func (a *App) monitoringSecretCheck(add func(name, status, detail, fix string), name string) {
+	if a.Store == nil {
+		add("comptes de supervision", "avertissement",
+			"base d'état indisponible : le scellement de "+name+" n'a pas pu être vérifié",
+			"ogs init")
+		return
+	}
+	nonce, ciphertext, err := a.Store.GetSecret(monitoring.SecretScope, name)
+	if err != nil {
+		add("comptes de supervision", "échec",
+			"aucun mot de passe scellé pour "+name+" : le fragment Telegraf en porte un que le "+
+				"moteur n'a peut-être jamais reçu — l'agent échouera à chaque collecte sans le dire",
+			"ogs apply")
+		return
+	}
+	if a.Keys == nil {
+		add("comptes de supervision", "avertissement",
+			name+" est scellé, mais la clé maître est indisponible : le contenu n'a pas été vérifié",
+			"vérifier "+a.Paths.MasterKey())
+		return
+	}
+	if _, err := a.Keys.Open(monitoring.SecretScope, name, nonce, ciphertext); err != nil {
+		add("comptes de supervision", "échec",
+			name+" : déchiffrement refusé — base d'état restaurée sans la clé maître qui l'a scellée",
+			"ogs apply (l'étape du compte rescelle le mot de passe et le repose sur le moteur)")
+		return
+	}
+	add("comptes de supervision", "ok", name+" scellé et déchiffrable", "")
+}
+
+// telegrafSecretNames énumère les secrets de parc que le fragment met en jeu.
+// Deux entrées seulement en ont un : le compte PostgreSQL est authentifié
+// « peer » et n'a pas de mot de passe (D67), et les autres n'ont pas de compte.
+// Le nom du compte est lu dans le fragment plutôt que dans la configuration :
+// c'est le mot de passe **écrit** que l'agent présente, et c'est celui-là qu'on
+// veut retrouver dans le keystore.
+func telegrafSecretNames(content string) []string {
+	var out []string
+	section := ""
+	for _, raw := range strings.Split(content, "\n") {
+		line := strings.TrimSpace(raw)
+		switch {
+		case strings.HasPrefix(line, "[[inputs."):
+			section = strings.TrimSuffix(strings.TrimPrefix(line, "[[inputs."), "]]")
+		case section == "mysql" && strings.HasPrefix(line, "servers"):
+			// servers = ["<compte>:<mot de passe>@unix(<socket>)/"]
+			if _, value, ok := strings.Cut(line, "="); ok {
+				dsn := strings.Trim(strings.TrimSpace(value), `[]" `)
+				if user, _, ok := strings.Cut(dsn, ":"); ok && user != "" {
+					out = append(out, "mysql/"+user)
+				}
+			}
+		case section == "rabbitmq" && strings.HasPrefix(line, "username"):
+			if _, value, ok := strings.Cut(line, "="); ok {
+				if user := strings.Trim(strings.TrimSpace(value), `"`); user != "" {
+					out = append(out, "rabbitmq/"+user)
+				}
+			}
+		}
+	}
+	return out
+}
+
+// envResetPolicy dit si la directive env_reset est en vigueur, en parcourant la
+// politique sudo comme sudo la lit lui-même. Le chemin de la racine est un
+// paramètre pour que le contrôle soit éprouvable sur une arborescence de test.
+//
+// Trois pièges, tous rencontrés par la version qui se contentait d'un
+// strings.Contains sur /etc/sudoers. La politique ne tient pas dans ce seul
+// fichier : Debian et Ubuntu le terminent par « @includedir /etc/sudoers.d », et
+// c'est là qu'un administrateur pose ses Defaults — ogs y écrit lui-même ses
+// règles de délégation. Dans un sudoers, « #includedir » n'est pas un
+// commentaire mais la forme historique de la même directive : écarter toute
+// ligne commençant par « # » supprimerait précisément l'inclusion qu'on veut
+// suivre. Enfin c'est la dernière affectation qui l'emporte, un drop-in annulant
+// ce que la racine a posé : on conclut sur l'état final, jamais sur la première
+// occurrence — et sur une vraie ligne « Defaults », une sous-chaîne trouvée dans
+// un commentaire n'étant pas une directive.
+//
+// Une source illisible ne vaut pas un « ok » : le contrôle dit alors qu'il n'a
+// pas conclu. Affirmer « active » sans avoir tout lu est le défaut qu'on corrige.
+func envResetPolicy(root string) (status, detail, fix string) {
+	// env_reset est le défaut de sudo : sans directive contraire, elle est active.
+	active, decided := true, ""
+	var unread []string
+	vus := map[string]bool{}
+
+	var lire func(path string)
+	lire = func(path string) {
+		if vus[path] {
+			return
+		}
+		vus[path] = true
+		data, err := os.ReadFile(path)
+		if err != nil {
+			unread = append(unread, path)
+			return
+		}
+		for _, line := range sudoersLines(string(data)) {
+			if dir, ok := sudoersInclude(line, "includedir"); ok {
+				entries, err := os.ReadDir(dir)
+				if err != nil {
+					unread = append(unread, dir)
+					continue
+				}
+				var noms []string
+				for _, e := range entries {
+					// sudo ignore les entrées contenant un point ou terminées par « ~ » :
+					// c'est ainsi qu'il écarte les .dpkg-dist et les sauvegardes d'éditeur.
+					if e.IsDir() || strings.Contains(e.Name(), ".") || strings.HasSuffix(e.Name(), "~") {
+						continue
+					}
+					noms = append(noms, e.Name())
+				}
+				// L'ordre des noms décide de la dernière valeur qui l'emporte.
+				sort.Strings(noms)
+				for _, n := range noms {
+					lire(filepath.Join(dir, n))
+				}
+				continue
+			}
+			if f, ok := sudoersInclude(line, "include"); ok {
+				lire(f)
+				continue
+			}
+			if strings.HasPrefix(line, "#") {
+				continue
+			}
+			if v, ok := envResetIn(line); ok {
+				active, decided = v, path
+			}
+		}
+	}
+	lire(root)
+
+	if !active {
+		return "échec",
+			"env_reset est désactivée par " + decided + " : la politique sudo n'est plus celle sous " +
+				"laquelle la surface déléguée « ogs my » a été taillée (D28)",
+			"retirer « !env_reset » de " + decided
+	}
+	if len(unread) > 0 {
+		return "avertissement",
+			"contrôle non concluant, source(s) illisible(s) : " + strings.Join(unread, ", "), ""
+	}
+	return "ok", "active", ""
+}
+
+// sudoersInclude reconnaît une directive d'inclusion et rend son chemin. Les
+// deux préfixes sont acceptés : « @include » est la forme moderne, « #include »
+// la forme historique, toujours valide et celle que livre Debian.
+func sudoersInclude(line, keyword string) (string, bool) {
+	if line == "" || (line[0] != '@' && line[0] != '#') {
+		return "", false
+	}
+	rest, ok := strings.CutPrefix(line[1:], keyword)
+	if !ok || rest == "" || (rest[0] != ' ' && rest[0] != '\t') {
+		return "", false
+	}
+	return strings.Trim(strings.TrimSpace(rest), `"`), true
+}
+
+// envResetIn lit l'état d'env_reset posé par une ligne « Defaults », s'il y en a
+// un. Les formes qualifiées — Defaults:utilisateur, Defaults@hôte,
+// Defaults>runas, Defaults!commande — décident autant que la forme nue.
+func envResetIn(line string) (value, found bool) {
+	fields := strings.Fields(line)
+	if len(fields) < 2 || !strings.HasPrefix(fields[0], "Defaults") {
+		return false, false
+	}
+	if q := fields[0][len("Defaults"):]; q != "" && !strings.ContainsRune(":@>!", rune(q[0])) {
+		return false, false
+	}
+	// Les paramètres sont séparés par des virgules, avec des espaces libres.
+	params := strings.FieldsFunc(strings.Join(fields[1:], " "), func(r rune) bool {
+		return r == ',' || r == ' ' || r == '\t'
+	})
+	for _, p := range params {
+		switch p {
+		case "env_reset":
+			value, found = true, true
+		case "!env_reset":
+			value, found = false, true
+		}
+	}
+	return value, found
+}
+
+// sudoersLines rend les lignes utiles d'un sudoers, les continuations recollées :
+// une liste de paramètres « Defaults » est souvent repliée sur plusieurs lignes
+// par une barre oblique inverse, et la couper en deux ferait perdre la directive.
+func sudoersLines(content string) []string {
+	var out []string
+	var pending string
+	for _, raw := range strings.Split(content, "\n") {
+		line := strings.TrimSpace(raw)
+		if pending != "" {
+			line = pending + " " + line
+			pending = ""
+		}
+		if strings.HasSuffix(line, `\`) {
+			pending = strings.TrimSpace(strings.TrimSuffix(line, `\`))
+			continue
+		}
+		if line == "" {
+			continue
+		}
+		out = append(out, line)
+	}
+	if pending != "" {
+		out = append(out, pending)
+	}
+	return out
 }
 
 // jailLogPaths extrait les chemins de journaux d'un fichier de prisons. La

@@ -151,6 +151,21 @@ func (a *App) buildPlan(ctx context.Context, provs *providers, p *model.Project)
 	}
 
 	if len(p.Spec.Domains) > 0 {
+		// Le fragment de portée serveur précède les vhosts, et non le plan global
+		// qui s'exécute après les projets : un vhost de proxy emploie
+		// $connection_upgrade, que seule la « map » de ce fragment définit — sans
+		// lui, nginx refuse toute la configuration à l'activation du vhost, la saga
+		// déroule le projet et le plan global qui l'aurait écrit n'est jamais
+		// atteint. C'est désormais le seul endroit qui le porte : le garder aussi au
+		// plan global faisait annoncer par « plan » et « diff » — qui calculent tout
+		// sans rien écrire — N+1 écritures d'un fichier unique, là où « apply » n'en
+		// fait qu'une.
+		snippet, err := provs.Web.PlanSnippet()
+		if err != nil {
+			return nil, wrap(CodeError, err)
+		}
+		plan.Add(snippet)
+
 		// Le complément d'unité du moteur web précède les vhosts, et non le plan
 		// global qui s'exécute après les projets : un vhost journalisant dans un
 		// répertoire que le moteur ne peut pas atteindre arrête le serveur au
@@ -213,15 +228,29 @@ func (a *App) buildPlan(ctx context.Context, provs *providers, p *model.Project)
 }
 
 // buildGlobalPlan calcule les étapes qui portent sur l'ensemble du parc.
-func (a *App) buildGlobalPlan(provs *providers, projects []*model.Project) (*engine.Plan, error) {
-	plan := &engine.Plan{Project: "*"}
-	step, err := provs.Logrotate.Plan(projects, provs.Engine.Name(), provs.Engine.Unit())
+//
+// Les fichiers de portée serveur — logrotate, répertoires d'exécution, vhost de
+// supervision, entrées Telegraf, prisons fail2ban — sont recalculés EN ENTIER
+// (D64), jamais complétés : les établir sur la seule liste visée par un « apply
+// <id> », ou sur le seul projet que « site create » vient d'écrire, effacerait
+// tous les autres du fichier. Rien ne le dirait — l'en-tête réécrit reste
+// conforme, et systemd-tmpfiles ne supprime pas : la panne n'apparaîtrait qu'au
+// redémarrage suivant, /run étant un tmpfs, quand plus aucun /run/ogs/<id> ne
+// serait recréé et que tous les verrous de tâches échoueraient. Le parc fait
+// donc foi ici, et la liste reçue ne sert qu'à y substituer la version en
+// mémoire des projets visés, qui peut n'être pas encore sur le disque (« -f »,
+// création).
+func (a *App) buildGlobalPlan(ctx context.Context, provs *providers, targeted []*model.Project) (*engine.Plan, error) {
+	projects, err := a.loadProjects()
 	if err != nil {
-		return nil, wrap(CodeError, err)
+		return nil, err
 	}
-	plan.Add(step)
+	for _, p := range targeted {
+		projects = withProject(projects, p)
+	}
 
-	// Répertoires d'exécution : verrous de tâches et sockets applicatifs.
+	plan := &engine.Plan{Project: "*"}
+
 	// Purge des archives expirées : une archive porte un dump de base, donc des
 	// données de clients. Elle est une étape du plan, non un effet de bord, pour
 	// être annoncée avant d'être faite.
@@ -231,14 +260,7 @@ func (a *App) buildGlobalPlan(provs *providers, projects []*model.Project) (*eng
 		plan.Add(step)
 	}
 
-	// Les réglages de portée serveur du moteur web : les vhosts de proxy en
-	// dépendent, et le fichier ne relève d'aucun projet en particulier.
-	snippet, err := provs.Web.PlanSnippet()
-	if err != nil {
-		return nil, wrap(CodeError, err)
-	}
-	plan.Add(snippet)
-
+	// Répertoires d'exécution : verrous de tâches et sockets applicatifs.
 	runtimeStep, err := provs.Runtime.Plan(projects)
 	if err != nil {
 		return nil, wrap(CodeError, err)
@@ -255,40 +277,91 @@ func (a *App) buildGlobalPlan(provs *providers, projects []*model.Project) (*eng
 	if err != nil {
 		return nil, wrap(CodeError, err)
 	}
+	parcNonBloquante(units...)
 	for _, s := range units {
 		plan.Add(s)
 	}
 
 	// Supervision. Le vhost d'état précède les entrées de l'agent, qui s'y
-	// adressent, et le fichier de prisons vient en dernier : fail2ban refuse de
+	// adressent, et le fichier de prisons ferme la marche : fail2ban refuse de
 	// démarrer sur une prison dont aucun journal n'existe, et les journaux des
 	// projets viennent d'être créés par le rechargement du moteur web à la fin de
 	// leurs propres plans.
-	monObs, err := provs.Monitoring.Observe(context.Background())
+	monObs, err := provs.Monitoring.Observe(ctx)
 	if err != nil {
-		return nil, wrap(CodeError, err)
+		return nil, planErr(err)
 	}
 	statusOn, set := a.Cfg.Monitoring.StatusEnabled()
 	if !set {
 		statusOn = monObs.TelegrafPresent
 	}
-	statusSteps, err := provs.Web.PlanStatus(context.Background(), projects,
+	statusSteps, err := provs.Web.PlanStatus(ctx, projects,
 		a.Cfg.Monitoring.StatusListen(), a.Cfg.Monitoring.StatusPath(), statusOn)
 	if err != nil {
-		return nil, wrap(CodeError, err)
+		return nil, planErr(err)
 	}
 	for _, s := range statusSteps {
 		plan.Add(s)
 	}
 
-	monSteps, err := provs.Monitoring.Plan(context.Background(), projects, monObs)
+	monSteps, err := provs.Monitoring.Plan(ctx, projects, monObs)
 	if err != nil {
-		return nil, wrap(CodeError, err)
+		return nil, planErr(err)
 	}
 	for _, s := range monSteps {
 		plan.Add(s)
 	}
+
+	// La rotation des journaux ferme la marche, et c'est un ordre, non une
+	// commodité : c'est le fichier de parc qu'un exploitant retouche le plus
+	// volontiers — un « compress », une taille —, donc l'étape qui a le plus de
+	// chances de refuser (§6.4). Rien de ce qui précède ne dépend d'elle, et
+	// l'infrastructure du parc — répertoires d'exécution, timer de renouvellement,
+	// supervision — est ainsi posée avant. L'ordre ne suffirait pas à lui seul, une
+	// saga déroulant ce qu'elle a appliqué avant un échec critique : voir
+	// parcNonBloquante, qui ôte à ce refus le pouvoir d'emporter le reste.
+	step, err := provs.Logrotate.Plan(projects, provs.Engine.Name(), provs.Engine.Unit())
+	if err != nil {
+		return nil, wrap(CodeError, err)
+	}
+	parcNonBloquante(step)
+	plan.Add(step)
 	return plan, nil
+}
+
+// parcNonBloquante rend non critiques les étapes de fichiers de portée parc que
+// l'exploitant retouche — la rotation des journaux et les unités de
+// renouvellement —, et c'est le plan qui en décide, non le provider qui les
+// fabrique.
+//
+// Le refus d'un fichier modifié à la main (§6.4) est légitime, et « --force »
+// reste sa porte de sortie ; ce qui ne l'est pas, c'est ce qu'un refus critique
+// emporte ici. La saga compense en ordre inverse tout ce qu'elle a appliqué avant
+// l'échec : un « compress » ajouté à /etc/logrotate.d/ogs déroulerait les
+// répertoires d'exécution — donc tous les verrous de tâches au redémarrage
+// suivant, /run étant un tmpfs —, le timer de renouvellement des certificats et
+// la supervision. Aucun ordre ne protège de cela : ce qui précède est déroulé, ce
+// qui suit n'est pas tenté. Un fichier de projet en écart n'engage que son
+// projet ; un fichier de parc en écart ne doit pas priver le parc de tout le
+// reste — d'où l'avertissement et le code 6, « succès partiel ou écart détecté »,
+// qui nomme le fichier et son remède sans rien démonter.
+func parcNonBloquante(steps ...*engine.Step) {
+	for _, s := range steps {
+		if s != nil {
+			s.Critical = false
+		}
+	}
+}
+
+// planErr distingue l'interruption de la panne. Les observations de supervision
+// atteignent le réseau et les moteurs, et portent désormais le contexte de la
+// commande : un Ctrl-C les fait échouer, ce qui n'est pas une erreur du système
+// mais l'annulation demandée par l'exploitant — code 9, pas code 1.
+func planErr(err error) error {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return wrap(CodeCancelled, err)
+	}
+	return wrap(CodeError, err)
 }
 
 // purgeArchivesStep supprime les archives dont l'âge dépasse la rétention.
@@ -431,7 +504,7 @@ func newPlanCommand(app *App) *cobra.Command {
 					app.printf("projet %s\n%s", p.ID(), plan.String())
 				}
 			}
-			global, err := app.buildGlobalPlan(provs, projects)
+			global, err := app.buildGlobalPlan(cmd.Context(), provs, projects)
 			if err != nil {
 				return err
 			}
@@ -625,7 +698,7 @@ func newApplyCommand(app *App) *cobra.Command {
 			// Rotation des journaux : elle porte sur tout le parc, donc après les
 			// projets et une seule fois.
 			if !app.DryRun {
-				global, err := app.buildGlobalPlan(provs, projects)
+				global, err := app.buildGlobalPlan(cmd.Context(), provs, projects)
 				if err != nil {
 					return err
 				}
@@ -693,12 +766,16 @@ func (a *App) recordState(p *model.Project) error {
 	return wrap(CodeError, a.Store.UpsertProject(row))
 }
 
-// withProject garantit la présence du projet courant dans la liste du parc : lors
-// d'une création, sa déclaration peut n'être pas encore sur le disque, et son
+// withProject fond le projet courant dans la liste du parc : lors d'une
+// création, sa déclaration peut n'être pas encore sur le disque, et son
 // répertoire de journaux serait alors le seul absent du complément d'unité.
+// S'il y figure déjà, c'est la version en mémoire qui l'emporte — celle d'un
+// « --file » fait autorité sur la copie enregistrée, puisque c'est elle qu'on
+// applique.
 func withProject(all []*model.Project, p *model.Project) []*model.Project {
-	for _, other := range all {
+	for i, other := range all {
 		if other.ID() == p.ID() {
+			all[i] = p
 			return all
 		}
 	}

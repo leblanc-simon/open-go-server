@@ -121,6 +121,11 @@ type DBState struct {
 	Grants      map[string]string
 	Extensions  map[string]bool
 	ExtraUsers  map[string]bool
+	// ExtraGrants porte les privilèges observés de chaque compte additionnel sur
+	// la base, sous la même clé qu'ExtraUsers. Leur existence ne suffit pas à les
+	// juger conformes : un compte additionnel déclaré « readonly » et créé jadis
+	// en « all » garderait ses droits d'écriture sans que rien ne l'annonce.
+	ExtraGrants map[string]string
 	// Unavailable porte le motif si le moteur n'est pas joignable.
 	Unavailable error
 }
@@ -135,7 +140,8 @@ func (p *Provider) Observe(ctx context.Context, proj *model.Project) (Observed, 
 	var obs Observed
 	for _, decl := range proj.Spec.Databases {
 		state := DBState{Declaration: decl, Grants: map[string]string{},
-			Extensions: map[string]bool{}, ExtraUsers: map[string]bool{}}
+			Extensions: map[string]bool{}, ExtraUsers: map[string]bool{},
+			ExtraGrants: map[string]string{}}
 		client, err := p.clientFor(decl)
 		if err != nil {
 			state.Unavailable = err
@@ -150,15 +156,24 @@ func (p *Provider) Observe(ctx context.Context, proj *model.Project) (Observed, 
 		}
 		state.Endpoint = endpoint
 
+		// Une lecture qui échoue après Endpoint n'est pas plus fatale que celui-ci :
+		// le moteur est devenu injoignable, et Plan produit l'étape non critique
+		// prévue. La rendre à l'appelant faisait abandonner la construction du plan
+		// **entier**, donc renoncer au site tout comme au reste du parc, pour une
+		// cause que la conception déclare non bloquante.
 		databases, err := client.Databases(ctx)
 		if err != nil {
-			return obs, err
+			state.Unavailable = err
+			obs.States = append(obs.States, state)
+			continue
 		}
 		state.DBExists = databases[decl.Name]
 
 		users, err := client.Users(ctx)
 		if err != nil {
-			return obs, err
+			state.Unavailable = err
+			obs.States = append(obs.States, state)
+			continue
 		}
 		host := decl.Host
 		if host == "" {
@@ -173,6 +188,15 @@ func (p *Provider) Observe(ctx context.Context, proj *model.Project) (Observed, 
 			state.UserExists = users[decl.User+"@"+host]
 			for _, u := range decl.ExtraUsers {
 				state.ExtraUsers[u.User] = users[u.User+"@"+host]
+				if !state.ExtraUsers[u.User] {
+					continue
+				}
+				// Une lecture en échec laisse l'entrée vide, donc non conforme :
+				// l'étape repasse, ce qui est le sens sûr — l'inverse ferait déclarer
+				// conforme un compte dont on n'a rien pu relire.
+				if grants, err := client.Grants(ctx, u.User, host); err == nil {
+					state.ExtraGrants[u.User] = grants[decl.Name]
+				}
 			}
 		}
 
@@ -218,10 +242,10 @@ func (p *Provider) Plan(ctx context.Context, proj *model.Project, obs Observed) 
 		if host == "" {
 			host = "localhost"
 		}
-		grantKey := decl.Name
-		hasGrant := state.Grants[grantKey] != ""
+		observedGrants := state.Grants[decl.Name]
+		hasGrant := grantsConform(decl.Engine, observedGrants, priv)
 		conforming := state.DBExists && state.UserExists && hasGrant &&
-			extensionsSatisfied(decl, state) && extraUsersSatisfied(state)
+			extensionsSatisfied(decl, state) && extraUsersSatisfied(decl, state)
 
 		if conforming {
 			steps = append(steps, engine.NewStep(resource, engine.NoOp,
@@ -254,6 +278,22 @@ func (p *Provider) Plan(ctx context.Context, proj *model.Project, obs Observed) 
 	return steps, nil
 }
 
+// grantsConform compare les privilèges observés sur la base au jeu déclaré. La
+// seule présence d'un privilège ne suffisait pas : un passage de « all » à
+// « readonly » restait un NoOp éternel, et ogs affirmait un état qu'il n'avait
+// jamais appliqué — dans l'autre sens, l'application restait sans droit
+// d'écriture alors que le plan annonçait la conformité (§7.2).
+//
+// Côté PostgreSQL l'observation ne rend que la propriété de la base, qui ne
+// s'énumère pas : elle fait foi, et l'y soumettre fabriquerait une dérive
+// permanente.
+func grantsConform(engine, observed string, priv Privilege) bool {
+	if engine == "postgres" {
+		return observed != ""
+	}
+	return MySQLGrantsSatisfied(observed, priv)
+}
+
 func extensionsSatisfied(decl model.Database, state DBState) bool {
 	for _, ext := range decl.Extensions {
 		if !state.Extensions[ext] {
@@ -263,9 +303,26 @@ func extensionsSatisfied(decl model.Database, state DBState) bool {
 	return true
 }
 
-func extraUsersSatisfied(state DBState) bool {
-	for _, present := range state.ExtraUsers {
-		if !present {
+// extraUsersSatisfied juge les comptes additionnels sur les mêmes critères que
+// le compte principal : leur existence, et le jeu de privilèges qu'ils portent
+// réellement sur la base. Ne regarder que l'existence laissait un compte déclaré
+// « readonly » garder l'écriture qu'un ancien apply lui avait donnée.
+//
+// Côté PostgreSQL, les comptes additionnels ne sont pas posés — l'observation n'y
+// rend que la propriété de la base — et seule leur existence est jugée.
+func extraUsersSatisfied(decl model.Database, state DBState) bool {
+	for _, u := range decl.ExtraUsers {
+		if !state.ExtraUsers[u.User] {
+			return false
+		}
+		if decl.Engine == "postgres" {
+			continue
+		}
+		priv, err := ParsePrivilege(u.Privileges)
+		if err != nil {
+			return false
+		}
+		if !MySQLGrantsSatisfied(state.ExtraGrants[u.User], priv) {
 			return false
 		}
 	}
@@ -290,6 +347,7 @@ func (p *Provider) statements(decl model.Database, state DBState, priv Privilege
 			Database: decl.Name, Charset: decl.Charset, Collation: decl.Collation,
 			User: decl.User, Host: host, Password: password, Privileges: priv,
 			AuthPlugin: decl.AuthPlugin,
+			Revoke:     MySQLGrantsOverflow(state.Grants[decl.Name], priv),
 		}
 		stmts, err := CreateMySQL(spec)
 		if err != nil {
@@ -304,6 +362,7 @@ func (p *Provider) statements(decl model.Database, state DBState, priv Privilege
 			extra, err := CreateMySQL(MySQLSpec{
 				Database: decl.Name, Charset: decl.Charset, Collation: decl.Collation,
 				User: u.User, Host: host, Password: password, Privileges: extraPriv,
+				Revoke: MySQLGrantsOverflow(state.ExtraGrants[u.User], extraPriv),
 			})
 			if err != nil {
 				return nil, err
@@ -345,6 +404,7 @@ func (p *Provider) apply(ctx context.Context, proj *model.Project, decl model.Da
 			Database: decl.Name, Charset: decl.Charset, Collation: decl.Collation,
 			User: decl.User, Host: host, Password: password, Privileges: priv,
 			AuthPlugin: decl.AuthPlugin,
+			Revoke:     MySQLGrantsOverflow(state.Grants[decl.Name], priv),
 		}
 		stmts, err := CreateMySQL(spec)
 		if err != nil {
@@ -367,6 +427,7 @@ func (p *Provider) apply(ctx context.Context, proj *model.Project, decl model.Da
 			extra, err := CreateMySQL(MySQLSpec{
 				Database: decl.Name, User: u.User, Host: host,
 				Password: extraPassword, Privileges: extraPriv,
+				Revoke: MySQLGrantsOverflow(state.ExtraGrants[u.User], extraPriv),
 			})
 			if err != nil {
 				return err

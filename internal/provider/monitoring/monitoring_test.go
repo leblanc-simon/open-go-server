@@ -2,16 +2,21 @@ package monitoring
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"leblanc.io/open-go-server/internal/config"
+	"leblanc.io/open-go-server/internal/engine"
 	"leblanc.io/open-go-server/internal/exec"
 	"leblanc.io/open-go-server/internal/model"
 	"leblanc.io/open-go-server/internal/naming"
+	"leblanc.io/open-go-server/internal/provider/amqp"
+	"leblanc.io/open-go-server/internal/provider/db"
 	"leblanc.io/open-go-server/internal/provider/php"
 	"leblanc.io/open-go-server/internal/secret"
 	"leblanc.io/open-go-server/internal/store"
@@ -98,9 +103,81 @@ func TestPrisonSansJournalNestPasEcrite(t *testing.T) {
 
 	data := p.BuildFail2ban([]*model.Project{proj})
 	for _, jail := range data.Jails {
-		if strings.HasPrefix(jail.Name, "ogs-web") {
-			t.Fatalf("prison %s écrite alors qu'aucun journal n'existe : fail2ban "+
-				"refuserait de démarrer, et toutes les prisons tomberaient avec elle", jail.Name)
+		// L'invariant porte sur toutes les prisons, non sur un préfixe de nom : seule
+		// la prison sshd a le droit de n'énumérer aucun journal, et elle bascule alors
+		// sur le backend systemd. Une prison en backend « auto » sans journal serait
+		// écrite sans « logpath » — muette, et invisible à « doctor », qui n'aurait
+		// aucun chemin à contrôler.
+		if jail.Backend == "auto" && len(jail.LogPaths) == 0 {
+			t.Fatalf("prison %s écrite alors qu'aucun journal n'existe : elle ne "+
+				"surveille rien, et sa protection est annoncée sans exister", jail.Name)
+		}
+	}
+}
+
+func TestPrisonDeRecidiveExigeLeJournalDeFail2ban(t *testing.T) {
+	// La récidive lit le journal de fail2ban lui-même, qui peut manquer
+	// durablement : « logtarget » n'est pas toujours un fichier, et un démon
+	// jamais démarré n'en a écrit aucun.
+	p, paths := fixture(t)
+	real(p)
+	proj := project(t, "shop.fr", model.KindSymfony, "8.3")
+	withLogs(t, proj, "nginx")
+
+	data := p.BuildFail2ban([]*model.Project{proj})
+	for _, jail := range data.Jails {
+		if jail.Name == "ogs-recidive" {
+			t.Fatal("prison de récidive écrite sans son journal : elle ne bannit personne")
+		}
+	}
+
+	if err := os.MkdirAll(filepath.Dir(paths.Fail2banLog()), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.Fail2banLog(), nil, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	data = p.BuildFail2ban([]*model.Project{proj})
+	found := false
+	for _, jail := range data.Jails {
+		if jail.Name == "ogs-recidive" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("la prison de récidive est attendue dès que son journal existe")
+	}
+}
+
+func TestLeFichierDePrisonsNecritAucuneSectionCommune(t *testing.T) {
+	// Une section [DEFAULT] posée dans jail.d n'est pas locale à son fichier :
+	// fail2ban fusionne tous les fichiers dans un même analyseur, et elle
+	// imposerait bantime, findtime et surtout ignoreip à toutes les prisons de la
+	// machine — la liste blanche d'administration serait remplacée, pas complétée.
+	p, _ := fixture(t)
+	p.Cfg.Monitoring.Fail2ban.IgnoreIP = []string{"203.0.113.4"}
+	proj := project(t, "shop.fr", model.KindSymfony, "8.3")
+	withLogs(t, proj, "nginx")
+
+	step, err := p.planFail2ban([]*model.Project{proj})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := step.Apply(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	content, err := os.ReadFile(p.Paths.Fail2banJailFile())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(content), "[DEFAULT]") {
+		t.Errorf("section commune écrite dans jail.d :\n%s", content)
+	}
+	// Les réglages ne disparaissent pas pour autant : ils sont portés par chaque
+	// prison, où ils ne débordent sur personne.
+	for _, want := range []string{"ignoreip = 127.0.0.1/8 ::1 203.0.113.4", "bantime  = 1h"} {
+		if !strings.Contains(string(content), want) {
+			t.Errorf("%q absent du fichier :\n%s", want, content)
 		}
 	}
 }
@@ -266,20 +343,198 @@ func TestSecretDeParcNeCollisionnePasAvecUnProjet(t *testing.T) {
 
 func TestSecretDeSupervisionNestPasRegenere(t *testing.T) {
 	p, _ := fixture(t)
-	first, err := p.ensureSecret("mysql/telegraf")
+	first, sealed, err := p.lookupSecret("mysql/telegraf")
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := p.ensureSecret("mysql/telegraf")
+	if sealed {
+		t.Error("un secret jamais scellé ne doit pas être annoncé comme tel : " +
+			"le moteur ne l'a pas reçu, le compte doit être repassé")
+	}
+	if err := p.sealSecret("mysql/telegraf", first); err != nil {
+		t.Fatal(err)
+	}
+	second, sealed, err := p.lookupSecret("mysql/telegraf")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if first != second {
+	if !sealed || first != second {
 		t.Error("un mot de passe scellé ne doit jamais être régénéré : l'agent " +
 			"resterait avec l'ancien, sans que rien ne le dise")
 	}
 	if len(first) != secret.DefaultPasswordLength {
 		t.Errorf("longueur %d, attendu %d", len(first), secret.DefaultPasswordLength)
+	}
+}
+
+// fakeBroker répond aux seuls appels que la planification du compte de
+// supervision fait. L'interface est incorporée sans valeur : tout autre appel
+// mettrait le test en échec plutôt que de passer inaperçu.
+type fakeBroker struct {
+	amqp.Client
+	users   []amqp.User
+	created map[string]string
+	// refuse fait échouer la pose du compte, comme un broker qui refuse le mot de
+	// passe ou une API momentanément fermée.
+	refuse error
+}
+
+func (b *fakeBroker) Overview(context.Context) (string, error) { return "3.13.7", nil }
+func (b *fakeBroker) Users(context.Context) ([]amqp.User, error) {
+	return b.users, nil
+}
+func (b *fakeBroker) EnsureUser(_ context.Context, name, password string, _ []string) error {
+	if b.refuse != nil {
+		return b.refuse
+	}
+	if b.created == nil {
+		b.created = map[string]string{}
+	}
+	b.created[name] = password
+	return nil
+}
+
+func TestPlanNeScellePasDeSecretDeParc(t *testing.T) {
+	// « ogs plan » annonce ne rien appliquer : il ne doit pas laisser derrière lui
+	// un mot de passe de parc, non journalisé et non compensable, que seul
+	// « ogs secrets show @parc » retrouverait — y compris quand l'exploitant
+	// renonce à l'apply.
+	p, _ := fixture(t)
+	broker := &fakeBroker{}
+	p.AMQP = &amqp.Provider{Client: broker, ManagementURL: amqp.DefaultManagementURL}
+
+	step, access := p.planRabbitAccount(context.Background())
+	if step == nil || access == nil {
+		t.Fatal("une étape et des identifiants sont attendus")
+	}
+	names, err := p.Store.SecretNames(SecretScope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(names) != 0 {
+		t.Fatalf("le calcul du plan a écrit dans le keystore : %v", names)
+	}
+
+	if err := step.Apply(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if names, err = p.Store.SecretNames(SecretScope); err != nil {
+		t.Fatal(err)
+	}
+	if len(names) != 1 || names[0] != "rabbitmq/"+p.Cfg.Monitoring.TelegrafAccount() {
+		t.Errorf("le secret doit être scellé par l'application : %v", names)
+	}
+	// Et c'est bien celui que le broker a reçu, sans quoi le fragment porterait un
+	// mot de passe que le broker refuserait.
+	if broker.created[p.Cfg.Monitoring.TelegrafAccount()] != access.Password {
+		t.Error("le mot de passe scellé et celui posé sur le broker diffèrent")
+	}
+}
+
+func TestCompteDeSupervisionPreexistantRecoitSonMotDePasse(t *testing.T) {
+	// Un compte créé par l'administrateur — ou une base d'état restaurée sans ses
+	// secrets — était jugé conforme sur son seul tag : le fragment partait avec un
+	// mot de passe que le broker ignore, et l'agent échouait à chaque collecte
+	// sans que rien — ni le plan, ni l'apply, ni doctor — ne le dise.
+	p, _ := fixture(t)
+	account := p.Cfg.Monitoring.TelegrafAccount()
+	broker := &fakeBroker{users: []amqp.User{{Name: account, Tags: "monitoring"}}}
+	p.AMQP = &amqp.Provider{Client: broker, ManagementURL: amqp.DefaultManagementURL}
+
+	step, _ := p.planRabbitAccount(context.Background())
+	if step == nil || step.Apply == nil {
+		t.Fatal("le compte doit être repassé tant que son mot de passe n'est pas scellé")
+	}
+	if err := step.Apply(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	// Une fois posé et scellé, le compte est conforme : le plan ne doit plus rien
+	// annoncer.
+	again, _ := p.planRabbitAccount(context.Background())
+	if again == nil || again.Apply != nil {
+		t.Errorf("second plan non vide : le compte n'est pas idempotent (%+v)", again)
+	}
+}
+
+func TestPrivilegesDeSupervisionCherchesLaOuIlsSont(t *testing.T) {
+	// PROCESS et REPLICATION CLIENT sont accordés « ON *.* » : ils vivent dans
+	// mysql.user, jamais dans SCHEMA_PRIVILEGES. Les chercher pêle-mêle avec les
+	// privilèges par base laissait un SELECT accordé sur la base d'un projet tenir
+	// lieu de conformité — et ne voyait jamais les deux privilèges attendus.
+	cases := []struct {
+		nom      string
+		observed map[string]string
+		want     bool
+	}{
+		{"compte conforme (MySQL)", map[string]string{
+			db.GlobalGrantKey: "PROCESS,REPLICATION CLIENT", "performance_schema": "SELECT"}, true},
+		{"compte conforme (MariaDB)", map[string]string{
+			db.GlobalGrantKey: "BINLOG MONITOR,PROCESS", "performance_schema": "SELECT"}, true},
+		{"privilèges globaux absents", map[string]string{
+			"performance_schema": "SELECT"}, false},
+		{"performance_schema absent", map[string]string{
+			db.GlobalGrantKey: "PROCESS,REPLICATION CLIENT"}, false},
+		{"SELECT sur la base d'un projet", map[string]string{
+			"shopfr": "PROCESS,REPLICATION CLIENT,SELECT"}, false},
+	}
+	for _, c := range cases {
+		if got := mysqlGrantsConform(c.observed); got != c.want {
+			t.Errorf("%s : conformité %v, attendu %v", c.nom, got, c.want)
+		}
+	}
+}
+
+func TestOutilDesactiveRetireSonFichier(t *testing.T) {
+	// Le premier réflexe d'un administrateur dont fail2ban ne démarre plus est de
+	// poser « enabled: false ». Le fichier laissé en place resterait chargé, avec
+	// ses prisons et ses journaux, et ne serait plus jamais recalculé — pas même à
+	// la suppression d'un projet, ce que D68 interdit.
+	p, _ := fixture(t)
+	shop := project(t, "shop.fr", model.KindSymfony, "8.3")
+	withLogs(t, shop, "nginx")
+	projects := []*model.Project{shop}
+
+	on := Observed{TelegrafPresent: true, Fail2banPresent: true, TelegrafGroup: -1}
+	steps, err := p.Plan(context.Background(), projects, on)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range steps {
+		if s.Apply != nil {
+			if err := s.Apply(context.Background()); err != nil {
+				t.Fatalf("%s : %v", s.Resource, err)
+			}
+		}
+	}
+
+	off := Observed{TelegrafGroup: -1}
+	steps, err = p.Plan(context.Background(), projects, off)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(steps) != 2 {
+		t.Fatalf("deux retraits attendus, %d étape(s) : %+v", len(steps), steps)
+	}
+	for _, s := range steps {
+		if s.Critical {
+			t.Errorf("%s : le retrait ne doit pas faire échouer un déploiement", s.Resource)
+		}
+		if err := s.Apply(context.Background()); err != nil {
+			t.Fatalf("%s : %v", s.Resource, err)
+		}
+	}
+	for _, path := range []string{p.Paths.TelegrafFile(), p.Paths.Fail2banJailFile()} {
+		if _, err := os.Stat(path); err == nil {
+			t.Errorf("%s subsiste alors que l'outil est désactivé", path)
+		}
+	}
+	// Rien à retirer une seconde fois : le plan doit redevenir vide.
+	steps, err = p.Plan(context.Background(), projects, off)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(steps) != 0 {
+		t.Errorf("plan non vide sur un outil désactivé sans fichier : %+v", steps)
 	}
 }
 
@@ -314,5 +569,158 @@ func TestFichiersIdempotents(t *testing.T) {
 				t.Errorf("%s : second plan non vide, le fichier n'est pas idempotent", s.Resource)
 			}
 		}
+	}
+}
+
+// appliquer déroule un plan comme le moteur : une étape non critique en échec
+// laisse l'exécution continuer, ce qui est tout le sujet ici — la supervision ne
+// fait jamais échouer un déploiement.
+func appliquer(t *testing.T, p *Provider, projects []*model.Project, obs Observed) []*engine.Step {
+	t.Helper()
+	steps, err := p.Plan(context.Background(), projects, obs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range steps {
+		if s.Apply == nil {
+			continue
+		}
+		if err := s.Apply(context.Background()); err != nil && s.Critical {
+			t.Fatalf("%s : %v", s.Resource, err)
+		}
+	}
+	return steps
+}
+
+// etape retrouve une étape par sa ressource.
+func etape(t *testing.T, steps []*engine.Step, resource string) *engine.Step {
+	t.Helper()
+	for _, s := range steps {
+		if s.Resource == resource {
+			return s
+		}
+	}
+	t.Fatalf("étape %s absente du plan : %+v", resource, steps)
+	return nil
+}
+
+func TestFragmentTelegrafNePorteAucunMotDePasseQueLeMoteurIgnore(t *testing.T) {
+	// Le compte n'a pas pu être posé : le mot de passe calculé n'a jamais atteint
+	// le broker. L'écrire dans le fragment donnerait à l'agent un identifiant
+	// refusé — et, un secret non scellé étant tiré au hasard à chaque
+	// planification, le fichier serait réécrit à chaque apply, l'agent relancé à
+	// chaque fois, et « diff » resterait en écart pour toujours.
+	p, _ := fixture(t)
+	broker := &fakeBroker{refuse: errors.New("api d'administration fermée")}
+	p.AMQP = &amqp.Provider{Client: broker, ManagementURL: amqp.DefaultManagementURL}
+	obs := Observed{TelegrafPresent: true, TelegrafGroup: -1}
+
+	appliquer(t, p, nil, obs)
+	content, err := os.ReadFile(p.Paths.TelegrafFile())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(content), "[[inputs.rabbitmq]]") {
+		t.Errorf("le fragment porte une entrée dont le broker ignore le mot de passe :\n%s", content)
+	}
+	// Et le plan converge : sans quoi le fragment oscillerait indéfiniment.
+	steps, err := p.Plan(context.Background(), nil, obs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s := etape(t, steps, "monitoring/telegraf"); s.Apply != nil {
+		diff, _ := s.Diff()
+		t.Errorf("second plan non vide alors que rien n'a changé :\n%s", diff)
+	}
+}
+
+func TestFragmentTelegrafPorteLeMotDePasseQueLeBrokerARecu(t *testing.T) {
+	// Le corps est recalculé à l'application, après l'étape du compte : c'est là
+	// que le mot de passe devient scellé. Sans ce second calcul, l'entrée
+	// n'apparaîtrait qu'à l'apply suivant.
+	p, _ := fixture(t)
+	broker := &fakeBroker{}
+	p.AMQP = &amqp.Provider{Client: broker, ManagementURL: amqp.DefaultManagementURL}
+	obs := Observed{TelegrafPresent: true, TelegrafGroup: -1}
+
+	appliquer(t, p, nil, obs)
+	content, err := os.ReadFile(p.Paths.TelegrafFile())
+	if err != nil {
+		t.Fatal(err)
+	}
+	pose := broker.created[p.Cfg.Monitoring.TelegrafAccount()]
+	if pose == "" {
+		t.Fatal("le compte n'a pas été posé sur le broker")
+	}
+	if !strings.Contains(string(content), "password = "+strconv.Quote(pose)) {
+		t.Errorf("le fragment ne porte pas le mot de passe posé sur le broker :\n%s", content)
+	}
+	steps, err := p.Plan(context.Background(), nil, obs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s := etape(t, steps, "monitoring/telegraf"); s.Apply != nil {
+		diff, _ := s.Diff()
+		t.Errorf("second plan non vide : le fragment n'est pas idempotent\n%s", diff)
+	}
+}
+
+func TestPrisonsRetoucheesALaMainNeSontPasEcrasees(t *testing.T) {
+	// §6.4 : un fichier généré que l'exploitant a retouché n'est pas réécrit sans
+	// qu'on le lui dise. Le fichier de prisons est celui qu'il a le plus de raisons
+	// d'ouvrir, et il est recalculé en entier à chaque apply : sans refus, sa ligne
+	// disparaîtrait sans un mot et sans copie.
+	p, _ := fixture(t)
+	shop := project(t, "shop.fr", model.KindSymfony, "8.3")
+	withLogs(t, shop, "nginx")
+	projects := []*model.Project{shop}
+	obs := Observed{Fail2banPresent: true, TelegrafGroup: -1}
+
+	appliquer(t, p, projects, obs)
+	path := p.Paths.Fail2banJailFile()
+	genere, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	retouche := append(append([]byte{}, genere...), "ignoreip = 10.0.0.0/8\n"...)
+	if err := os.WriteFile(path, retouche, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	steps, err := p.Plan(context.Background(), projects, obs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := etape(t, steps, "monitoring/fail2ban")
+	if s.Apply == nil {
+		t.Fatal("aucune étape : le fichier retouché passerait pour conforme")
+	}
+	err = s.Apply(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "--force") {
+		t.Fatalf("l'écrasement doit être refusé et dire comment passer outre : %v", err)
+	}
+	if s.Critical {
+		t.Error("le refus ne doit pas faire compenser le déploiement d'un site")
+	}
+	if data, _ := os.ReadFile(path); string(data) != string(retouche) {
+		t.Error("le fichier retouché a été réécrit malgré le refus")
+	}
+
+	// --force : l'écrasement est permis, mais l'original part en sauvegarde.
+	p.Force = true
+	appliquer(t, p, projects, obs)
+	if data, _ := os.ReadFile(path); string(data) == string(retouche) {
+		t.Error("--force n'a pas réécrit le fichier")
+	}
+	copies, err := filepath.Glob(filepath.Join(p.Paths.Lib(), "backups",
+		filepath.Base(path)+".ogs-bak-*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(copies) != 1 {
+		t.Fatalf("une sauvegarde horodatée attendue hors du répertoire des prisons : %v", copies)
+	}
+	if data, _ := os.ReadFile(copies[0]); string(data) != string(retouche) {
+		t.Error("la sauvegarde ne porte pas le fichier de l'exploitant")
 	}
 }

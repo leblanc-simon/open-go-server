@@ -82,9 +82,16 @@ func (p *Provider) Observe(ctx context.Context, proj *model.Project) (Observed, 
 			obs.VhostExists = true
 		}
 	}
+	// Une lecture qui échoue après Overview et Vhosts n'est pas plus fatale que
+	// les précédentes : les cinq passent par le même appel HTTP, et « broker
+	// indisponible » ne peut pas être non critique sur /api/vhosts et fatal sur
+	// /api/users à quelques millisecondes près. Rendue à l'appelant, l'erreur
+	// faisait abandonner le plan **entier** — ni utilisateur système, ni vhost web,
+	// ni certificat — et, sous « --all », les projets suivants du parc avec.
 	users, err := p.Client.Users(ctx)
 	if err != nil {
-		return obs, err
+		obs.Unavailable = err
+		return obs, nil
 	}
 	for _, u := range users {
 		if u.Name == proj.Spec.AMQP.User {
@@ -93,7 +100,8 @@ func (p *Provider) Observe(ctx context.Context, proj *model.Project) (Observed, 
 	}
 	perms, err := p.Client.Permissions(ctx)
 	if err != nil {
-		return obs, err
+		obs.Unavailable = err
+		return obs, nil
 	}
 	for i := range perms {
 		if perms[i].Vhost == vhost && perms[i].User == proj.Spec.AMQP.User {

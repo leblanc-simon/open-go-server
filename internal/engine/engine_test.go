@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // tracker enregistre l'ordre des applications et des compensations.
@@ -292,5 +293,106 @@ func TestReloadIntentDeclaredAfterAFlushIsStillHonoured(t *testing.T) {
 	}
 	if len(report.Reloaded) != 2 {
 		t.Errorf("deux rechargements attendus : %v", report.Reloaded)
+	}
+}
+
+// Une annulation survenue *pendant* une étape doit compenser tout autant qu'une
+// annulation vue entre deux : Ctrl-C tombe rarement dans l'intervalle. Le
+// contexte étant alors déjà mort, une compensation qui lance une commande
+// (groupdel, userdel, suppression d'une base) échouerait sans avoir rien fait.
+func TestExecuteCompenseMalgreUneAnnulationPendantUneEtape(t *testing.T) {
+	ctx, annuler := context.WithCancel(context.Background())
+	defer annuler()
+
+	var vivant, compense bool
+	premiere := NewStep("test/user", Create, "user")
+	premiere.Apply = func(context.Context) error { return nil }
+	premiere.Compensate = func(ctx context.Context) error {
+		compense = true
+		vivant = ctx.Err() == nil
+		return ctx.Err()
+	}
+	seconde := NewStep("test/database", Create, "database")
+	seconde.Apply = func(ctx context.Context) error {
+		annuler()
+		return ctx.Err()
+	}
+
+	plan := &Plan{Project: "shopfr", Steps: []*Step{premiere, seconde}}
+	report, err := Execute(ctx, plan, Options{})
+	if err == nil {
+		t.Fatal("une étape critique annulée doit remonter une erreur")
+	}
+	if !compense {
+		t.Fatal("la compensation de la première étape n'a pas eu lieu")
+	}
+	if !vivant {
+		t.Error("la compensation a reçu un contexte déjà annulé")
+	}
+	if !report.RolledBack {
+		t.Error("le rapport n'annonce pas de déroulage")
+	}
+	if report.RollbackErr != nil {
+		t.Errorf("déroulage en échec : %v", report.RollbackErr)
+	}
+}
+
+// Chaque compensation reçoit son propre délai. Une borne unique pour tout le
+// déroulage expirerait en cours de route sur une saga longue : les compensations
+// lentes — l'arrêt des instances systemd, qui consomme jusqu'à TimeoutStopSec par
+// instance — appartiennent à des étapes appliquées tard, donc compensées tôt, et
+// mangeraient le budget de groupdel, userdel et de la suppression des bases,
+// dernières compensées. Compte, groupe et base resteraient en place alors que le
+// rapport annonce un déroulage.
+func TestChaqueCompensationRecoitSonProprePlafondDeTemps(t *testing.T) {
+	échéances := map[string]time.Time{}
+	compenser := func(nom string) func(context.Context) error {
+		return func(ctx context.Context) error {
+			if err := ctx.Err(); err != nil {
+				t.Errorf("compensation de %s sur un contexte mort : %v", nom, err)
+				return err
+			}
+			échéance, ok := ctx.Deadline()
+			if !ok {
+				t.Fatalf("compensation de %s : aucune échéance, la borne a disparu", nom)
+			}
+			échéances[nom] = échéance
+			// Sans quoi les deux échéances pourraient tomber sur la même valeur
+			// d'horloge et le test ne distinguerait plus les deux budgets.
+			time.Sleep(2 * time.Millisecond)
+			return nil
+		}
+	}
+
+	groupe := NewStep("system/group", Create, "group")
+	groupe.Apply = func(context.Context) error { return nil }
+	groupe.Compensate = compenser("groupe")
+	instance := NewStep("unit/instance", Create, "instance")
+	instance.Apply = func(context.Context) error { return nil }
+	instance.Compensate = compenser("instance")
+	sudoers := NewStep("sudoers/file", Create, "sudoers")
+	sudoers.Apply = func(context.Context) error { return errors.New("visudo refuse la règle") }
+
+	plan := &Plan{Project: "shopfr", Steps: []*Step{groupe, instance, sudoers}}
+	report, err := Execute(context.Background(), plan, Options{})
+	if err == nil {
+		t.Fatal("une étape critique en échec doit remonter une erreur")
+	}
+	if report.RollbackErr != nil {
+		t.Fatalf("déroulage en échec : %v", report.RollbackErr)
+	}
+	if len(échéances) != 2 {
+		t.Fatalf("%d compensation(s) déroulée(s), deux attendues", len(échéances))
+	}
+	// L'instance est compensée la première : son échéance doit être antérieure à
+	// celle du groupe, faute de quoi les deux partagent le même budget.
+	if !échéances["groupe"].After(échéances["instance"]) {
+		t.Errorf("les deux compensations partagent une seule échéance (%v)", échéances)
+	}
+	// Et ce budget est bien celui d'une compensation, non le reliquat de celui du
+	// déroulage entier.
+	if reste := time.Until(échéances["groupe"]); reste > délaiCompensation {
+		t.Errorf("la dernière compensation dispose de %v, %v au plus attendus",
+			reste, délaiCompensation)
 	}
 }

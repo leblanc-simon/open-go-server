@@ -142,7 +142,7 @@ func newUserKeyRotateCommand(app *App) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			old, err := system.RotateKey(cmd.Context(), app.Exec, p, provs.System.Identity)
+			old, err := system.RotateKey(cmd.Context(), app.Exec, p, provs.System.Identity, app.Paths.BackupsDir())
 			if err != nil {
 				return wrap(CodeError, err)
 			}

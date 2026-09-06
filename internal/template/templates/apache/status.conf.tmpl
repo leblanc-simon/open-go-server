@@ -39,18 +39,19 @@ Listen {{ .Listen }}
     # demandée, non du chemin de la cible fcgi://, et FPM compare cette variable à
     # son pm.status_path. Sans cette réécriture, il ne reconnaît pas le chemin de
     # statut, cherche un fichier, et répond « Primary script unknown » — une 404
-    # que rien dans la configuration ne laisse prévoir.
+    # que rien dans la configuration ne laisse prévoir. Le chemin est celui de ce
+    # pool-ci, et non celui du parc : un projet peut le déplacer par ses settings.
     <Location {{ $.Prefix }}/fpm/{{ .Name }}>
         Require local
-        ProxyFCGISetEnvIf "true" SCRIPT_NAME "{{ $.PoolStatus }}"
-        ProxyFCGISetEnvIf "true" SCRIPT_FILENAME "{{ $.PoolStatus }}"
-        ProxyPass {{ .Pass }}{{ $.PoolStatus }}
+        ProxyFCGISetEnvIf "true" SCRIPT_NAME "{{ .Status }}"
+        ProxyFCGISetEnvIf "true" SCRIPT_FILENAME "{{ .Status }}"
+        ProxyPass {{ .Pass }}{{ .Status }}
     </Location>
     <Location {{ $.Prefix }}/ping/{{ .Name }}>
         Require local
-        ProxyFCGISetEnvIf "true" SCRIPT_NAME "{{ $.PoolPing }}"
-        ProxyFCGISetEnvIf "true" SCRIPT_FILENAME "{{ $.PoolPing }}"
-        ProxyPass {{ .Pass }}{{ $.PoolPing }}
+        ProxyFCGISetEnvIf "true" SCRIPT_NAME "{{ .Ping }}"
+        ProxyFCGISetEnvIf "true" SCRIPT_FILENAME "{{ .Ping }}"
+        ProxyPass {{ .Pass }}{{ .Ping }}
     </Location>
 {{- end }}
 </VirtualHost>

@@ -38,16 +38,45 @@ const (
 	EnvPrep Env = "prep"
 )
 
-// ParseEnv valide une valeur d'environnement.
+// envs est la liste de référence des environnements (D24). ParseEnv la
+// parcourt, le message d'erreur l'énumère et Envs la publie : tout ce qui est
+// proposé à l'utilisateur vient donc de ce qui est accepté. Une liste recopiée
+// ailleurs avait fait proposer « staging » à la complétion de « --env », que le
+// chargement refuse — la complétion suggérait la faute de frappe qu'elle est
+// censée éviter.
+var envs = []Env{EnvProd, EnvPrep}
+
+// Envs rend les environnements acceptés, dans l'ordre où on les propose. La
+// copie est délibérée : l'appelant ne doit pas pouvoir modifier ce que ParseEnv
+// accepte.
+func Envs() []Env { return append([]Env(nil), envs...) }
+
+// ParseEnv valide une valeur d'environnement. L'absence de valeur vaut
+// production, cas de loin le plus courant.
 func ParseEnv(v string) (Env, error) {
-	switch Env(strings.ToLower(strings.TrimSpace(v))) {
-	case "", EnvProd:
+	e := Env(strings.ToLower(strings.TrimSpace(v)))
+	if e == "" {
 		return EnvProd, nil
-	case EnvPrep:
-		return EnvPrep, nil
-	default:
-		return "", fmt.Errorf("environnement inconnu %q (attendu : prod ou prep)", v)
 	}
+	for _, connu := range envs {
+		if e == connu {
+			return connu, nil
+		}
+	}
+	return "", fmt.Errorf("environnement inconnu %q (attendu : %s)", v, envsAttendus())
+}
+
+// envsAttendus met la liste en français pour un message d'erreur : « prod ou
+// prep », et « a, b ou c » si un troisième environnement apparaissait.
+func envsAttendus() string {
+	noms := make([]string, len(envs))
+	for i, e := range envs {
+		noms[i] = string(e)
+	}
+	if len(noms) < 2 {
+		return strings.Join(noms, "")
+	}
+	return strings.Join(noms[:len(noms)-1], ", ") + " ou " + noms[len(noms)-1]
 }
 
 var (

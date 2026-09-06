@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path"
+	"regexp"
 	"sort"
 
 	"leblanc.io/open-go-server/internal/config"
@@ -24,6 +25,34 @@ type StatusPool struct {
 	Project string
 	// Pass est la référence du point d'écoute FPM, dans la syntaxe du moteur.
 	Pass string
+	// Status et Ping sont les chemins d'état *effectifs* de ce pool. Ils ne sont
+	// pas ceux du parc : « pm.status_path » et « ping.path » sont des réglages de
+	// base, qu'un projet surcharge par spec.php.pools[].settings. Or FPM compare
+	// SCRIPT_NAME à la valeur qu'il a retenue, lui — le vhost force cette variable
+	// (D66), il doit donc forcer le bon chemin, sans quoi le pool cherche un
+	// fichier et répond « Primary script unknown » à chaque collecte.
+	Status string
+	Ping   string
+}
+
+// reCheminEtat reconnaît un chemin d'état écrivable tel quel dans un vhost.
+// Le contrôle n'est pas une coquetterie : la valeur vient du fichier d'un
+// projet, et le vhost de supervision est de portée serveur. Un point-virgule,
+// une espace ou un saut de ligne y ajouterait une directive — et sur nginx une
+// directive dupliquée est fatale, donc un seul projet abattrait le moteur.
+var reCheminEtat = regexp.MustCompile(`^/[A-Za-z0-9._~/-]{1,64}$`)
+
+// cheminEtat rend le chemin d'état retenu par le pool, ou le défaut du parc.
+//
+// Une valeur qu'on ne saurait pas écrire sans risque retombe sur le défaut :
+// une métrique manquante pour ce pool — l'état d'avant ce contrôle — vaut mieux
+// qu'une directive arbitraire dans un vhost que le moteur charge en root.
+func cheminEtat(settings map[string]string, clef, defaut string) string {
+	v := settings[clef]
+	if v == "" || !reCheminEtat.MatchString(v) {
+		return defaut
+	}
+	return v
 }
 
 // PlanStatus produit le vhost de supervision : un point d'écoute local qui
@@ -70,10 +99,13 @@ func (p *Provider) PlanStatus(ctx context.Context, projects []*model.Project,
 	}
 	tmplName := p.Engine.TemplateName("status")
 	body, err := p.Templates.Render(tmplName, map[string]any{
-		"Listen":     listen,
-		"Prefix":     prefix,
-		"Engine":     p.Engine.Name(),
-		"Pools":      pools,
+		"Listen": listen,
+		"Prefix": prefix,
+		"Engine": p.Engine.Name(),
+		"Pools":  pools,
+		// Les chemins du parc restent offerts au contexte alors que les templates
+		// livrés emploient désormais ceux du pool : les templates sont
+		// surchargeables, et une surcharge écrite avant eux les emploie encore.
 		"PoolStatus": config.PoolStatusPath,
 		"PoolPing":   config.PoolPingPath,
 	})
@@ -103,15 +135,21 @@ func (p *Provider) PlanStatus(ctx context.Context, projects []*model.Project,
 		}
 		s := engine.NewStep("web/status", action, summary)
 		s.Diff = func() (string, error) { return diffText(filePath, content) }
+		// Corps précédent, relevé à l'application : l'état du disque a pu changer
+		// depuis le plan.
+		var previous []byte
+		var hadPrevious bool
 		s.Apply = func(ctx context.Context) error {
-			previous, hadPrevious := os.ReadFile(filePath)
+			if data, err := os.ReadFile(filePath); err == nil {
+				previous, hadPrevious = data, true
+			}
 			if err := fs.WriteAtomic(filePath, content, 0o644, fs.KeepOwner); err != nil {
 				return err
 			}
 			// Même précaution que pour un vhost de projet : une configuration
 			// invalide écrite ici arrête tout le serveur au rechargement suivant.
 			if err := validate(ctx, p.Engine, p.Exec); err != nil {
-				if hadPrevious == nil {
+				if hadPrevious {
 					_ = fs.WriteAtomic(filePath, previous, 0o644, fs.KeepOwner)
 				} else {
 					_ = os.Remove(filePath)
@@ -120,7 +158,21 @@ func (p *Provider) PlanStatus(ctx context.Context, projects []*model.Project,
 			}
 			return nil
 		}
-		s.Compensate = func(context.Context) error { return os.Remove(filePath) }
+		// Comme pour un vhost de projet : la compensation d'une mise à jour rend le
+		// contenu antérieur. Le supprimer laisserait le lien d'activation — déjà
+		// posé, donc jamais compensé — pointer dans le vide, et ce vhost-ci est de
+		// portée serveur : nginx refuserait alors de démarrer pour tout le parc.
+		s.Compensate = func(context.Context) error {
+			if hadPrevious {
+				return fs.WriteAtomic(filePath, previous, 0o644, fs.KeepOwner)
+			}
+			// Un fichier déjà absent n'est pas une erreur : une compensation en
+			// échec arrête tout le déroulage.
+			if err := os.Remove(filePath); err != nil && !os.IsNotExist(err) {
+				return err
+			}
+			return nil
+		}
 		s.Reload = []string{"web:" + p.Engine.Name()}
 		steps = append(steps, s)
 	}
@@ -164,7 +216,9 @@ func (p *Provider) statusPools(projects []*model.Project) ([]StatusPool, error) 
 			}
 			pools = append(pools, StatusPool{
 				Name: bp.Name, Project: proj.ID(),
-				Pass: p.Engine.FPMReference(bp.Listen, bp.Unix),
+				Pass:   p.Engine.FPMReference(bp.Listen, bp.Unix),
+				Status: cheminEtat(bp.Pool.Settings, "pm.status_path", config.PoolStatusPath),
+				Ping:   cheminEtat(bp.Pool.Settings, "ping.path", config.PoolPingPath),
 			})
 		}
 	}

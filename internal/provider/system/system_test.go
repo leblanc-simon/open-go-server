@@ -10,6 +10,7 @@ import (
 	"leblanc.io/open-go-server/internal/config"
 	"leblanc.io/open-go-server/internal/engine"
 	"leblanc.io/open-go-server/internal/exec"
+	"leblanc.io/open-go-server/internal/fs"
 	"leblanc.io/open-go-server/internal/model"
 	"leblanc.io/open-go-server/internal/naming"
 )
@@ -532,5 +533,352 @@ func TestShellDuSystemeEstLuDansPasswd(t *testing.T) {
 	}
 	if _, ok := shellFromPasswd(filepath.Join(dir, "absent"), "shopfr"); ok {
 		t.Error("une base de comptes absente ne doit pas rendre de shell")
+	}
+}
+
+func TestPlanRefuseUnRepertoireRemplaceParUnLien(t *testing.T) {
+	// www/ vit sous un home que l'utilisateur du projet écrit (0711) : il peut le
+	// retirer et poser à sa place un lien vers n'importe quel répertoire du
+	// système. Le suivre poserait le mode 0710 et le propriétaire du projet sur la
+	// cible — l'escalade vers root que la propriété root de logs/ ferme par un
+	// autre chemin (§7.1.2).
+	p, prov, _, _ := fixture(t)
+	apply(t, prov, p)
+
+	temoin := t.TempDir()
+	if err := os.Chmod(temoin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	www := filepath.Join(p.Spec.Layout.Root, "www")
+	if err := os.Remove(www); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(temoin, www); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	obs, err := prov.Observe(ctx, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !obs.Dirs[www].Symlink {
+		t.Fatal("le lien n'est pas constaté : statDir suit encore les liens")
+	}
+	steps, err := prov.Plan(ctx, p, obs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := &engine.Plan{Project: p.ID()}
+	for _, s := range steps {
+		plan.Add(s)
+	}
+	// Le refus se lit dès le plan : annoncer « mode 0755 → 0710 » ferait croire à
+	// une correction bénigne, alors que le mode constaté est celui de la cible.
+	for _, s := range plan.Mutating() {
+		if s.Resource != "system/dir/"+www {
+			continue
+		}
+		if !strings.Contains(s.Summary, "lien symbolique") {
+			t.Errorf("le plan doit annoncer le lien, non une correction de mode : %q", s.Summary)
+		}
+	}
+	report, err := engine.Execute(ctx, plan, engine.Options{})
+	if err == nil {
+		t.Fatal("un répertoire remplacé par un lien doit faire échouer l'étape, non la corriger")
+	}
+	var signale bool
+	for _, o := range report.Outcomes {
+		if o.Step.Resource != "system/dir/"+www || o.Err == nil {
+			continue
+		}
+		signale = true
+		if !strings.Contains(o.Err.Error(), www) || !strings.Contains(o.Err.Error(), "lien symbolique") {
+			t.Errorf("message peu explicite : %v", o.Err)
+		}
+	}
+	if !signale {
+		t.Error("le lien doit produire une étape en échec qui nomme le chemin")
+	}
+	info, err := os.Stat(temoin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o755 {
+		t.Errorf("la cible du lien est passée en %04o : ogs a suivi le lien", got)
+	}
+	// Le reste de l'arborescence continue d'être planifié : un lien ne rend pas
+	// le plan aveugle au reste du projet.
+	if len(steps) < len(prov.paths(p)) {
+		t.Errorf("plan tronqué : %d étapes pour %d répertoires", len(steps), len(prov.paths(p)))
+	}
+}
+
+// etatConforme fabrique l'état d'une arborescence au mode attendu, appartenant
+// tout entière à un même couple : c'est ce que laisse un « chown -R ».
+func etatConforme(t *testing.T, p *model.Project, uid, gid int) Observed {
+	t.Helper()
+	obs := Observed{
+		User:  &UserInfo{Name: p.Spec.User.Name, UID: uid, GID: gid, Managed: true},
+		Group: &GroupInfo{Name: p.Spec.User.Group, GID: gid},
+		Dirs:  map[string]DirState{},
+	}
+	mode, err := fs.ParseMode(p.Spec.Layout.Mode)
+	if err != nil {
+		t.Fatal(err)
+	}
+	obs.Dirs[p.Spec.Layout.Root] = DirState{Exists: true, Mode: mode, UID: uid, GID: gid}
+	for _, d := range p.Spec.Layout.Dirs {
+		m, merr := fs.ParseMode(d.Mode)
+		if merr != nil {
+			t.Fatal(merr)
+		}
+		obs.Dirs[filepath.Join(p.Spec.Layout.Root, d.Path)] = DirState{
+			Exists: true, Mode: m, UID: uid, GID: gid,
+		}
+	}
+	return obs
+}
+
+func TestPlanCorrigeUneDeriveDeProprietaire(t *testing.T) {
+	// Un « chown -R shopfr:shopfr /home/shop.fr » laisse les modes intacts : seul
+	// le propriétaire change. Sans comparaison, logs/ et .bin/ restent « conformes »
+	// à jamais alors que l'utilisateur du projet peut désormais y substituer un
+	// lien symbolique au journal que le maître Apache ouvre en root (§7.1.2).
+	p, prov, _, _ := fixture(t)
+	// L'exécuteur réel : sous préfixe, ensureDir laisse le propriétaire en place
+	// (fs.KeepOwner), et comparer y ferait osciller le plan.
+	prov.Exec = &exec.Local{}
+
+	steps, err := prov.dirSteps(p, etatConforme(t, p, 4242, 4242))
+	if err != nil {
+		t.Fatal(err)
+	}
+	corriges := map[string]string{}
+	for _, s := range steps {
+		if s.Mutates() {
+			corriges[s.Resource] = s.Summary
+		}
+	}
+	for _, dir := range []string{"logs", ".bin"} {
+		res := "system/dir/" + filepath.Join(p.Spec.Layout.Root, dir)
+		resume, ok := corriges[res]
+		if !ok {
+			t.Errorf("%s appartient à root : la dérive de propriétaire doit être corrigée", dir)
+			continue
+		}
+		if !strings.Contains(resume, "propriétaire") {
+			t.Errorf("%s : le libellé doit nommer la dérive de propriétaire (%q)", dir, resume)
+		}
+		delete(corriges, res)
+	}
+	if len(corriges) != 0 {
+		t.Errorf("les répertoires du projet sont au bon propriétaire : %v", corriges)
+	}
+}
+
+func TestDeriveDeProprietaireIgnoreeEnModeSimule(t *testing.T) {
+	// Sous préfixe, l'arborescence appartient à qui fait tourner l'essai et
+	// ensureDir ne pose aucun propriétaire : signaler un écart ferait osciller le
+	// plan sur une correction qu'aucune étape n'applique.
+	p, prov, _, _ := fixture(t)
+	steps, err := prov.dirSteps(p, etatConforme(t, p, 4242, 4242))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range steps {
+		if s.Mutates() {
+			t.Errorf("étape inattendue en mode simulé : %s", s)
+		}
+	}
+}
+
+func TestCleDeDeploiementRefuseUnLienDansSsh(t *testing.T) {
+	// .ssh appartient à l'utilisateur du projet, qui en choisit les entrées. Un
+	// os.Stat conclurait « clé absente » sur un lien pendant, et ssh-keygen —
+	// lancé en root, sans O_NOFOLLOW — écrirait la clé dans la cible, que le chown
+	// suivant lui donnerait : écriture root arbitraire, déclenchée par un apply de
+	// routine (§7.1.2).
+	for _, cas := range []struct{ nom, fichier string }{
+		{"clé privée", KeyName},
+		{"clé publique", KeyName + ".pub"},
+	} {
+		t.Run(cas.nom, func(t *testing.T) {
+			p, prov, rec, _ := fixture(t)
+			ssh := filepath.Dir(KeyPath(p.Spec.Layout.Root))
+			if err := os.MkdirAll(ssh, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			cible := filepath.Join(t.TempDir(), "fichier-de-root")
+			if err := os.Symlink(cible, filepath.Join(ssh, cas.fichier)); err != nil {
+				t.Fatal(err)
+			}
+
+			report := apply(t, prov, p)
+			if report.RolledBack {
+				t.Fatal("le refus doit rester non bloquant : le reste du projet s'applique")
+			}
+			var signale bool
+			for _, o := range report.Outcomes {
+				if o.Step.Resource == "system/deploy-key/shopfr" && o.Err != nil {
+					signale = true
+					if !strings.Contains(o.Err.Error(), cas.fichier) {
+						t.Errorf("message peu explicite : %v", o.Err)
+					}
+				}
+			}
+			if !signale {
+				t.Error("un lien à la place de la clé doit être signalé, non contourné")
+			}
+			if _, err := os.Lstat(cible); !os.IsNotExist(err) {
+				t.Errorf("ogs a écrit dans la cible du lien : %v", err)
+			}
+			if rec.Contains("ssh-keygen") {
+				t.Errorf("ssh-keygen ne doit pas être lancé sur un chemin lié : %v", rec.Calls())
+			}
+		})
+	}
+}
+
+func TestCleDeDeploiementEstGenereeHorsDeSsh(t *testing.T) {
+	p, prov, rec, _ := fixture(t)
+	apply(t, prov, p)
+	// La paire est produite dans un répertoire de root, puis installée : laisser
+	// ssh-keygen écrire directement dans .ssh donnerait à l'utilisateur du projet
+	// une écriture root sur le chemin de son choix.
+	ssh := filepath.Dir(KeyPath(p.Spec.Layout.Root))
+	for _, appel := range rec.Calls() {
+		if !strings.Contains(appel.String(), "ssh-keygen") {
+			continue
+		}
+		if strings.Contains(appel.String(), ssh) {
+			t.Errorf("ssh-keygen écrit dans le répertoire du projet : %s", appel.String())
+		}
+	}
+}
+
+func TestInstallKeyFileNeSuitPasUnLien(t *testing.T) {
+	// La fenêtre que l'utilisateur du projet gagnerait sinon : reposer un lien
+	// entre le contrôle du plan et l'écriture de l'apply. Le chemin est délié puis
+	// recréé en O_CREAT|O_EXCL|O_NOFOLLOW, jamais suivi.
+	dir := t.TempDir()
+	temoin := filepath.Join(dir, "fichier-de-root")
+	const contenu = "contenu de root\n"
+	if err := os.WriteFile(temoin, []byte(contenu), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	lien := filepath.Join(dir, KeyName)
+	if err := os.Symlink(temoin, lien); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := installKeyFile(lien, []byte("clé privée\n"), 0o600, -1, -1); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(temoin)
+	if err != nil || string(data) != contenu {
+		t.Errorf("la cible du lien a été écrasée : %q, %v", string(data), err)
+	}
+	info, err := os.Lstat(lien)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.Mode().IsRegular() {
+		t.Errorf("%s devrait être un fichier régulier (%v)", lien, info.Mode())
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Errorf("mode = %04o, attendu 0600", got)
+	}
+}
+
+func TestRotationRefuseUnLien(t *testing.T) {
+	// fs.Backup lit par os.ReadFile, donc à travers le lien : une rotation lancée
+	// sur un lien vers un fichier de root en recopierait le contenu dans .ssh, où
+	// le projet — qui possède le répertoire — le lit.
+	p, _, rec, ident := fixture(t)
+	ident.Users["shopfr"] = &UserInfo{Name: "shopfr", UID: 1004, GID: 1004, Managed: true}
+	ident.Groups["shopfr"] = &GroupInfo{Name: "shopfr", GID: 1004}
+	ssh := filepath.Dir(KeyPath(p.Spec.Layout.Root))
+	if err := os.MkdirAll(ssh, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	temoin := filepath.Join(t.TempDir(), "fichier-de-root")
+	if err := os.WriteFile(temoin, []byte("secret de root\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(temoin, KeyPath(p.Spec.Layout.Root)); err != nil {
+		t.Fatal(err)
+	}
+
+	sauvegardes := filepath.Join(t.TempDir(), "backups")
+	if _, err := RotateKey(context.Background(), rec, p, ident, sauvegardes); err == nil {
+		t.Fatal("la rotation doit refuser un chemin qui n'est pas un fichier régulier")
+	}
+	entries, err := os.ReadDir(ssh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if strings.Contains(e.Name(), ".ogs-bak-") {
+			t.Errorf("le contenu de la cible a été recopié dans .ssh : %s", e.Name())
+		}
+	}
+	// Le refus précède toute lecture : rien n'a pu partir non plus dans le
+	// répertoire des sauvegardes, où la copie irait désormais.
+	if copies, _ := os.ReadDir(sauvegardes); len(copies) != 0 {
+		t.Errorf("%d copie(s) écrite(s) malgré le refus", len(copies))
+	}
+}
+
+func TestLaCompensationNeSuitPasUnLien(t *testing.T) {
+	// Le plan refuse un répertoire lié, mais la compensation intervient après
+	// coup : entre l'apply et le rollback, l'utilisateur du projet — qui écrit
+	// dans son home — a le temps de substituer un lien. Un os.Chmod suivi d'un
+	// os.Chown sur le chemin rendraient alors à la cible le mode et le
+	// propriétaire d'origine de www/, c'est-à-dire ceux du projet (§7.1.2).
+	p, prov, _, _ := fixture(t)
+	apply(t, prov, p)
+
+	www := filepath.Join(p.Spec.Layout.Root, "www")
+	if err := os.Chmod(www, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	obs, err := prov.Observe(context.Background(), p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	steps, err := prov.dirSteps(p, obs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var compense func(context.Context) error
+	for _, s := range steps {
+		if s.Resource == "system/dir/"+www && s.Compensate != nil {
+			compense = s.Compensate
+		}
+	}
+	if compense == nil {
+		t.Fatal("un mode divergent doit produire une étape compensable")
+	}
+
+	temoin := t.TempDir()
+	if err := os.Chmod(temoin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(www); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(temoin, www); err != nil {
+		t.Fatal(err)
+	}
+	if err := compense(context.Background()); err == nil {
+		t.Error("la compensation doit refuser un chemin devenu un lien")
+	}
+	info, err := os.Stat(temoin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o755 {
+		t.Errorf("la cible du lien est passée en %04o : la compensation a suivi le lien", got)
 	}
 }

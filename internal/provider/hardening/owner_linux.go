@@ -25,3 +25,15 @@ func ownerNames(info os.FileInfo) (string, string) {
 	}
 	return owner, group
 }
+
+// fileGID rend le groupe numérique d'un fichier, ou -1. Il sert à décider si un
+// fichier porte déjà le groupe du service : comparer les noms passerait par une
+// résolution par fichier, et rendrait « 998 » là où la comparaison doit être
+// exacte.
+func fileGID(info os.FileInfo) int {
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return -1
+	}
+	return int(st.Gid)
+}

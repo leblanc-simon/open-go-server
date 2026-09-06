@@ -49,6 +49,19 @@ func newDeleteCommand(app *App) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			// Le dernier rempart est éprouvé AVANT tout le reste : la suppression
+			// franchit très vite le point de non-retour — archive, fichiers générés,
+			// bases, vhosts, compte système —, si bien qu'un refus prononcé au moment
+			// d'effacer l'arborescence ne sauvait plus que celle-ci et conseillait de
+			// corriger une déclaration qui venait de partir aux archives. Une racine
+			// que l'on ne peut pas effacer sans emporter les voisins arrête donc le
+			// geste, pas seulement sa dernière étape ; « --keep-data », qui ne touche
+			// ni au compte ni à l'arborescence, reste ouvert.
+			if !keepData {
+				if err := app.checkRemovableRoot(p); err != nil {
+					return wrap(CodeValidation, err)
+				}
+			}
 			if purge {
 				// La purge ne laisse aucun recours : la confirmation exige de saisir
 				// l'identifiant, ce qui rend l'erreur de frappe improbable.
@@ -106,7 +119,7 @@ func newDeleteCommand(app *App) *cobra.Command {
 			var removed []string
 			archived := ""
 			if !purge {
-				path, list, err := app.archiveProject(cmd, provs, p, noDump)
+				path, list, err := app.archiveProject(cmd, provs, p, noDump, warn)
 				if err != nil {
 					return err
 				}
@@ -244,11 +257,7 @@ func newDeleteCommand(app *App) *cobra.Command {
 // retrait d'un projet. Le plan est recalculé depuis les fichiers restants : le
 // projet supprimé a déjà quitté /etc/ogs/projects.
 func (a *App) refreshGlobal(ctx context.Context, provs *providers) error {
-	projects, err := a.loadProjects()
-	if err != nil {
-		return err
-	}
-	plan, err := a.buildGlobalPlan(provs, projects)
+	plan, err := a.buildGlobalPlan(ctx, provs, nil)
 	if err != nil {
 		return err
 	}
@@ -379,13 +388,73 @@ func (a *App) removeUser(cmd *cobra.Command, provs *providers, p *model.Project)
 		}
 	}
 	// L'arborescence part en dernier : tout ce qui précède a pu avoir besoin de la lire.
-	if err := os.RemoveAll(p.Spec.Layout.Root); err != nil {
-		return errors.Join(accountErr, err)
+	treeErr := a.checkRemovableRoot(p)
+	if treeErr == nil {
+		treeErr = os.RemoveAll(p.Spec.Layout.Root)
 	}
+	// Le répertoire d'exécution est dérivé du préfixe et de l'identifiant, non du
+	// fichier de projet : il part quoi qu'il arrive à l'arborescence.
 	if err := os.RemoveAll(a.Paths.ProjectRunDir(p.ID())); err != nil {
-		return errors.Join(accountErr, err)
+		return errors.Join(accountErr, treeErr, err)
 	}
-	return accountErr
+	return errors.Join(accountErr, treeErr)
+}
+
+// checkRemovableRoot est le rempart devant un geste sans retour. La racine vient
+// du fichier YAML du projet : la validation la contrôle désormais à l'entrée,
+// mais une déclaration écrite avant ce durcissement — ou à la main — reste sur le
+// disque, et os.RemoveAll ne demande rien à personne. Le contrôle est donc refait
+// ici, en nommant le chemin : l'exploitant corrige layout.root puis recommence.
+//
+// Il est appelé deux fois, et les deux comptent : à l'entrée de « project
+// delete », où il refuse le geste tant qu'il est encore refusable, et juste avant
+// os.RemoveAll, où il garde le seul appel qui efface — removeUser ne doit pas
+// dépendre de qui l'appelle.
+//
+// Un projet adopté échappe à la racine des homes, et c'est voulu : l'import
+// reprend le home réel d'un compte du système (/var/www/boutique, par exemple).
+// Pour lui, seuls tiennent les emplacements interdits à tout le monde. La liste
+// est celle de la validation, recopiée — le rempart doit valoir même quand l'amont
+// n'a rien vu — et élargie aux racines que plusieurs sites se partagent : un
+// /etc/passwd dont le home vaut /var/www ferait effacer les voisins.
+func (a *App) checkRemovableRoot(p *model.Project) error {
+	clean := filepath.Clean(p.Spec.Layout.Root)
+	home := filepath.Clean(a.homeRoot())
+	refus := func(raison string) error {
+		return fmt.Errorf("racine de projet %q : %s — suppression refusée ; corriger "+
+			"spec.layout.root dans la déclaration du projet, ou relancer avec --keep-data, "+
+			"qui retire le projet sans toucher ni aux bases ni à l'arborescence",
+			p.Spec.Layout.Root, raison)
+	}
+	switch {
+	// filepath.Clean rend « . » pour une racine vide : un chemin relatif
+	// effacerait le répertoire de travail de qui a lancé la commande.
+	case clean == "/" || clean == ".":
+		return refus("ni la racine du système ni un chemin relatif ne sont effaçables")
+	case systemRoot(clean):
+		return refus("emplacement système")
+	// L'égalité est refusée au même titre que le débordement : effacer la racine
+	// des homes emporterait tous les autres projets du parc (D60).
+	case clean == home:
+		return refus("c'est la racine des homes elle-même, partagée par tout le parc")
+	case !strings.HasPrefix(clean, home+string(filepath.Separator)) &&
+		p.Metadata.Labels["adopted"] != "true":
+		return refus("hors de " + home + ", alors que le projet n'est pas adopté")
+	}
+	return nil
+}
+
+// systemRoot énumère les emplacements qu'aucune racine de projet ne peut valoir,
+// adoptée ou non.
+func systemRoot(clean string) bool {
+	for _, f := range []string{"/etc", "/usr", "/bin", "/sbin", "/lib", "/boot",
+		"/dev", "/proc", "/sys", "/run", "/var", "/var/lib", "/var/log", "/var/www",
+		"/root", "/tmp", "/home", "/srv", "/opt"} {
+		if clean == f {
+			return true
+		}
+	}
+	return false
 }
 
 // unitActive dit si systemd a l'unité active. Une unité inconnue, non chargée ou
@@ -462,8 +531,34 @@ func uidMatches(status string, uid int) bool {
 	return false
 }
 
-// archiveProject construit l'archive complète du projet.
-func (a *App) archiveProject(cmd *cobra.Command, provs *providers, p *model.Project, noDump bool) (string, []string, error) {
+// dumpWorkDir crée un répertoire de travail privé pour les sauvegardes de
+// passage — celles qui entrent dans une archive, en sortent, ou transitent d'un
+// projet à l'autre lors d'un clonage.
+//
+// Il ne peut pas être /tmp : le nom du fichier y serait déductible, le
+// répertoire est inscriptible par tous, et chaque projet a un compte local
+// dont le shell est ouvert (D62). Un fichier planté d'avance serait ouvert tel
+// quel — le mode 0600 du dump ne vaut qu'à la création —, et un attaquant
+// n'aurait même pas à le lire pour nuire : sur les plateformes visées le noyau
+// refuse l'ouverture (fs.protected_regular), la sauvegarde échoue, et la
+// suppression continue vers une archive sans données. Sous /var/lib/ogs, que
+// seul root traverse, aucun utilisateur de projet n'y crée de nom.
+func (a *App) dumpWorkDir() (string, error) {
+	root := a.Paths.DumpsDir()
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		return "", err
+	}
+	// MkdirTemp crée en 0700 : rien à corriger après coup.
+	return os.MkdirTemp(root, ".travail-")
+}
+
+// archiveProject construit l'archive complète du projet. Les avertissements
+// passent par le compteur de la commande et non par un simple affichage : une
+// archive à laquelle il manque un dump n'est pas une archive dont on peut
+// restaurer le site, et rendre 0 après l'avoir produite ferait croire le
+// contraire à qui enchaîne sur la suppression.
+func (a *App) archiveProject(cmd *cobra.Command, provs *providers, p *model.Project, noDump bool,
+	warn func(format string, args ...any)) (string, []string, error) {
 	// L'espace disponible est vérifié avant de commencer : échouer au milieu
 	// d'une suppression laisserait le système à moitié démonté.
 	size, err := treeSize(p.Spec.Layout.Root)
@@ -514,11 +609,17 @@ func (a *App) archiveProject(cmd *cobra.Command, provs *providers, p *model.Proj
 		removed = append(removed, file)
 	}
 	// Les dumps : sans eux, l'archive serait inexploitable pour une restauration.
-	if !noDump {
+	if !noDump && len(p.Spec.Databases) > 0 {
+		dir, err := a.dumpWorkDir()
+		if err != nil {
+			return "", nil, wrap(CodeError, err)
+		}
+		defer os.RemoveAll(dir)
 		for _, decl := range p.Spec.Databases {
-			tmp := filepath.Join(os.TempDir(), fmt.Sprintf("ogs-dump-%s-%s.sql", p.ID(), decl.Name))
+			tmp := filepath.Join(dir, decl.Name+".sql")
 			if _, err := provs.DB.Dump(cmd.Context(), p, decl, tmp); err != nil {
-				a.printf("⚠ sauvegarde de %s impossible : %v\n", decl.Name, err)
+				warn("sauvegarde de %s impossible : %v — l'archive ne contiendra pas ses données, "+
+					"et « ogs project restore » ne les rendra pas", decl.Name, err)
 				continue
 			}
 			if err := w.AddFile("dump", "dumps/"+decl.Name+".sql", tmp); err != nil {
@@ -680,6 +781,12 @@ func (a *App) restoreDumps(cmd *cobra.Command, path string, p *model.Project, ma
 		return
 	}
 	defer provs.close()
+	dir, err := a.dumpWorkDir()
+	if err != nil {
+		a.printf("⚠ %v\n", err)
+		return
+	}
+	defer os.RemoveAll(dir)
 	for _, entry := range manifest.Entries {
 		if entry.Kind != "dump" {
 			continue
@@ -689,7 +796,7 @@ func (a *App) restoreDumps(cmd *cobra.Command, path string, p *model.Project, ma
 			a.printf("⚠ %s : %v\n", entry.Name, err)
 			continue
 		}
-		tmp := filepath.Join(os.TempDir(), filepath.Base(entry.Name))
+		tmp := filepath.Join(dir, filepath.Base(entry.Name))
 		if err := os.WriteFile(tmp, data, 0o600); err != nil {
 			a.printf("⚠ %s : %v\n", entry.Name, err)
 			continue

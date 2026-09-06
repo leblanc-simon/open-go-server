@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"time"
@@ -27,6 +28,21 @@ func Open(path string) (*Store, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
 		return nil, err
 	}
+	// La base est créée ici, en 0600, et non par SQLite : le mode d'un fichier
+	// créé par SQLite est rogné par l'umask ambiant, et /var/lib/ogs est
+	// volontairement traversable (0751, pour le challenge ACME). Surtout, SQLite
+	// calque le mode de « <base>-wal » et de « <base>-shm » sur celui de la base
+	// (findCreateFileMode) : poser le mode après coup laissait un journal en 0644,
+	// où passent l'inventaire du parc et le journal d'audit. Le chmod couvre le
+	// cas d'une base héritée d'une version antérieure, créée en 0644.
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	f.Close()
+	if err := os.Chmod(path, 0o600); err != nil {
+		return nil, err
+	}
 	db, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)")
 	if err != nil {
 		return nil, err
@@ -39,9 +55,13 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("migration de %s : %w", path, err)
 	}
-	if err := os.Chmod(path, 0o600); err != nil {
-		db.Close()
-		return nil, err
+	// Un journal abandonné par un processus tué garde le mode qu'il avait à sa
+	// création et n'est jamais recorrigé par SQLite, qui le reprend tel quel.
+	for _, suffixe := range []string{"-wal", "-shm"} {
+		if err := os.Chmod(path+suffixe, 0o600); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			db.Close()
+			return nil, err
+		}
 	}
 	return s, nil
 }

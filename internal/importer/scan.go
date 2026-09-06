@@ -98,6 +98,19 @@ var (
 	reFPMTCP      = regexp.MustCompile(`(?:fcgi://|fastcgi_pass\s+)(127\.0\.0\.1:\d+)`)
 )
 
+// sauvegardeRE reconnaît une copie horodatée déposée par un écrasement forcé,
+// au format de fs.Backup. Elle porte le contenu précédent du vhost, ServerName
+// compris : sans cette exclusion, un site déjà géré serait proposé une seconde
+// fois à l'adoption, sous les traits de sa propre sauvegarde.
+//
+// Les écrasements forcés déposent désormais leur copie hors de /etc, ce qui tarit
+// la source ; le filtre reste parce que l'importateur inspecte précisément un
+// système qu'ogs n'a pas écrit — une reprise porte l'héritage des versions
+// antérieures, qui laissaient la copie à côté de l'original. Le motif est celui
+// de fs.backupName, qui ne l'expose pas : le composer est l'affaire de fs, le
+// reconnaître celle de ses lecteurs, ici comme dans web.Observe.
+var sauvegardeRE = regexp.MustCompile(`\.ogs-bak-\d{8}-\d{6}$`)
+
 // scanVHosts lit les configurations du serveur web.
 func (s *Scanner) scanVHosts() []Resource {
 	if s.Engine == nil {
@@ -116,7 +129,7 @@ func (s *Scanner) scanVHosts() []Resource {
 	}
 	var out []Resource
 	for _, e := range entries {
-		if e.IsDir() {
+		if e.IsDir() || sauvegardeRE.MatchString(e.Name()) {
 			continue
 		}
 		path := filepath.Join(dir, e.Name())

@@ -44,6 +44,21 @@ func TestSatisfies(t *testing.T) {
 		{"8.1", "8.1", true},
 		{"8.1", "8.2", false},
 		{"8.1.*", "8.1", true},
+		// Jokers : « 8.* » ne contraint que la majeure, « 7.4.* » la mineure. Le
+		// point du joker était compté comme une composante, si bien que « 8.* »
+		// exigeait une mineure nulle et refusait toutes les PHP 8 au-delà de 8.0.
+		{"8.*", "8.0", true},
+		{"8.*", "8.1", true},
+		{"8.*", "8.3", true},
+		{"8.*", "7.4", false},
+		{"8.x", "8.3", true},
+		{"7.4.*", "7.4", true},
+		{"7.4.*", "8.1", false},
+		{"8.1.*", "8.3", false},
+		// Un « 8 » nu reste une version exacte, comme Composer le lit.
+		{"8", "8.3", false},
+		// Le tilde n'est pas concerné : « ~8.1 » borne la majeure, pas la mineure.
+		{"~8.1", "8.4", true},
 	}
 	for _, c := range cases {
 		got, err := Satisfies(c.constraint, c.version)

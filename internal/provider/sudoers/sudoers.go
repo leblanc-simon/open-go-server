@@ -42,6 +42,28 @@ type Provider struct {
 	Paths config.Paths
 	Exec  exec.Executor
 	Now   func() time.Time
+	// Force autorise l'écrasement d'un fichier qu'ogs n'a pas écrit, après
+	// sauvegarde horodatée (§6.4). Sans lui, le refus n'aurait aucune porte de
+	// sortie et l'apply du projet resterait bloqué.
+	Force bool
+}
+
+// refusStep produit l'étape qui refuse d'écraser un fichier qu'ogs n'a pas
+// écrit. Une règle sudoers retouchée à la main porte une délégation que
+// quelqu'un a voulue : l'écraser en silence la retirerait sans un mot. Le
+// message distingue les deux causes — un fichier « non géré » n'a jamais porté
+// la marque d'ogs, un fichier « modifié hors ogs » a été retouché après coup.
+func refusStep(resource, summary, path, backups string, state fs.State) *engine.Step {
+	libelle, motif := "modifié hors ogs", "a été modifié en dehors d'ogs"
+	if state == fs.StateForeign {
+		libelle, motif = "non géré par ogs", "existe déjà sans porter la marque d'ogs"
+	}
+	s := engine.NewStep(resource, engine.Update, summary+" — fichier "+libelle)
+	s.Apply = func(context.Context) error {
+		return fmt.Errorf("%s %s : relancer avec --force pour l'écraser "+
+			"(l'original sera sauvegardé dans %s)", path, motif, backups)
+	}
+	return s
 }
 
 // Name identifie le provider.
@@ -74,7 +96,7 @@ func (p *Provider) Build(proj *model.Project, instances map[string]int) ([]byte,
 		b.WriteString("# La commande ne prend aucun argument de projet : ogs déduit le projet de\n")
 		b.WriteString("# l'appelant, donc aucune cible n'est détournable.\n")
 		for _, verb := range verbs {
-			if err := checkToken(verb); err != nil {
+			if err := checkToken("verbe", verb); err != nil {
 				return nil, err
 			}
 			fmt.Fprintf(&b, "%s ALL=(root) NOPASSWD: %s my %s\n", user, Binary, verb)
@@ -83,18 +105,37 @@ func (p *Provider) Build(proj *model.Project, instances map[string]int) ([]byte,
 		b.WriteString("# Unités énumérées nommément : régénéré à chaque changement d'échelle.\n")
 		target := unit.TargetName(proj.ID())
 		for _, verb := range verbs {
-			if err := checkToken(verb); err != nil {
+			if err := checkToken("verbe", verb); err != nil {
 				return nil, err
 			}
 			fmt.Fprintf(&b, "%s ALL=(root) NOPASSWD: %s %s %s\n", user, SystemctlBinary, verb, target)
 		}
 		for _, svc := range proj.Spec.Services {
-			count := instances[svc.Name]
-			if count == 0 {
-				count = svc.Instances
+			// Le nom du service est recopié dans une spécification de commande : il
+			// subit le même régime que le verbe. Une virgule y sépare deux commandes
+			// et un « # » commente la fin de ligne — deux élargissements qu'une
+			// grammaire sudoers irréprochable ne trahit pas, donc que visudo laisse
+			// passer.
+			if err := checkToken("service", svc.Name); err != nil {
+				return nil, err
 			}
+			// La spécification fait foi. La carte observée décrit l'état d'AVANT le
+			// plan d'unités, qui vient de ramener le parc au nombre déclaré : s'y
+			// fier laissait la délégation d'un apply en retard — sans droit sur les
+			// instances qui viennent d'être démarrées à la montée en charge. L'observé
+			// n'est retenu qu'en union, tant que la désactivation n'a pas eu lieu :
+			// une instance encore active doit rester pilotable par son propriétaire.
+			count := svc.Instances
 			if count <= 0 {
 				count = 1
+			}
+			if svc.Enabled != nil && !*svc.Enabled {
+				// Un service explicitement désactivé ne se pilote plus, même s'il
+				// tourne encore : l'unité étant un modèle, « systemctl start » ne
+				// relancerait pas l'instance, il la recréerait.
+				count = 0
+			} else if observed := instances[svc.Name]; observed > count {
+				count = observed
 			}
 			for i := 1; i <= count; i++ {
 				name := unit.InstanceName(proj.ID(), svc.Name, i)
@@ -133,14 +174,19 @@ func (p *Provider) settings(proj *model.Project) (string, []string) {
 	return style, verbs
 }
 
-// checkToken refuse tout élément susceptible d'élargir la délégation.
-func checkToken(v string) error {
+// checkToken refuse tout élément susceptible d'élargir la délégation. Il vaut
+// pour le verbe comme pour le nom de service : tous deux sont recopiés tels
+// quels dans une spécification de commande.
+func checkToken(kind, v string) error {
 	if v == "" {
-		return fmt.Errorf("verbe vide")
+		return fmt.Errorf("%s vide", kind)
 	}
 	for _, r := range v {
-		if !(r >= 'a' && r <= 'z') && r != '-' {
-			return fmt.Errorf("verbe %q invalide : lettres minuscules et tiret seulement", v)
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '-', r == '_':
+		default:
+			return fmt.Errorf("%s %q invalide : minuscules, chiffres, tiret et souligné seulement",
+				kind, v)
 		}
 	}
 	return nil
@@ -166,6 +212,14 @@ func Validate(content []byte) error {
 			return fmt.Errorf("ligne %d : règle inattendue (%q)", i+1, trimmed)
 		}
 		command := strings.TrimSpace(trimmed[colon+len("NOPASSWD:"):])
+		// Une virgule sépare deux commandes dans une spécification sudoers, le tag
+		// NOPASSWD se propageant à la suivante ; un « # » commente la fin de la
+		// ligne. Ni l'un ni l'autre ne rend la règle invalide — visudo l'accepte —
+		// et tous deux suffisent à glisser un shell dans la délégation.
+		if strings.ContainsAny(command, ",#") {
+			return fmt.Errorf("ligne %d : ni virgule ni dièse dans une spécification de commande (%q)",
+				i+1, command)
+		}
 		fields := strings.Fields(command)
 		if len(fields) == 0 || !filepath.IsAbs(fields[0]) {
 			return fmt.Errorf("ligne %d : la commande doit être un chemin absolu (%q)", i+1, command)
@@ -199,14 +253,27 @@ func (p *Provider) Plan(_ context.Context, proj *model.Project, instances map[st
 	}
 	style, _ := p.settings(proj)
 	summary := fmt.Sprintf("délégation sudo à %s (style %s)", proj.Spec.User.Name, style)
-	if state == fs.StateCurrent {
-		return engine.NewStep("sudoers/"+proj.ID(), engine.NoOp, summary), nil
+	resource := "sudoers/" + proj.ID()
+	forced := false
+	switch state {
+	case fs.StateCurrent:
+		return engine.NewStep(resource, engine.NoOp, summary), nil
+	case fs.StateHandEdited, fs.StateForeign:
+		if !p.Force {
+			return refusStep(resource, summary, path, p.Paths.BackupsDir(), state), nil
+		}
+		// --force : l'étape redevient une mise à jour ordinaire, annoncée comme
+		// telle par « plan » avant qu'« apply » ne l'exécute. La sauvegarde, elle,
+		// n'a lieu qu'à l'application : « plan » et « diff » n'écrivent rien.
+		forced = true
+		state = fs.StateOutdated
+		summary += " — écrasement forcé (sauvegarde dans " + p.Paths.BackupsDir() + ")"
 	}
 	action := engine.Create
 	if state != fs.StateAbsent {
 		action = engine.Update
 	}
-	s := engine.NewStep("sudoers/"+proj.ID(), action, summary)
+	s := engine.NewStep(resource, action, summary)
 	s.Diff = func() (string, error) {
 		current, err := os.ReadFile(path)
 		if err != nil {
@@ -214,8 +281,33 @@ func (p *Provider) Plan(_ context.Context, proj *model.Project, instances map[st
 		}
 		return fs.UnifiedDiff(string(current), string(content), path), nil
 	}
-	s.Apply = func(ctx context.Context) error { return p.write(ctx, path, content) }
-	s.Compensate = func(context.Context) error { return os.Remove(path) }
+	var previous []byte
+	var hadPrevious bool
+	s.Apply = func(ctx context.Context) error {
+		if data, err := os.ReadFile(path); err == nil {
+			previous, hadPrevious = data, true
+		}
+		if forced {
+			// Écraser le travail d'un exploitant sans en garder trace rend
+			// l'opération irréversible : la sauvegarde précède l'écriture.
+			if _, err := fs.BackupTo(path, p.Paths.BackupsDir(), p.now()); err != nil && !os.IsNotExist(err) {
+				return err
+			}
+		}
+		return p.write(ctx, path, content)
+	}
+	// La compensation rend la délégation qui était en place. La supprimer serait
+	// juste pour une création, mais retirerait à l'utilisateur du projet un accès
+	// qu'il avait déjà s'il s'agissait d'une mise à jour.
+	s.Compensate = func(context.Context) error {
+		if hadPrevious {
+			return fs.WriteAtomic(path, previous, 0o440, fs.KeepOwner)
+		}
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		return nil
+	}
 	return s, nil
 }
 

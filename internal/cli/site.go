@@ -471,8 +471,15 @@ func (a *App) cloneData(cmd *cobra.Command, source, target *model.Project) error
 		return err
 	}
 	defer provs.close()
-	tmp := filepath.Join(os.TempDir(), fmt.Sprintf("ogs-clone-%s-%d.sql", source.ID(), time.Now().Unix()))
-	defer os.Remove(tmp)
+	// Le dump de la source ne transite pas par /tmp : son nom y serait déductible
+	// et un tiers projet se ferait livrer par root la base d'un site dont il n'est
+	// pas propriétaire.
+	dir, err := a.dumpWorkDir()
+	if err != nil {
+		return wrap(CodeError, err)
+	}
+	defer os.RemoveAll(dir)
+	tmp := filepath.Join(dir, source.Spec.Databases[0].Name+".sql")
 	if _, err := provs.DB.Dump(cmd.Context(), source, source.Spec.Databases[0], tmp); err != nil {
 		return fmt.Errorf("sauvegarde de la source : %w", err)
 	}
@@ -556,7 +563,7 @@ func (a *App) applyProjects(cmd *cobra.Command, projects []*model.Project) error
 		}
 	}
 
-	global, err := a.buildGlobalPlan(provs, projects)
+	global, err := a.buildGlobalPlan(cmd.Context(), provs, projects)
 	if err != nil {
 		return err
 	}

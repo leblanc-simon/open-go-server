@@ -27,6 +27,11 @@ type memClient struct {
 	policies    map[string]Policy
 	deleted     []string
 	fail        error
+	// failUsers et failPerms n'échouent qu'à partir d'une lecture précise : le
+	// broker qui redémarre entre deux appels du client HTTP, ou un compte de
+	// management dont le tag ne suffit pas à /api/users.
+	failUsers error
+	failPerms error
 }
 
 func newMemClient() *memClient {
@@ -61,6 +66,9 @@ func (m *memClient) DeleteVhost(_ context.Context, name string) error {
 	return nil
 }
 func (m *memClient) Users(context.Context) ([]User, error) {
+	if m.failUsers != nil {
+		return nil, m.failUsers
+	}
 	var out []User
 	for name := range m.users {
 		out = append(out, User{Name: name})
@@ -77,6 +85,9 @@ func (m *memClient) DeleteUser(_ context.Context, name string) error {
 	return nil
 }
 func (m *memClient) Permissions(context.Context) ([]Permission, error) {
+	if m.failPerms != nil {
+		return nil, m.failPerms
+	}
 	var out []Permission
 	for _, p := range m.permissions {
 		out = append(out, p)
@@ -444,6 +455,39 @@ func TestUnavailableBrokerIsNonCritical(t *testing.T) {
 	}
 	if len(steps) != 1 || steps[0].Critical {
 		t.Errorf("une seule étape non critique attendue : %+v", steps)
+	}
+}
+
+func TestLectureInterrompueNeBloquePasLePlan(t *testing.T) {
+	// Les cinq lectures d'Observe passent par le même appel HTTP : « broker
+	// indisponible » ne peut pas être non critique sur /api/vhosts et fatal sur
+	// /api/users à quelques millisecondes près. Rendue à l'appelant, l'erreur
+	// faisait abandonner le plan entier du projet — utilisateur système et vhost
+	// web compris — et, sous « --all », les projets suivants du parc avec.
+	for _, c := range []struct {
+		nom    string
+		casser func(*memClient)
+	}{
+		{"users", func(m *memClient) { m.failUsers = ErrUnavailable }},
+		{"permissions", func(m *memClient) { m.failPerms = ErrUnavailable }},
+	} {
+		p, client, proj := fixture(t)
+		c.casser(client)
+		ctx := context.Background()
+		obs, err := p.Observe(ctx, proj)
+		if err != nil {
+			t.Fatalf("%s : l'observation ne doit pas échouer : %v", c.nom, err)
+		}
+		if obs.Unavailable == nil {
+			t.Fatalf("%s : l'indisponibilité doit être rapportée", c.nom)
+		}
+		steps, err := p.Plan(ctx, proj, obs)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(steps) != 1 || steps[0].Critical {
+			t.Errorf("%s : une seule étape non critique attendue : %+v", c.nom, steps)
+		}
 	}
 }
 

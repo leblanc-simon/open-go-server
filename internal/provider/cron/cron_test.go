@@ -318,3 +318,234 @@ func TestAbsoluteCommandIsLeftAlone(t *testing.T) {
 		t.Errorf("une commande absolue ne doit pas être réécrite :\n%s", content)
 	}
 }
+
+func TestBuildEchappeLePourcent(t *testing.T) {
+	// Un « % » non échappé coupe la ligne de cron : le reste part sur l'entrée
+	// standard, la redirection vers le journal comprise, et la tâche échoue sans
+	// laisser de trace.
+	prov, proj := fixture(t)
+	proj.Spec.Crons = []model.CronJob{{
+		Name: "rapport", Schedule: "0 3 * * *",
+		Command: "bin/console app:rapport --jour=$(date +%F)",
+	}}
+	content, jobs, err := prov.Build(proj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(content)
+	if strings.Contains(text, "+%F") || !strings.Contains(text, `+\%F`) {
+		t.Errorf("le pourcent doit être échappé :\n%s", text)
+	}
+	// La redirection doit rester sur la même ligne que la commande.
+	if !strings.Contains(text, `+\%F) >> `) {
+		t.Errorf("la redirection doit suivre la commande :\n%s", text)
+	}
+	// La tâche rendue reste la chaîne vraie : « ogs cron run » la passe à /bin/sh,
+	// qui ne défait pas la contre-oblique entre apostrophes.
+	if !strings.Contains(jobs[0].Command, "+%F") || strings.Contains(jobs[0].Command, `\%`) {
+		t.Errorf("la commande exécutable ne doit pas être échappée : %q", jobs[0].Command)
+	}
+}
+
+func TestBuildRespecteUnPourcentDejaEchappe(t *testing.T) {
+	// L'idiome connu « date +\%F » est déjà correct : le redoubler écrirait « \\% »,
+	// que cron rendrait comme une contre-oblique suivie d'un saut de ligne.
+	prov, proj := fixture(t)
+	proj.Spec.Crons = []model.CronJob{{
+		Name: "sauvegarde", Schedule: "0 4 * * *",
+		Command: `bin/console app:dump --nom=sauvegarde-$(date +\%F).sql`,
+	}}
+	content, _, err := prov.Build(proj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(content)
+	if strings.Contains(text, `\\%`) {
+		t.Errorf("le pourcent déjà échappé doit être laissé tel quel :\n%s", text)
+	}
+	if !strings.Contains(text, `+\%F`) {
+		t.Errorf("échappement perdu :\n%s", text)
+	}
+}
+
+func TestPlanResteIdempotentAvecUnPourcent(t *testing.T) {
+	// L'échappement est déterministe : l'empreinte du corps ne doit pas varier
+	// d'un plan à l'autre, sinon le fichier resterait éternellement « en écart ».
+	prov, proj := fixture(t)
+	proj.Spec.Crons = []model.CronJob{{
+		Name: "rapport", Schedule: "0 3 * * *",
+		Command: "bin/console app:rapport --jour=$(date +%F)",
+	}}
+	ctx := context.Background()
+	steps, err := prov.Plan(ctx, proj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := &engine.Plan{Project: proj.ID()}
+	for _, s := range steps {
+		plan.Add(s)
+	}
+	if _, err := engine.Execute(ctx, plan, engine.Options{}); err != nil {
+		t.Fatal(err)
+	}
+	steps, err = prov.Plan(ctx, proj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan2 := &engine.Plan{Project: proj.ID()}
+	for _, s := range steps {
+		plan2.Add(s)
+	}
+	if !plan2.Empty() {
+		t.Errorf("second plan non vide :\n%s", plan2.String())
+	}
+}
+
+// applique exécute le plan du provider et rend les étapes calculées.
+func applique(t *testing.T, prov *Provider, proj *model.Project) {
+	t.Helper()
+	ctx := context.Background()
+	steps, err := prov.Plan(ctx, proj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := &engine.Plan{Project: proj.ID()}
+	for _, s := range steps {
+		plan.Add(s)
+	}
+	if _, err := engine.Execute(ctx, plan, engine.Options{}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// sauvegardes énumère les copies d'un fichier déposées dans le répertoire de
+// sauvegardes du parc, et refuse qu'il en reste une à côté de l'original :
+// /etc/cron.d est relu en entier — par cron, qui ignore les noms ponctués, mais
+// aussi par ogs lorsqu'il inventorie le parc.
+func sauvegardes(t *testing.T, prov *Provider, path string) []string {
+	t.Helper()
+	restes, err := filepath.Glob(path + ".ogs-bak-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(restes) != 0 {
+		t.Errorf("une sauvegarde ne doit jamais rester dans %s : %v", filepath.Dir(path), restes)
+	}
+	matches, err := filepath.Glob(filepath.Join(prov.Paths.BackupsDir(), filepath.Base(path)+".ogs-bak-*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return matches
+}
+
+func TestPlanEcraseAvecForceEtSauvegarde(t *testing.T) {
+	prov, proj := fixture(t)
+	proj.Spec.Crons = []model.CronJob{{Name: "x", Schedule: "* * * * *", Command: "bin/console x"}}
+	ctx := context.Background()
+	applique(t, prov, proj)
+
+	path := prov.Path(proj.ID())
+	data, _ := os.ReadFile(path)
+	const ajout = "\n* * * * * root /bin/evil\n"
+	if err := os.WriteFile(path, append(data, []byte(ajout)...), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Sans --force, le refus tient et rien n'est écrit.
+	steps, err := prov.Plan(ctx, proj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range steps {
+		if strings.Contains(s.Summary, "modifié hors ogs") {
+			if err := s.Apply(ctx); err == nil {
+				t.Error("l'écrasement doit être refusé sans --force")
+			}
+		}
+	}
+	if got := sauvegardes(t, prov, path); len(got) != 0 {
+		t.Fatalf("aucune sauvegarde ne doit être créée par un refus : %v", got)
+	}
+
+	// Avec --force, l'étape redevient une mise à jour ordinaire, et la
+	// sauvegarde est la seule trace qui reste de la version manuelle.
+	prov.Force = true
+	steps, err = prov.Plan(ctx, proj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var forcée *engine.Step
+	for _, s := range steps {
+		if strings.Contains(s.Summary, "écrasement forcé") {
+			forcée = s
+		}
+	}
+	if forcée == nil {
+		t.Fatalf("le plan doit annoncer l'écrasement forcé")
+	}
+	if err := forcée.Apply(ctx); err != nil {
+		t.Fatalf("l'écrasement forcé doit réussir : %v", err)
+	}
+	after, _ := os.ReadFile(path)
+	if strings.Contains(string(after), "/bin/evil") {
+		t.Error("le fichier doit avoir été réécrit")
+	}
+	baks := sauvegardes(t, prov, path)
+	if len(baks) != 1 {
+		t.Fatalf("une sauvegarde attendue, %d trouvée(s)", len(baks))
+	}
+	saved, _ := os.ReadFile(baks[0])
+	if !strings.Contains(string(saved), "/bin/evil") {
+		t.Errorf("la sauvegarde doit contenir l'original :\n%s", saved)
+	}
+
+	// Le plan suivant est de nouveau conforme : la sauvegarde ne doit pas être
+	// prise pour un fichier cron par ogs ni par cron lui-même (un point dans le
+	// nom la fait ignorer).
+	prov.Force = false
+	steps, err = prov.Plan(ctx, proj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range steps {
+		if s.Action != engine.NoOp {
+			t.Errorf("étape inattendue après l'écrasement forcé : %s", s.Summary)
+		}
+	}
+}
+
+func TestPlanRefuseUnFichierEtranger(t *testing.T) {
+	// Un fichier posé par un autre outil ne porte pas la marque d'ogs : le
+	// message doit le dire, et non parler d'une modification.
+	prov, proj := fixture(t)
+	proj.Spec.Crons = []model.CronJob{{Name: "x", Schedule: "* * * * *", Command: "bin/console x"}}
+	path := prov.Path(proj.ID())
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("* * * * * root /bin/true\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	steps, err := prov.Plan(ctx, proj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var refus *engine.Step
+	for _, s := range steps {
+		if strings.Contains(s.Summary, "non géré par ogs") {
+			refus = s
+		}
+	}
+	if refus == nil {
+		t.Fatalf("un fichier étranger doit être signalé comme tel")
+	}
+	err = refus.Apply(ctx)
+	if err == nil || !strings.Contains(err.Error(), "--force") {
+		t.Errorf("le refus doit nommer la porte de sortie : %v", err)
+	}
+	// Le refus dit où l'original partira : le répertoire commun, jamais /etc/cron.d.
+	if err == nil || !strings.Contains(err.Error(), prov.Paths.BackupsDir()) {
+		t.Errorf("le refus doit dire où l'original sera sauvegardé : %v", err)
+	}
+}

@@ -42,11 +42,19 @@ func (errs Errors) OrNil() error {
 }
 
 var (
-	reDBObject  = regexp.MustCompile(`^[a-zA-Z0-9_]+$`)
-	reMode      = regexp.MustCompile(`^0[0-7]{3}$`)
-	rePHPVer    = regexp.MustCompile(`^[78]\.[0-9]$`)
-	reQueueName = regexp.MustCompile(`^[a-zA-Z0-9._-]+$`)
+	reDBObject    = regexp.MustCompile(`^[a-zA-Z0-9_]+$`)
+	reMode        = regexp.MustCompile(`^0[0-7]{3}$`)
+	rePHPVer      = regexp.MustCompile(`^[78]\.[0-9]$`)
+	reQueueName   = regexp.MustCompile(`^[a-zA-Z0-9._-]+$`)
+	reServiceName = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_.-]*$`)
 )
+
+// maxServiceName borne le nom d'un service par ce que systemd accepte, et non
+// par ce qui paraît raisonnable : un nom d'unité tient dans 255 octets, et le
+// nom du service n'en occupe qu'une part — « ogs-<id>-<nom>@<n>.service ». La
+// borne est donc large à dessein. Une borne serrée n'écarterait aucun danger et
+// invaliderait des projets déjà en service.
+const maxServiceName = 200
 
 // supportedPHP énumère les versions gérées (D39).
 // dnsProviderOVH est le seul provider DNS géré (D27).
@@ -125,17 +133,31 @@ func Project(p *model.Project, homeRoot string) error {
 
 	// Arborescence : le home doit rester sous la racine autorisée.
 	root := filepath.Clean(p.Spec.Layout.Root)
-	if !filepath.IsAbs(root) {
+	switch {
+	case !filepath.IsAbs(root):
 		add("spec.layout.root", "chemin absolu attendu, obtenu %q", root)
-	} else if !isUnder(root, homeRoot) {
+	case forbiddenRoot(root):
+		// Les emplacements manifestement dangereux le sont pour tout le monde :
+		// l'import reprend le home réel d'un compte du système, qui peut valoir
+		// n'importe quoi. Le contrôle précède donc celui de l'appartenance à la
+		// racine, où il n'était atteint que par un projet adopté.
+		add("spec.layout.root", "emplacement interdit pour une racine de projet : %q", root)
+	case root == filepath.Clean(homeRoot):
+		// isUnder accepte l'égalité — filepath.Rel rend « . », qui n'est pas
+		// « .. » —, si bien que la racine des homes passait le contrôle. L'apply
+		// l'aurait alors chownée à l'utilisateur du projet (system.dirSteps pose
+		// le propriétaire du projet sur spec.layout.root), lui donnant la main sur
+		// le home de tous les voisins, et « ogs project delete » l'effacerait tout
+		// entière. Elle appartient à root en 0711 et n'est le home d'aucun projet
+		// (D60).
+		add("spec.layout.root", "ne peut pas valoir la racine des homes elle-même (%s) : "+
+			"elle appartient à root et n'est le home d'aucun projet (D60)", homeRoot)
+	case !isUnder(root, homeRoot):
 		// Un projet adopté décrit l'existant : son arborescence peut vivre hors de
 		// la racine conventionnelle, et la refuser rendrait l'import inutilisable.
-		// Les emplacements manifestement dangereux restent interdits.
 		if !adopted {
 			add("spec.layout.root", "doit être sous %s, obtenu %q "+
 				"(un projet adopté peut y échapper : voir « ogs import »)", homeRoot, root)
-		} else if forbiddenRoot(root) {
-			add("spec.layout.root", "emplacement interdit pour une racine de projet : %q", root)
 		}
 	}
 	if p.Spec.User.Home != root {
@@ -197,6 +219,7 @@ func Project(p *model.Project, homeRoot string) error {
 	validatePHP(p, add)
 	validateAMQP(p, add)
 	validateCrons(p, add)
+	validateServices(p, add)
 	validateCertificates(p, add)
 	return errs.OrNil()
 }
@@ -341,6 +364,26 @@ func validateAMQP(p *model.Project, add func(string, string, ...any)) {
 	}
 }
 
+// interditsCron énumère ce qui n'a rien à faire dans le nom d'une tâche, lequel
+// sert à trois choses à la fois.
+//
+// Composant de chemin d'abord : le verrou /run/ogs/<id>/<nom>.lock et le journal
+// logs/cron-<nom>.log — d'où le refus de la barre oblique et du point, « .. »
+// remontant l'arborescence.
+//
+// Argument d'une commande de shell ensuite : ce chemin de verrou est recollé
+// sans citation dans la ligne passée à /bin/sh, par cron comme par « ogs cron
+// run ». L'espace l'y découpe, et « ; », « | » ou l'accent grave y enchaînent
+// une seconde commande sous l'identité du projet.
+//
+// Contenu d'un fichier de /etc/cron.d enfin : « % » n'y est pas un caractère
+// ordinaire — cron le remplace par un saut de ligne et fait passer la suite pour
+// l'entrée standard de la commande. Le provider échappe la commande et le chemin
+// de journal ; le nom, lui, ne l'est nulle part. Et un retour à la ligne, écrit
+// tel quel dans le commentaire qui précède la tâche, n'y coupe pas une commande :
+// il ouvre une entrée de cron entière, dont le champ d'utilisateur est libre.
+const interditsCron = "/. \t\r\n%;&|<>()$`\"'\\*?[]{}#~!"
+
 func validateCrons(p *model.Project, add func(string, string, ...any)) {
 	seen := map[string]bool{}
 	for i, c := range p.Spec.Crons {
@@ -352,8 +395,10 @@ func validateCrons(p *model.Project, add func(string, string, ...any)) {
 			add(f+".name", "tâche %q déclarée deux fois", c.Name)
 		}
 		seen[c.Name] = true
-		if strings.ContainsAny(c.Name, "/. ") {
-			add(f+".name", "nom %q invalide : ni point, ni barre oblique, ni espace", c.Name)
+		if strings.ContainsAny(c.Name, interditsCron) {
+			add(f+".name", "nom %q invalide : ni point, ni barre oblique, ni espace, ni « %% », "+
+				"ni métacaractère de shell — ce nom devient un fichier de verrou, un fichier "+
+				"de journal et une ligne de /etc/cron.d", c.Name)
 		}
 		if err := CronExpression(c.Schedule); err != nil {
 			add(f+".schedule", "%v", err)
@@ -363,6 +408,59 @@ func validateCrons(p *model.Project, add func(string, string, ...any)) {
 		}
 		if strings.ContainsAny(c.Command, "\n\r") {
 			add(f+".command", "la commande ne peut pas contenir de retour à la ligne")
+		}
+	}
+}
+
+// validateServices contrôle les services déclarés. Le nom d'un service n'est pas
+// une simple étiquette : il devient composant du nom d'unité systemd, composant
+// de chemin sous /etc/systemd/system, et surtout élément d'une spécification de
+// commande sudoers quand la délégation est en style « systemctl » (D28). Là, une
+// virgule ouvre une seconde commande à laquelle le tag NOPASSWD se propage, un
+// « : » ouvre une nouvelle paire hôtes = commandes et un « # » commente la fin de
+// ligne : la règle produite reste syntaxiquement irréprochable pour visudo, et
+// l'utilisateur du projet obtient un shell root sans mot de passe. Un « .. »
+// sortirait quant à lui de /etc/systemd/system.
+//
+// La règle se cale donc sur ce qu'un nom d'unité systemd peut porter — lettres,
+// chiffres, tiret, souligné et point —, moins les deux points, que systemd admet
+// mais que sudoers relit, et moins l'arobase, qui sépare déjà le modèle de son
+// instance. Le premier caractère est en outre une lettre, un chiffre ou un
+// souligné : un tiret de tête passerait pour une option de systemctl, un point de
+// tête pour un fichier caché. Refuser au-delà — la majuscule, par exemple —
+// n'écarterait aucun danger et condamnerait un projet déjà en service : la
+// validation étant en amont de tout chargement, un seul fichier refusé bloque
+// l'apply du parc entier, sans qu'« ogs service remove » ni « ogs project
+// delete » puissent le réparer.
+func validateServices(p *model.Project, add func(string, string, ...any)) {
+	seen := map[string]bool{}
+	for i, s := range p.Spec.Services {
+		f := fmt.Sprintf("spec.services[%d]", i)
+		switch {
+		case s.Name == "":
+			add(f+".name", "nom requis")
+		case !reServiceName.MatchString(s.Name):
+			add(f+".name", "nom %q invalide : lettres, chiffres, tiret, souligné et point "+
+				"seulement, en commençant par une lettre, un chiffre ou un souligné — ce nom "+
+				"devient un nom d'unité systemd et une spécification de commande sudoers",
+				s.Name)
+		case strings.Contains(s.Name, ".."):
+			add(f+".name", "nom %q invalide : « .. » sortirait de /etc/systemd/system", s.Name)
+		case len(s.Name) > maxServiceName:
+			add(f+".name", "nom %q trop long : %d caractères au plus", s.Name, maxServiceName)
+		}
+		if seen[s.Name] {
+			// Deux services homonymes produisent deux étapes de même ressource sur
+			// le même fichier d'unité : elles se marchent dessus dans le plan comme
+			// dans l'audit.
+			add(f+".name", "service %q déclaré deux fois", s.Name)
+		}
+		seen[s.Name] = true
+		// Pas de plafond : le nombre d'instances n'est le vecteur de rien — il est
+		// rendu par %d — et aucune décision n'en arbitre un. En inventer un
+		// invaliderait un parc qui tourne.
+		if s.Instances < 0 {
+			add(f+".instances", "nombre d'instances négatif (%d)", s.Instances)
 		}
 	}
 }

@@ -119,26 +119,24 @@ func Correlate(resources []Resource, homeRoot, prepDomain string) ([]Candidate, 
 		}
 
 		// Le compte système : celui du pool, ou celui dont le home contient le docroot.
-		for _, user := range byKind[KindUser] {
-			if Managed(user) {
-				continue
-			}
-			home := user.Attr("home")
-			switch {
-			case candidate.User != "" && user.Name == candidate.User:
-			case candidate.User == "" && candidate.Docroot != "" && home != "" &&
-				strings.HasPrefix(candidate.Docroot, home):
+		if user, parLeHome := chercherCompte(byKind[KindUser], candidate, claimed); user != nil {
+			if parLeHome {
+				// Le home englobant le docroot est une déduction, pas une preuve :
+				// un home partagé par plusieurs sites (/var/www, /srv) ne désigne
+				// personne, et le premier vhost rencontré s'approprierait sinon le
+				// compte, la racine et l'arborescence de tous les autres — l'apply
+				// chownant spec.layout.root à l'utilisateur du projet. D'où la
+				// revendication unique, et l'incertitude annoncée.
 				candidate.User = user.Name
-				indices++
-			default:
-				continue
+				candidate.Uncertain = append(candidate.Uncertain, fmt.Sprintf(
+					"compte %s rapproché par le home englobant le docroot, non par un pool",
+					user.Name))
 			}
-			candidate.Home = home
+			candidate.Home = user.Attr("home")
 			candidate.Shell = user.Attr("shell")
-			candidate.Resources = append(candidate.Resources, user)
-			claimed[key(user)] = true
+			candidate.Resources = append(candidate.Resources, *user)
+			claimed[key(*user)] = true
 			indices++
-			break
 		}
 		if candidate.Home == "" && candidate.Docroot != "" {
 			// Sans compte, la racine est déduite du docroot : www/ ou public/ en
@@ -238,6 +236,54 @@ func Correlate(resources []Resource, homeRoot, prepDomain string) ([]Candidate, 
 	}
 	sort.Slice(candidates, func(i, j int) bool { return candidates[i].ID < candidates[j].ID })
 	return candidates, unmanaged
+}
+
+// chercherCompte retient le compte système d'un candidat, et dit s'il l'a été par
+// son home faute de mieux.
+//
+// Le socket du pool a le dernier mot : c'est une preuve, et deux vhosts servis
+// par le même pool partagent légitimement le compte — « claimed » ne s'y applique
+// donc pas. À défaut, le home englobant le docroot est une déduction, et c'est le
+// home le plus profond qui l'emporte : sous une racine commune vivent le compte
+// du site et celui qui possède la racine, tous deux englobants, et retenir le
+// premier venu dans l'ordre alphabétique donnerait au projet le compte et
+// l'arborescence de tous ses voisins.
+func chercherCompte(users []Resource, candidate Candidate, claimed map[string]bool) (*Resource, bool) {
+	if candidate.User != "" {
+		for i, user := range users {
+			if !Managed(user) && user.Name == candidate.User {
+				return &users[i], false
+			}
+		}
+		return nil, false
+	}
+	if candidate.Docroot == "" {
+		return nil, false
+	}
+	var retenu *Resource
+	for i, user := range users {
+		home := user.Attr("home")
+		if Managed(user) || claimed[key(user)] || home == "" ||
+			!sousRacine(home, candidate.Docroot) {
+			continue
+		}
+		if retenu == nil ||
+			len(filepath.Clean(home)) > len(filepath.Clean(retenu.Attr("home"))) {
+			retenu = &users[i]
+		}
+	}
+	return retenu, retenu != nil
+}
+
+// sousRacine dit si un chemin vit sous une racine, frontière de chemin comprise.
+// Le préfixe brut rapprocherait « /var/www » de « /var/www2/site », qui n'a rien
+// à voir avec lui : le candidat en hériterait le compte et la racine d'un autre.
+func sousRacine(racine, chemin string) bool {
+	rel, err := filepath.Rel(filepath.Clean(racine), filepath.Clean(chemin))
+	if err != nil {
+		return false
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 // deduceHome remonte du docroot vers la racine probable du projet.

@@ -4,6 +4,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/goccy/go-yaml"
+
 	"leblanc.io/open-go-server/internal/model"
 )
 
@@ -112,4 +114,141 @@ func TestSupervisionTriEtat(t *testing.T) {
 	if !set || value {
 		t.Error("un « false » explicite doit être retenu comme une décision")
 	}
+}
+
+func TestFusionConserveLesDefautsDesTables(t *testing.T) {
+	// Le décodeur remplace une table entière dès qu'elle est déclarée : un fichier
+	// n'annonçant que le domaine de préproduction vidait la référence au
+	// certificat partagé (@wildcard-prep) et faisait disparaître « prod ». La
+	// mutualisation des certificats de préproduction (D26) tombait en silence.
+	c := Default()
+	doc := "environments:\n  prep:\n    domain: preprod.mycorp.net\n"
+	if err := yaml.Unmarshal([]byte(doc), c); err != nil {
+		t.Fatal(err)
+	}
+	prep := c.Environments["prep"]
+	if prep.Domain != "preprod.mycorp.net" {
+		t.Errorf("le domaine déclaré doit primer : %q", prep.Domain)
+	}
+	if prep.Certificate != "@wildcard-prep" {
+		t.Errorf("certificat partagé effacé : %q", prep.Certificate)
+	}
+	if prep.HostTemplate != "{{.PrepLabel}}.{{.Domain}}" || prep.IDSuffix != "prep" {
+		t.Errorf("champ tu écrasé : %+v", prep)
+	}
+	if !prep.RobotsNoindex || !prep.PresetDowngrade || prep.PHPEnv["APP_ENV"] != "dev" {
+		t.Errorf("champ tu écrasé : %+v", prep)
+	}
+	if _, ok := c.Environments["prod"]; !ok {
+		t.Errorf("l'environnement prod a disparu : %v", c.Environments)
+	}
+	if _, ok := c.Certificates["wildcard-prep"]; !ok {
+		t.Errorf("le certificat partagé livré a disparu : %v", c.Certificates)
+	}
+}
+
+func TestFusionRespecteUneValeurExpliciteFausse(t *testing.T) {
+	// Un « false » écrit l'emporte ; c'est le « false » par omission que la fusion
+	// ne doit pas confondre avec une décision.
+	c := Default()
+	doc := "environments:\n  prep:\n    robotsNoindex: false\n"
+	if err := yaml.Unmarshal([]byte(doc), c); err != nil {
+		t.Fatal(err)
+	}
+	prep := c.Environments["prep"]
+	if prep.RobotsNoindex {
+		t.Error("un robotsNoindex explicitement faux doit être retenu")
+	}
+	if prep.Domain != "preprod-pp.net" {
+		t.Errorf("le reste de l'entrée doit survivre : %+v", prep)
+	}
+}
+
+func TestFusionLaisseRetirerUnCertificatPartage(t *testing.T) {
+	// Le catalogue des certificats partagés appartient à l'administrateur :
+	// réinsérer d'office wildcard-prep ferait demander à l'autorité un domaine qui
+	// n'est pas le sien. La référence devenue orpheline est en revanche refusée au
+	// chargement, plutôt qu'avalée par SharedRef.
+	c := Default()
+	doc := "certificates:\n  mycorp:\n    domains: [\"*.pp.mycorp.net\"]\n" +
+		"    challenge: dns-01\n    dnsProvider: ovh\n"
+	if err := yaml.Unmarshal([]byte(doc), c); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := c.Certificates["wildcard-prep"]; ok {
+		t.Error("un certificat non repris doit rester retiré")
+	}
+	err := c.Validate()
+	if err == nil {
+		t.Fatal("une référence partagée orpheline doit être refusée au chargement")
+	}
+	if !strings.Contains(err.Error(), "wildcard-prep") || !strings.Contains(err.Error(), "mycorp") {
+		t.Errorf("le message doit nommer la référence morte et ce qui reste : %v", err)
+	}
+
+	// L'environnement repointé sur le certificat maison, la configuration passe.
+	prep := c.Environments["prep"]
+	prep.Certificate = "@mycorp"
+	c.Environments["prep"] = prep
+	if err := c.Validate(); err != nil {
+		t.Errorf("référence résolue refusée : %v", err)
+	}
+}
+
+func TestFusionCompleteUneEntreeDeCertificatRedeclaree(t *testing.T) {
+	// Redéclarer wildcard-prep pour ses seuls domaines ne doit pas lui ôter son
+	// challenge ni son provider : le certificat deviendrait indemandable.
+	c := Default()
+	doc := "certificates:\n  wildcard-prep:\n    domains: [\"*.pp.mycorp.net\", \"pp.mycorp.net\"]\n"
+	if err := yaml.Unmarshal([]byte(doc), c); err != nil {
+		t.Fatal(err)
+	}
+	cert := c.Certificates["wildcard-prep"]
+	if len(cert.Domains) != 2 || cert.Domains[0] != "*.pp.mycorp.net" {
+		t.Errorf("domaines déclarés non retenus : %+v", cert)
+	}
+	if cert.Challenge != "dns-01" || cert.DNSProvider != "ovh" || cert.KeyType != "ec256" {
+		t.Errorf("champs tus écrasés : %+v", cert)
+	}
+}
+
+func TestFusionLaisseLesChampsDeStructureIntacts(t *testing.T) {
+	// La fusion des tables ne doit pas défaire ce que le décodeur faisait déjà
+	// bien : un fichier partiel garde les défauts des champs de structure.
+	c := Default()
+	doc := "web:\n  engine: nginx\n"
+	if err := yaml.Unmarshal([]byte(doc), c); err != nil {
+		t.Fatal(err)
+	}
+	if c.Web.Engine != "nginx" {
+		t.Errorf("moteur %q", c.Web.Engine)
+	}
+	if c.Logs.Rotate != 30 || c.Naming.HomeRoot != "/home" || c.Sudo.Style != "ogs" {
+		t.Errorf("défauts perdus : %+v", c)
+	}
+	if len(c.Environments) != 2 || len(c.Certificates) != 1 {
+		t.Errorf("tables perdues : %v / %v", c.Environments, c.Certificates)
+	}
+}
+
+func TestLeRepertoireDesSauvegardesEstCreeParInit(t *testing.T) {
+	// Toute sauvegarde d'un écrasement forcé y atterrit : s'il n'est pas dans la
+	// table des répertoires, personne ne le crée avec un mode explicite et le
+	// premier apply forcé le poserait au gré du umask ambiant — un répertoire
+	// portant des configurations système que leur original n'exposait qu'à root.
+	// « ogs init » et « doctor » ne connaissent que cette table.
+	p := NewPaths("/tmp/ogs-essai")
+	if got, want := p.BackupsDir(), "/tmp/ogs-essai/var/lib/ogs/backups"; got != want {
+		t.Errorf("répertoire de sauvegarde %q, attendu %q", got, want)
+	}
+	for _, d := range p.Dirs() {
+		if d.Path != p.BackupsDir() {
+			continue
+		}
+		if d.Mode != 0o700 {
+			t.Errorf("mode %04o, attendu 0700", d.Mode)
+		}
+		return
+	}
+	t.Errorf("%s ne figure pas dans les répertoires créés par « ogs init »", p.BackupsDir())
 }

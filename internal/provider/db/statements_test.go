@@ -397,10 +397,76 @@ func TestMonitoringMySQLBorneLesPrivileges(t *testing.T) {
 	}
 	for _, want := range []string{
 		"GRANT PROCESS, REPLICATION CLIENT ON *.*",
-		"GRANT SELECT ON `performance_schema`.*",
+		"GRANT SELECT ON `performance\\_schema`.*",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("%q absent :\n%s", want, joined)
+		}
+	}
+	// Le nom de base placé après ON est un motif : non échappé, le privilège
+	// porterait aussi sur « performanceXschema » — une base de projet adoptée
+	// pourrait porter ce nom, et l'agent y lirait les données du client.
+	if strings.Contains(joined, "ON `performance_schema`") {
+		t.Errorf("le souligné n'est pas échappé, le GRANT est un motif :\n%s", joined)
+	}
+}
+
+func TestLePrivilegeHeriteEstRevoqueAuMotifLitteral(t *testing.T) {
+	// L'échappement ne vaut que pour les installations neuves : sur un serveur où
+	// le GRANT non échappé a déjà tourné, la ligne joker de mysql.db survit à tous
+	// les apply — GRANT est additif, seul un REVOKE la retire. Il vise le motif
+	// **littéral**, celui qui a été stocké ; l'échapper ne désignerait rien.
+	stmt, err := MonitoringMySQLLegacyRevoke("telegraf", "localhost")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const want = "REVOKE SELECT ON `performance_schema`.* FROM 'telegraf'@'localhost'"
+	if stmt != want {
+		t.Errorf("requête = %q, attendu %q", stmt, want)
+	}
+	// Et le GRANT, lui, reste échappé : les deux motifs sont deux lignes
+	// distinctes, et les confondre reviendrait à révoquer ce qu'on vient
+	// d'accorder.
+	stmts, err := MonitoringMySQL("telegraf", "localhost", "motdepasse")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(strings.Join(stmts, "\n"), "GRANT SELECT ON `performance\\_schema`.*") {
+		t.Errorf("le GRANT doit rester échappé :\n%s", strings.Join(stmts, "\n"))
+	}
+	if _, err := MonitoringMySQLLegacyRevoke("tele'graf", "localhost"); err == nil {
+		t.Error("un nom d'utilisateur hors liste blanche doit être refusé")
+	}
+}
+
+func TestPrivilegesObservesCompares(t *testing.T) {
+	// Le passage d'un jeu à un autre doit se voir, et le retour d'un moteur ne
+	// doit pas se voir : MariaDB et MySQL ne développent pas « ALL PRIVILEGES »
+	// de la même façon, et exiger l'égalité rejouerait éternellement le GRANT.
+	const allMySQL = "ALTER,CREATE,CREATE ROUTINE,CREATE TEMPORARY TABLES,CREATE VIEW," +
+		"DELETE,DROP,EVENT,EXECUTE,INDEX,INSERT,LOCK TABLES,REFERENCES,SELECT," +
+		"SHOW VIEW,TRIGGER,UPDATE"
+	cases := []struct {
+		nom       string
+		observed  string
+		priv      Privilege
+		satisfait bool
+		deborde   bool
+	}{
+		{"all déjà accordé", allMySQL, PrivAll, true, false},
+		{"all sur MariaDB", allMySQL + ",DELETE HISTORY", PrivAll, true, false},
+		{"réduction vers readonly", allMySQL, PrivReadOnly, false, true},
+		{"réduction vers crud", allMySQL, PrivCRUD, false, true},
+		{"readonly conforme", "SELECT,SHOW VIEW", PrivReadOnly, true, false},
+		{"élargissement vers all", "SELECT,SHOW VIEW", PrivAll, false, false},
+		{"aucun privilège", "", PrivAll, false, false},
+	}
+	for _, c := range cases {
+		if got := MySQLGrantsSatisfied(c.observed, c.priv); got != c.satisfait {
+			t.Errorf("%s : conformité %v, attendu %v", c.nom, got, c.satisfait)
+		}
+		if got := MySQLGrantsOverflow(c.observed, c.priv); got != c.deborde {
+			t.Errorf("%s : débordement %v, attendu %v", c.nom, got, c.deborde)
 		}
 	}
 }

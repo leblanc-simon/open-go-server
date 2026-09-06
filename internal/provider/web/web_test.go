@@ -649,6 +649,76 @@ func TestPlanDropInListsLogDirs(t *testing.T) {
 	}
 }
 
+// Le complément d'unité est ce qui remonte les journaux des projets en
+// ReadWritePaths (D59). Sa compensation supprimait le fichier : un déroulage
+// rendait donc au moteur web l'unité durcie par sa distribution, où /home est en
+// lecture seule pour le seul service, et le maître s'arrêtait au démarrage
+// suivant — 226/NAMESPACE ou AH00019 — en emportant tout le parc.
+func TestCompensationRendLeComplementPrecedent(t *testing.T) {
+	p, _ := fixture(t, "apache")
+	ctx := context.Background()
+	projet := func(host string) *model.Project {
+		t.Helper()
+		proj := model.New(host, naming.EnvProd, model.KindStatic)
+		if err := proj.Normalize("/home", "preprod-pp.net"); err != nil {
+			t.Fatal(err)
+		}
+		return proj
+	}
+	a, b := projet("shop.fr"), projet("autre.fr")
+
+	steps, err := p.PlanDropIn(ctx, []*model.Project{a})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := steps[0].Apply(ctx); err != nil {
+		t.Fatal(err)
+	}
+	avant, err := os.ReadFile(p.DropInPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Un projet de plus rend le complément obsolète.
+	steps, err = p.PlanDropIn(ctx, []*model.Project{a, b})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if steps[0].Action != engine.Update {
+		t.Fatalf("action %s, attendu une mise à jour", steps[0].Action)
+	}
+	if err := steps[0].Apply(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := steps[0].Compensate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	après, err := os.ReadFile(p.DropInPath())
+	if err != nil {
+		t.Fatalf("la compensation ne doit pas supprimer le complément d'unité : %v", err)
+	}
+	if string(après) != string(avant) {
+		t.Errorf("la compensation doit rendre le complément précédent :\n%s", après)
+	}
+
+	// À l'inverse, compenser une création laisse le système tel qu'elle l'a
+	// trouvé : le fichier n'existait pas, il doit disparaître.
+	neuf, _ := fixture(t, "apache")
+	steps, err = neuf.PlanDropIn(ctx, []*model.Project{a})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := steps[0].Apply(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := steps[0].Compensate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(neuf.DropInPath()); !os.IsNotExist(err) {
+		t.Errorf("la compensation d'une création doit retirer le complément : %v", err)
+	}
+}
+
 // underHome borne le contrôle au territoire que ProtectHome couvre : refuser un
 // journal sous /var/log au prétexte d'un ProtectHome serait un faux positif.
 func TestUnderHome(t *testing.T) {
@@ -996,5 +1066,573 @@ func TestVHostDeSupervisionSansPoolResteValide(t *testing.T) {
 				t.Fatalf("un parc sans pool doit produire un vhost valide : %v", err)
 			}
 		}
+	}
+}
+
+// etapeEnEchec imite l'étape critique qui suit les vhosts dans un plan réel —
+// sudoers, dont l'apply passe par visudo — et fait dérouler la saga.
+func etapeEnEchec() *engine.Step {
+	s := engine.NewStep("essai/echec", engine.Create, "étape critique en échec")
+	s.Apply = func(context.Context) error { return errors.New("visudo a refusé le fichier") }
+	return s
+}
+
+func TestCompensationDUnVHostMisAJourRendLAncienContenu(t *testing.T) {
+	for _, engineName := range []string{"apache", "nginx"} {
+		t.Run(engineName, func(t *testing.T) {
+			prov, _ := fixture(t, engineName)
+			p := project(t, "shop.fr", model.KindSymfony, "6.4", "8.5")
+			ctx := context.Background()
+
+			// Le vhost tel qu'un apply précédent l'a laissé : écrit et activé.
+			bp := buildMain(t, prov, p)
+			if err := fs.WriteAtomic(bp.Path, bp.Content, 0o644, fs.KeepOwner); err != nil {
+				t.Fatal(err)
+			}
+			if err := prov.enable(ctx, bp); err != nil {
+				t.Fatal(err)
+			}
+			origine := string(bp.Content)
+
+			// Un alias de plus, et le vhost passe en écart : l'étape sera une mise à
+			// jour, et l'activation un NoOp puisque le lien est déjà là.
+			p.Spec.Domains = append(p.Spec.Domains, model.Domain{Name: "boutique.shop.fr", Role: "alias"})
+			maj := buildMain(t, prov, p)
+			if maj.State != fs.StateOutdated {
+				t.Fatalf("état attendu « à mettre à jour », obtenu « %s »", maj.State)
+			}
+
+			plan := &engine.Plan{Project: p.ID()}
+			for _, s := range prov.vhostStep(p, maj) {
+				plan.Add(s)
+			}
+			plan.Add(etapeEnEchec())
+
+			report, err := engine.Execute(ctx, plan, engine.Options{})
+			if err == nil {
+				t.Fatal("l'étape critique devait faire échouer l'exécution")
+			}
+			if !report.RolledBack {
+				t.Fatal("la saga devait être déroulée")
+			}
+			if report.RollbackErr != nil {
+				t.Fatalf("compensation en échec : %v", report.RollbackErr)
+			}
+
+			apres, err := os.ReadFile(maj.Path)
+			if err != nil {
+				t.Fatalf("le vhost a été supprimé au lieu d'être restauré : %v", err)
+			}
+			if string(apres) != origine {
+				t.Errorf("le vhost n'a pas retrouvé son contenu d'origine :\n%s", apres)
+			}
+			// Stat suit le lien : il échoue si la cible a disparu. Un lien mort dans
+			// sites-enabled empêche nginx de démarrer, tout le parc avec lui.
+			if _, err := os.Stat(maj.EnabledPath); err != nil {
+				t.Errorf("le lien d'activation pointe dans le vide : %v", err)
+			}
+		})
+	}
+}
+
+func TestCompensationDuVHostDeSupervisionRendLAncienContenu(t *testing.T) {
+	prov, _ := fixture(t, "nginx")
+	shop := project(t, "shop.fr", model.KindSymfony, "6.4", "8.5")
+	ctx := context.Background()
+
+	steps, err := prov.PlanStatus(ctx, []*model.Project{shop}, "127.0.0.1:8099", "/ogs-status", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range steps {
+		if s.Apply != nil {
+			if err := s.Apply(ctx); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	path := filepath.Join(prov.Engine.AvailableDir(), prov.Engine.FileName(StatusVHostName))
+	enabledPath := filepath.Join(prov.Engine.EnabledDir(), prov.Engine.FileName(StatusVHostName))
+	origine, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Le préfixe change : le vhost passe en mise à jour, son lien reste en place.
+	maj, err := prov.PlanStatus(ctx, []*model.Project{shop}, "127.0.0.1:8099", "/supervision", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := &engine.Plan{Project: "parc"}
+	for _, s := range maj {
+		plan.Add(s)
+	}
+	if plan.Empty() {
+		t.Fatal("le changement de préfixe devait produire une mise à jour")
+	}
+	// Dans le plan global, Monitoring.Plan suit le vhost de supervision et ses
+	// étapes sont critiques : un fragment Telegraf impossible à écrire déroule.
+	plan.Add(etapeEnEchec())
+
+	report, err := engine.Execute(ctx, plan, engine.Options{})
+	if err == nil {
+		t.Fatal("l'étape critique devait faire échouer l'exécution")
+	}
+	if report.RollbackErr != nil {
+		t.Fatalf("compensation en échec : %v", report.RollbackErr)
+	}
+
+	apres, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("le vhost de supervision a été supprimé au lieu d'être restauré : %v", err)
+	}
+	if string(apres) != string(origine) {
+		t.Errorf("le vhost de supervision n'a pas retrouvé son contenu d'origine :\n%s", apres)
+	}
+	if _, err := os.Stat(enabledPath); err != nil {
+		t.Errorf("le lien d'activation pointe dans le vide : %v", err)
+	}
+}
+
+// blocDePool isole la portion du vhost de supervision consacrée à un pool. Les
+// deux templates la font précéder du même commentaire.
+func blocDePool(t *testing.T, contenu, pool string) string {
+	t.Helper()
+	for _, seg := range strings.Split(contenu, "# pool ")[1:] {
+		if strings.HasPrefix(seg, pool+" ") {
+			return seg
+		}
+	}
+	t.Fatalf("aucun bloc pour le pool %s :\n%s", pool, contenu)
+	return ""
+}
+
+// rendStatus applique le vhost de supervision et rend son contenu.
+func rendStatus(t *testing.T, prov *Provider, projects []*model.Project) string {
+	t.Helper()
+	ctx := context.Background()
+	steps, err := prov.PlanStatus(ctx, projects, "127.0.0.1:8099", "/ogs-status", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range steps {
+		if s.Apply != nil {
+			if err := s.Apply(ctx); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	c, err := os.ReadFile(filepath.Join(prov.Engine.AvailableDir(), prov.Engine.FileName(StatusVHostName)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(c)
+}
+
+func TestVHostDeSupervisionSuitLeStatutDeChaquePool(t *testing.T) {
+	for _, engineName := range []string{"apache", "nginx"} {
+		t.Run(engineName, func(t *testing.T) {
+			prov, _ := fixture(t, engineName)
+			// « pm.status_path » est un réglage de base, que la déclaration du projet
+			// surcharge. FPM compare SCRIPT_NAME à la valeur qu'il a retenue : le
+			// vhost, qui force cette variable, doit forcer celle du pool.
+			shop := project(t, "shop.fr", model.KindSymfony, "6.4", "8.5")
+			shop.Spec.PHP.Pools[0].Settings = map[string]string{
+				"pm.status_path": "/ailleurs",
+				"ping.path":      "/ailleurs-ping",
+			}
+			blog := project(t, "blog.fr", model.KindSymfony, "6.4", "8.5")
+
+			c := rendStatus(t, prov, []*model.Project{shop, blog})
+			surcharge := blocDePool(t, c, "shopfr")
+			defaut := blocDePool(t, c, "blogfr")
+
+			for _, want := range []string{"/ailleurs", "/ailleurs-ping"} {
+				if !strings.Contains(surcharge, want) {
+					t.Errorf("le pool surchargé doit être interrogé sur %s :\n%s", want, surcharge)
+				}
+			}
+			if strings.Contains(surcharge, config.PoolStatusPath) {
+				t.Errorf("le chemin du parc n'a rien à faire dans le bloc du pool surchargé :\n%s", surcharge)
+			}
+			// Le pool voisin, lui, garde les chemins du parc.
+			for _, want := range []string{config.PoolStatusPath, config.PoolPingPath} {
+				if !strings.Contains(defaut, want) {
+					t.Errorf("le pool sans surcharge doit garder %s :\n%s", want, defaut)
+				}
+			}
+			if strings.Contains(defaut, "/ailleurs") {
+				t.Errorf("la surcharge d'un pool a débordé sur un autre :\n%s", defaut)
+			}
+		})
+	}
+}
+
+func TestVHostDeSupervisionRefuseUnStatutInjectable(t *testing.T) {
+	prov, _ := fixture(t, "nginx")
+	shop := project(t, "shop.fr", model.KindSymfony, "6.4", "8.5")
+	// Le chemin vient du fichier d'un projet et le vhost est de portée serveur :
+	// une directive glissée là serait chargée en root, et une directive dupliquée
+	// est fatale à nginx. Une valeur impossible à écrire sans risque retombe sur
+	// le défaut du parc — une métrique manquante, jamais un moteur à terre.
+	shop.Spec.PHP.Pools[0].Settings = map[string]string{
+		"pm.status_path": "/x;\n    deny all",
+	}
+	c := rendStatus(t, prov, []*model.Project{shop})
+	bloc := blocDePool(t, c, "shopfr")
+	if strings.Contains(bloc, "deny all") {
+		t.Errorf("une directive a été injectée dans le vhost de supervision :\n%s", bloc)
+	}
+	if !strings.Contains(bloc, config.PoolStatusPath) {
+		t.Errorf("le chemin refusé devait retomber sur le défaut du parc :\n%s", bloc)
+	}
+}
+
+func TestPlanRefuseEtForceUnVHostModifieAlaMain(t *testing.T) {
+	prov, paths := fixture(t, "apache")
+	p := project(t, "shop.fr", model.KindSymfony, "6.4", "8.5")
+	ctx := context.Background()
+	obs, _ := prov.Observe(ctx, p)
+	steps, err := prov.Plan(ctx, p, obs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := &engine.Plan{Project: p.ID()}
+	for _, s := range steps {
+		plan.Add(s)
+	}
+	if _, err := engine.Execute(ctx, plan, engine.Options{}); err != nil {
+		t.Fatal(err)
+	}
+
+	vhost := filepath.Join(prov.Engine.AvailableDir(), "shopfr.conf")
+	data, _ := os.ReadFile(vhost)
+	const ajout = "\n# réglage posé à la main\n"
+	if err := os.WriteFile(vhost, append(data, []byte(ajout)...), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Sans --force : refus, fichier intact, aucune sauvegarde.
+	obs, _ = prov.Observe(ctx, p)
+	steps, _ = prov.Plan(ctx, p, obs)
+	var refus *engine.Step
+	for _, s := range steps {
+		if strings.Contains(s.Summary, "modifié hors ogs") {
+			refus = s
+		}
+	}
+	if refus == nil {
+		t.Fatal("la modification manuelle doit être détectée")
+	}
+	if err := refus.Apply(ctx); err == nil {
+		t.Error("l'écrasement doit être refusé sans --force")
+	}
+	if intact, _ := os.ReadFile(vhost); !strings.Contains(string(intact), "posé à la main") {
+		t.Error("le refus ne doit rien écrire")
+	}
+
+	// Avec --force : mise à jour ordinaire, précédée de la sauvegarde.
+	prov.Force = true
+	obs, _ = prov.Observe(ctx, p)
+	steps, err = prov.Plan(ctx, p, obs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var forcée *engine.Step
+	for _, s := range steps {
+		if strings.Contains(s.Summary, "écrasement forcé") {
+			forcée = s
+		}
+	}
+	if forcée == nil {
+		t.Fatal("le plan doit annoncer l'écrasement forcé")
+	}
+	// Le rechargement du moteur reste demandé : le chemin forcé retombe sur
+	// l'écriture ordinaire plutôt que d'en dupliquer une seconde.
+	if len(forcée.Reload) != 1 || forcée.Reload[0] != "web:apache" {
+		t.Errorf("l'écrasement forcé doit porter le rechargement : %v", forcée.Reload)
+	}
+	if err := forcée.Apply(ctx); err != nil {
+		t.Fatalf("l'écrasement forcé doit réussir : %v", err)
+	}
+	if after, _ := os.ReadFile(vhost); strings.Contains(string(after), "posé à la main") {
+		t.Error("le vhost doit avoir été réécrit")
+	}
+	// La sauvegarde sort du répertoire de configuration : Apache charge
+	// sites-available tout entier par l'inclusion, et l'importateur le lit.
+	if next, _ := filepath.Glob(vhost + ".ogs-bak-*"); len(next) != 0 {
+		t.Errorf("la sauvegarde ne doit pas rester dans sites-available : %v", next)
+	}
+	baks, _ := filepath.Glob(filepath.Join(paths.BackupsDir(), filepath.Base(vhost)+".ogs-bak-*"))
+	if len(baks) != 1 {
+		t.Fatalf("une sauvegarde attendue, %d trouvée(s)", len(baks))
+	}
+	if saved, _ := os.ReadFile(baks[0]); !strings.Contains(string(saved), "posé à la main") {
+		t.Error("la sauvegarde doit contenir l'original")
+	}
+
+	// La sauvegarde porte le ServerName du vhost écrasé : prise pour une
+	// configuration étrangère, elle mettrait le projet en conflit avec lui-même
+	// et l'apply suivant refuserait de planifier.
+	prov.Force = false
+	obs, err = prov.Observe(ctx, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(obs.Conflicts) != 0 {
+		t.Errorf("la sauvegarde ne doit pas passer pour un vhost concurrent : %v", obs.Conflicts)
+	}
+	if len(obs.Stale) != 0 {
+		t.Errorf("la sauvegarde ne doit pas être prise pour un vhost obsolète : %v", obs.Stale)
+	}
+	steps, err = prov.Plan(ctx, p, obs)
+	if err != nil {
+		t.Fatalf("l'apply suivant doit rester planifiable : %v", err)
+	}
+	plan2 := &engine.Plan{Project: p.ID()}
+	for _, s := range steps {
+		plan2.Add(s)
+	}
+	if !plan2.Empty() {
+		t.Errorf("le plan suivant doit être vide :\n%s", plan2.String())
+	}
+}
+
+// moteurRefusant se déclare non simulé : validate() court-circuite sur un
+// exécuteur simulé, et le chemin d'échec de la revalidation ne serait pas éprouvé.
+type moteurRefusant struct{ *exec.Recorder }
+
+func (m *moteurRefusant) Simulated() bool { return false }
+
+// refuserLaValidation installe un binaire de moteur factice et fait échouer sa
+// vérification de configuration, comme le ferait une invalidité étrangère au
+// fichier qu'ogs vient d'écrire.
+func refuserLaValidation(t *testing.T, prov *Provider) {
+	t.Helper()
+	bin, args := prov.Engine.ValidateArgs()
+	if err := os.MkdirAll(filepath.Dir(bin), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rec := exec.NewRecorder()
+	rec.Errors[bin+" "+args[0]] = errors.New("configuration refusée : cause étrangère au fragment")
+	prov.Exec = &moteurRefusant{rec}
+}
+
+// poserLeFragment dépose un fragment de portée serveur antérieur et rend son corps.
+// poserLeFragment écrit un fragment tel qu'une version antérieure d'ogs l'aurait
+// laissé : marqué, donc « à mettre à jour » et non « non géré par ogs ». La
+// distinction décide de tout depuis que le fragment suit le régime des cinq
+// états — un fichier sans marque est refusé, et l'étape n'écrit plus rien.
+func poserLeFragment(t *testing.T, prov *Provider) []byte {
+	t.Helper()
+	chemin := prov.Engine.SnippetPath()
+	if err := os.MkdirAll(filepath.Dir(chemin), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	origine := fs.Render(fs.Header{
+		Project: "parc", Resource: "web/snippet", Generated: time.Now().Add(-time.Hour),
+	}, []byte("map $http_upgrade $connection_upgrade { default upgrade; '' close; }\n"), "#")
+	if err := os.WriteFile(chemin, origine, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return origine
+}
+
+// Le fragment de portée serveur porte la « map $connection_upgrade » dont dépend
+// tout vhost de proxy du parc. Un exploitant peut légitimement y avoir ajouté un
+// réglage : l'écraser en silence le lui retirerait sans un mot, d'où le régime
+// des cinq états et sa porte de sortie (§6.4).
+func TestFragmentRetoucheALaMainRefusePuisEcraseAvecForce(t *testing.T) {
+	prov, _ := fixture(t, "nginx")
+	chemin := prov.Engine.SnippetPath()
+	if err := os.MkdirAll(filepath.Dir(chemin), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	retouche := []byte("# posé à la main par l'exploitant\nclient_max_body_size 64m;\n")
+	if err := os.WriteFile(chemin, retouche, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := prov.PlanSnippet()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Apply(context.Background()); err == nil {
+		t.Fatal("un fragment non géré par ogs doit être refusé")
+	}
+	if apres, _ := os.ReadFile(chemin); string(apres) != string(retouche) {
+		t.Errorf("le refus ne doit rien écrire :\n%s", apres)
+	}
+
+	prov.Force = true
+	s, err = prov.PlanSnippet()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Apply(context.Background()); err != nil {
+		t.Fatalf("--force doit écraser : %v", err)
+	}
+	apres, _ := os.ReadFile(chemin)
+	if !strings.Contains(string(apres), fs.Marker) {
+		t.Errorf("le fragment devait être réécrit par ogs :\n%s", apres)
+	}
+	// L'original part dans le répertoire des sauvegardes, jamais à côté : le
+	// répertoire des fragments est chargé en entier par le moteur.
+	copies, _ := filepath.Glob(filepath.Join(prov.Paths.BackupsDir(), "*.ogs-bak-*"))
+	if len(copies) != 1 {
+		t.Fatalf("une sauvegarde attendue, %d trouvée(s)", len(copies))
+	}
+	if data, _ := os.ReadFile(copies[0]); string(data) != string(retouche) {
+		t.Errorf("la sauvegarde ne porte pas l'original :\n%s", data)
+	}
+	if voisines, _ := filepath.Glob(chemin + ".ogs-bak-*"); len(voisines) != 0 {
+		t.Errorf("aucune copie ne doit rester dans le répertoire des fragments : %v", voisines)
+	}
+}
+
+// La revalidation qui suit l'écriture du fragment porte sur la configuration
+// entière : elle échoue pour une invalidité étrangère au fragment aussi bien que
+// pour le fragment lui-même. Le supprimer alors emporte la « map $connection_upgrade »
+// dont dépend tout vhost de proxy du parc, et nginx refuse ensuite de démarrer.
+func TestUnFragmentRefuseParLeMoteurRetrouveSonContenuPrecedent(t *testing.T) {
+	prov, _ := fixture(t, "nginx")
+	origine := poserLeFragment(t, prov)
+	refuserLaValidation(t, prov)
+
+	s, err := prov.PlanSnippet()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Apply(context.Background()); err == nil {
+		t.Fatal("une configuration refusée doit faire échouer l'étape")
+	}
+	apres, err := os.ReadFile(prov.Engine.SnippetPath())
+	if err != nil {
+		t.Fatalf("le fragment a été supprimé au lieu d'être restauré : %v", err)
+	}
+	if string(apres) != string(origine) {
+		t.Errorf("le fragment n'a pas retrouvé son contenu d'origine :\n%s", apres)
+	}
+}
+
+// L'étape du fragment figure désormais dans le plan de chaque projet : elle est
+// soumise au déroulage de sa saga, et la compensation doit rendre le fragment
+// précédent — pas le supprimer.
+func TestCompensationDuFragmentDePorteeServeurRendLAncienContenu(t *testing.T) {
+	t.Run("fragment présent", func(t *testing.T) {
+		prov, _ := fixture(t, "nginx")
+		origine := poserLeFragment(t, prov)
+
+		plan := &engine.Plan{Project: "shopfr"}
+		s, err := prov.PlanSnippet()
+		if err != nil {
+			t.Fatal(err)
+		}
+		plan.Add(s)
+		plan.Add(etapeEnEchec())
+
+		report, err := engine.Execute(context.Background(), plan, engine.Options{})
+		if err == nil {
+			t.Fatal("l'étape critique devait faire échouer l'exécution")
+		}
+		if !report.RolledBack {
+			t.Fatal("la saga devait être déroulée")
+		}
+		if report.RollbackErr != nil {
+			t.Fatalf("compensation en échec : %v", report.RollbackErr)
+		}
+		apres, err := os.ReadFile(prov.Engine.SnippetPath())
+		if err != nil {
+			t.Fatalf("le fragment a été supprimé au lieu d'être restauré : %v", err)
+		}
+		if string(apres) != string(origine) {
+			t.Errorf("le fragment n'a pas retrouvé son contenu d'origine :\n%s", apres)
+		}
+	})
+
+	// L'autre bout de l'invariant : la suppression n'est juste que si le fichier
+	// était absent avant l'étape.
+	t.Run("fragment absent", func(t *testing.T) {
+		prov, _ := fixture(t, "nginx")
+		plan := &engine.Plan{Project: "shopfr"}
+		s, err := prov.PlanSnippet()
+		if err != nil {
+			t.Fatal(err)
+		}
+		plan.Add(s)
+		plan.Add(etapeEnEchec())
+
+		report, err := engine.Execute(context.Background(), plan, engine.Options{})
+		if err == nil {
+			t.Fatal("l'étape critique devait faire échouer l'exécution")
+		}
+		if report.RollbackErr != nil {
+			t.Fatalf("compensation en échec : %v", report.RollbackErr)
+		}
+		if _, err := os.Stat(prov.Engine.SnippetPath()); !os.IsNotExist(err) {
+			t.Error("un fragment créé par l'étape doit disparaître au déroulage")
+		}
+	})
+}
+
+// La compensation d'une suppression de vhost doit rendre le lien d'activation
+// autant que le fichier : ni Apache ni nginx ne chargent sites-available, et la
+// saga annoncerait un retour à l'état initial en laissant le domaine sans service.
+func TestCompensationDUneSuppressionDeVHostRetablitLeLienDActivation(t *testing.T) {
+	for _, engineName := range []string{"apache", "nginx"} {
+		t.Run(engineName, func(t *testing.T) {
+			prov, _ := fixture(t, engineName)
+			nom := prov.Engine.FileName("shopfr_redir")
+			chemin := filepath.Join(prov.Engine.AvailableDir(), nom)
+			origine := []byte("# ancien vhost de redirection\n")
+			if err := fs.WriteAtomic(chemin, origine, 0o644, fs.KeepOwner); err != nil {
+				t.Fatal(err)
+			}
+			lien := filepath.Join(prov.Engine.EnabledDir(), nom)
+			rel, err := filepath.Rel(prov.Engine.EnabledDir(), chemin)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(rel, lien); err != nil {
+				t.Fatal(err)
+			}
+
+			plan := &engine.Plan{Project: "shopfr"}
+			plan.Add(prov.removeStep(chemin))
+			plan.Add(etapeEnEchec())
+
+			report, err := engine.Execute(context.Background(), plan, engine.Options{})
+			if err == nil {
+				t.Fatal("l'étape critique devait faire échouer l'exécution")
+			}
+			if !report.RolledBack {
+				t.Fatal("la saga devait être déroulée")
+			}
+			if report.RollbackErr != nil {
+				t.Fatalf("compensation en échec : %v", report.RollbackErr)
+			}
+			apres, err := os.ReadFile(chemin)
+			if err != nil {
+				t.Fatalf("le vhost n'a pas été restauré : %v", err)
+			}
+			if string(apres) != string(origine) {
+				t.Errorf("le vhost n'a pas retrouvé son contenu d'origine :\n%s", apres)
+			}
+			cible, err := os.Readlink(lien)
+			if err != nil {
+				t.Fatalf("le vhost est restauré mais n'est plus activé : %v", err)
+			}
+			if cible != rel {
+				t.Errorf("la cible du lien a changé : %q au lieu de %q", cible, rel)
+			}
+			// Stat suit le lien : il échoue si la cible manque. Nginx tient
+			// l'inclusion d'un lien mort pour fatale, tout le parc avec lui.
+			if _, err := os.Stat(lien); err != nil {
+				t.Errorf("le lien d'activation pointe dans le vide : %v", err)
+			}
+		})
 	}
 }
