@@ -422,7 +422,7 @@ est transmis par `SOCKET_PATH`, et si le code l'ignore, l'attente de disponibili
 
 ## Documentation
 
-- [`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md) — la référence : 68 décisions d'architecture
+- [`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md) — la référence : 69 décisions d'architecture
   arbitrées, spécification par module, plan de tests, découpage en lots.
 - [`docs/INSTALLATION.md`](docs/INSTALLATION.md) — installation, premier démarrage, sauvegarde, mise à jour.
 - [`docs/HOOKS.md`](docs/HOOKS.md) — raccorder l'outil au reste de l'exploitation.
