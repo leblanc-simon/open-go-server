@@ -125,6 +125,10 @@ type Options struct {
 	OnWarning func(*Step, error)
 	// Reload exécute une intention de rechargement en fin d'application.
 	Reload func(context.Context, string) error
+	// OnReloadWarning remonte un rechargement en échec. Il n'est rattaché à
+	// aucune étape, donc OnWarning ne le voit pas : sans ce rappel, l'exploitant
+	// lisait « 1 avertissement(s) » sans que rien ne dise lequel.
+	OnReloadWarning func(target string, err error)
 	// Audit consigne le résultat de chaque étape.
 	Audit func(step *Step, outcome string, detail string)
 }
@@ -178,6 +182,9 @@ func Execute(ctx context.Context, plan *Plan, opts Options) (*Report, error) {
 		for _, r := range aFaire {
 			if err := opts.Reload(ctx, r); err != nil {
 				report.Warnings = append(report.Warnings, fmt.Sprintf("rechargement %s : %v", r, err))
+				if opts.OnReloadWarning != nil {
+					opts.OnReloadWarning(r, err)
+				}
 				continue
 			}
 			report.Reloaded = append(report.Reloaded, r)

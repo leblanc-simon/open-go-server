@@ -19,6 +19,7 @@ import (
 	"leblanc.io/open-go-server/internal/hook"
 	"leblanc.io/open-go-server/internal/model"
 	appprov "leblanc.io/open-go-server/internal/provider/app"
+	"leblanc.io/open-go-server/internal/provider/mail"
 	"leblanc.io/open-go-server/internal/provider/unit"
 	"leblanc.io/open-go-server/internal/spec"
 	"leblanc.io/open-go-server/internal/store"
@@ -213,6 +214,22 @@ func (a *App) buildPlan(ctx context.Context, provs *providers, p *model.Project)
 		plan.Add(s)
 	}
 
+	// Clés DKIM (D69). Elles ne dépendent de rien de ce qui précède, et rien n'en
+	// dépend dans le projet : les tables qui les désignent sont au plan global,
+	// qui s'exécute après — une table ne référence ainsi jamais une clé que
+	// l'apply n'a pas encore posée.
+	mailObs, err := provs.Mail.Observe(ctx)
+	if err != nil {
+		return nil, wrap(CodeError, err)
+	}
+	mailSteps, err := provs.Mail.Plan(ctx, p, mailObs)
+	if err != nil {
+		return nil, wrap(CodeError, err)
+	}
+	for _, s := range mailSteps {
+		plan.Add(s)
+	}
+
 	// La délégation est écrite en dernier : en style systemctl, elle énumère les
 	// instances, dont le nombre vient d'être arrêté. Une application supervisée y
 	// donne droit autant qu'un service déclaré : son propriétaire doit pouvoir la
@@ -309,6 +326,20 @@ func (a *App) buildGlobalPlan(ctx context.Context, provs *providers, targeted []
 		return nil, planErr(err)
 	}
 	for _, s := range monSteps {
+		plan.Add(s)
+	}
+
+	// Tables d'OpenDKIM : recalculées depuis le parc entier, comme les fichiers de
+	// supervision, et après les plans de projets qui ont posé les clés.
+	mailObs, err := provs.Mail.Observe(ctx)
+	if err != nil {
+		return nil, planErr(err)
+	}
+	mailSteps, err := provs.Mail.PlanTables(projects, mailObs)
+	if err != nil {
+		return nil, planErr(err)
+	}
+	for _, s := range mailSteps {
 		plan.Add(s)
 	}
 
@@ -421,6 +452,9 @@ func (a *App) reloadFunc(provs *providers) func(context.Context, string) error {
 		case target == "monitoring:fail2ban":
 			a.printf("  ↻ rechargement de fail2ban\n")
 			return provs.Monitoring.ReloadFail2ban(ctx)
+		case target == mail.ReloadTarget:
+			a.printf("  ↻ rechargement d'opendkim\n")
+			return provs.Mail.Reload(ctx)
 		case strings.HasPrefix(target, "systemd:enable:"):
 			unit := strings.TrimPrefix(target, "systemd:enable:")
 			a.printf("  ↻ activation de %s\n", unit)
@@ -664,7 +698,8 @@ func newApplyCommand(app *App) *cobra.Command {
 					Audit: func(s *engine.Step, outcome, detail string) {
 						_ = app.Audit.Record(p.ID(), s.Resource, "apply."+s.Action.String(), outcome, detail)
 					},
-					Reload: reload,
+					Reload:          reload,
+					OnReloadWarning: app.reloadWarning,
 				})
 				warnings += len(report.Warnings)
 				if err != nil {
@@ -719,7 +754,8 @@ func newApplyCommand(app *App) *cobra.Command {
 						// jamais exécutés : systemd-tmpfiles ne créait pas les répertoires
 						// d'exécution — les verrous de tâches échouaient donc tous — et le
 						// timer de renouvellement des certificats n'était jamais activé.
-						Reload: reload,
+						Reload:          reload,
+						OnReloadWarning: app.reloadWarning,
 					})
 					if err != nil {
 						return wrap(CodeError, err)
@@ -820,3 +856,9 @@ func trimTrailingNewline(s string) string {
 }
 
 var _ = tabwriter.NewWriter
+
+// reloadWarning affiche un rechargement en échec. Il n'appartient à aucune
+// étape : sans lui, seul le compte des avertissements en gardait la trace.
+func (a *App) reloadWarning(target string, err error) {
+	a.printf("  ⚠ rechargement %s : %v\n", target, err)
+}

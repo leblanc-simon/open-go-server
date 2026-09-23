@@ -147,7 +147,7 @@ Décisions arbitrées et figées pour la v1. Toute remise en cause est une évol
 | D66 | Accès de l'agent à l'état des pools | Un **vhost de supervision** de portée serveur (`ogs-status`), écoutant sur la **boucle locale seule**, expose l'état du moteur web et celui de chaque pool PHP-FPM ; l'agent l'interroge en HTTP. Toute autre adresse d'écoute est **refusée au chargement de la configuration** | Le seul autre moyen de donner l'état d'un pool à l'agent est de lui donner le socket FPM. Or **parler au socket d'un pool, c'est pouvoir y faire exécuter du code sous l'identité du projet** : le protocole FastCGI n'a aucune authentification, et le pool exécute le script qu'on lui nomme. L'agent deviendrait un moyen d'exécution sur tous les projets à la fois. Le serveur web, lui, détient déjà ces sockets : il sert d'intermédiaire, et l'agent n'obtient que ce que le pool rend sur son chemin de statut. Le refus d'une adresse routable est au **chargement**, non à l'écriture du vhost : une erreur à l'apply laisserait le fichier écrit avant de se plaindre. Les pools exposent `pm.status_path` et `ping.path` sous des noms préfixés `ogs-`, inatteignables depuis un vhost de projet — ceux-ci ne routent vers FPM que les URI en `.php`. Deux pièges de moteur, tous deux invisibles à une vérification de configuration : Apache traite les sections `<Location>` **dans l'ordre du fichier** et non par spécificité, donc le refus par défaut doit venir en premier ; et `mod_proxy_fcgi` dérive `SCRIPT_NAME` de l'URI demandée et non du chemin de la cible `fcgi://`, d'où une réécriture explicite par `ProxyFCGISetEnvIf` — sans elle FPM ne reconnaît pas son chemin de statut, cherche un fichier et répond « Primary script unknown » |
 | D67 | Comptes de supervision | Un compte par moteur, de **portée parc** (scope de keystore `@parc`, impossible à porter par un projet), aux privilèges bornés : MySQL `PROCESS, REPLICATION CLIENT` et la lecture du `performance_schema` ; PostgreSQL le rôle `pg_monitor` **sans mot de passe** ; RabbitMQ le seul tag `monitoring`. Chaque étape est **non critique** | Un agent de métriques compromis ne doit pas être un accès aux données de clients : aucun de ces comptes n'atteint la base d'un projet. Le rôle PostgreSQL porte le **nom de l'utilisateur système de l'agent**, non un nom choisi : la connexion locale est authentifiée « peer », qui compare l'utilisateur du système — c'est la règle de D44, et un rôle nommé autrement serait créé puis refusé à chaque collecte. Le tag `monitoring` de RabbitMQ suffit et se suffit : il donne la lecture de tous les vhosts par l'API d'administration, là où une permission par vhost donnerait le droit de lire les messages des projets. Deux pièges : un moteur **installé mais injoignable** produit un avertissement, un moteur **absent** ne produit rien — une machine sans MySQL n'a pas à voir un avertissement à chaque apply ; et **MariaDB rend « BINLOG MONITOR » là où MySQL rend « REPLICATION CLIENT »**, si bien que comparer au seul libellé de MySQL faisait annoncer éternellement une correction qu'on venait d'appliquer |
 | D68 | Prisons fail2ban | Les prisons sont **préfixées `ogs-`**, leurs journaux **énumérés un à un** et filtrés par existence, et le fichier est **recalculé à la suppression d'un projet** | Trois conséquences d'un même comportement : **une prison dont fail2ban ne trouve aucun journal l'empêche de démarrer, et il s'arrête alors tout entier** — les prisons valides comprises. D'où le filtrage à l'écriture, le recalcul à la suppression — sans lui, retirer un projet cassait fail2ban au prochain redémarrage, sans un mot — et un contrôle de `doctor` qui nomme les journaux disparus avant qu'ils ne bloquent le démon. Le même raisonnement décide du **backend de la prison sshd** : une Debian récente n'installe plus rsyslog, `/var/log/auth.log` peut ne pas exister, mais le backend `systemd` exige les liaisons `python3-systemd` qui ne sont qu'une recommandation du paquet — on choisit donc d'après ce qui existe, en préférant le fichier, qui ne dépend d'aucune liaison. Le préfixe n'est pas décoratif : `jail.d` est un espace partagé avec l'administrateur, et une prison nommée `sshd` recouvrirait la sienne en silence. `doctor` exécute par ailleurs `fail2ban-client -t`, seul contrôle qui couvre filtres, expressions et backend d'un coup |
-| D69 | Signature DKIM | ogs **génère et garde** une clé DKIM par domaine d'envoi d'un projet qui la demande (`spec.mail.dkim`, **opt-in**), écrit la `KeyTable` et la `SigningTable` d'**OpenDKIM** à partir du parc entier et **émet l'enregistrement à publier** ; il ne touche **ni au DNS, ni au MTA, ni à `opendkim.conf`**. Clé **RSA-2048** générée en Go, scellée dans le keystore (`<projet>/dkim/<domaine>/<sélecteur>`) et écrite en **0600 opendkim:opendkim** ; sélecteur daté (`ogs202609`) ; rotation en **deux temps** — `rotate` prépare, `activate` bascule et refuse tant que l'enregistrement publié ne correspond pas à la clé, sauf `--force`. Étapes **non critiques** ; la préproduction est **refusée à la validation** | Révise §1.3, qui plaçait la messagerie hors périmètre, pour la raison de D64 : OpenDKIM a besoin de ce qu'ogs seul sait — quels domaines appartiennent à quel projet, et quand un projet disparaît. Le reste de la messagerie demeure dehors : ni MTA, ni relais, ni SPF — qui dépend des relais empruntés, qu'ogs ignore —, ni DMARC. **Le DNS reste hors périmètre malgré D53** : les identifiants OVH ne couvrent que la zone de préproduction, les zones des clients vivent ailleurs, et écrire dans la zone d'un client n'engage pas la même confiance que dans la sienne ; `doctor` vérifie ce qui est publié. **Pourquoi deux temps** : passer d'une clé qui se vérifie à une clé dont la partie publique n'est pas publiée casse la signature de tout envoi — sous un DMARC `p=reject` sans SPF aligné, le courrier est rejeté. À la **création**, en revanche, on signe aussitôt : une signature invérifiable ne vaut pas moins qu'une absence de signature, DMARC les traitant de même, et faire dépendre l'apply d'une résolution DNS rendrait le plan instable d'une exécution à l'autre. **Pourquoi sceller** : une clé DKIM, contrairement à un mot de passe, ne se régénère pas sans action extérieure — la perdre oblige à republier chez le client ; le keystore est la source de vérité et le fichier en dérive, donc un fichier disparu est réécrit, jamais recréé avec une clé neuve. Le fichier de clé ne peut porter l'en-tête d'ogs : il est comparé au contenu scellé, et un écart est traité comme une modification à la main (`--force`). **Pourquoi 0600** : sous `RequireSafeKeys`, défaut d'OpenDKIM, une clé lisible au-delà de son propriétaire est refusée — le régime 0640 de D65 ne convient pas ici. **Pourquoi des tables de parc** : OpenDKIM n'en accepte qu'une de chaque, et recalculées depuis un sous-ensemble elles retireraient de la signature tous les autres projets — la leçon de logrotate et de tmpfiles ; elles vivent donc dans le plan global, et `doctor` vérifie qu'`opendkim.conf`, laissé à l'administrateur comme `telegraf.conf` (D65), les référence bien. **Pourquoi pas la préproduction** : elle ne doit jamais pouvoir signer au nom du domaine de production — un envoi de test parti vers de vrais clients serait authentifié. **Pourquoi l'opt-in** : beaucoup de projets envoient par un relais tiers qui signe de sa propre clé ; signer par défaut créerait des clés dont aucun courrier ne se sert. **Pourquoi RSA** : ed25519 (RFC 8463) est encore trop peu vérifié pour servir seul. Piège : une clé RSA-2048 dépasse les 255 octets d'une chaîne TXT, l'enregistrement émis est donc découpé et `doctor` recolle les morceaux avant de comparer. **Pourquoi OpenDKIM plutôt que rspamd** : ses tables sont des fichiers plats, recalculables comme logrotate ou fail2ban, là où rspamd est une tout autre pièce à supposer présente |
+| D69 | Signature DKIM | ogs **génère et garde** une clé DKIM par domaine d'envoi d'un projet qui la demande (`spec.mail.dkim`, **opt-in**), écrit la `KeyTable` et la `SigningTable` d'**OpenDKIM** à partir du parc entier et **émet l'enregistrement à publier** ; il ne touche **ni au DNS, ni au MTA, ni à `opendkim.conf`**. Clé **RSA-2048** générée en Go, scellée dans le keystore (`<projet>/dkim/<domaine>/<sélecteur>`) et écrite en **0600 opendkim:opendkim** ; sélecteur daté (`ogs202609`) ; rotation en **deux temps** — `rotate` prépare, `activate` bascule et refuse tant que l'enregistrement publié ne correspond pas à la clé, sauf `--force`. Étapes **non critiques** ; la préproduction est **refusée à la validation** | Révise §1.3, qui plaçait la messagerie hors périmètre, pour la raison de D64 : OpenDKIM a besoin de ce qu'ogs seul sait — quels domaines appartiennent à quel projet, et quand un projet disparaît. Le reste de la messagerie demeure dehors : ni MTA, ni relais, ni SPF — qui dépend des relais empruntés, qu'ogs ignore —, ni DMARC. **Le DNS reste hors périmètre malgré D53** : les identifiants OVH ne couvrent que la zone de préproduction, les zones des clients vivent ailleurs, et écrire dans la zone d'un client n'engage pas la même confiance que dans la sienne ; `doctor` vérifie ce qui est publié. **Pourquoi deux temps** : passer d'une clé qui se vérifie à une clé dont la partie publique n'est pas publiée casse la signature de tout envoi — sous un DMARC `p=reject` sans SPF aligné, le courrier est rejeté. À la **création**, en revanche, on signe aussitôt : une signature invérifiable ne vaut pas moins qu'une absence de signature, DMARC les traitant de même, et faire dépendre l'apply d'une résolution DNS rendrait le plan instable d'une exécution à l'autre. **Pourquoi sceller** : une clé DKIM, contrairement à un mot de passe, ne se régénère pas sans action extérieure — la perdre oblige à republier chez le client ; le keystore est la source de vérité et le fichier en dérive, donc un fichier disparu est réécrit, jamais recréé avec une clé neuve. Le fichier de clé ne peut porter l'en-tête d'ogs : il est comparé au contenu scellé, et un écart est traité comme une modification à la main (`--force`). **Pourquoi 0600** : sous `RequireSafeKeys`, défaut d'OpenDKIM, une clé lisible au-delà de son propriétaire est refusée — le régime 0640 de D65 ne convient pas ici. Et le refus n'est pas un silence : l'essai réel l'a montré, une clé refusée **ou absente** ne laisse pas partir le courrier sans signature, OpenDKIM rend une erreur temporaire et **le MTA garde en file tout le courrier du domaine**. D'où deux règles : une table ne désigne jamais une clé dont le fichier manque, et le fichier d'un domaine qui cesse d'être signé n'est retiré qu'**après** le rechargement des tables, OpenDKIM gardant en mémoire celles qu'il a chargées. **Pourquoi des tables de parc** : OpenDKIM n'en accepte qu'une de chaque, et recalculées depuis un sous-ensemble elles retireraient de la signature tous les autres projets — la leçon de logrotate et de tmpfiles ; elles vivent donc dans le plan global, et `doctor` vérifie qu'`opendkim.conf`, laissé à l'administrateur comme `telegraf.conf` (D65), les référence bien. **Pourquoi pas la préproduction** : elle ne doit jamais pouvoir signer au nom du domaine de production — un envoi de test parti vers de vrais clients serait authentifié. **Pourquoi l'opt-in** : beaucoup de projets envoient par un relais tiers qui signe de sa propre clé ; signer par défaut créerait des clés dont aucun courrier ne se sert. **Pourquoi RSA** : ed25519 (RFC 8463) est encore trop peu vérifié pour servir seul. Piège : une clé RSA-2048 dépasse les 255 octets d'une chaîne TXT, l'enregistrement émis est donc découpé et `doctor` recolle les morceaux avant de comparer. **Pourquoi OpenDKIM plutôt que rspamd** : ses tables sont des fichiers plats, recalculables comme logrotate ou fail2ban, là où rspamd est une tout autre pièce à supposer présente |
 
 ---
 
@@ -2099,13 +2099,19 @@ ogs tient les clés DKIM des projets qui le demandent et les tables d'OpenDKIM q
 n'installe ni OpenDKIM ni le MTA, ne touche ni à `opendkim.conf` ni au branchement du milter, et n'écrit
 aucun enregistrement DNS : il **émet** celui qu'il faut publier.
 
+Le critère de présence est `/etc/opendkim.conf`, non un répertoire : c'est le fichier qu'OpenDKIM lit, et
+le paquet Debian ne crée pas `/etc/opendkim`. Un parc où aucun projet ne demande la signature n'est pas
+touché — ni tables vides posées d'office, ni reproche de `doctor` à un OpenDKIM que l'administrateur
+tiendrait à la main.
+
 #### Configuration
 
 ```yaml
 # /etc/ogs/config.yaml
 mail:
   dkim:
-    enabled: true              # absent : actif si /etc/opendkim existe
+    enabled: true              # absent : actif si /etc/opendkim.conf existe
+    user: opendkim             # compte d'OpenDKIM, propriétaire des clés
     keyBits: 2048              # RSA ; 1024 refusé au chargement
     selectorPrefix: ogs        # sélecteur = <préfixe><AAAAMM>
     retention: 168h            # durée de vie d'une clé remplacée par activate
@@ -2128,12 +2134,16 @@ projet, et un domaine déjà signé par un autre projet du parc.
 
 | Fichier | Contenu | Plan | Droits |
 |---|---|---|---|
-| `/etc/opendkim/keys/<id>/<domaine>/<sélecteur>.private` | clé privée RSA, PEM | projet | 0600 opendkim:opendkim, répertoires 0700 |
+| `/etc/opendkim/keys/<id>/<domaine>/<sélecteur>.private` | clé privée RSA, PEM (PKCS#8) | projet | 0600 opendkim:opendkim, répertoires 0750 root:opendkim |
 | `/etc/opendkim/ogs/KeyTable` | `<sélecteur>._domainkey.<domaine> <domaine>:<sélecteur>:<chemin>` | global | 0644 root:root |
 | `/etc/opendkim/ogs/SigningTable` | `*@<domaine> <sélecteur>._domainkey.<domaine>` | global | 0644 root:root |
 
 La clé est écrite dans le plan de projet, les tables dans le plan global, qui s'exécute après : une table ne
-référence jamais une clé pas encore posée. Les tables sont **recalculées en entier** depuis le parc, jamais
+référence jamais une clé pas encore posée — ni une clé dont le fichier manque, qu'elle ne désigne pas. Le
+fichier d'un domaine qui cesse d'être signé est retiré à la fin du plan global, **après** le rechargement
+des tables : OpenDKIM garde en mémoire celles qu'il a chargées, et retirer le fichier d'abord lui ferait
+retenir le courrier du domaine. La clé, elle, reste scellée : réactiver la signature retrouve
+l'enregistrement déjà publié. Les tables sont **recalculées en entier** depuis le parc, jamais
 depuis les projets visés, et à la suppression d'un projet — comme `/etc/logrotate.d/ogs`. Elles ne
 désignent que la clé **active** de chaque domaine : une clé préparée par `rotate` a son fichier, pas encore
 sa ligne.
@@ -2163,6 +2173,16 @@ ogs202609._domainkey.shop.fr. IN TXT ( "v=DKIM1; k=rsa; p=MIIBIjANBgkqhkiG9w0BAQ
 Une clé RSA-2048 dépasse les 255 octets d'une chaîne TXT : l'enregistrement est découpé en plusieurs
 chaînes, et la comparaison de `doctor` les recolle avant de comparer.
 
+#### Commandes
+
+```
+ogs mail dkim enable <projet> [--domain d]…   demande la signature (défaut : les domaines primaires)
+ogs mail dkim disable <projet>                 cesse de signer ; les clés restent scellées
+ogs mail dkim show <projet>                    clés et états, jamais leur partie privée
+ogs mail dkim records <projet>                 enregistrements à publier (zone ou JSON)
+ogs mail dkim rotate | activate <projet>       rotation en deux temps
+```
+
 #### Rotation
 
 1. `ogs mail dkim rotate <projet> [--domain <d>]` génère une clé sous un nouveau sélecteur et l'écrit. La
@@ -2179,14 +2199,20 @@ signature invérifiable ne vaut pas moins qu'une absence de signature.
 
 #### Rechargement
 
-`mail:opendkim` est une intention groupée comme les autres : `opendkim -n` valide la configuration, puis
-`systemctl reload opendkim` et le constat `is-active`. Les étapes sont **non critiques** : une clé qui
+`mail:opendkim` est une intention groupée comme les autres : `opendkim -n -x /etc/opendkim.conf` valide la
+configuration — il ouvre les tables, et en refuse une introuvable —, puis `systemctl reload-or-restart
+opendkim` et le constat `is-active`, avec relève du démon s'il est tombé. Seules les tables la déclarent :
+OpenDKIM relit le fichier d'une clé à chaque message, et recharger à l'écriture d'une clé ferait valider une
+configuration qui désigne des tables pas encore écrites. Les étapes sont **non critiques** : une clé qui
 n'est pas posée ne doit pas défaire un site par ailleurs fonctionnel.
 
 #### Ce que `doctor` porte
 
-- l'enregistrement publié correspond-il à la clé active de chaque domaine (`opendkim-testkey`) ;
-- les clés sont-elles en 0600 et au compte d'OpenDKIM, sans quoi `RequireSafeKeys` les refuse ;
+- l'enregistrement publié correspond-il à la clé active de chaque domaine — comparé par ogs lui-même,
+  chaînes recollées et blancs retirés, par le code qui garde `activate` : `opendkim-testkey` n'est que dans
+  `opendkim-tools`, et deux vérifications distinctes pourraient se contredire ;
+- les clés sont-elles en 0600 et au compte d'OpenDKIM, sans quoi `RequireSafeKeys` les refuse — et le
+  courrier du domaine reste en file ;
 - `opendkim.conf` référence-t-il les deux tables d'ogs — sinon rien n'est signé, et rien ne le dit ;
 - une clé retirée des tables a-t-elle encore un enregistrement publié, à retirer à la main.
 
@@ -2352,6 +2378,7 @@ ogs
 ├── cert revoke
 ├── cert dns-provider set | list
 │
+├── mail dkim enable | disable <projet>
 ├── mail dkim show | records <projet>  clés DKIM et enregistrements à publier (§7.13)
 ├── mail dkim rotate | activate <projet>
 │
@@ -2800,6 +2827,16 @@ Scénarios exigés :
     déplacé est nommé par `doctor` **et** refusé par fail2ban — le diagnostic est éprouvé contre le démon
     lui-même. Enfin la suppression d'un projet retire ses entrées de tous les fichiers de parc, et les deux
     configurations restent valides.
+32. **Signature DKIM** : un vrai OpenDKIM branché sur un vrai Postfix, et un résolveur local tenant lieu de
+    zone publiée. OpenDKIM accepte les tables d'ogs, en-tête compris, et le courrier sortant est signé ;
+    l'enregistrement émis par `records` vérifie la signature produite. `doctor` signale un
+    `opendkim.conf` qui ignore les tables, puis lit l'enregistrement publié, découpé en plusieurs chaînes.
+    Une clé passée en 0644 **retient le courrier en file** — ce que `doctor` dit et que l'apply répare, le
+    courrier repartant signé. Un fichier disparu est réécrit à l'identique. La rotation refuse de basculer
+    (code 5) tant que la clé préparée n'est pas publiée. Un apply qui ne vise qu'un projet laisse les autres
+    dans les tables ; une table retouchée est refusée puis sauvegardée sous `--force` ; un rechargement sur
+    une configuration invalide laisse le démon debout ; la préproduction est refusée ; la suppression
+    retire les clés, nomme les enregistrements à retirer et laisse le voisin signé.
 
 ### 16.3 Intégration continue
 
@@ -2844,11 +2881,11 @@ build multi-architecture. Les tests d'intégration sont obligatoires avant fusio
 | **L7 — TUI** | inspecteur, panneau de détail, actions contextuelles, suivi de logs, wizard de création | Création complète d'un projet depuis la TUI, parité avec la CLI |
 | **L8 — Import** | scan multi-sources, corrélation, adoption interactive, ressources non gérées | Adoption d'un serveur préconfiguré sans régression |
 | **L9 — Applications non-PHP** | types d'application, providers `runtime` (nvm, rbenv, pyenv, venv), templates de service Go/Node/Python/Ruby, vhosts de proxy, attente de disponibilité | Scénarios d'intégration 22 à 25 validés |
-| **L10 — Industrialisation** | hooks de parc et de projet, complétions dynamiques bash/zsh/fish, 96 pages de manuel engendrées, paquet `.deb` (nfpm), CI GitHub Actions, quinze scénarios d'intégration conteneurisés (Apache, PHP, nginx, hooks, MariaDB, PostgreSQL, RabbitMQ, ACME, systemd et cron, runtimes, durcissement, paquet, suppression, moteur web durci, supervision), plus un scénario optionnel pour les runtimes qui compilent, documentation d'exploitation | Paquet installable, documentation publiée |
+| **L10 — Industrialisation** | hooks de parc et de projet, complétions dynamiques bash/zsh/fish, 96 pages de manuel engendrées, paquet `.deb` (nfpm), CI GitHub Actions, seize scénarios d'intégration conteneurisés (Apache, PHP, nginx, hooks, MariaDB, PostgreSQL, RabbitMQ, ACME, systemd et cron, runtimes, durcissement, paquet, suppression, moteur web durci, supervision, signature DKIM), plus un scénario optionnel pour les runtimes qui compilent, documentation d'exploitation | Paquet installable, documentation publiée |
 
 ### Ce que les essais sur système réel ont corrigé
 
-Les scénarios conteneurisés du lot L10 ont mis au jour vingt-huit défauts qu'aucun test unitaire ne
+Les scénarios conteneurisés ont mis au jour trente défauts qu'aucun test unitaire ne
 pouvait voir, parce que tous supposaient un interlocuteur simulé :
 
 | Défaut | Conséquence en exploitation |
@@ -2881,6 +2918,8 @@ pouvait voir, parce que tous supposaient un interlocuteur simulé :
 | Mode de `logs/` imposé par deux providers | le plan oscillait entre deux valeurs, donc restait éternellement en écart |
 | `$connection_upgrade` employé par les vhosts de proxy mais défini nulle part | **toute application Go, Node, Ruby ou Python rendait la configuration nginx entière invalide** : au rechargement suivant, tous les sites de la machine tombaient (D50) |
 | Suppression d'un projet sans rechargement des serveurs | le maître PHP-FPM gardait le pool en mémoire : **ses workers continuaient de tourner et le site restait servi** |
+| Intention de rechargement « web », sans moteur, émise à l'ajout de `www-data` au groupe d'un projet | routée nulle part depuis le lot L0 : le rechargement n'avait pas lieu, et **toute création de projet se soldait par le code 6**, sur un avertissement que rien n'affichait — les rechargements en échec n'étaient que comptés |
+| Clé DKIM retirée avant le rechargement des tables qui la désignaient | OpenDKIM, qui garde ses tables en mémoire, **retenait en file le courrier du domaine** jusqu'au rechargement : une clé désignée mais illisible ne laisse pas partir le courrier sans signature (D69) |
 
 Les lots L0 à L2 constituent le socle minimal utilisable ; L3 à L6 apportent la valeur cible ; L7 à L10
 finalisent le produit. L9 (applications non-PHP) est le seul lot réellement détachable : le produit est

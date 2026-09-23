@@ -18,6 +18,7 @@ import (
 
 	"leblanc.io/open-go-server/internal/archive"
 	"leblanc.io/open-go-server/internal/exec"
+	"leblanc.io/open-go-server/internal/model"
 	appprov "leblanc.io/open-go-server/internal/provider/app"
 	"leblanc.io/open-go-server/internal/provider/db"
 	"leblanc.io/open-go-server/internal/provider/hardening"
@@ -452,7 +453,30 @@ func (a *App) runChecks(ctx context.Context) []check {
 		}
 	}
 	a.monitoringChecks(add)
+	a.mailChecks(ctx, projects, add)
 	return out
+}
+
+// mailChecks porte les contrôles de la signature DKIM (D69) : ce que le plan ne
+// voit pas — un opendkim.conf qui ne désigne pas les tables d'ogs, une clé trop
+// ouverte, un enregistrement non publié ou différent.
+func (a *App) mailChecks(ctx context.Context, projects []*model.Project, add func(name, status, detail, fix string)) {
+	if a.Store == nil || a.Keys == nil {
+		return
+	}
+	provs, err := a.buildProviders()
+	if err != nil {
+		return
+	}
+	defer provs.close()
+	obs, err := provs.Mail.Observe(ctx)
+	if err != nil {
+		add("signature DKIM", "avertissement", err.Error(), "")
+		return
+	}
+	for _, f := range provs.Mail.Checks(ctx, projects, obs) {
+		add(f.Name, f.Status, f.Detail, f.Fix)
+	}
 }
 
 // journalEtat est le mode d'un journal de la base d'état tel qu'il a été trouvé

@@ -10,6 +10,7 @@ import (
 
 	"leblanc.io/open-go-server/internal/importer"
 	"leblanc.io/open-go-server/internal/provider/db"
+	"leblanc.io/open-go-server/internal/provider/mail"
 	"leblanc.io/open-go-server/internal/spec"
 	"leblanc.io/open-go-server/internal/validate"
 )
@@ -67,11 +68,25 @@ func newImportScanCommand(app *App) *cobra.Command {
 			candidates, unmanaged := importer.Correlate(resources,
 				app.homeRoot(), app.Cfg.PrepDomain())
 
+			// Des tables DKIM tenues à la main sont signalées, non adoptées (D69) :
+			// reprendre une clé exigerait de la sceller telle quelle sous son
+			// sélecteur — le seul moyen de ne pas republier chez le client —, et
+			// OpenDKIM n'accepte qu'une KeyTable, que les projets adoptés puis
+			// signés par ogs lui disputeraient.
+			var warnings []string
+			dkim := &mail.Provider{Paths: app.Paths, Cfg: app.Cfg}
+			if table, foreign := dkim.ForeignTables(); foreign {
+				warnings = append(warnings, fmt.Sprintf("opendkim.conf désigne la KeyTable %s, qui "+
+					"n'est pas celle d'ogs : ses clés ne sont pas adoptées, et un projet signé par "+
+					"ogs ne sera signé qu'une fois opendkim.conf pointé vers %s", table,
+					app.Paths.OpenDKIMKeyTable()))
+			}
+
 			if app.Format != "table" {
 				return wrap(CodeError, app.emit("ImportScan", map[string]any{
 					"candidates": candidates, "unmanaged": unmanaged,
 					"summary": importer.Summary(resources),
-				}, nil, nil))
+				}, warnings, nil))
 			}
 
 			counts := importer.Summary(resources)
@@ -125,6 +140,9 @@ func newImportScanCommand(app *App) *cobra.Command {
 				if limit < len(unmanaged) {
 					app.printf("  … %d de plus (--all pour tout voir)\n", len(unmanaged)-limit)
 				}
+			}
+			for _, w := range warnings {
+				app.printf("\n⚠ %s\n", w)
 			}
 			return nil
 		},

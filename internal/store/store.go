@@ -408,6 +408,14 @@ func (s *Store) GetSecret(scope, name string) (nonce, ciphertext []byte, err err
 	return nonce, ciphertext, err
 }
 
+// DeleteSecret retire un secret. Il ne sert qu'aux secrets qu'ogs sait n'être
+// plus utilisés nulle part — une clé DKIM remplacée dont la rétention a expiré :
+// les mots de passe, eux, suivent leur ressource dans l'archive d'un projet.
+func (s *Store) DeleteSecret(scope, name string) error {
+	_, err := s.db.Exec(`DELETE FROM secrets WHERE scope = ? AND name = ?`, scope, name)
+	return err
+}
+
 // SecretNames liste les noms de secrets d'un scope, sans jamais exposer de valeur.
 func (s *Store) SecretNames(scope string) ([]string, error) {
 	rows, err := s.db.Query(`SELECT name FROM secrets WHERE scope = ? ORDER BY name`, scope)

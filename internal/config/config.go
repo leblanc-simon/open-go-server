@@ -6,8 +6,10 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/goccy/go-yaml"
 
@@ -35,7 +37,87 @@ type Config struct {
 	Archives     Archives               `yaml:"archives"`
 	Hardening    Hardening              `yaml:"hardening"`
 	Monitoring   Monitoring             `yaml:"monitoring"`
+	Mail         Mail                   `yaml:"mail"`
 }
+
+// Mail paramètre la signature DKIM du courrier des projets (D69). ogs n'installe
+// ni OpenDKIM ni le MTA, ne touche ni à opendkim.conf ni au branchement du
+// milter, et ne publie rien dans le DNS : il tient les clés et les deux tables
+// qui les désignent.
+type Mail struct {
+	DKIM DKIM `yaml:"dkim"`
+}
+
+// DKIM décrit les clés engendrées pour les projets qui demandent la signature.
+type DKIM struct {
+	// Enabled force la gestion, ou l'interdit. Nil : ogs gère les clés si
+	// opendkim.conf existe — c'est le fichier qu'OpenDKIM lit, et sans lui les
+	// tables ne seraient lues par personne.
+	Enabled *bool `yaml:"enabled,omitempty"`
+	// User est le compte sous lequel tourne OpenDKIM. Il possède les clés : sous
+	// RequireSafeKeys, une clé lisible au-delà de son propriétaire est refusée.
+	User string `yaml:"user,omitempty"`
+	// KeyBits est la taille des clés RSA. En dessous de 2048, les destinataires
+	// les refusent ou les ignorent.
+	KeyBits int `yaml:"keyBits,omitempty"`
+	// SelectorPrefix préfixe le sélecteur, suivi de l'année et du mois.
+	SelectorPrefix string `yaml:"selectorPrefix,omitempty"`
+	// Retention est la durée de vie d'une clé remplacée : son enregistrement doit
+	// survivre aux courriers encore en transit.
+	Retention string `yaml:"retention,omitempty"`
+}
+
+// DKIMEnabled traduit le tri-état de « mail.dkim.enabled ».
+func (m Mail) DKIMEnabled() (bool, bool) { return deref(m.DKIM.Enabled) }
+
+// DKIMUser renvoie le compte d'OpenDKIM, défaut appliqué.
+func (m Mail) DKIMUser() string {
+	if m.DKIM.User == "" {
+		return DefaultDKIMUser
+	}
+	return m.DKIM.User
+}
+
+// DKIMKeyBits renvoie la taille des clés, défaut appliqué.
+func (m Mail) DKIMKeyBits() int {
+	if m.DKIM.KeyBits == 0 {
+		return DefaultDKIMKeyBits
+	}
+	return m.DKIM.KeyBits
+}
+
+// DKIMSelectorPrefix renvoie le préfixe des sélecteurs, défaut appliqué.
+func (m Mail) DKIMSelectorPrefix() string {
+	if m.DKIM.SelectorPrefix == "" {
+		return DefaultDKIMSelectorPrefix
+	}
+	return m.DKIM.SelectorPrefix
+}
+
+// DKIMRetention renvoie la durée de vie d'une clé remplacée, défaut appliqué.
+// Une valeur illisible est refusée au chargement : elle ne peut pas arriver ici.
+func (m Mail) DKIMRetention() time.Duration {
+	if m.DKIM.Retention == "" {
+		return DefaultDKIMRetention
+	}
+	d, err := time.ParseDuration(m.DKIM.Retention)
+	if err != nil {
+		return DefaultDKIMRetention
+	}
+	return d
+}
+
+// Défauts de la signature DKIM.
+const (
+	DefaultDKIMUser           = "opendkim"
+	DefaultDKIMKeyBits        = 2048
+	DefaultDKIMSelectorPrefix = "ogs"
+	DefaultDKIMRetention      = 7 * 24 * time.Hour
+)
+
+// reSelectorPrefix borne le préfixe à ce qu'un label DNS accepte, et laisse la
+// place de l'année et du mois dans les 63 caractères d'un label.
+var reSelectorPrefix = regexp.MustCompile(`^[a-z][a-z0-9-]{0,40}$`)
 
 // Hardening paramètre la restriction des droits des répertoires sensibles :
 // ceux de configuration, et la racine des homes (D60).
@@ -447,6 +529,31 @@ func (c *Config) Validate() error {
 	if p := c.Monitoring.StatusPath(); p != "" && !strings.HasPrefix(p, "/") {
 		return fmt.Errorf("monitoring.status.path doit commencer par « / » (valeur : %q)", p)
 	}
+	return c.Mail.validate()
+}
+
+// validate contrôle la section « mail ». Tout est refusé au chargement : une clé
+// de 1024 bits engendrée puis publiée chez le client ne se rattrape pas sans une
+// seconde publication.
+func (m Mail) validate() error {
+	if bits := m.DKIMKeyBits(); bits < 2048 || bits > 4096 {
+		return fmt.Errorf("mail.dkim.keyBits doit être compris entre 2048 et 4096 (valeur : %d) — "+
+			"en dessous, les destinataires refusent ou ignorent la signature", bits)
+	}
+	if prefix := m.DKIMSelectorPrefix(); !reSelectorPrefix.MatchString(prefix) {
+		return fmt.Errorf("mail.dkim.selectorPrefix %q invalide : une lettre minuscule, puis des "+
+			"lettres, chiffres ou tirets, 41 caractères au plus", prefix)
+	}
+	if m.DKIM.Retention != "" {
+		d, err := time.ParseDuration(m.DKIM.Retention)
+		if err != nil || d < 0 {
+			return fmt.Errorf("mail.dkim.retention %q invalide : durée attendue, par exemple 168h",
+				m.DKIM.Retention)
+		}
+	}
+	if u := m.DKIM.User; u != "" && strings.ContainsAny(u, " /:") {
+		return fmt.Errorf("mail.dkim.user %q invalide : nom de compte attendu", u)
+	}
 	return nil
 }
 
@@ -509,7 +616,10 @@ const (
 	telegrafDir     = "/etc/telegraf/telegraf.d"
 	fail2banJailDir = "/etc/fail2ban/jail.d"
 	fail2banLog     = "/var/log/fail2ban.log"
-	authLog         = "/var/log/auth.log"
+
+	opendkimConf = "/etc/opendkim.conf"
+	opendkimDir  = "/etc/opendkim"
+	authLog      = "/var/log/auth.log"
 
 	// defaultAuthorizedKeysFile est le trousseau commun du parc : s'il existe, le
 	// .ssh/authorized_keys de chaque projet y est lié (D61). Il n'est pas un
@@ -591,6 +701,29 @@ func (p Paths) TelegrafFile() string { return filepath.Join(p.TelegrafDir(), "og
 // siennes.
 func (p Paths) Fail2banJailDir() string  { return p.join(fail2banJailDir) }
 func (p Paths) Fail2banJailFile() string { return filepath.Join(p.Fail2banJailDir(), "ogs.conf") }
+
+// OpenDKIMConf est la configuration d'OpenDKIM. Elle appartient à
+// l'administrateur (D69) : ogs ne la lit que pour vérifier qu'elle désigne ses
+// tables, et sa présence dit qu'OpenDKIM est installé.
+func (p Paths) OpenDKIMConf() string { return p.join(opendkimConf) }
+
+// OpenDKIMKeysDir est la racine des clés privées écrites par ogs, un répertoire
+// par projet puis par domaine.
+func (p Paths) OpenDKIMKeysDir() string { return p.join(opendkimDir, "keys") }
+
+// OpenDKIMKeyFile est le chemin de la clé privée d'un domaine et d'un sélecteur.
+func (p Paths) OpenDKIMKeyFile(id, domain, selector string) string {
+	return filepath.Join(p.OpenDKIMKeysDir(), id, domain, selector+".private")
+}
+
+// OpenDKIMTablesDir porte les deux tables d'ogs. Elles sont dans un répertoire à
+// elles : OpenDKIM n'accepte qu'une KeyTable et une SigningTable, et celles de
+// l'administrateur, s'il en a, vivent ailleurs sous un autre nom.
+func (p Paths) OpenDKIMTablesDir() string { return p.join(opendkimDir, "ogs") }
+func (p Paths) OpenDKIMKeyTable() string  { return filepath.Join(p.OpenDKIMTablesDir(), "KeyTable") }
+func (p Paths) OpenDKIMSigningTable() string {
+	return filepath.Join(p.OpenDKIMTablesDir(), "SigningTable")
+}
 
 // Fail2banLog est le journal de fail2ban, que la prison de récidive relit.
 func (p Paths) Fail2banLog() string { return p.join(fail2banLog) }

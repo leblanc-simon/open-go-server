@@ -8,6 +8,11 @@ ENV DEBIAN_FRONTEND=noninteractive
 # exclusion pour éprouver ce que le paquet installe réellement.
 RUN rm -f /etc/dpkg/dpkg.cfg.d/docker
 
+# Postfix pose une question à l'installation : sans réponse préalable, il reste
+# « sans configuration », et le scénario DKIM n'aurait aucun courrier à signer.
+RUN echo "postfix postfix/main_mailer_type select Local only" | debconf-set-selections \
+    && echo "postfix postfix/mailname string essai.local" | debconf-set-selections
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
         apache2 \
         libapache2-mod-fcgid \
@@ -35,6 +40,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         fail2ban \
         python3-systemd \
         iptables \
+        opendkim \
+        postfix \
+        dnsmasq-base \
+        python3-dkim \
     && a2enmod proxy proxy_fcgi proxy_http rewrite headers setenvif ssl status \
     && rm -rf /var/lib/apt/lists/*
 

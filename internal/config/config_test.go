@@ -3,6 +3,7 @@ package config
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/goccy/go-yaml"
 
@@ -251,4 +252,40 @@ func TestLeRepertoireDesSauvegardesEstCreeParInit(t *testing.T) {
 		return
 	}
 	t.Errorf("%s ne figure pas dans les répertoires créés par « ogs init »", p.BackupsDir())
+}
+
+func TestSignatureDKIMDefauts(t *testing.T) {
+	m := Default().Mail
+	if m.DKIMUser() != "opendkim" || m.DKIMKeyBits() != 2048 || m.DKIMSelectorPrefix() != "ogs" ||
+		m.DKIMRetention() != 7*24*time.Hour {
+		t.Errorf("défauts inattendus : %s %d %s %s", m.DKIMUser(), m.DKIMKeyBits(),
+			m.DKIMSelectorPrefix(), m.DKIMRetention())
+	}
+	if _, set := m.DKIMEnabled(); set {
+		t.Error("sans déclaration, la présence d'OpenDKIM doit décider")
+	}
+}
+
+func TestSignatureDKIMRefusDuChargement(t *testing.T) {
+	cases := []struct {
+		nom    string
+		regler func(*Config)
+		motif  string
+	}{
+		// Une clé de 1024 bits publiée chez le client ne se rattrape pas sans une
+		// seconde publication : le refus est au chargement.
+		{"clé trop courte", func(c *Config) { c.Mail.DKIM.KeyBits = 1024 }, "keyBits"},
+		{"préfixe hors label DNS", func(c *Config) { c.Mail.DKIM.SelectorPrefix = "Ogs_" }, "selectorPrefix"},
+		{"rétention illisible", func(c *Config) { c.Mail.DKIM.Retention = "une semaine" }, "retention"},
+	}
+	for _, c := range cases {
+		t.Run(c.nom, func(t *testing.T) {
+			cfg := Default()
+			c.regler(cfg)
+			err := cfg.Validate()
+			if err == nil || !strings.Contains(err.Error(), c.motif) {
+				t.Errorf("refus portant sur %s attendu, obtenu %v", c.motif, err)
+			}
+		})
+	}
 }

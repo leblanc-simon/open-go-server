@@ -37,9 +37,14 @@ done
 # Les scénarios de runtime et de services exigent un vrai systemd en PID 1 :
 # rien de ce qui suit un « systemctl enable » ne s'éprouve autrement. La
 # suppression en fait partie : c'est le rechargement de PHP-FPM par systemd qui
-# libère les workers du projet, et donc son compte.
+# libère les workers du projet, et donc son compte. DKIM aussi : OpenDKIM et
+# Postfix y tournent comme des services, et c'est leur rechargement qu'on éprouve.
 case "$scenario" in
-systemd | runtimes | runtimes-compiles | harden | suppression | web-durci)
+systemd | runtimes | runtimes-compiles | harden | suppression | web-durci | dkim)
+    # Le répertoire monté doit exister avant « docker run » : sinon Docker le crée
+    # au nom de root, et la compilation de l'application du scénario runtimes, qui
+    # passe après suppression dans la série, ne peut plus y écrire.
+    mkdir -p test/integration/dist
     nom="ogs-integration-$scenario"
     docker rm -f "$nom" >/dev/null 2>&1 || true
     trap 'docker rm -f '"$nom"' >/dev/null 2>&1' EXIT

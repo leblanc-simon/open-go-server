@@ -221,7 +221,57 @@ func Project(p *model.Project, homeRoot string) error {
 	validateCrons(p, add)
 	validateServices(p, add)
 	validateCertificates(p, add)
+	validateMail(p, add)
 	return errs.OrNil()
+}
+
+// validateMail contrôle la demande de signature DKIM (D69). Le refus est à la
+// validation, non à l'apply : une préproduction ne doit jamais pouvoir signer au
+// nom du domaine de production — un envoi de test parti vers de vrais clients
+// serait authentifié —, et le découvrir après avoir écrit la clé serait trop tard.
+func validateMail(p *model.Project, add func(string, string, ...any)) {
+	if p.Spec.Mail == nil || p.Spec.Mail.DKIM == nil {
+		return
+	}
+	dkim := p.Spec.Mail.DKIM
+	if !dkim.Enabled {
+		if len(dkim.Domains) > 0 {
+			// Des domaines sans activation : l'intention est ambiguë, et la
+			// signature n'aurait pas lieu sans que rien ne le dise.
+			add("spec.mail.dkim.enabled", "des domaines sont déclarés mais la signature n'est pas activée")
+		}
+		return
+	}
+	if p.IsPrep() {
+		add("spec.mail.dkim", "la signature DKIM est refusée en préproduction : "+
+			"elle authentifierait des envois de test au nom du domaine de production")
+		return
+	}
+	// Un domaine signé doit appartenir au projet : c'est ce qui rend la signature
+	// unique dans le parc, les domaines l'étant déjà.
+	own := map[string]bool{}
+	for _, d := range p.Spec.Domains {
+		own[strings.ToLower(strings.TrimSuffix(d.Name, "."))] = true
+	}
+	seen := map[string]bool{}
+	for i, d := range dkim.Domains {
+		f := fmt.Sprintf("spec.mail.dkim.domains[%d]", i)
+		name := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(d), "."))
+		if _, err := naming.NormalizeHost(name); err != nil || strings.HasPrefix(name, "*") {
+			add(f, "nom de domaine attendu, obtenu %q", d)
+			continue
+		}
+		if seen[name] {
+			add(f, "domaine %q déclaré deux fois", d)
+		}
+		seen[name] = true
+		if !own[name] {
+			add(f, "le domaine %q n'appartient pas aux domaines du projet (spec.domains)", d)
+		}
+	}
+	if len(p.DKIMDomains()) == 0 {
+		add("spec.mail.dkim.domains", "aucun domaine à signer : le projet n'a aucun domaine primaire")
+	}
 }
 
 // validateCertificates contrôle les certificats déclarés. Le provider DNS est

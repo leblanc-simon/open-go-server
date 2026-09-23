@@ -59,6 +59,7 @@ type Spec struct {
 	Crons        []CronJob         `yaml:"crons,omitempty"`
 	Services     []Service         `yaml:"services,omitempty"`
 	Sudo         *Sudo             `yaml:"sudo,omitempty"`
+	Mail         *Mail             `yaml:"mail,omitempty"`
 	Hooks        map[string]string `yaml:"hooks,omitempty"`
 }
 
@@ -260,6 +261,42 @@ type Service struct {
 type Sudo struct {
 	Style string   `yaml:"style,omitempty"`
 	Verbs []string `yaml:"verbs,omitempty"`
+}
+
+// Mail regroupe ce qui touche au courrier sortant du projet. ogs n'en gère que
+// la signature DKIM (D69) : le MTA, ses relais, SPF et DMARC restent dehors.
+type Mail struct {
+	DKIM *DKIM `yaml:"dkim,omitempty"`
+}
+
+// DKIM demande la signature du courrier du projet. Elle est opt-in : beaucoup de
+// projets envoient par un relais tiers qui signe de sa propre clé, et signer par
+// défaut créerait des clés dont aucun courrier ne se sert.
+type DKIM struct {
+	Enabled bool `yaml:"enabled"`
+	// Domains énumère les domaines d'envoi. Vide, ce sont les domaines primaires
+	// du projet — jamais ceux de redirection, qui n'émettent rien.
+	Domains []string `yaml:"domains,omitempty"`
+}
+
+// DKIMDomains renvoie les domaines dont le courrier doit être signé, défaut
+// appliqué ; nil si le projet ne demande pas de signature. Le défaut n'est pas
+// matérialisé dans le fichier : un domaine primaire ajouté plus tard doit être
+// signé sans qu'il faille y penser.
+func (p *Project) DKIMDomains() []string {
+	if p.Spec.Mail == nil || p.Spec.Mail.DKIM == nil || !p.Spec.Mail.DKIM.Enabled {
+		return nil
+	}
+	if len(p.Spec.Mail.DKIM.Domains) > 0 {
+		return append([]string(nil), p.Spec.Mail.DKIM.Domains...)
+	}
+	var out []string
+	for _, d := range p.Spec.Domains {
+		if d.Role == "" || d.Role == "primary" {
+			out = append(out, d.Name)
+		}
+	}
+	return out
 }
 
 // New construit un projet neuf à partir d'un host et d'un environnement.

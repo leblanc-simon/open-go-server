@@ -35,6 +35,13 @@ type Provider struct {
 	// SkipWebUser désactive l'ajout de www-data au groupe, lorsque le compte
 	// n'existe pas sur la machine (poste de développement, conteneur minimal).
 	SkipWebUser bool
+	// WebReload est l'intention de rechargement du serveur web retenu
+	// (« web:apache », « web:nginx »). Le provider système ne choisit pas le
+	// moteur : c'est l'assemblage qui le lui dit. L'intention nue « web », qu'il
+	// émettait jusque-là, n'était routée nulle part — le rechargement n'avait pas
+	// lieu, et chaque création de projet se soldait par un avertissement
+	// invisible et le code 6.
+	WebReload string
 }
 
 // Name identifie le provider.
@@ -239,7 +246,9 @@ func (p *Provider) Plan(_ context.Context, proj *model.Project, obs Observed) ([
 			}
 			// Les workers rappellent initgroups() à chaque fork : un rechargement
 			// suffit à prendre en compte la nouvelle appartenance.
-			s.Reload = []string{"web"}
+			if p.WebReload != "" {
+				s.Reload = []string{p.WebReload}
+			}
 			steps = append(steps, s)
 		} else {
 			steps = append(steps, engine.NewStep("system/group-member/"+spec.Group, engine.NoOp,

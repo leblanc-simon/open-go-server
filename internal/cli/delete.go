@@ -151,6 +151,15 @@ func newDeleteCommand(app *App) *cobra.Command {
 				}
 			}
 
+			// Les enregistrements DKIM publiés (D69) sont hors de portée : ogs ne les
+			// a pas posés, et c'est le seul moment où l'exploitant apprend qu'ils
+			// sont à retirer. Les fichiers de clés, eux, partent après le recalcul
+			// des tables — voir plus bas.
+			dkimRecords, _ := provs.Mail.Records(p)
+			for _, r := range dkimRecords {
+				app.printf("= enregistrement DKIM à retirer du DNS : %s\n", r.Name)
+			}
+
 			// 3. Ressources vivantes.
 			if !keepData {
 				app.dropResources(cmd, provs, p, &removed)
@@ -224,6 +233,17 @@ func newDeleteCommand(app *App) *cobra.Command {
 			if err := app.refreshGlobal(cmd.Context(), provs); err != nil {
 				warn("mise à jour des fichiers de parc : %v", err)
 			}
+			// Les clés DKIM partent une fois les tables d'OpenDKIM rechargées sans
+			// elles : retirées avant, le démon les désignerait encore, et retiendrait
+			// en file le courrier qui s'en réclame. Elles restent scellées et suivent
+			// le projet dans l'archive.
+			if len(dkimRecords) > 0 {
+				if err := provs.Mail.RemoveProject(p.ID()); err != nil {
+					warn("clés DKIM : %v", err)
+				} else {
+					removed = append(removed, "clés DKIM "+p.ID())
+				}
+			}
 
 			_, _ = app.runHook(cmd.Context(), provs.Hooks, p, hook.PostDelete,
 				hook.Context{Resources: removed, Extra: map[string]string{"archive": archived}})
@@ -273,7 +293,8 @@ func (a *App) refreshGlobal(ctx context.Context, provs *providers) error {
 		OnWarning: func(s *engine.Step, stepErr error) {
 			a.printf("  ⚠ %s : %v\n", s.Summary, stepErr)
 		},
-		Reload: a.reloadFunc(provs),
+		Reload:          a.reloadFunc(provs),
+		OnReloadWarning: a.reloadWarning,
 	})
 	return err
 }

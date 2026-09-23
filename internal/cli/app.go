@@ -22,6 +22,7 @@ import (
 	"leblanc.io/open-go-server/internal/provider/cron"
 	"leblanc.io/open-go-server/internal/provider/db"
 	"leblanc.io/open-go-server/internal/provider/logrotate"
+	"leblanc.io/open-go-server/internal/provider/mail"
 	"leblanc.io/open-go-server/internal/provider/monitoring"
 	"leblanc.io/open-go-server/internal/provider/php"
 	"leblanc.io/open-go-server/internal/provider/runtime"
@@ -262,6 +263,7 @@ type providers struct {
 	Web        *web.Provider
 	Logrotate  *logrotate.Provider
 	Monitoring *monitoring.Provider
+	Mail       *mail.Provider
 	Engine     web.Engine
 }
 
@@ -289,6 +291,7 @@ func (a *App) buildProviders() (*providers, error) {
 	if err != nil {
 		return nil, err
 	}
+	sys.WebReload = "web:" + eng.Name()
 	appProv := &appprov.Provider{Paths: a.Paths, Exec: a.Exec, Templates: tmpl, Store: a.Store,
 		Installer: &appprov.Installer{Exec: a.Exec}, Force: a.Force}
 	amqpProv := a.amqpProvider()
@@ -337,6 +340,10 @@ func (a *App) buildProviders() (*providers, error) {
 			DB: dbProv, AMQP: amqpProv, PHP: php,
 			WebEngine: eng.Name(), WebUnit: eng.Unit(),
 			Force: a.Force,
+		},
+		Mail: &mail.Provider{
+			Paths: a.Paths, Cfg: a.Cfg, Exec: a.Exec,
+			Store: a.Store, Keys: a.Keys, Force: a.Force,
 		},
 		Engine: eng,
 	}, nil

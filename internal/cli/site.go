@@ -535,7 +535,8 @@ func (a *App) applyProjects(cmd *cobra.Command, projects []*model.Project) error
 			Audit: func(s *engine.Step, outcome, detail string) {
 				_ = a.Audit.Record(p.ID(), s.Resource, "apply."+s.Action.String(), outcome, detail)
 			},
-			Reload: reload,
+			Reload:          reload,
+			OnReloadWarning: a.reloadWarning,
 		})
 		warnings += len(report.Warnings)
 		if err != nil {
@@ -580,7 +581,8 @@ func (a *App) applyProjects(cmd *cobra.Command, projects []*model.Project) error
 			// Les rechargements du plan global comptent autant que ceux d'un projet :
 			// c'est là que les répertoires d'exécution sont créés et que le timer de
 			// renouvellement est activé.
-			Reload: a.reloadFunc(provs),
+			Reload:          a.reloadFunc(provs),
+			OnReloadWarning: a.reloadWarning,
 		}); err != nil {
 			return wrap(CodeError, err)
 		}

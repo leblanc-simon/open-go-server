@@ -43,12 +43,12 @@ make dev-demo                                   # crée ./dev, deux projets, pla
 
 ### Essais sur système réel
 
-Quinze scénarios conteneurisés éprouvent ce que les tests unitaires ne peuvent pas voir. Ils ont mis au jour
+Seize scénarios conteneurisés éprouvent ce que les tests unitaires ne peuvent pas voir. Ils ont mis au jour
 plus de trente défauts invisibles autrement (§18 du cahier des charges) : **y recourir avant de déclarer un
 provider fonctionnel**.
 
 ```sh
-make integration-all       # les quinze, à la suite
+make integration-all       # les seize, à la suite
 make integration-nginx     # un seul (voir SCENARIOS dans le Makefile)
 
 # Hors série : rbenv et pyenv compilent depuis les sources (un quart d'heure).
@@ -173,6 +173,16 @@ régulière qu'il faudrait maintenir au rythme des changements de format de jour
 L'agent n'atteint jamais un socket FPM. `web.Provider.PlanStatus` pose un vhost `ogs-status` sur la boucle
 locale, qui relaie l'état de chaque pool : **parler au socket d'un pool, c'est pouvoir y faire exécuter du
 code sous l'identité du projet**, le protocole FastCGI n'ayant aucune authentification.
+
+### Signature DKIM : des clés scellées, deux tables de parc
+
+`internal/provider/mail` (D69) engendre une clé RSA par domaine d'envoi d'un projet qui la demande
+(`spec.mail.dkim`), la **scelle** dans le keystore — état compris, pour qu'archive et restauration la
+reprennent entière — et l'écrit pour OpenDKIM ; le plan global écrit la `KeyTable` et la `SigningTable`
+(`refile:`, d'où `*@domaine`) depuis le parc entier. Le keystore fait foi : un fichier disparu est
+**réécrit**, jamais régénéré, une clé neuve exigeant de republier chez le client. ogs ne touche ni au MTA,
+ni à `opendkim.conf`, ni au DNS ; la rotation (`rotate` puis `activate`) ne bascule qu'une fois
+l'enregistrement publié, vérifié par le résolveur.
 
 ### Surfaces particulières
 
@@ -310,6 +320,19 @@ Ils ont tous coûté un défaut réel ; les tests unitaires ne les voyaient pas.
   **remplacé et non complété** : la liste blanche d'administration disparaît, et quelques échecs
   d'authentification suffisent à verrouiller l'administrateur hors de son propre serveur. Le préfixe
   `ogs-` protège les noms de prisons, pas les réglages communs — d'où des réglages portés prison par prison.
+- **Une clé DKIM refusée ne laisse pas partir le courrier sans signature** : OpenDKIM rend une erreur
+  temporaire et le MTA garde en file **tout** le courrier du domaine. Une clé lisible au-delà de son
+  propriétaire l'est (`RequireSafeKeys`), une clé absente aussi. D'où trois règles : clés en 0600 au compte
+  d'OpenDKIM, jamais une ligne de table pour un fichier manquant, et le fichier d'un domaine qui cesse
+  d'être signé retiré **après** le rechargement des tables (`FlushReloads`) — OpenDKIM garde en mémoire
+  celles qu'il a chargées. Le fichier d'une clé, lui, est relu à chaque message : l'écrire ne demande
+  aucun rechargement. Le critère de présence est `/etc/opendkim.conf` : le paquet Debian ne crée pas
+  `/etc/opendkim`.
+- **Toute intention de rechargement doit être routée** par `reloadFunc`, et un rechargement en échec doit
+  être **affiché** (`Options.OnReloadWarning`), pas seulement compté. L'intention nue `web`, émise depuis le
+  lot L0 à l'ajout de `www-data` au groupe d'un projet, n'était routée nulle part : chaque création de
+  projet rendait le code 6 sur un avertissement invisible. `TestToutesLesIntentionsDeRechargementSontRoutees`
+  le verrouille.
 - Telegraf n'a **pas d'équivalent d'`apachectl -t`** : son option de test exécute réellement la collecte.
   Le rechargement se contente d'un constat en aval. Et un fragment que l'agent ne peut pas lire ne produit
   **aucune erreur** — il démarre, ne collecte rien, et se tait ; d'où le contrôle de `doctor`.

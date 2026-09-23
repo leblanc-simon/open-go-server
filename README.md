@@ -27,6 +27,7 @@ C'est la référence : toute contribution s'y adosse.
 | **L9** | Applications Go, Node, Ruby et Python : runtimes par projet, service supervisé, écoute sur socket, proxy | **livré** |
 | **L10** | Industrialisation : hooks de parc et de projet, complétions dynamiques, pages de manuel, paquet `.deb`, CI, scénarios d'intégration conteneurisés | **livré** |
 | **L11** | Supervision : prisons fail2ban et entrées Telegraf dérivées du parc, vhost d'état local, comptes de supervision MySQL, PostgreSQL et RabbitMQ | **livré** |
+| **L12** | Signature DKIM : une clé par domaine d'envoi, scellée dans le keystore, tables d'OpenDKIM dérivées du parc, enregistrements à publier, rotation en deux temps (D69) | **livré** |
 
 ## Compilation
 
@@ -409,6 +410,11 @@ est transmis par `SOCKET_PATH`, et si le code l'ignore, l'attente de disponibili
   filtre se maintient au rythme des changements de format de journal. L'état des pools passe par un vhost
   qui n'écoute que la boucle locale, jamais par le socket FPM — parler à ce socket, c'est pouvoir y faire
   exécuter du code sous l'identité du projet.
+- **Signature DKIM** : ogs tient une clé par domaine d'envoi et les tables d'OpenDKIM, mais ne touche ni
+  au MTA ni à `opendkim.conf`, et ne publie rien dans le DNS — `ogs mail dkim records` émet
+  l'enregistrement, `doctor` vérifie ce qui l'a été. La rotation ne bascule qu'une fois la nouvelle clé
+  publiée : basculer vers une clé non publiée casserait la signature de tout envoi. Refusée en
+  préproduction, qui signerait sinon au nom du domaine de production.
 
 ## Codes de retour
 

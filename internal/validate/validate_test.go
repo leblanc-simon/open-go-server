@@ -431,3 +431,41 @@ func TestNomDeTacheRefuseCeQuiCasseLaLigneDeCron(t *testing.T) {
 		}
 	}
 }
+
+func TestSignatureDKIMRefuseeEnPreproduction(t *testing.T) {
+	// Une préproduction ne doit jamais signer au nom du domaine de production : un
+	// envoi de test parti vers de vrais clients serait authentifié.
+	p := newProject(t, "shop.fr", naming.EnvPrep, model.KindStatic)
+	p.Spec.Mail = &model.Mail{DKIM: &model.DKIM{Enabled: true}}
+	err := Project(p, "/home")
+	if err == nil || !strings.Contains(err.Error(), "préproduction") {
+		t.Fatalf("la signature DKIM doit être refusée en préproduction, obtenu : %v", err)
+	}
+}
+
+func TestSignatureDKIMLimiteeAuxDomainesDuProjet(t *testing.T) {
+	p := newProject(t, "shop.fr", naming.EnvProd, model.KindStatic)
+	p.Spec.Mail = &model.Mail{DKIM: &model.DKIM{Enabled: true, Domains: []string{"voisin.fr"}}}
+	err := Project(p, "/home")
+	if err == nil || !strings.Contains(err.Error(), "n'appartient pas aux domaines du projet") {
+		t.Fatalf("un domaine étranger au projet doit être refusé, obtenu : %v", err)
+	}
+	p.Spec.Mail.DKIM.Domains = []string{"shop.fr", "SHOP.fr."}
+	if err := Project(p, "/home"); err == nil || !strings.Contains(err.Error(), "deux fois") {
+		t.Fatalf("un domaine déclaré deux fois doit être refusé, obtenu : %v", err)
+	}
+	p.Spec.Mail.DKIM.Domains = []string{"shop.fr"}
+	if err := Project(p, "/home"); err != nil {
+		t.Fatalf("un domaine du projet doit être accepté : %v", err)
+	}
+}
+
+func TestDomainesDKIMSansActivationRefuses(t *testing.T) {
+	// Des domaines déclarés sans activation : l'intention est ambiguë, et la
+	// signature n'aurait pas lieu sans que rien ne le dise.
+	p := newProject(t, "shop.fr", naming.EnvProd, model.KindStatic)
+	p.Spec.Mail = &model.Mail{DKIM: &model.DKIM{Domains: []string{"shop.fr"}}}
+	if err := Project(p, "/home"); err == nil || !strings.Contains(err.Error(), "pas activée") {
+		t.Fatalf("des domaines sans activation doivent être refusés, obtenu : %v", err)
+	}
+}

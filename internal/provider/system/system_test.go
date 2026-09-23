@@ -308,6 +308,33 @@ func TestWebAccessNoneSkipsGroupMembership(t *testing.T) {
 	}
 }
 
+func TestLAppartenanceAuGroupeRechargeLeMoteurRetenu(t *testing.T) {
+	// L'intention nue « web », émise ici depuis le premier lot, n'était routée
+	// nulle part : le rechargement n'avait pas lieu, et chaque création de projet
+	// se soldait par un avertissement que rien n'affichait, et par le code 6.
+	p, prov, _, _ := fixture(t)
+	prov.WebReload = "web:nginx"
+	ctx := context.Background()
+	obs, err := prov.Observe(ctx, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	steps, err := prov.Plan(ctx, p, obs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range steps {
+		if !strings.HasPrefix(s.Resource, "system/group-member/") {
+			continue
+		}
+		if len(s.Reload) != 1 || s.Reload[0] != "web:nginx" {
+			t.Errorf("intention « web:nginx » attendue, obtenu %v", s.Reload)
+		}
+		return
+	}
+	t.Fatal("aucune étape d'appartenance au groupe")
+}
+
 func TestDeployKeyIsGeneratedOnceAndNonCritical(t *testing.T) {
 	p, prov, rec, _ := fixture(t)
 	apply(t, prov, p)
