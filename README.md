@@ -384,8 +384,9 @@ est transmis par `SOCKET_PATH`, et si le code l'ignore, l'attente de disponibili
   type d'application (`www` pour Prestashop, `www/public` pour Symfony 4+, `www/web` pour Symfony 3.4).
 - **`logs/` appartient à root** : l'utilisateur y lit mais n'y crée rien. Cela interdit de substituer un
   fichier de log par un lien symbolique et d'obtenir une écriture root arbitraire. La protection a une
-  limite connue, en cours d'arbitrage : le home appartenant à l'utilisateur, il peut renommer `logs/`
-  lui-même.
+  limite connue : le home appartenant à l'utilisateur, il peut renommer `logs/` lui-même. D71 la referme en
+  sortant les journaux du home (`/var/log/ogs-projects/<id>/`, avec un lien `~/logs`) — décision arbitrée,
+  implémentation à venir.
 - **Liens gérés dans `~/.local/bin`** (D70) : interpréteur PHP et runtimes, au compte de l'utilisateur et
   sur son PATH. Le lien est rétabli à chaque apply ; root l'écrit sans jamais suivre de lien, et un fichier
   posé à sa place n'est remplacé que sous `--force`.
@@ -433,7 +434,7 @@ est transmis par `SOCKET_PATH`, et si le code l'ignore, l'attente de disponibili
 
 ## Documentation
 
-- [`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md) — la référence : 70 décisions d'architecture
+- [`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md) — la référence : 71 décisions d'architecture
   arbitrées, spécification par module, plan de tests, découpage en lots.
 - [`docs/INSTALLATION.md`](docs/INSTALLATION.md) — installation, premier démarrage, sauvegarde, mise à jour.
 - [`docs/HOOKS.md`](docs/HOOKS.md) — raccorder l'outil au reste de l'exploitation.

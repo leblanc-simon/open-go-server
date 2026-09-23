@@ -12,8 +12,8 @@ Les commits ne mentionnent jamais l'assistance d'un outil d'IA.
 
 ## La référence
 
-[`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md) fait autorité : 70 décisions d'architecture
-arbitrées (D1–D70, tableau §2), spécification par module, plan de tests, découpage en lots. **Consulter le
+[`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md) fait autorité : 71 décisions d'architecture
+arbitrées (D1–D71, tableau §2), spécification par module, plan de tests, découpage en lots. **Consulter le
 tableau des décisions avant de proposer une architecture** — la plupart des questions « pourquoi pas
 plutôt… ? » y sont déjà tranchées, avec leur raison. Toute décision nouvelle s'y ajoute.
 
@@ -207,7 +207,8 @@ Ils ont tous coûté un défaut réel ; les tests unitaires ne les voyaient pas.
 - **Un répertoire root dans le home ne protège rien contre l'utilisateur** : le home lui appartient (D51),
   donc il **renomme** un sous-répertoire root sans privilège et en recrée un à lui. C'est pourquoi les liens
   gérés vivent dans `~/.local/bin`, au compte du projet (D70) — un `.bin/` root ne garantissait rien — et
-  pourquoi la protection de `logs/` (D29) a une faille ouverte, à arbitrer (§20). Corollaire : **quand root
+  pourquoi `logs/` quitte le home pour `/var/log/ogs-projects/<id>/` (D71, arbitrée, **pas encore
+  implémentée** : jusque-là, la faille de D29 reste ouverte). Corollaire : **quand root
   écrit dans un répertoire de l'utilisateur, il ne suit jamais un lien** — `fs.SymlinkAt`, `LinkStateAt`,
   `RemoveLinkAt` ouvrent chaque composant par `openat` avec `O_NOFOLLOW` et opèrent relativement au
   descripteur. Écrire par le nom, c'est laisser l'utilisateur choisir où root crée ou supprime ; c'était le

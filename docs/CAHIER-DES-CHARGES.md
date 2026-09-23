@@ -107,7 +107,7 @@ Décisions arbitrées et figées pour la v1. Toute remise en cause est une évol
 | D26 | Certificats partagés | Un certificat peut être de **portée serveur** et référencé par `@<nom>` ; la préproduction utilise un wildcard `*.preprod-pp.net` unique | Impose DNS-01 et des credentials en écriture sur la zone ; supprime tout appel ACME à la création d'une préproduction |
 | D27 | DNS | **Hors périmètre** : un wildcard `*.preprod-pp.net` est créé manuellement une fois ; `doctor` vérifie seulement la résolution | Un seul serveur de préproduction par domaine |
 | D28 | Délégation | L'utilisateur du projet pilote ses services par **sudoers énuméré, sans métacaractère** ; `ogs my <verbe>` déduit le projet de **`SUDO_UID`** | Aucune cible à détourner ; fichier sudoers validé par `visudo -cf` avant activation ; dépend de `env_reset`, vérifié par `doctor` |
-| D29 | Logs | Logs d'infrastructure dans **`/home/<host>/logs/`**, répertoire **root** avec fichiers pré-créés ; rotation par un `/etc/logrotate.d/ogs` unique | Bloque l'escalade root par substitution de lien symbolique ; un seul reload par rotation |
+| D29 | Logs | Logs d'infrastructure dans **`/var/log/ogs-projects/<id>/`** (emplacement révisé par D71 ; `/home/<host>/logs/` à l'origine), répertoire **root** avec fichiers pré-créés ; rotation par un `/etc/logrotate.d/ogs` unique | Bloque l'escalade root par substitution de lien symbolique ; un seul reload par rotation |
 | D30 | Interpréteur | Crons et unités invoquent **`/home/<host>/.local/bin/php`**, lien géré (emplacement révisé par D70) | Une bascule de version ne réécrit ni cron ni unité |
 | D31 | Transport FPM | **Socket Unix par défaut**, numéroté selon la norme `1<version><incrément>` ; TCP possible mais explicite | Le numéro est un identifiant logique, pas un port ouvert |
 | D32 | Layout | Code applicatif dans **`/home/<host>/www`** ; le docroot dépend du **type d'application** (`www` pour Prestashop, `www/public` pour Symfony) | Un type d'application devient une donnée de premier plan du modèle |
@@ -120,7 +120,7 @@ Décisions arbitrées et figées pour la v1. Toute remise en cause est une évol
 | D39 | Versions PHP | **7.4 à 8.5**, y compris des versions en fin de support | `doctor` les signale sans jamais bloquer : un Prestashop ancien peut exiger 7.4 |
 | D57 | Accès aux préproductions | **Aucune authentification** : elles sont accessibles par défaut, protégées seulement de l'indexation (`X-Robots-Tag`, `robots.txt`) | Une authentification à poser gêne le travail quotidien — recettes clients, tests d'intégration, webhooks de fournisseurs. La contrepartie est explicite : une préproduction est publique, donc sans donnée réelle |
 | D58 | Host de préproduction | Le sous-domaine reprend le host canonique **privé de son extension** (`jardindeco.fr` → `jardindeco.preprod-pp.net`) ; un host **déjà posé** sur le domaine de préproduction est pris **tel quel**, et l'identifiant se dérive alors de son seul label | L'extension n'apporte rien à un nom qui vit sur un domaine dédié. Et le host construit est celui qu'on a sous les yeux : le saisir tel quel est le réflexe naturel, qui donnait `jardindecopreprodppnet.preprod-pp.net`, le home du même nom et l'utilisateur `jardindecopreprodppnetprep`. Deux contreparties assumées : deux hosts ne différant que par leur extension revendiquent le même sous-domaine — la collision est refusée par le contrôle d'unicité du host effectif, jamais silencieuse ; seul le **dernier** label est retiré, reconnaître `co.uk` ou `com.br` exigeant une liste des suffixes publics, hors périmètre |
-| D59 | Unité du moteur web | ogs gère un complément d'unité `/etc/systemd/system/<moteur>.d/ogs.conf` qui **énumère** les répertoires de journaux des projets en `ReadWritePaths=-<chemin>` ; il est écrit **avant** les vhosts et déclenche un **redémarrage** du moteur, non un rechargement | Les distributions durcissent l'unité du serveur web — Ubuntu livre `apache2.service` avec `ProtectHome=read-only` — et un service ainsi protégé voit `/home` en lecture seule dans son seul espace de noms : le maître s'arrête en ouvrant le journal d'un vhost et emporte tous les sites, alors que `mount` affiche `rw` et que root écrit sans peine. `ReadWritePaths` remonte les chemins après application des protections, ce qui laisse le durcissement intact. Chaque répertoire est énuméré plutôt que la racine des homes : rien d'autre que les journaux n'a besoin de s'ouvrir. Le préfixe `-` est indispensable — un chemin absent fait échouer le service en 226/NAMESPACE — et le redémarrage l'est aussi : l'espace de noms est établi au démarrage, un `reload` ne le refait pas |
+| D59 | Unité du moteur web | ogs gère un complément d'unité `/etc/systemd/system/<moteur>.d/ogs.conf` qui **énumère** les répertoires de journaux des projets en `ReadWritePaths=-<chemin>` ; il est écrit **avant** les vhosts et déclenche un **redémarrage** du moteur, non un rechargement | Les distributions durcissent l'unité du serveur web — Ubuntu livre `apache2.service` avec `ProtectHome=read-only` — et un service ainsi protégé voit `/home` en lecture seule dans son seul espace de noms : le maître s'arrête en ouvrant le journal d'un vhost et emporte tous les sites, alors que `mount` affiche `rw` et que root écrit sans peine. `ReadWritePaths` remonte les chemins après application des protections, ce qui laisse le durcissement intact. Chaque répertoire est énuméré plutôt que la racine des homes : rien d'autre que les journaux n'a besoin de s'ouvrir. Le préfixe `-` est indispensable — un chemin absent fait échouer le service en 226/NAMESPACE — et le redémarrage l'est aussi : l'espace de noms est établi au démarrage, un `reload` ne le refait pas — **réduit par D71** à une seule entrée, `ReadWritePaths=-<logs.root>`, les journaux ayant quitté `/home` |
 | D56 | Droits des répertoires de configuration | `ogs harden` **rapporte** par défaut et n'applique qu'avec `--apply` ; il **ne desserre jamais** et **ne suit aucun lien symbolique** ; `/etc/php` reste ouvert à dessein | Les utilisateurs de projet ont un compte local : sans restriction ils dressent la carte du parc. Mais fermer un répertoire qu'un démon lit sous sa propre identité l'interromprait : le groupe cible est celui du service (rabbitmq, telegraf, redis, postgres), et `/etc/php` reste lisible parce que le PHP en ligne de commande des crons y lit son `php.ini`. Un outil de sécurité qui desserrerait des droits déjà plus stricts serait une régression |
 | D60 | Droits de la racine des homes | `ogs harden` ferme la racine des homes (`naming.homeRoot`) en **0711 root:root**, sans récursion ni `fileMode` | Un utilisateur de projet dresse la carte du parc d'un seul `ls /home` : le nom de chaque voisin, et le chemin de son code. La traversée reste ouverte à tous, donc rien ne change pour le serveur web — servir un fichier n'exige que la traversée des répertoires et la lecture du fichier (D51) — ni pour un projet qui atteint son propre home. Trois contreparties, toutes assumées : les globs non privilégiés (`ls /home`, `du -sh /home/*`) et la complétion cessent d'aboutir ; un agent de sauvegarde ou de supervision qui parcourrait `/home` sous une identité non root est à revoir ; et le gain est **partiel** — `/etc/passwd` est lisible par tous et énumère déjà les homes, ce qui fait de cette mesure une gêne, non une cloison. Le traitement n'est **jamais récursif** : sous la racine vivent les répertoires des projets, dont `model.defaultDirs` est le seul juge (D51), et un second juge ferait osciller le plan entre deux valeurs. La règle « ne desserre jamais » de D56 s'applique ici aussi, et elle mord : un `/home` en 0700 ne rend plus un seul fichier et reste pourtant en place — c'est `doctor` qui a la charge de le dire, aucune vérification de configuration ne le voyant. Une racine montée depuis le réseau (`/home` sur NFS) rend le verdict « refusé » plutôt qu'un échec de `chmod` : le mode y appartient au serveur, et un export en `root_squash` refuserait root lui-même |
 | D51 | Droits de l'arborescence | Home en **0711**, répertoires du projet en **0710** | Le home se traverse sans s'énumérer : servir un fichier n'exige que la traversée du répertoire et la lecture du fichier. Personne — pas même le serveur web — ne peut lister le contenu, ce qui ôte tout moyen de se promener dans l'arborescence. Le bit de groupe du home est indispensable : Unix retient la première classe applicable sans repli, donc un home en 0701 refuserait la traversée à `www-data` **parce qu'il est membre du groupe** |
@@ -149,6 +149,7 @@ Décisions arbitrées et figées pour la v1. Toute remise en cause est une évol
 | D68 | Prisons fail2ban | Les prisons sont **préfixées `ogs-`**, leurs journaux **énumérés un à un** et filtrés par existence, et le fichier est **recalculé à la suppression d'un projet** | Trois conséquences d'un même comportement : **une prison dont fail2ban ne trouve aucun journal l'empêche de démarrer, et il s'arrête alors tout entier** — les prisons valides comprises. D'où le filtrage à l'écriture, le recalcul à la suppression — sans lui, retirer un projet cassait fail2ban au prochain redémarrage, sans un mot — et un contrôle de `doctor` qui nomme les journaux disparus avant qu'ils ne bloquent le démon. Le même raisonnement décide du **backend de la prison sshd** : une Debian récente n'installe plus rsyslog, `/var/log/auth.log` peut ne pas exister, mais le backend `systemd` exige les liaisons `python3-systemd` qui ne sont qu'une recommandation du paquet — on choisit donc d'après ce qui existe, en préférant le fichier, qui ne dépend d'aucune liaison. Le préfixe n'est pas décoratif : `jail.d` est un espace partagé avec l'administrateur, et une prison nommée `sshd` recouvrirait la sienne en silence. `doctor` exécute par ailleurs `fail2ban-client -t`, seul contrôle qui couvre filtres, expressions et backend d'un coup |
 | D69 | Signature DKIM | ogs **génère et garde** une clé DKIM par domaine d'envoi d'un projet qui la demande (`spec.mail.dkim`, **opt-in**), écrit la `KeyTable` et la `SigningTable` d'**OpenDKIM** à partir du parc entier et **émet l'enregistrement à publier** ; il ne touche **ni au DNS, ni au MTA, ni à `opendkim.conf`**. Clé **RSA-2048** générée en Go, scellée dans le keystore (`<projet>/dkim/<domaine>/<sélecteur>`) et écrite en **0600 opendkim:opendkim** ; sélecteur daté (`ogs202609`) ; rotation en **deux temps** — `rotate` prépare, `activate` bascule et refuse tant que l'enregistrement publié ne correspond pas à la clé, sauf `--force`. Étapes **non critiques** ; la préproduction est **refusée à la validation** | Révise §1.3, qui plaçait la messagerie hors périmètre, pour la raison de D64 : OpenDKIM a besoin de ce qu'ogs seul sait — quels domaines appartiennent à quel projet, et quand un projet disparaît. Le reste de la messagerie demeure dehors : ni MTA, ni relais, ni SPF — qui dépend des relais empruntés, qu'ogs ignore —, ni DMARC. **Le DNS reste hors périmètre malgré D53** : les identifiants OVH ne couvrent que la zone de préproduction, les zones des clients vivent ailleurs, et écrire dans la zone d'un client n'engage pas la même confiance que dans la sienne ; `doctor` vérifie ce qui est publié. **Pourquoi deux temps** : passer d'une clé qui se vérifie à une clé dont la partie publique n'est pas publiée casse la signature de tout envoi — sous un DMARC `p=reject` sans SPF aligné, le courrier est rejeté. À la **création**, en revanche, on signe aussitôt : une signature invérifiable ne vaut pas moins qu'une absence de signature, DMARC les traitant de même, et faire dépendre l'apply d'une résolution DNS rendrait le plan instable d'une exécution à l'autre. **Pourquoi sceller** : une clé DKIM, contrairement à un mot de passe, ne se régénère pas sans action extérieure — la perdre oblige à republier chez le client ; le keystore est la source de vérité et le fichier en dérive, donc un fichier disparu est réécrit, jamais recréé avec une clé neuve. Le fichier de clé ne peut porter l'en-tête d'ogs : il est comparé au contenu scellé, et un écart est traité comme une modification à la main (`--force`). **Pourquoi 0600** : sous `RequireSafeKeys`, défaut d'OpenDKIM, une clé lisible au-delà de son propriétaire est refusée — le régime 0640 de D65 ne convient pas ici. Et le refus n'est pas un silence : l'essai réel l'a montré, une clé refusée **ou absente** ne laisse pas partir le courrier sans signature, OpenDKIM rend une erreur temporaire et **le MTA garde en file tout le courrier du domaine**. D'où deux règles : une table ne désigne jamais une clé dont le fichier manque, et le fichier d'un domaine qui cesse d'être signé n'est retiré qu'**après** le rechargement des tables, OpenDKIM gardant en mémoire celles qu'il a chargées. **Pourquoi des tables de parc** : OpenDKIM n'en accepte qu'une de chaque, et recalculées depuis un sous-ensemble elles retireraient de la signature tous les autres projets — la leçon de logrotate et de tmpfiles ; elles vivent donc dans le plan global, et `doctor` vérifie qu'`opendkim.conf`, laissé à l'administrateur comme `telegraf.conf` (D65), les référence bien. **Pourquoi pas la préproduction** : elle ne doit jamais pouvoir signer au nom du domaine de production — un envoi de test parti vers de vrais clients serait authentifié. **Pourquoi l'opt-in** : beaucoup de projets envoient par un relais tiers qui signe de sa propre clé ; signer par défaut créerait des clés dont aucun courrier ne se sert. **Pourquoi RSA** : ed25519 (RFC 8463) est encore trop peu vérifié pour servir seul. Piège : une clé RSA-2048 dépasse les 255 octets d'une chaîne TXT, l'enregistrement émis est donc découpé et `doctor` recolle les morceaux avant de comparer. **Pourquoi OpenDKIM plutôt que rspamd** : ses tables sont des fichiers plats, recalculables comme logrotate ou fail2ban, là où rspamd est une tout autre pièce à supposer présente |
 | D70 | Liens gérés | L'interpréteur PHP et les liens des runtimes (`node`, `python`, `ruby`, `bundle`, `app`) vivent dans **`~/.local/bin`**, qui appartient à **l'utilisateur du projet** (0700) ; `.bin/` disparaît, retiré à la migration une fois les unités relues. Root y écrit **par descripteurs ouverts sans suivre de lien** (`openat`, `O_NOFOLLOW`), et un fichier posé à la place d'un lien n'est remplacé que sous `--force` | Révise D30, D35 et §7.1.2. `~/.local/bin` est le répertoire que la convention XDG réserve aux exécutables de l'utilisateur, et que le `.profile` de Debian ajoute au PATH : le shell ouvert par D62 y trouve la version déclarée sans rien configurer. Il appartient à l'utilisateur parce que pip, pipx et bien d'autres y écrivent : le fermer les casserait. **Et le fermer ne protégerait rien** : l'essai l'a montré, le home appartenant à l'utilisateur (D51), un sous-répertoire root se **renomme** sans privilège, puis se remplace — `.bin/` n'a jamais garanti la version effective contre l'utilisateur, seulement contre l'accident. La garantie devient donc ce qu'elle était dans les faits : un **état réconcilié**, rétabli à chaque apply. Ce que la décision ajoute est la contrepartie d'écrire en root chez quelqu'un d'autre : chaque composant du chemin est ouvert sans suivre de lien, et le lien est posé relativement au descripteur — un `~/.local` remplacé par un lien vers un autre répertoire fait refuser l'étape au lieu d'y faire écrire root. Le même traitement vaut désormais pour `.ssh/authorized_keys` (D61), que root posait jusque-là par son nom dans un répertoire de l'utilisateur. La migration retire l'ancienne entrée `.bin` des déclarations à la normalisation — sous sa forme exacte seulement, un `.bin` déclaré autrement l'ayant été par l'exploitant — et l'ancien répertoire en **fin de plan**, après le vidage des rechargements : une unité réécrite mais pas encore relue par systemd désigne toujours l'ancien lien. Seuls les liens connus sont retirés, et le répertoire ne part que vide |
+| D71 | Journaux hors du home | Les journaux d'Apache, de nginx, de PHP-FPM et des crons vivent dans **`/var/log/ogs-projects/<id>/`** — racine réglable par **`logs.root`** —, chaîne entièrement root : la racine en **0711 root:root**, le répertoire du projet en **0750 root:<id>**, tous les fichiers **pré-créés** en 0640 (`root:<id>` pour ce qu'écrit un maître root, `<id>:<id>` pour `php-error.log` et `cron-<nom>.log`, écrits sous l'identité du projet). Le home ne porte qu'un lien de commodité, **`~/logs → /var/log/ogs-projects/<id>`**, qu'aucun processus root n'emprunte. `spec.layout.logDir` est refusé hors de la racine, `spec.crons[].log` n'est plus qu'un nom de fichier | Révise D29, D59 et §7.1.2, et referme la faille constatée le 23/09/2026 : le home appartenant à l'utilisateur (D51), il **renommait** le `logs/` root sans privilège et en recréait un à lui, où `apache-error.log` devenait un lien vers un fichier système que le maître du serveur web ouvrait en root à son redémarrage suivant — au plus tard à la rotation quotidienne. D29 protégeait d'une substitution *dans* `logs/`, pas *de* `logs/`. Désormais plus aucun composant du chemin n'appartient à l'utilisateur : il n'a plus rien à renommer. Le lien du home ne rouvre rien — lui seul le suit —, et il rend la lecture triviale : `tail -f ~/logs/apache-error.log`, `zless` sur les archives, qui gardent le mode du fichier roté. **Deux défauts antérieurs se referment du même coup**, vus en le préparant : `php-error.log` n'était **jamais écrit** — les workers, qui ouvrent `php_admin_value[error_log]` sous l'identité du projet, ne pouvaient pas créer le fichier dans un répertoire root, et PHP se rabattait sur le journal global de FPM, où se mêlaient les erreurs de tous les projets — et les droits annoncés au §14.5 étaient faux, les journaux sortant en 0644 root:root et `php-slow.log` en 0600, illisible au projet ; la pré-création rend les droits vrais. **Logrotate** : aucun `su`, et il ne faut jamais en ajouter — un répertoire non inscriptible par un groupe non root passe le contrôle de sécurité du répertoire parent, et le rendre inscriptible au projet, pour laisser une application y créer ses fichiers, ferait refuser la rotation et rouvrirait la faille ; `create` reste sans mode ni propriétaire, chaque fichier gardant le sien ; jamais un chemin passant par le home, ni un `olddir` dans le home, logrotate suivant le lien en root. **Le complément d'unité** du serveur web se réduit à une entrée fixe, conservée par prudence envers un `ProtectSystem=strict` : son contenu ne change plus à la création d'un projet, qui **ne redémarre donc plus le serveur web**. **Contrepartie** : les journaux quittent `/home` pour `/var`, qui porte aussi `/var/lib/mysql` et `/var/lib/postgresql` — un journal d'accès qui s'emballe peut remplir la partition et arrêter les bases. D'où `logs.root`, dont `doctor` contrôle la chaîne de propriété, et l'avertissement de `doctor` sur l'espace libre ; `maxsize` borne déjà chaque fichier. `www-data`, membre du groupe de chaque projet (D25), lit tous les journaux, comme auparavant. Les journaux applicatifs (`var/log/`) restent hors périmètre, gérés par l'application. **Migration**, sans perte de lignes : le nouveau répertoire est créé et les fichiers courants y sont copiés ; vhosts, pool, cron et complément d'unité sont réécrits puis rechargés, les serveurs ouvrant alors les nouveaux fichiers ; les lignes écrites dans l'ancien entre la copie et le rechargement sont ajoutées au nouveau, les fichiers rotés déplacés sous leur nom — logrotate poursuit la numérotation —, puis l'ancien `~/logs` est retiré et le lien posé à sa place. L'ancien répertoire vivant dans le home, l'utilisateur a pu le substituer : il n'est lu que par descripteur ouvert sans suivre de lien, **s'il appartient à root**, et seuls ses fichiers réguliers appartenant à root ou au projet sont repris — sans quoi root recopierait un `apache-error.log → /etc/shadow` dans un répertoire que ce même utilisateur lit. À défaut, rien n'est lu, et `doctor` le signale |
 
 ---
 
@@ -208,7 +209,7 @@ spec:
   layout:
     root: /home/shop.fr
     docroot: /home/shop.fr/www/public
-    logDir: /home/shop.fr/logs      # root:<id> 0710, non inscriptible par l'utilisateur
+    logDir: /var/log/ogs-projects/shopfr   # root:<id> 0750, hors du home (D71) ; ~/logs y renvoie
     mode: "0711"                  # racine : le propriétaire seul énumère, les autres traversent
     dirs:                         # créés avec propriétaire et mode explicites
       - { path: www,        mode: "0710" }   # le groupe traverse, il n'énumère pas
@@ -471,7 +472,7 @@ Points à noter :
 | Unité systemd | `ogs-<id>-<service>@.service` | `ogs-shopfr-messenger-async@.service` | — |
 | Cible systemd | `ogs-<id>.target` | `ogs-shopfr.target` | — |
 | Fichier cron | `/etc/cron.d/ogs-<id>` | `/etc/cron.d/ogs-shopfr` | pas de `.` dans le nom |
-| Logs du projet | `/home/<host effectif>/logs/` | `/home/shop.fr/logs/` | répertoire root, §7.1.2 |
+| Logs du projet | `<logs.root>/<id>/` | `/var/log/ogs-projects/shopfr/` | chaîne root, §14.5 ; lien `~/logs` (D71) |
 | Lien interpréteur | `/home/<host effectif>/.local/bin/php` | `/home/shop.fr/.local/bin/php` | répertoire de l'utilisateur (D70) |
 | Sudoers | `/etc/sudoers.d/ogs-<id>` | `/etc/sudoers.d/ogs-shopfr` | 0440 root:root, §7.9.1 |
 
@@ -557,11 +558,14 @@ explicite :
     <job>.lock                            verrous de crons
     app.sock                              socket de l'application non-PHP (§7.11)
 
+/var/log/ogs-projects/                    racine des journaux des projets (logs.root), 0711 root:root (D71)
+  <id>/                                   0750 root:<id> — apache, nginx, php, crons (§14.5)
+
 /home/                                    racine des homes, 0711 root:root (D60)
 /home/<host effectif>/                    racine projet, 0711 <id>:<id> (docroot simple)
   public/                                 docroot, 0710
   var/                                    0700, hors de portée de www-data
-  logs/                                   0710 root:<id> — apache, nginx, php, crons
+  logs → /var/log/ogs-projects/<id>       lien de commodité, au compte du projet (D71)
   .local/bin/php                          lien vers l'interpréteur de la version courante (D70)
 ```
 
@@ -885,7 +889,8 @@ groupadd shopfr
 useradd --gid shopfr --home-dir /home/shop.fr --shell /bin/bash \
         --no-create-home --comment "ogs=shopfr" shopfr
 gpasswd -a www-data shopfr          # si webAccess = group (défaut)
-install -d -o root -g shopfr -m 0710 /home/shop.fr/logs
+install -d -o root -g shopfr -m 0750 /var/log/ogs-projects/shopfr
+ln -sfn /var/log/ogs-projects/shopfr /home/shop.fr/logs   # posé sans suivre de lien (D70)
 install -d -o shopfr -g shopfr -m 0700 /home/shop.fr/.local /home/shop.fr/.local/bin
 ln -sfn /usr/bin/php8.5 /home/shop.fr/.local/bin/php   # posé sans suivre de lien (D70)
 install -m 0440 -o root -g root <généré> /etc/sudoers.d/ogs-shopfr
@@ -910,12 +915,7 @@ adopté ou étranger.
 ├── var/                     0700  shopfr:shopfr  cache, sessions, logs applicatifs
 │   ├── tmp/                 0700  shopfr:shopfr  upload_tmp_dir
 │   └── sessions/            0700  shopfr:shopfr  session.save_path
-├── logs/                    0710  root:shopfr    ← répertoire NON inscriptible par l'utilisateur
-│   ├── apache-access.log    0640  root:shopfr    écrit par le master Apache (root)
-│   ├── apache-error.log     0640  root:shopfr
-│   ├── php-error.log        0640  root:shopfr    écrit par le master FPM (root)
-│   ├── php-slow.log         0640  root:shopfr
-│   └── cron-scheduler.log   0640  shopfr:shopfr  pré-créé par ogs, écrit par la tâche
+├── logs → /var/log/ogs-projects/shopfr         lien de commodité (D71) — voir §14.5
 ├── .local/                  0700  shopfr:shopfr
 │   └── bin/                 0700  shopfr:shopfr  répertoire des liens gérés (D70), sur le PATH
 │       ├── php → /usr/bin/php8.5                lien géré par ogs (§7.5)
@@ -940,28 +940,23 @@ site cesserait d'être servi. Le bit « autres » sert, lui, au mode `webAccess:
 pas membre du groupe. Rien n'est lisible pour autant : les répertoires du niveau suivant sont fermés aux
 autres, et aucun n'est énumérable.
 
-**Pourquoi `logs/` appartient à root.** Ce répertoire est lisible et traversable par l'utilisateur (groupe
-`shopfr`) mais **il ne peut pas y créer, renommer ni supprimer d'entrée**. Ce détail est une exigence de
-sécurité, pas une préférence :
+**Pourquoi les journaux ne vivent plus dans le home (D71).** Apache, nginx et le maître PHP-FPM ouvrent
+leurs fichiers de journal **en tant que root**, avant d'abandonner leurs privilèges. Si l'utilisateur pouvait
+remplacer `apache-error.log` par un lien vers `/etc/shadow` ou `/etc/sudoers.d/`, il obtiendrait une écriture
+root arbitraire, donc une escalade de privilèges complète — une classe de vulnérabilité connue et
+régulièrement exploitée sur les panels d'hébergement. Un répertoire root avec des fichiers pré-créés
+l'empêche **de substituer un fichier**, mais pas **de substituer le répertoire** quand celui-ci vit dans un
+home qui lui appartient : il le renomme sans privilège et en recrée un à lui. D'où `/var/log/ogs-projects`,
+dont aucun composant n'appartient à l'utilisateur (§14.5), et un simple lien `~/logs` pour la lecture,
+qu'aucun processus root n'emprunte.
 
-- `logs/` : Apache, Nginx et le master PHP-FPM ouvrent leurs fichiers de log **en tant que root**, avant
-  d'abandonner leurs privilèges. Si l'utilisateur pouvait remplacer `apache-error.log` par un lien
-  symbolique vers `/etc/shadow` ou `/etc/sudoers.d/`, il obtiendrait une écriture root arbitraire, donc une
-  escalade de privilèges complète. C'est une classe de vulnérabilité connue et régulièrement exploitée sur
-  les panels d'hébergement. Un répertoire root avec des fichiers pré-créés la supprime : l'utilisateur peut
-  écrire *dans* les fichiers qui lui appartiennent (logs de crons), jamais en substituer un.
-- Les **liens gérés** n'y sont plus (D70) : ils vivent dans `~/.local/bin`, au compte de l'utilisateur. Un
-  `.bin/` root ne garantissait pas la version effective — le home appartenant à l'utilisateur, un
-  sous-répertoire root s'y renomme puis se remplace sans privilège. Le lien est un état réconcilié à chaque
-  apply, et root l'écrit sans jamais suivre de lien.
+Même raisonnement pour les **liens gérés** (D70) : ils vivent dans `~/.local/bin`, au compte de
+l'utilisateur. Un `.bin/` root ne garantissait pas la version effective, pour la même raison — le lien est
+un état réconcilié à chaque apply, et root l'écrit sans jamais suivre de lien.
 
-**Limite constatée, à arbitrer** (§20) : ce même renommage vaut pour `logs/`. L'utilisateur peut déplacer
-le répertoire root et en recréer un à lui, où un journal devient un lien vers un fichier système, que le
-maître du serveur web ouvre en root à son prochain redémarrage. La protection décrite ci-dessus tient contre
-une substitution **dans** `logs/`, pas contre la substitution **de** `logs/`.
-
-Corollaire pratique : `logrotate` n'a pas besoin de la directive `su`, précisément parce que le répertoire
-n'est pas inscriptible par un non-root (§14.5).
+Règle générale, que ces deux cas illustrent : **un répertoire root dans le home ne protège rien contre
+l'utilisateur**. Ce qu'un processus root ouvre en écriture vit hors du home, ou est écrit par des
+descripteurs ouverts sans suivre de lien.
 
 #### 7.1.3 Accès du serveur web : arbitrage
 
@@ -1029,7 +1024,7 @@ vhost AMQP      shopfrprep      user AMQP      shopfrprep
 pool PHP        shopfrprep      socket         /run/php/php8.5-fpm-18502-shopfrprep.sock
 vhost web       shopfrprep.conf certificat     *.preprod-pp.net (partagé)
 unités          ogs-shopfrprep-*.service        cron  /etc/cron.d/ogs-shopfrprep
-logs            /home/shop.preprod-pp.net/logs/       interpréteur  .local/bin/php
+logs            /var/log/ogs-projects/shopfrprep/     interpréteur  .local/bin/php
 sudoers         /etc/sudoers.d/ogs-shopfrprep
 ```
 
@@ -1270,7 +1265,7 @@ consumers, exploités par la TUI et `ogs status`.
 aucune granularité par vhost. Il est donc impossible de dédier un fichier de log à un projet, et un lien
 symbolique vers le log global serait une fuite d'information entre projets : il exposerait l'activité de
 tous les vhosts à l'utilisateur d'un seul. `ogs logs <id> --amqp` lit donc le log du broker et le filtre
-sur le vhost et l'utilisateur du projet ; rien n'est écrit dans `logs/`. La restriction est documentée
+sur le vhost et l'utilisateur du projet ; rien n'est écrit dans le répertoire des journaux du projet. La restriction est documentée
 comme telle plutôt que contournée.
 
 ### 7.5 PHP-FPM
@@ -1344,12 +1339,12 @@ pm.max_spare_servers = 6
 pm.max_requests = 500
 php_admin_value[memory_limit] = 256M
 php_admin_value[open_basedir] = /home/shop.fr:/tmp:/usr/share/php
-php_admin_value[error_log] = /home/shop.fr/logs/php-error.log
+php_admin_value[error_log] = /var/log/ogs-projects/shopfr/php-error.log
 php_admin_flag[log_errors] = on
 php_admin_value[upload_tmp_dir] = /home/shop.fr/var/tmp
 php_admin_value[session.save_path] = /home/shop.fr/var/sessions
 env[APP_ENV] = prod
-slowlog = /home/shop.fr/logs/php-slow.log
+slowlog = /var/log/ogs-projects/shopfr/php-slow.log
 request_slowlog_timeout = 10s
 request_terminate_timeout = 300s
 catch_workers_output = yes
@@ -1411,8 +1406,8 @@ sa configuration.
     RewriteEngine On
     RewriteCond %{REQUEST_URI} !^/\.well-known/acme-challenge/
     RewriteRule ^(.*)$ https://shop.fr$1 [R=301,L]
-    ErrorLog /home/shop.fr/logs/apache-error.log
-    CustomLog /home/shop.fr/logs/apache-access.log combined
+    ErrorLog /var/log/ogs-projects/shopfr/apache-error.log
+    CustomLog /var/log/ogs-projects/shopfr/apache-access.log combined
 </VirtualHost>
 
 <VirtualHost *:443>
@@ -1431,8 +1426,8 @@ sa configuration.
     SSLCertificateFile /var/lib/ogs/acme/certificates/shopfr/fullchain.pem
     SSLCertificateKeyFile /var/lib/ogs/acme/certificates/shopfr/privkey.pem
     Header always set Strict-Transport-Security "max-age=31536000; includeSubDomains"
-    ErrorLog /home/shop.fr/logs/apache-error.log
-    CustomLog /home/shop.fr/logs/apache-access.log combined
+    ErrorLog /var/log/ogs-projects/shopfr/apache-error.log
+    CustomLog /var/log/ogs-projects/shopfr/apache-access.log combined
 </VirtualHost>
 ```
 
@@ -1597,7 +1592,7 @@ MAILTO=""
 # scheduler
 * * * * * shopfr /usr/bin/flock -n /run/ogs/shopfr/scheduler.lock \
   /home/shop.fr/.local/bin/php /home/shop.fr/bin/console schedule:run \
-  >> /home/shop.fr/logs/cron-scheduler.log 2>&1
+  >> /var/log/ogs-projects/shopfr/cron-scheduler.log 2>&1
 ```
 
 Règles :
@@ -1609,9 +1604,11 @@ Règles :
   afin de survivre au redémarrage. C'est aussi là que vivent les sockets des applications non-PHP
   (§7.11), ce qui donne un seul répertoire d'exécution par projet, inscriptible par lui seul.
 - **Identité** : exécution sous l'utilisateur du projet.
-- **Journalisation** : sortie redirigée vers `logs/cron-<nom>.log`, fichier **pré-créé par `ogs`** avec
-  propriétaire `<id>:<id>` et mode 0640 dans un répertoire appartenant à root (§7.1.2) — la tâche peut
-  écrire dans le fichier, jamais le remplacer.
+- **Journalisation** : sortie redirigée vers `cron-<nom>.log` du répertoire des journaux du projet
+  (§14.5), fichier **pré-créé par `ogs`** avec propriétaire `<id>:<id>` et mode 0640 dans un répertoire
+  appartenant à root — la tâche peut écrire dans le fichier, jamais le remplacer. `spec.crons[].log` n'est
+  qu'un **nom de fichier** : un chemin ferait pré-créer par root un fichier au nom du projet n'importe où
+  (D71).
 - **Validation** : l'expression cron est vérifiée à la saisie, avec affichage des trois prochaines
   occurrences pour confirmation.
 - **Désactivation** : `enabled: false` commente la ligne sans la supprimer, ce qui conserve l'historique et
@@ -2636,39 +2633,60 @@ indications de traçabilité, sans valeur de preuve puisque falsifiables par qui
 - `doctor` : vérifie paquets et binaires attendus, modules Apache/Nginx, plugin RabbitMQ management,
   accessibilité des sockets SGBD, permissions de `/etc/ogs` et de la clé maître, cohérence entre la base
   d'état et le système, présence des unités `ogs-renew`, versions PHP utilisables, clés DKIM et
-  enregistrements publiés (§7.13). Chaque anomalie est
+  enregistrements publiés (§7.13), chaîne de propriété et espace libre du répertoire des journaux (D71). Chaque anomalie est
   accompagnée de la commande de correction.
 
 ---
 
 ### 14.5 Logs des projets et rotation
 
-Chaque projet dispose d'un unique répertoire de logs d'infrastructure, `/home/<host effectif>/logs/`, dont
-la propriété root et les implications de sécurité sont détaillées au §7.1.2.
+Chaque projet dispose d'un unique répertoire de logs d'infrastructure, **`<logs.root>/<id>/`** —
+`/var/log/ogs-projects/<id>/` par défaut —, hors du home (D71). Le home n'en porte qu'un lien, `~/logs`.
+
+```
+/var/log/ogs-projects/        0711  root:root     traversable, non énumérable : les voisins ne se voient pas
+└── shopfr/                   0750  root:shopfr   le projet lit et liste ; seul root crée ou renomme
+    ├── apache-access.log     0640  root:shopfr   écrit par le maître Apache (root)
+    ├── apache-error.log      0640  root:shopfr
+    ├── php-slow.log          0640  root:shopfr   écrit par le maître FPM (root)
+    ├── php-error.log         0640  shopfr:shopfr écrit par les workers, sous l'identité du projet
+    └── cron-scheduler.log    0640  shopfr:shopfr écrit par la tâche
+/home/shop.fr/logs → /var/log/ogs-projects/shopfr  lien de commodité, au compte du projet
+```
 
 | Fichier | Producteur | Propriétaire |
 |---|---|---|
-| `apache-access.log`, `apache-error.log` | master Apache (root) | `root:<id>` |
-| `nginx-access.log`, `nginx-error.log` | master Nginx (root) | `root:<id>` |
-| `php-error.log`, `php-slow.log` | master PHP-FPM (root) | `root:<id>` |
+| `apache-access.log`, `apache-error.log` | maître Apache (root) | `root:<id>` |
+| `nginx-access.log`, `nginx-error.log` | maître nginx (root) | `root:<id>` |
+| `php-slow.log` | maître PHP-FPM (root) | `root:<id>` |
+| `php-error.log` | workers PHP-FPM (utilisateur du projet) | `<id>:<id>` |
 | `cron-<nom>.log` | tâche cron (utilisateur du projet) | `<id>:<id>` |
+
+Tous sont **pré-créés** par ogs : le répertoire n'étant inscriptible que par root, un worker ou une tâche ne
+pourrait pas les créer — c'est ce qui faisait retomber les erreurs PHP dans le journal global de FPM, mêlées
+à celles des autres projets —, et un maître root les créerait avec son umask, en 0644 ou 0600.
+
+La chaîne de propriété est la garantie : aucun composant du chemin n'appartient à l'utilisateur, qui n'a
+donc rien à renommer ni à substituer. Le lien `~/logs` ne rouvre rien — seuls l'utilisateur et ses propres
+outils le suivent —, et il est posé comme les liens gérés (D70), sans suivre de lien, rétabli à chaque apply.
+`spec.layout.logDir` est refusé hors de `logs.root`, et `logs.root` lui-même est contrôlé par `doctor`.
 
 Les logs **applicatifs** (Symfony, Monolog) restent sous `var/log/`, entièrement gérés par l'application, et
 ne sont pas rotés par `ogs`. Les logs RabbitMQ n'ont pas d'équivalent par projet (§7.4).
 
 **Rotation** — un fichier unique `/etc/logrotate.d/ogs`, régénéré à chaque apply, listant explicitement les
-chemins de tous les projets. Pas de glob sur `/home/*/logs/`, qui embarquerait les répertoires
-d'utilisateurs humains et permettrait de déclencher les scripts de rotation depuis un compte non géré.
+chemins de tous les projets. Pas de glob sur la racine : l'énumération suit l'inventaire, comme les prisons
+fail2ban, et un fichier n'y figure que si son projet existe.
 
 ```
 # Généré par ogs — NE PAS MODIFIER À LA MAIN
 # 12 projets  empreinte: sha256:…  généré: 2026-08-23T03:00:00Z
 
-/home/shop.fr/logs/apache-access.log
-/home/shop.fr/logs/apache-error.log
-/home/shop.fr/logs/php-error.log
-/home/shop.fr/logs/php-slow.log
-/home/autresite.fr/logs/apache-access.log
+/var/log/ogs-projects/shopfr/apache-access.log
+/var/log/ogs-projects/shopfr/apache-error.log
+/var/log/ogs-projects/shopfr/php-error.log
+/var/log/ogs-projects/shopfr/php-slow.log
+/var/log/ogs-projects/autresitefr/apache-access.log
 {
     daily
     rotate 30
@@ -2684,8 +2702,8 @@ d'utilisateurs humains et permettrait de déclencher les scripts de rotation dep
     endscript
 }
 
-/home/shop.fr/logs/cron-*.log
-/home/autresite.fr/logs/cron-*.log
+/var/log/ogs-projects/shopfr/cron-*.log
+/var/log/ogs-projects/autresitefr/cron-*.log
 {
     weekly
     rotate 8
@@ -2705,8 +2723,18 @@ Points de conception :
   cent projets provoqueraient cent rechargements du serveur web.
 - Le bloc de reload n'énumère que les moteurs et versions PHP réellement utilisés, recalculés à chaque
   génération.
-- Aucune directive `su` n'est nécessaire, les répertoires `logs/` n'étant pas inscriptibles par un non-root.
-- Rétention configurable globalement (`logs.rotate`, `logs.maxSize`, `logs.compress`) et surchargeable par
+- **Aucune directive `su`, et il ne faut jamais en ajouter.** Le répertoire n'étant inscriptible par aucun
+  groupe non root, il passe le contrôle de sécurité que logrotate applique au répertoire parent ; le rendre
+  inscriptible au projet — pour laisser une application y créer ses fichiers — ferait refuser la rotation,
+  et rouvrirait la substitution que D71 ferme.
+- **Jamais un chemin passant par le home**, ni un `olddir` dans le home : logrotate suivrait le lien `~/logs`
+  en root, et l'utilisateur choisirait ce que root renomme et recrée.
+- **Réouverture** : PHP rouvre `php-error.log` à chaque écriture et la tâche son `cron-<nom>.log` à chaque
+  exécution ; `php-slow.log` et les journaux web le sont par les rechargements du `postrotate`. Les archives
+  compressées gardent le mode du fichier roté, donc restent lisibles au projet.
+- **Espace disque** : les journaux vivent sur `/var`, qui porte aussi les bases. `logs.root` permet de les
+  poser sur une partition dédiée, et `doctor` avertit quand l'espace libre de la sienne baisse.
+- Rétention configurable globalement (`logs.root`, `logs.rotate`, `logs.maxSize`, `logs.compress`) et surchargeable par
   projet.
 - `ogs logs <id>` agrège la consultation : `--web`, `--php`, `--cron <nom>`, `--service <nom>` (journalctl),
   `--amqp` (log du broker filtré), avec `-f` pour le suivi et `--since`.
@@ -2731,7 +2759,7 @@ Points de conception :
 | Runtime altéré | Les runtimes non-PHP vivant dans le home de l'utilisateur (D35), leur intégrité n'est pas garantie par ogs : `status` compare la version rapportée à celle déclarée et signale l'écart. Aucune escalade possible, le processus tournant déjà sous cette identité. |
 | Privilège MySQL trop large | Échappement systématique de `_` en `\_` dans tout motif de `GRANT`, verrouillé par un test unitaire dédié (§3.3.5). |
 | Collision prod / préproduction | Suffixe `prep` préservé lors de toute troncature ; unicité vérifiée sur l'identifiant, le host effectif **et** le home. |
-| Escalade root par lien symbolique de log | `logs/` appartient à root et n'est pas inscriptible par l'utilisateur ; les fichiers sont pré-créés. Aucun processus root n'ouvre en écriture un chemin dont un non-root contrôle le répertoire (§7.1.2). |
+| Escalade root par lien symbolique de log | Les journaux vivent hors du home, dans une chaîne de répertoires entièrement root, et sont pré-créés (D71) : l'utilisateur ne peut ni substituer un fichier, ni substituer le répertoire. Le lien `~/logs` n'est emprunté par aucun processus root. Aucun processus root n'ouvre en écriture un chemin dont un non-root contrôle un composant (§7.1.2). |
 | Élargissement de la délégation sudo | Commandes énumérées sans métacaractère, jamais de `systemctl` nu ; `ogs my` ne prend aucun argument et déduit le projet de `SUDO_UID`, que sudo positionne sous `env_reset` ; validation `visudo -cf` avant activation, revalidation par `doctor` (§7.9.1). |
 | Exécution croisée via un pool FPM | Socket Unix `0660 www-data:<id>` par défaut : seuls le serveur web et l'utilisateur du projet peuvent s'y connecter. Le mode TCP, dépourvu d'authentification, exige `--allow-tcp` et un avertissement explicite (§7.5). |
 | Détournement de l'interpréteur | Le lien `php` vit dans `~/.local/bin`, au compte de l'utilisateur (D70) : il peut le changer, sans autre effet qu'une exécution sous sa propre identité, et l'apply suivant le rétablit. Root l'écrit sans jamais suivre de lien : un répertoire substitué fait refuser l'étape au lieu de faire écrire root ailleurs. |
@@ -2795,8 +2823,9 @@ Scénarios exigés :
     autre commande `ogs` n'est autorisée par sudo. Le fichier généré est vérifié par `visudo -cf` dans le
     test lui-même.
 18. **Escalade par lien symbolique** : sous l'utilisateur du projet, tentative de remplacer
-    `logs/apache-error.log` par un lien vers `/etc/sudoers.d/x` → refus du système (répertoire root), et
-    vérification qu'aucune écriture root n'a eu lieu hors du fichier attendu.
+    `apache-error.log` par un lien vers `/etc/sudoers.d/x` → refus du système (répertoire root) ; tentative
+    de renommer le répertoire des journaux, ou de faire pointer `~/logs` ailleurs, puis rotation et
+    redémarrage du serveur web → aucune écriture root hors des fichiers attendus (D71).
 19. **Rotation** : trois projets, un `logrotate -f /etc/logrotate.d/ogs` → tous les fichiers rotés, chacun
     recréé avec son propriétaire d'origine, **un seul** reload du serveur web, et le service web comme les
     crons continuent d'écrire dans les nouveaux fichiers.
@@ -2998,14 +3027,17 @@ complet sans lui pour un parc exclusivement PHP.
 - **Signature DKIM** : opt-in par projet, jamais par défaut.
 - **Publication DNS de DKIM** : jamais par ogs, même quand la zone est chez OVH — D27 reste entier.
 
-**Points restant à arbitrer** :
+**Points arbitrés le 23/09/2026** (D71) :
 
-- **Substitution de `logs/`** (constatée le 23/09/2026, §7.1.2) : le home appartenant à l'utilisateur
-  (D51), il peut renommer `logs/` — répertoire root — et en recréer un à lui, où `apache-error.log` devient
-  un lien vers un fichier système que le maître du serveur web ouvre en root à son prochain redémarrage,
-  donc au plus tard à la rotation quotidienne. La garantie de D29 ne tient que contre une substitution
-  dans le répertoire. Les deux voies de correction touchent l'architecture : sortir les journaux du home,
-  ou ne plus donner le home à l'utilisateur (révision de D29 ou de D51).
+- **Racine des journaux** : `/var/log/ogs-projects`, distincte de `/var/log/ogs` — qu'il aurait sinon
+  fallu rendre traversable alors qu'il porte le journal d'audit d'ogs.
+- **Espace disque** : racine réglable par `logs.root`, dont `doctor` contrôle la chaîne de propriété et
+  l'espace libre.
+- **Historique à la migration** : **déplacé** dans le nouveau répertoire, fichiers rotés compris, pour que
+  logrotate poursuive la numérotation (D71). ogs n'étant pas encore réellement en production, la migration
+  n'a pas à ménager un parc existant, mais elle reste sans perte de lignes.
+
+**Points restant à arbitrer** :
 
 - **Mode `webAccess: acl` par défaut ?** Le mode `group` est retenu ; si le serveur héberge des clients
   tiers non fiables, basculer le défaut sur `acl` restreindrait `www-data` au seul docroot. La question
