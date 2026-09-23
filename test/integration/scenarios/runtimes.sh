@@ -29,10 +29,10 @@ ogs apply apptest --yes 2>&1 | grep -Ei "application|unité|attente|⚠" | head 
 
 echo
 echo "--- le lien géré désigne-t-il le binaire ? ---"
-ls -l /home/app.test/.bin/app
-cible=$(readlink -f /home/app.test/.bin/app)
+ls -l /home/app.test/.local/bin/app
+cible=$(readlink -f /home/app.test/.local/bin/app)
 if [ "$cible" != "/home/app.test/www/app" ]; then
-    echo "ÉCHEC : .bin/app ne désigne pas le binaire déposé ($cible)"
+    echo "ÉCHEC : .local/bin/app ne désigne pas le binaire déposé ($cible)"
     exit 1
 fi
 
@@ -174,9 +174,9 @@ echo "version rapportée : $(su -s /bin/bash nodetest -c "$binaire --version")"
 
 echo
 echo "--- le lien géré suit la version installée ---"
-ls -l /home/node.test/.bin/node
-if [ "$(readlink -f /home/node.test/.bin/node)" != "$binaire" ]; then
-    echo "ÉCHEC : .bin/node ne désigne pas la version installée"
+ls -l /home/node.test/.local/bin/node
+if [ "$(readlink -f /home/node.test/.local/bin/node)" != "$binaire" ]; then
+    echo "ÉCHEC : .local/bin/node ne désigne pas la version installée"
     exit 1
 fi
 echo "version vue par ogs : $(ogs runtime list 2>&1 | grep nodetest || echo '(non listée)')"
@@ -190,7 +190,7 @@ if ! echo "$sortie" | grep -qiE "échec|introuvable|version"; then
     exit 1
 fi
 # Et le lien ne doit pas avoir bougé.
-if [ "$(readlink -f /home/node.test/.bin/node)" != "$binaire" ]; then
+if [ "$(readlink -f /home/node.test/.local/bin/node)" != "$binaire" ]; then
     echo "ÉCHEC : un échec d'installation a cassé le lien de la version en service"
     exit 1
 fi

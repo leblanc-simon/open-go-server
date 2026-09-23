@@ -105,7 +105,7 @@ type Layout struct {
 type Dir struct {
 	Path  string `yaml:"path"`
 	Mode  string `yaml:"mode"`
-	Owner string `yaml:"owner,omitempty"` // vide = utilisateur du projet ; « root » pour logs/ et .bin/
+	Owner string `yaml:"owner,omitempty"` // vide = utilisateur du projet ; « root » pour logs/
 }
 
 // Domain est un nom de domaine servi.
@@ -474,10 +474,32 @@ func (p *Project) Normalize(homeRoot, prepDomain string) error {
 	return nil
 }
 
+// LinkDir est le répertoire des liens gérés — interpréteur PHP, runtimes,
+// binaire applicatif —, relatif à la racine du projet (D70). C'est celui que la
+// convention XDG réserve aux exécutables de l'utilisateur, et que le .profile de
+// Debian ajoute au PATH : le projet y trouve la version que l'inventaire déclare
+// sans rien configurer. Il appartient à l'utilisateur, comme la convention le
+// veut — pip et pipx y écrivent.
+const LinkDir = ".local/bin"
+
+// LegacyLinkDir est l'ancien emplacement des liens, retiré à la migration.
+const LegacyLinkDir = ".bin"
+
+// BinDir renvoie le chemin absolu du répertoire des liens gérés d'un projet.
+func BinDir(root string) string { return filepath.Join(root, filepath.FromSlash(LinkDir)) }
+
+// legacyBinDir est l'entrée que les déclarations antérieures à D70 portent pour
+// .bin/. Elle en est retirée à la normalisation, et seulement sous cette forme
+// exacte : un .bin/ déclaré autrement l'a été par l'exploitant.
+var legacyBinDir = Dir{Path: LegacyLinkDir, Mode: "0710", Owner: "root"}
+
 // defaultDirs complète l'arborescence attendue sans écraser les entrées déjà
-// déclarées. logs/ et .bin/ appartiennent à root : le projet ne doit pas pouvoir
-// y créer d'entrée, ce qui interdit la substitution d'un fichier de log par un
-// lien symbolique (§7.1.2).
+// déclarées. logs/ appartient à root : le projet ne doit pas pouvoir y créer
+// d'entrée, ce qui interdit la substitution d'un fichier de log par un lien
+// symbolique (§7.1.2). Les liens gérés, eux, vivent dans un répertoire de
+// l'utilisateur (D70) : ils sont un état réconcilié à chaque apply, non une
+// barrière — le home appartenant à l'utilisateur, un répertoire root en dessous
+// se renomme et se remplace sans le moindre privilège.
 //
 // Les modes sont en 0710 plutôt qu'en 0750 : le groupe traverse, il n'énumère
 // pas. Servir un fichier n'exige que la traversée du répertoire et la lecture du
@@ -490,7 +512,8 @@ func (p *Project) defaultDirs(at AppType) []Dir {
 		{Path: "var/tmp", Mode: "0700"},
 		{Path: "var/sessions", Mode: "0700"},
 		{Path: "logs", Mode: "0710", Owner: "root"},
-		{Path: ".bin", Mode: "0710", Owner: "root"},
+		{Path: ".local", Mode: "0700"},
+		{Path: LinkDir, Mode: "0700"},
 		{Path: ".ssh", Mode: "0700"},
 	}
 	if at.Docroot != "" && at.Docroot != "www" {
@@ -499,6 +522,9 @@ func (p *Project) defaultDirs(at AppType) []Dir {
 	existing := make(map[string]bool, len(p.Spec.Layout.Dirs))
 	out := make([]Dir, 0, len(want)+len(p.Spec.Layout.Dirs))
 	for _, d := range p.Spec.Layout.Dirs {
+		if d == legacyBinDir {
+			continue
+		}
 		existing[path.Clean(d.Path)] = true
 		out = append(out, d)
 	}

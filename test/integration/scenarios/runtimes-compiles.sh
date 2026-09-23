@@ -91,7 +91,7 @@ for cas in "ruby:$VERSION_RUBY" "python:$VERSION_PYTHON"; do
     echo "version : $(su -s /bin/bash "$projet" -c "$attendu --version" 2>&1 | head -1)"
 
     echo "--- le lien géré désigne la version installée ---"
-    lien="/home/$hote/.bin/$runtime"
+    lien="/home/$hote/.local/bin/$runtime"
     ls -l "$lien"
     if [ "$(readlink -f "$lien")" != "$(readlink -f "$attendu")" ]; then
         echo "ÉCHEC : $lien ne désigne pas la version installée"

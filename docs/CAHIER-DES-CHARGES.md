@@ -108,12 +108,12 @@ Décisions arbitrées et figées pour la v1. Toute remise en cause est une évol
 | D27 | DNS | **Hors périmètre** : un wildcard `*.preprod-pp.net` est créé manuellement une fois ; `doctor` vérifie seulement la résolution | Un seul serveur de préproduction par domaine |
 | D28 | Délégation | L'utilisateur du projet pilote ses services par **sudoers énuméré, sans métacaractère** ; `ogs my <verbe>` déduit le projet de **`SUDO_UID`** | Aucune cible à détourner ; fichier sudoers validé par `visudo -cf` avant activation ; dépend de `env_reset`, vérifié par `doctor` |
 | D29 | Logs | Logs d'infrastructure dans **`/home/<host>/logs/`**, répertoire **root** avec fichiers pré-créés ; rotation par un `/etc/logrotate.d/ogs` unique | Bloque l'escalade root par substitution de lien symbolique ; un seul reload par rotation |
-| D30 | Interpréteur | Crons et unités invoquent **`/home/<host>/.bin/php`**, lien géré | Une bascule de version ne réécrit ni cron ni unité |
+| D30 | Interpréteur | Crons et unités invoquent **`/home/<host>/.local/bin/php`**, lien géré (emplacement révisé par D70) | Une bascule de version ne réécrit ni cron ni unité |
 | D31 | Transport FPM | **Socket Unix par défaut**, numéroté selon la norme `1<version><incrément>` ; TCP possible mais explicite | Le numéro est un identifiant logique, pas un port ouvert |
 | D32 | Layout | Code applicatif dans **`/home/<host>/www`** ; le docroot dépend du **type d'application** (`www` pour Prestashop, `www/public` pour Symfony) | Un type d'application devient une donnée de premier plan du modèle |
 | D33 | Clé de déploiement | Paire **ed25519 sans passphrase** générée à la création, privée conservée sur le serveur, publique à déclarer en deploy key | Déploiement en **tirage** (le serveur clone) ; aucune clé privée à confier à un tiers. Le volet « aucune surface SSH entrante, `nologin` conservé » est **révisé par D62** : le shell est ouvert par défaut, ce qui ne change rien au sens du déploiement |
 | D34 | Applications non-PHP | **Go, Node, Ruby, Python** supportés : processus supervisé par systemd + vhost en reverse-proxy | Élargit le périmètre à la supervision de runtimes applicatifs |
-| D35 | Runtimes | `nvm`, `rbenv`, `pyenv`/`venv` installés **par utilisateur** dans son home, liens gérés dans `.bin/` | Une copie par site ; intégrité du runtime hors du contrôle de l'inventaire |
+| D35 | Runtimes | `nvm`, `rbenv`, `pyenv`/`venv` installés **par utilisateur** dans son home, liens gérés dans `.local/bin/` (D70) | Une copie par site ; intégrité du runtime hors du contrôle de l'inventaire |
 | D36 | Écoute des applications | **Socket Unix** `0660 www-data:<id>` quand le runtime le permet ; sinon port TCP `2<runtime><incrément>` sur **127.0.0.1 exclusivement** | Isolation équivalente à celle des pools PHP |
 | D37 | Types livrés | **Prestashop** et **Symfony 3.4 → 8** (+ `static`, `php-plain` et les 4 runtimes) ; les autres frameworks s'ajoutent par `apptypes.yaml` sans code | Symfony 3.4 impose une variante distincte : docroot `web`, `app.php`, pas de Messenger |
 | D38 | Compatibilité PHP | La contrainte `require.php` du **`composer.json` de l'application** fait autorité ; table indicative en secours seulement | Aucune matrice figée à maintenir ; `php switch` refuse une bascule incompatible sans `--force` |
@@ -148,6 +148,7 @@ Décisions arbitrées et figées pour la v1. Toute remise en cause est une évol
 | D67 | Comptes de supervision | Un compte par moteur, de **portée parc** (scope de keystore `@parc`, impossible à porter par un projet), aux privilèges bornés : MySQL `PROCESS, REPLICATION CLIENT` et la lecture du `performance_schema` ; PostgreSQL le rôle `pg_monitor` **sans mot de passe** ; RabbitMQ le seul tag `monitoring`. Chaque étape est **non critique** | Un agent de métriques compromis ne doit pas être un accès aux données de clients : aucun de ces comptes n'atteint la base d'un projet. Le rôle PostgreSQL porte le **nom de l'utilisateur système de l'agent**, non un nom choisi : la connexion locale est authentifiée « peer », qui compare l'utilisateur du système — c'est la règle de D44, et un rôle nommé autrement serait créé puis refusé à chaque collecte. Le tag `monitoring` de RabbitMQ suffit et se suffit : il donne la lecture de tous les vhosts par l'API d'administration, là où une permission par vhost donnerait le droit de lire les messages des projets. Deux pièges : un moteur **installé mais injoignable** produit un avertissement, un moteur **absent** ne produit rien — une machine sans MySQL n'a pas à voir un avertissement à chaque apply ; et **MariaDB rend « BINLOG MONITOR » là où MySQL rend « REPLICATION CLIENT »**, si bien que comparer au seul libellé de MySQL faisait annoncer éternellement une correction qu'on venait d'appliquer |
 | D68 | Prisons fail2ban | Les prisons sont **préfixées `ogs-`**, leurs journaux **énumérés un à un** et filtrés par existence, et le fichier est **recalculé à la suppression d'un projet** | Trois conséquences d'un même comportement : **une prison dont fail2ban ne trouve aucun journal l'empêche de démarrer, et il s'arrête alors tout entier** — les prisons valides comprises. D'où le filtrage à l'écriture, le recalcul à la suppression — sans lui, retirer un projet cassait fail2ban au prochain redémarrage, sans un mot — et un contrôle de `doctor` qui nomme les journaux disparus avant qu'ils ne bloquent le démon. Le même raisonnement décide du **backend de la prison sshd** : une Debian récente n'installe plus rsyslog, `/var/log/auth.log` peut ne pas exister, mais le backend `systemd` exige les liaisons `python3-systemd` qui ne sont qu'une recommandation du paquet — on choisit donc d'après ce qui existe, en préférant le fichier, qui ne dépend d'aucune liaison. Le préfixe n'est pas décoratif : `jail.d` est un espace partagé avec l'administrateur, et une prison nommée `sshd` recouvrirait la sienne en silence. `doctor` exécute par ailleurs `fail2ban-client -t`, seul contrôle qui couvre filtres, expressions et backend d'un coup |
 | D69 | Signature DKIM | ogs **génère et garde** une clé DKIM par domaine d'envoi d'un projet qui la demande (`spec.mail.dkim`, **opt-in**), écrit la `KeyTable` et la `SigningTable` d'**OpenDKIM** à partir du parc entier et **émet l'enregistrement à publier** ; il ne touche **ni au DNS, ni au MTA, ni à `opendkim.conf`**. Clé **RSA-2048** générée en Go, scellée dans le keystore (`<projet>/dkim/<domaine>/<sélecteur>`) et écrite en **0600 opendkim:opendkim** ; sélecteur daté (`ogs202609`) ; rotation en **deux temps** — `rotate` prépare, `activate` bascule et refuse tant que l'enregistrement publié ne correspond pas à la clé, sauf `--force`. Étapes **non critiques** ; la préproduction est **refusée à la validation** | Révise §1.3, qui plaçait la messagerie hors périmètre, pour la raison de D64 : OpenDKIM a besoin de ce qu'ogs seul sait — quels domaines appartiennent à quel projet, et quand un projet disparaît. Le reste de la messagerie demeure dehors : ni MTA, ni relais, ni SPF — qui dépend des relais empruntés, qu'ogs ignore —, ni DMARC. **Le DNS reste hors périmètre malgré D53** : les identifiants OVH ne couvrent que la zone de préproduction, les zones des clients vivent ailleurs, et écrire dans la zone d'un client n'engage pas la même confiance que dans la sienne ; `doctor` vérifie ce qui est publié. **Pourquoi deux temps** : passer d'une clé qui se vérifie à une clé dont la partie publique n'est pas publiée casse la signature de tout envoi — sous un DMARC `p=reject` sans SPF aligné, le courrier est rejeté. À la **création**, en revanche, on signe aussitôt : une signature invérifiable ne vaut pas moins qu'une absence de signature, DMARC les traitant de même, et faire dépendre l'apply d'une résolution DNS rendrait le plan instable d'une exécution à l'autre. **Pourquoi sceller** : une clé DKIM, contrairement à un mot de passe, ne se régénère pas sans action extérieure — la perdre oblige à republier chez le client ; le keystore est la source de vérité et le fichier en dérive, donc un fichier disparu est réécrit, jamais recréé avec une clé neuve. Le fichier de clé ne peut porter l'en-tête d'ogs : il est comparé au contenu scellé, et un écart est traité comme une modification à la main (`--force`). **Pourquoi 0600** : sous `RequireSafeKeys`, défaut d'OpenDKIM, une clé lisible au-delà de son propriétaire est refusée — le régime 0640 de D65 ne convient pas ici. Et le refus n'est pas un silence : l'essai réel l'a montré, une clé refusée **ou absente** ne laisse pas partir le courrier sans signature, OpenDKIM rend une erreur temporaire et **le MTA garde en file tout le courrier du domaine**. D'où deux règles : une table ne désigne jamais une clé dont le fichier manque, et le fichier d'un domaine qui cesse d'être signé n'est retiré qu'**après** le rechargement des tables, OpenDKIM gardant en mémoire celles qu'il a chargées. **Pourquoi des tables de parc** : OpenDKIM n'en accepte qu'une de chaque, et recalculées depuis un sous-ensemble elles retireraient de la signature tous les autres projets — la leçon de logrotate et de tmpfiles ; elles vivent donc dans le plan global, et `doctor` vérifie qu'`opendkim.conf`, laissé à l'administrateur comme `telegraf.conf` (D65), les référence bien. **Pourquoi pas la préproduction** : elle ne doit jamais pouvoir signer au nom du domaine de production — un envoi de test parti vers de vrais clients serait authentifié. **Pourquoi l'opt-in** : beaucoup de projets envoient par un relais tiers qui signe de sa propre clé ; signer par défaut créerait des clés dont aucun courrier ne se sert. **Pourquoi RSA** : ed25519 (RFC 8463) est encore trop peu vérifié pour servir seul. Piège : une clé RSA-2048 dépasse les 255 octets d'une chaîne TXT, l'enregistrement émis est donc découpé et `doctor` recolle les morceaux avant de comparer. **Pourquoi OpenDKIM plutôt que rspamd** : ses tables sont des fichiers plats, recalculables comme logrotate ou fail2ban, là où rspamd est une tout autre pièce à supposer présente |
+| D70 | Liens gérés | L'interpréteur PHP et les liens des runtimes (`node`, `python`, `ruby`, `bundle`, `app`) vivent dans **`~/.local/bin`**, qui appartient à **l'utilisateur du projet** (0700) ; `.bin/` disparaît, retiré à la migration une fois les unités relues. Root y écrit **par descripteurs ouverts sans suivre de lien** (`openat`, `O_NOFOLLOW`), et un fichier posé à la place d'un lien n'est remplacé que sous `--force` | Révise D30, D35 et §7.1.2. `~/.local/bin` est le répertoire que la convention XDG réserve aux exécutables de l'utilisateur, et que le `.profile` de Debian ajoute au PATH : le shell ouvert par D62 y trouve la version déclarée sans rien configurer. Il appartient à l'utilisateur parce que pip, pipx et bien d'autres y écrivent : le fermer les casserait. **Et le fermer ne protégerait rien** : l'essai l'a montré, le home appartenant à l'utilisateur (D51), un sous-répertoire root se **renomme** sans privilège, puis se remplace — `.bin/` n'a jamais garanti la version effective contre l'utilisateur, seulement contre l'accident. La garantie devient donc ce qu'elle était dans les faits : un **état réconcilié**, rétabli à chaque apply. Ce que la décision ajoute est la contrepartie d'écrire en root chez quelqu'un d'autre : chaque composant du chemin est ouvert sans suivre de lien, et le lien est posé relativement au descripteur — un `~/.local` remplacé par un lien vers un autre répertoire fait refuser l'étape au lieu d'y faire écrire root. Le même traitement vaut désormais pour `.ssh/authorized_keys` (D61), que root posait jusque-là par son nom dans un répertoire de l'utilisateur. La migration retire l'ancienne entrée `.bin` des déclarations à la normalisation — sous sa forme exacte seulement, un `.bin` déclaré autrement l'ayant été par l'exploitant — et l'ancien répertoire en **fin de plan**, après le vidage des rechargements : une unité réécrite mais pas encore relue par systemd désigne toujours l'ancien lien. Seuls les liens connus sont retirés, et le répertoire ne part que vide |
 
 ---
 
@@ -214,7 +215,8 @@ spec:
       - { path: www/public, mode: "0710" }   # selon le type d'application
       - { path: var,        mode: "0700" }
       - { path: logs,       mode: "0710", owner: root }
-      - { path: .bin,       mode: "0710", owner: root }
+      - { path: .local,     mode: "0700" }
+      - { path: .local/bin, mode: "0700" }   # liens gérés (D70), au compte du projet
       - { path: .ssh,       mode: "0700" }
       - { path: var/tmp,      mode: "0700" }
       - { path: var/sessions, mode: "0700" }
@@ -470,7 +472,7 @@ Points à noter :
 | Cible systemd | `ogs-<id>.target` | `ogs-shopfr.target` | — |
 | Fichier cron | `/etc/cron.d/ogs-<id>` | `/etc/cron.d/ogs-shopfr` | pas de `.` dans le nom |
 | Logs du projet | `/home/<host effectif>/logs/` | `/home/shop.fr/logs/` | répertoire root, §7.1.2 |
-| Lien interpréteur | `/home/<host effectif>/.bin/php` | `/home/shop.fr/.bin/php` | répertoire root |
+| Lien interpréteur | `/home/<host effectif>/.local/bin/php` | `/home/shop.fr/.local/bin/php` | répertoire de l'utilisateur (D70) |
 | Sudoers | `/etc/sudoers.d/ogs-<id>` | `/etc/sudoers.d/ogs-shopfr` | 0440 root:root, §7.9.1 |
 
 Les modèles sont surchargeables dans `/etc/ogs/config.yaml`, mais le principe du nom unique est structurant :
@@ -560,7 +562,7 @@ explicite :
   public/                                 docroot, 0710
   var/                                    0700, hors de portée de www-data
   logs/                                   0710 root:<id> — apache, nginx, php, crons
-  .bin/php                                lien vers l'interpréteur de la version courante
+  .local/bin/php                          lien vers l'interpréteur de la version courante (D70)
 ```
 
 Fichiers générés en dehors de l'arborescence `ogs` (toujours marqués par un en-tête de gestion) :
@@ -883,8 +885,9 @@ groupadd shopfr
 useradd --gid shopfr --home-dir /home/shop.fr --shell /bin/bash \
         --no-create-home --comment "ogs=shopfr" shopfr
 gpasswd -a www-data shopfr          # si webAccess = group (défaut)
-install -d -o root -g shopfr -m 0710 /home/shop.fr/logs /home/shop.fr/.bin
-ln -sfn /usr/bin/php8.5 /home/shop.fr/.bin/php
+install -d -o root -g shopfr -m 0710 /home/shop.fr/logs
+install -d -o shopfr -g shopfr -m 0700 /home/shop.fr/.local /home/shop.fr/.local/bin
+ln -sfn /usr/bin/php8.5 /home/shop.fr/.local/bin/php   # posé sans suivre de lien (D70)
 install -m 0440 -o root -g root <généré> /etc/sudoers.d/ogs-shopfr
 ```
 
@@ -913,9 +916,10 @@ adopté ou étranger.
 │   ├── php-error.log        0640  root:shopfr    écrit par le master FPM (root)
 │   ├── php-slow.log         0640  root:shopfr
 │   └── cron-scheduler.log   0640  shopfr:shopfr  pré-créé par ogs, écrit par la tâche
-├── .bin/                    0710  root:shopfr    ← répertoire NON inscriptible par l'utilisateur
-│   ├── php → /usr/bin/php8.5                    lien géré par ogs (§7.5)
-│   └── node, ruby, python, app                  liens des autres runtimes (§7.11)
+├── .local/                  0700  shopfr:shopfr
+│   └── bin/                 0700  shopfr:shopfr  répertoire des liens gérés (D70), sur le PATH
+│       ├── php → /usr/bin/php8.5                lien géré par ogs (§7.5)
+│       └── node, ruby, python, bundle, app      liens des autres runtimes (§7.11)
 └── .env                     0600  shopfr:shopfr  lu par FPM (sous shopfr), pas par www-data
 ```
 
@@ -936,9 +940,9 @@ site cesserait d'être servi. Le bit « autres » sert, lui, au mode `webAccess:
 pas membre du groupe. Rien n'est lisible pour autant : les répertoires du niveau suivant sont fermés aux
 autres, et aucun n'est énumérable.
 
-**Pourquoi `logs/` et `.bin/` appartiennent à root.** Ces deux répertoires sont lisibles et traversables par
-l'utilisateur (groupe `shopfr`, `r-x`) mais **il ne peut pas y créer, renommer ni supprimer d'entrée**. Ce
-détail est une exigence de sécurité, pas une préférence :
+**Pourquoi `logs/` appartient à root.** Ce répertoire est lisible et traversable par l'utilisateur (groupe
+`shopfr`) mais **il ne peut pas y créer, renommer ni supprimer d'entrée**. Ce détail est une exigence de
+sécurité, pas une préférence :
 
 - `logs/` : Apache, Nginx et le master PHP-FPM ouvrent leurs fichiers de log **en tant que root**, avant
   d'abandonner leurs privilèges. Si l'utilisateur pouvait remplacer `apache-error.log` par un lien
@@ -946,10 +950,15 @@ détail est une exigence de sécurité, pas une préférence :
   escalade de privilèges complète. C'est une classe de vulnérabilité connue et régulièrement exploitée sur
   les panels d'hébergement. Un répertoire root avec des fichiers pré-créés la supprime : l'utilisateur peut
   écrire *dans* les fichiers qui lui appartiennent (logs de crons), jamais en substituer un.
-- `.bin/` : le lien `php` étant référencé par les tâches cron et les unités systemd, un utilisateur qui
-  pourrait le remplacer n'obtiendrait certes qu'une exécution sous sa propre identité — sans escalade — mais
-  cela contournerait silencieusement le pilotage de version par `ogs`. Le répertoire root garantit que la
-  version effective est bien celle que l'inventaire déclare.
+- Les **liens gérés** n'y sont plus (D70) : ils vivent dans `~/.local/bin`, au compte de l'utilisateur. Un
+  `.bin/` root ne garantissait pas la version effective — le home appartenant à l'utilisateur, un
+  sous-répertoire root s'y renomme puis se remplace sans privilège. Le lien est un état réconcilié à chaque
+  apply, et root l'écrit sans jamais suivre de lien.
+
+**Limite constatée, à arbitrer** (§20) : ce même renommage vaut pour `logs/`. L'utilisateur peut déplacer
+le répertoire root et en recréer un à lui, où un journal devient un lien vers un fichier système, que le
+maître du serveur web ouvre en root à son prochain redémarrage. La protection décrite ci-dessus tient contre
+une substitution **dans** `logs/`, pas contre la substitution **de** `logs/`.
 
 Corollaire pratique : `logrotate` n'a pas besoin de la directive `su`, précisément parce que le répertoire
 n'est pas inscriptible par un non-root (§14.5).
@@ -1020,7 +1029,7 @@ vhost AMQP      shopfrprep      user AMQP      shopfrprep
 pool PHP        shopfrprep      socket         /run/php/php8.5-fpm-18502-shopfrprep.sock
 vhost web       shopfrprep.conf certificat     *.preprod-pp.net (partagé)
 unités          ogs-shopfrprep-*.service        cron  /etc/cron.d/ogs-shopfrprep
-logs            /home/shop.preprod-pp.net/logs/       interpréteur  .bin/php
+logs            /home/shop.preprod-pp.net/logs/       interpréteur  .local/bin/php
 sudoers         /etc/sudoers.d/ogs-shopfrprep
 ```
 
@@ -1346,16 +1355,17 @@ request_terminate_timeout = 300s
 catch_workers_output = yes
 ```
 
-**Interpréteur CLI : le lien `/home/<host>/.bin/php`**
+**Interpréteur CLI : le lien `/home/<host>/.local/bin/php`**
 
 Les tâches cron et les unités systemd n'invoquent jamais `/usr/bin/php8.5` mais toujours
-`/home/shop.fr/.bin/php`, lien symbolique géré par `ogs` (répertoire root, §7.1.2). Conséquence directe : une
+`/home/shop.fr/.local/bin/php`, lien symbolique géré par `ogs` (D70). Conséquence directe : une
 bascule de version ne touche ni les fichiers cron ni les unités systemd, dont le contenu est indépendant de
 la version. Le lien est également le point de vérité pour l'utilisateur, qui peut s'y référer dans ses
-propres scripts (`.bin/php bin/console …`) sans jamais coder une version en dur.
+propres scripts — et le trouve sur son PATH, `~/.local/bin` y étant ajouté par le `.profile` de Debian — sans
+jamais coder une version en dur.
 
-`.bin/` est prévu pour accueillir d'autres liens gérés selon le même principe (`composer` notamment), sans
-que cela relève du périmètre v1.
+Le répertoire appartenant à l'utilisateur, le lien est un **état réconcilié** : changé à la main, il est
+rétabli au prochain apply ; un fichier régulier posé à sa place n'est remplacé que sous `--force`.
 
 **Bascule de version** (`ogs php switch shopfr 8.5`) — séquence sans coupure :
 
@@ -1365,7 +1375,7 @@ que cela relève du périmètre v1.
 3. Écrire le pool sur la nouvelle version, `php-fpm8.5 -t`.
 4. `systemctl reload php8.5-fpm`, attendre l'apparition du socket (avec délai d'attente).
 5. Réécrire les vhosts pointant sur l'ancien socket, valider, recharger le serveur web.
-6. Mettre à jour le lien `.bin/php` (`ln -sfn`, atomique).
+6. Mettre à jour le lien `.local/bin/php` (atomique, posé sans suivre de lien).
 7. Redémarrer les services du projet via sa target, afin qu'ils chargent le nouvel interpréteur. Les crons
    basculent d'eux-mêmes à leur prochaine exécution ; aucun fichier cron n'est réécrit.
 8. Supprimer l'ancien pool, recharger l'ancien FPM, libérer l'ancien numéro.
@@ -1586,13 +1596,13 @@ MAILTO=""
 
 # scheduler
 * * * * * shopfr /usr/bin/flock -n /run/ogs/shopfr/scheduler.lock \
-  /home/shop.fr/.bin/php /home/shop.fr/bin/console schedule:run \
+  /home/shop.fr/.local/bin/php /home/shop.fr/bin/console schedule:run \
   >> /home/shop.fr/logs/cron-scheduler.log 2>&1
 ```
 
 Règles :
 
-- **Interpréteur** : toujours `/home/<host>/.bin/php`, jamais un binaire versionné (§7.5). Une bascule de
+- **Interpréteur** : toujours `/home/<host>/.local/bin/php`, jamais un binaire versionné (§7.5). Une bascule de
   version PHP ne réécrit donc aucun fichier cron.
 - **Anti-recouvrement** : `flock -n` par défaut, désactivable par tâche. Les verrous vivent dans
   `/run/ogs/<id>/`, répertoire propre au projet (`0710 <id>:<id>`, §7.8) créé par `/etc/tmpfiles.d/ogs.conf`
@@ -1625,7 +1635,7 @@ Type=simple
 User=shopfr
 Group=shopfr
 WorkingDirectory=/home/shop.fr
-ExecStart=/home/shop.fr/.bin/php bin/console messenger:consume async \
+ExecStart=/home/shop.fr/.local/bin/php bin/console messenger:consume async \
   --time-limit=3600 --memory-limit=128M --limit=500 -v
 Restart=always
 RestartSec=5
@@ -1666,7 +1676,7 @@ d'instances actives (`systemctl enable --now ogs-shopfr-messenger-async@4`, `dis
 **Redémarrage groupé** : `ogs service restart shopfr --all` redémarre via la target, ce qui permet un arrêt
 propre (SIGTERM, Messenger termine le message en cours) puis un redémarrage ordonné.
 
-**Cohérence de version PHP** : les unités et les crons invoquent `/home/<host>/.bin/php`, jamais un binaire
+**Cohérence de version PHP** : les unités et les crons invoquent `/home/<host>/.local/bin/php`, jamais un binaire
 versionné. Une bascule de version ne réécrit donc **aucune** unité ni aucun fichier cron : elle met à jour
 le lien, puis redémarre les services du projet pour qu'ils chargent le nouvel interpréteur. Les tâches cron
 prennent la nouvelle version à leur exécution suivante, sans intervention. `daemon-reload` n'est plus requis
@@ -1878,7 +1888,7 @@ Conformément à D35, chaque projet possède sa propre installation dans son hom
 $ ogs runtime install shopfr node 22.11.0
   → installe nvm dans /home/shop.fr/.nvm (si absent)
   → nvm install 22.11.0
-  → lien /home/shop.fr/.bin/node → …/v22.11.0/bin/node
+  → lien /home/shop.fr/.local/bin/node → …/v22.11.0/bin/node
   → liens npm, npx
 ```
 
@@ -1886,24 +1896,24 @@ Points d'implémentation :
 
 - `nvm`, `rbenv` et `pyenv` sont des **scripts shell conçus pour un shell interactif** : ils sont
   inutilisables tels quels dans une unité systemd, qui n'en charge aucun profil. Les unités et les crons
-  invoquent donc exclusivement les liens de `.bin/` (D30), jamais `nvm use`.
+  invoquent donc exclusivement les liens de `.local/bin/` (D30, D70), jamais `nvm use`.
 - Les commandes d'installation sont exécutées par `su -s /bin/bash -c '…' <id>`, qui **force** le shell
   indépendamment de `/etc/passwd`. Le forçage reste nécessaire alors même que le shell par défaut est
   `/bin/bash` (D62) : un parc peut l'avoir refermé, et un compte adopté peut porter n'importe quoi.
 - L'installation télécharge depuis Internet : l'étape est **non critique** (§6.3) et son échec n'annule pas la
   création du site, mais le service applicatif reste alors à l'arrêt avec un message explicite.
 - Pour Python, `pyenv` fournit l'interpréteur et `ogs` crée le venv du projet (`python -m venv www/.venv`) ;
-  `.bin/python` pointe vers le venv, pas vers l'interpréteur nu, afin que les dépendances suivent.
+  `.local/bin/python` pointe vers le venv, pas vers l'interpréteur nu, afin que les dépendances suivent.
 - Pour Go, aucun gestionnaire de version : `ogs` ne compile pas (§1.3). Le déploiement dépose un binaire et
-  `.bin/app` pointe dessus — le remplacer puis redémarrer le service constitue une bascule atomique.
+  `.local/bin/app` pointe dessus — le remplacer puis redémarrer le service constitue une bascule atomique.
 
 **Contrepartie assumée du choix « par utilisateur »** : chaque version est dupliquée par site (de l'ordre de
 100 Mio pour une version de Node), les mises à jour de sécurité du runtime sont à faire autant de fois qu'il
-y a de projets, et le lien `.bin/node`, bien qu'appartenant à root, pointe vers un binaire situé dans un
-répertoire que l'utilisateur contrôle : il peut donc en changer le contenu. Cela ne crée aucune escalade — il
-exécuterait ce binaire sous sa propre identité de toute façon — mais la garantie « la version effective est
-celle de l'inventaire » ne vaut, pour ces runtimes, que pour PHP. `ogs status` compare la version rapportée
-par `.bin/<runtime> --version` à celle déclarée et signale l'écart.
+y a de projets, et le lien `.local/bin/node` pointe vers un binaire situé dans un répertoire que
+l'utilisateur contrôle : il peut donc en changer le contenu. Cela ne crée aucune escalade — il exécuterait ce
+binaire sous sa propre identité de toute façon. La garantie « la version effective est celle de
+l'inventaire » est, pour tous les liens, celle d'un état réconcilié à chaque apply (D70). `ogs status`
+compare la version rapportée par `.local/bin/<runtime> --version` à celle déclarée et signale l'écart.
 
 #### 7.11.3 Écoute : socket Unix par défaut
 
@@ -1950,7 +1960,7 @@ Group=shopfr
 WorkingDirectory=/home/shop.fr/www
 Environment=NODE_ENV=production
 Environment=SOCKET_PATH=/run/ogs/shopfr/app.sock
-ExecStart=/home/shop.fr/.bin/node server.js
+ExecStart=/home/shop.fr/.local/bin/node server.js
 Restart=always
 RestartSec=5
 UMask=0007
@@ -2724,7 +2734,7 @@ Points de conception :
 | Escalade root par lien symbolique de log | `logs/` appartient à root et n'est pas inscriptible par l'utilisateur ; les fichiers sont pré-créés. Aucun processus root n'ouvre en écriture un chemin dont un non-root contrôle le répertoire (§7.1.2). |
 | Élargissement de la délégation sudo | Commandes énumérées sans métacaractère, jamais de `systemctl` nu ; `ogs my` ne prend aucun argument et déduit le projet de `SUDO_UID`, que sudo positionne sous `env_reset` ; validation `visudo -cf` avant activation, revalidation par `doctor` (§7.9.1). |
 | Exécution croisée via un pool FPM | Socket Unix `0660 www-data:<id>` par défaut : seuls le serveur web et l'utilisateur du projet peuvent s'y connecter. Le mode TCP, dépourvu d'authentification, exige `--allow-tcp` et un avertissement explicite (§7.5). |
-| Détournement de l'interpréteur | `.bin/` appartient à root : l'utilisateur ne peut pas substituer le lien `php` et faire diverger la version effective de celle que déclare l'inventaire. |
+| Détournement de l'interpréteur | Le lien `php` vit dans `~/.local/bin`, au compte de l'utilisateur (D70) : il peut le changer, sans autre effet qu'une exécution sous sa propre identité, et l'apply suivant le rétablit. Root l'écrit sans jamais suivre de lien : un répertoire substitué fait refuser l'étape au lieu de faire écrire root ailleurs. |
 
 ---
 
@@ -2810,7 +2820,7 @@ Scénarios exigés :
 27. **Application Node de bout en bout** : `runtime install` puis service démarré sur socket Unix, attente
     de disponibilité respectée, réponse HTTPS via le proxy, `www-data` capable de se connecter au socket
     (vérifie `UMask=0007`), et refus de connexion depuis un utilisateur tiers.
-28. **Application Go sur port** : binaire déposé, `.bin/app` mis à jour, redémarrage, réponse via le
+28. **Application Go sur port** : binaire déposé, `.local/bin/app` mis à jour, redémarrage, réponse via le
     proxy ; puis test négatif — une application écoutant sur `0.0.0.0` est détectée et signalée par
     `doctor`.
 29. **Échec d'installation de runtime** (réseau coupé) : le site est créé, le service reste à l'arrêt, code
@@ -2872,7 +2882,7 @@ build multi-architecture. Les tests d'intégration sont obligatoires avant fusio
 | Lot | Contenu | Critère d'acceptation |
 |---|---|---|
 | **L0 — Socle** | `exec`, `fs` (écriture atomique, empreintes), `store` + migrations, `secret`, `config`, `model` + `spec` + `validate` (dérivation du nommage, troncature, unicité), `template`, `audit`, `engine` (plan/apply/diff/saga/verrou), CLI de base, `init`, `doctor` | `plan`/`apply` sur un projet ne contenant qu'un utilisateur et une arborescence ; idempotence et rollback démontrés par les tests |
-| **L1 — Web + PHP** | provider `system` (users, groupes, `logs/`, `.bin/php`, clé de déploiement), `php` (détection 7.4→8.5, pools, presets, numérotation, switch), types d'application Prestashop et Symfony 3.4→8 avec détection de variante et garde-fou de compatibilité, `web` (interface, Apache, Nginx), rotation des logs, reloads groupés, validation avant activation | Un Prestashop en 7.4 et un Symfony 8 en 8.5 servis simultanément, `php switch` sans coupure ni réécriture d'unité, bascule incompatible refusée |
+| **L1 — Web + PHP** | provider `system` (users, groupes, `logs/`, lien d'interpréteur, clé de déploiement), `php` (détection 7.4→8.5, pools, presets, numérotation, switch), types d'application Prestashop et Symfony 3.4→8 avec détection de variante et garde-fou de compatibilité, `web` (interface, Apache, Nginx), rotation des logs, reloads groupés, validation avant activation | Un Prestashop en 7.4 et un Symfony 8 en 8.5 servis simultanément, `php switch` sans coupure ni réécriture d'unité, bascule incompatible refusée |
 | **L2 — Bases** | providers `mysql` et `postgres`, privilèges nommés, dump/restore, `secrets env` | Création complète, rotation de mot de passe, connexion applicative vérifiée |
 | **L3 — TLS** | provider `acme` (lego), HTTP-01, DNS-01, timer de renouvellement, hooks de reload, staging, auto-signé | Émission et renouvellement réels contre pebble, échec non bloquant vérifié |
 | **L4 — RabbitMQ** | provider `amqp` (API HTTP + fallback), exchanges/queues/bindings/policies, préréglage Messenger, détection d'arguments immuables | Transport Messenger fonctionnel de bout en bout |
@@ -2989,6 +2999,13 @@ complet sans lui pour un parc exclusivement PHP.
 - **Publication DNS de DKIM** : jamais par ogs, même quand la zone est chez OVH — D27 reste entier.
 
 **Points restant à arbitrer** :
+
+- **Substitution de `logs/`** (constatée le 23/09/2026, §7.1.2) : le home appartenant à l'utilisateur
+  (D51), il peut renommer `logs/` — répertoire root — et en recréer un à lui, où `apache-error.log` devient
+  un lien vers un fichier système que le maître du serveur web ouvre en root à son prochain redémarrage,
+  donc au plus tard à la rotation quotidienne. La garantie de D29 ne tient que contre une substitution
+  dans le répertoire. Les deux voies de correction touchent l'architecture : sortir les journaux du home,
+  ou ne plus donner le home à l'utilisateur (révision de D29 ou de D51).
 
 - **Mode `webAccess: acl` par défaut ?** Le mode `group` est retenu ; si le serveur héberge des clients
   tiers non fiables, basculer le défaut sur `acl` restreindrait `www-data` au seul docroot. La question

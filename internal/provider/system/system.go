@@ -35,6 +35,9 @@ type Provider struct {
 	// SkipWebUser désactive l'ajout de www-data au groupe, lorsque le compte
 	// n'existe pas sur la machine (poste de développement, conteneur minimal).
 	SkipWebUser bool
+	// Force autorise le remplacement d'un fichier posé à la place d'un lien géré
+	// (§6.4) : dans un répertoire de l'utilisateur, il porte son travail.
+	Force bool
 	// WebReload est l'intention de rechargement du serveur web retenu
 	// (« web:apache », « web:nginx »). Le provider système ne choisit pas le
 	// moteur : c'est l'assemblage qui le lui dit. L'intention nue « web », qu'il
@@ -307,9 +310,9 @@ func (p *Provider) dirSteps(proj *model.Project, obs Observed) ([]*engine.Step, 
 	for _, t := range targets {
 		t := t
 		state := obs.Dirs[t.path]
-		// logs/ et .bin/ appartiennent à root : l'utilisateur ne doit pas pouvoir
-		// y créer d'entrée, ce qui interdirait de substituer un fichier de log par
-		// un lien symbolique et d'obtenir une écriture root arbitraire (§7.1.2).
+		// logs/ appartient à root : l'utilisateur ne doit pas pouvoir y créer
+		// d'entrée, ce qui interdirait de substituer un fichier de log par un lien
+		// symbolique et d'obtenir une écriture root arbitraire (§7.1.2).
 		ownerLabel := proj.Spec.User.Name + ":" + proj.Spec.User.Group
 		if t.owner == "root" {
 			ownerLabel = "root:" + proj.Spec.User.Group
@@ -317,8 +320,7 @@ func (p *Provider) dirSteps(proj *model.Project, obs Observed) ([]*engine.Step, 
 		desired := fmt.Sprintf("%s (%04o %s)", t.path, t.mode.Perm(), ownerLabel)
 
 		// Le propriétaire est du désiré au même titre que le mode : c'est lui, non
-		// le 0710, qui interdit à l'utilisateur de créer une entrée dans logs/ et
-		// .bin/. Un « chown -R » d'exploitation laisse le mode intact et rouvre la
+		// le 0710, qui interdit à l'utilisateur de créer une entrée dans logs/. Un « chown -R » d'exploitation laisse le mode intact et rouvre la
 		// substitution d'un journal par un lien symbolique, que le maître Apache
 		// ouvre ensuite en root (§7.1.2) : sans cette comparaison, la dérive reste
 		// « conforme » indéfiniment.

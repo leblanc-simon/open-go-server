@@ -13,7 +13,7 @@ func TestRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	// Une arborescence de projet réaliste, avec un lien symbolique.
 	root := filepath.Join(dir, "home", "shop.fr")
-	for _, sub := range []string{"www/public", "var/log", "logs", ".bin"} {
+	for _, sub := range []string{"www/public", "var/log", "logs", ".local/bin"} {
 		if err := os.MkdirAll(filepath.Join(root, sub), 0o750); err != nil {
 			t.Fatal(err)
 		}
@@ -25,7 +25,7 @@ func TestRoundTrip(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, ".env"), []byte("APP_ENV=prod\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Symlink("/usr/bin/php8.5", filepath.Join(root, ".bin", "php")); err != nil {
+	if err := os.Symlink("/usr/bin/php8.5", filepath.Join(root, ".local", "bin", "php")); err != nil {
 		t.Fatal(err)
 	}
 
@@ -110,7 +110,7 @@ func TestRoundTrip(t *testing.T) {
 	} else if info.Mode().Perm() != 0o600 {
 		t.Errorf(".env restauré en %04o, attendu 0600", info.Mode().Perm())
 	}
-	target, err := os.Readlink(filepath.Join(dest, ".bin", "php"))
+	target, err := os.Readlink(filepath.Join(dest, ".local", "bin", "php"))
 	if err != nil {
 		t.Fatalf("lien non restauré : %v", err)
 	}

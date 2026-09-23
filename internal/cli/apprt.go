@@ -92,7 +92,7 @@ func newRuntimeInstallCommand(app *App) *cobra.Command {
 		Use:   "install <id> <version>",
 		Short: "Installer une version de runtime dans le home d'un projet",
 		Long: "L'installation télécharge depuis Internet et s'exécute sous l'identité du\n" +
-			"projet. Le lien de .bin est mis à jour pour désigner la version demandée.",
+			"projet. Le lien de ~/.local/bin est mis à jour pour désigner la version demandée.",
 		Args: cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			p, err := app.loadProject(args[0])

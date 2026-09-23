@@ -72,7 +72,7 @@ func TestBuildMessengerUnit(t *testing.T) {
 		"Environment=APP_ENV=prod",
 		// L'interpréteur passe par le lien : une bascule de version ne réécrit
 		// aucune unité.
-		filepath.Join(".bin", "php"),
+		filepath.Join(".local", "bin", "php"),
 		// Durcissement.
 		"NoNewPrivileges=true",
 		"ProtectSystem=full",

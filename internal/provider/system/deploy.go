@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 
 	"leblanc.io/open-go-server/internal/engine"
@@ -199,7 +200,13 @@ func (p *Provider) authorizedKeysStep(proj *model.Project) *engine.Step {
 			fmt.Sprintf("clés autorisées : %s → %s", current, source))
 		s.Critical = false
 		s.Apply = func(context.Context) error { return p.linkAuthorizedKeys(proj, link, source) }
-		s.Compensate = func(context.Context) error { return replaceSymlink(link, current) }
+		s.Compensate = func(context.Context) error {
+			rel, err := filepath.Rel(proj.Spec.Layout.Root, filepath.Dir(link))
+			if err != nil {
+				return err
+			}
+			return fs.SymlinkAt(proj.Spec.Layout.Root, rel, filepath.Base(link), current, p.linkOwner(proj), false)
+		}
 		return s
 	}
 	s := engine.NewStep(resource, engine.Create,
@@ -223,68 +230,135 @@ func (p *Provider) authorizedKeysStep(proj *model.Project) *engine.Step {
 // lui — et il le lit sous l'identité de cet utilisateur, donc il doit aussi lui
 // être lisible. C'est au trousseau commun de porter ces droits, non au lien ;
 // « doctor » les contrôle, faute de quoi sshd l'ignore en silence.
+//
+// Le lien est posé par un descripteur de .ssh ouvert sans suivre de lien :
+// .ssh appartient à l'utilisateur, qui pourrait sinon le remplacer par un lien
+// vers un répertoire de son choix et y faire créer — puis lchown — un fichier
+// par root.
 func (p *Provider) linkAuthorizedKeys(proj *model.Project, link, source string) error {
-	if err := replaceSymlink(link, source); err != nil {
-		return err
-	}
-	if p.Exec.Simulated() {
-		return nil
-	}
-	uid, gid, err := p.ResolveOwner(proj, "")
+	rel, err := filepath.Rel(proj.Spec.Layout.Root, filepath.Dir(link))
 	if err != nil {
 		return err
 	}
-	return os.Lchown(link, uid, gid)
+	return fs.SymlinkAt(proj.Spec.Layout.Root, rel, filepath.Base(link), source, p.linkOwner(proj), false)
 }
 
-// binStep maintient le lien .bin/php vers l'interpréteur de la version courante.
-// Les tâches cron et les unités systemd référencent ce lien, jamais un binaire
-// versionné : une bascule de version ne réécrit donc aucun de ces fichiers (D30).
+// binStep maintient le lien php vers l'interpréteur de la version courante, dans
+// le répertoire des liens gérés (D70). Les tâches cron et les unités systemd
+// référencent ce lien, jamais un binaire versionné : une bascule de version ne
+// réécrit donc aucun de ces fichiers (D30).
+//
+// Le répertoire appartient à l'utilisateur : le lien est un état réconcilié,
+// rétabli à chaque apply s'il a été changé. Un fichier régulier posé à sa place
+// porte en revanche le travail de quelqu'un, et n'est remplacé que sous --force.
 func (p *Provider) binStep(proj *model.Project) *engine.Step {
 	if len(proj.Spec.PHP.Pools) == 0 {
 		return nil
 	}
 	version := proj.Spec.PHP.Pools[0].Version
 	target := p.Paths.PHPBin(version)
-	link := filepath.Join(proj.Spec.Layout.Root, ".bin", "php")
-
-	current, err := os.Readlink(link)
+	root := proj.Spec.Layout.Root
+	label := model.LinkDir + "/php"
+	kind, current, err := fs.LinkStateAt(root, model.LinkDir, "php")
 	switch {
-	case err == nil && current == target:
+	case err != nil:
+		// Un composant remplacé par un lien : root n'écrira pas là où
+		// l'utilisateur l'envoie. L'arborescence le signale et le corrige.
+		s := engine.NewStep("system/bin/php", engine.Update, "lien "+label+" — chemin refusé")
+		s.Critical = false
+		s.Apply = func(context.Context) error { return err }
+		return s
+	case kind == fs.EntrySymlink && current == target:
 		return engine.NewStep("system/bin/php", engine.NoOp,
-			fmt.Sprintf("lien .bin/php → php %s", version))
-	case err == nil:
+			fmt.Sprintf("lien %s → php %s", label, version))
+	case kind == fs.EntryOther && !p.Force:
 		s := engine.NewStep("system/bin/php", engine.Update,
-			fmt.Sprintf("lien .bin/php : %s → %s", current, target))
-		previous := current
-		s.Apply = func(context.Context) error { return replaceSymlink(link, target) }
-		s.Compensate = func(context.Context) error { return replaceSymlink(link, previous) }
+			fmt.Sprintf("lien %s → %s — un fichier occupe déjà ce nom", label, target))
+		s.Critical = false
+		s.Apply = func(context.Context) error {
+			return fmt.Errorf("%s existe et n'est pas un lien : le déplacer, ou relancer avec "+
+				"--force pour le remplacer par le lien géré", filepath.Join(model.BinDir(root), "php"))
+		}
 		return s
 	}
-	s := engine.NewStep("system/bin/php", engine.Create,
-		fmt.Sprintf("lien .bin/php → %s", target))
-	s.Apply = func(context.Context) error { return replaceSymlink(link, target) }
-	s.Compensate = func(context.Context) error { return os.Remove(link) }
+	action, summary := engine.Create, fmt.Sprintf("lien %s → %s", label, target)
+	if kind != fs.EntryAbsent {
+		action, summary = engine.Update, fmt.Sprintf("lien %s : %s → %s", label, orValue(current, "fichier"), target)
+	}
+	s := engine.NewStep("system/bin/php", action, summary)
+	s.Apply = func(context.Context) error {
+		return fs.SymlinkAt(root, model.LinkDir, "php", target, p.linkOwner(proj), p.Force)
+	}
+	s.Compensate = func(context.Context) error {
+		if kind == fs.EntrySymlink {
+			return fs.SymlinkAt(root, model.LinkDir, "php", current, p.linkOwner(proj), false)
+		}
+		return fs.RemoveLinkAt(root, model.LinkDir, "php")
+	}
 	return s
 }
 
-// replaceSymlink remplace un lien de façon atomique : le lien temporaire est créé
-// puis renommé, de sorte qu'aucun appelant ne voit de chemin manquant.
-func replaceSymlink(link, target string) error {
-	// Le mode de .bin/ relève de l'arborescence : ce n'est ici qu'un filet.
-	if err := os.MkdirAll(filepath.Dir(link), 0o710); err != nil {
-		return err
+// linkOwner est le propriétaire des liens posés dans un répertoire de
+// l'utilisateur : lui-même. En mode simulé, rien n'est changé.
+func (p *Provider) linkOwner(proj *model.Project) fs.Owner {
+	if p.Exec.Simulated() {
+		return fs.KeepOwner
 	}
-	tmp := link + ".ogs-tmp"
-	_ = os.Remove(tmp)
-	if err := os.Symlink(target, tmp); err != nil {
-		return err
+	uid, gid, err := p.ResolveOwner(proj, "")
+	if err != nil {
+		return fs.KeepOwner
 	}
-	if err := os.Rename(tmp, link); err != nil {
-		_ = os.Remove(tmp)
-		return err
+	return fs.Owner{UID: uid, GID: gid}
+}
+
+// LegacyLinks sont les liens que l'ancien .bin/ portait : ceux-là seuls sont
+// retirés à la migration (D70).
+var LegacyLinks = []string{"php", "node", "python", "ruby", "bundle", "app"}
+
+// PlanLegacyBin retire l'ancien répertoire des liens, .bin/, une fois les crons
+// et les unités passés au nouvel emplacement. L'étape vient en fin de plan et
+// vide d'abord les rechargements en attente : une unité réécrite mais pas
+// encore relue par systemd désigne toujours l'ancien lien, et le retirer avant
+// ferait échouer le premier redémarrage du service.
+//
+// Seuls les liens connus sont retirés, sans jamais suivre de lien — le home
+// appartient à l'utilisateur, qui a pu remplacer .bin/ —, et le répertoire ne
+// part que s'il est vide : ce qui reste n'a pas été posé par ogs.
+func (p *Provider) PlanLegacyBin(proj *model.Project) *engine.Step {
+	root := proj.Spec.Layout.Root
+	legacy := filepath.Join(root, model.LegacyLinkDir)
+	info, err := os.Lstat(legacy)
+	if err != nil || !info.IsDir() {
+		return nil
 	}
-	return nil
+	s := engine.NewStep("system/legacy-bin", engine.Delete,
+		fmt.Sprintf("retrait de l'ancien %s (liens désormais dans %s)", legacy, model.BinDir(root)))
+	s.Critical = false
+	s.FlushReloads = true
+	s.Apply = func(context.Context) error {
+		for _, name := range LegacyLinks {
+			if err := fs.RemoveLinkAt(root, model.LegacyLinkDir, name); err != nil {
+				return err
+			}
+		}
+		remaining, err := fs.RemoveEmptyDirAt(root, model.LegacyLinkDir)
+		if err != nil {
+			return err
+		}
+		if len(remaining) > 0 {
+			return fmt.Errorf("%s conservé : il contient encore %s, qu'ogs n'a pas posé",
+				legacy, strings.Join(remaining, ", "))
+		}
+		return nil
+	}
+	return s
+}
+
+func orValue(v, fallback string) string {
+	if v == "" {
+		return fallback
+	}
+	return v
 }
 
 // PublicKey lit la clé publique de déploiement d'un projet.

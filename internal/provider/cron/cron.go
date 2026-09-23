@@ -189,7 +189,7 @@ func (p *Provider) command(proj *model.Project, decl model.CronJob) (string, err
 	// « bin/console » est réécrit pour passer par le lien d'interpréteur : une
 	// bascule de version PHP ne doit pas exiger de réécrire les crons (D30).
 	if strings.HasPrefix(command, "bin/console") || strings.HasPrefix(command, "./bin/console") {
-		command = filepath.Join(proj.Spec.Layout.Root, ".bin", "php") + " " +
+		command = filepath.Join(model.BinDir(proj.Spec.Layout.Root), "php") + " " +
 			filepath.Join(workdir, strings.TrimPrefix(strings.TrimPrefix(command, "./"), ""))
 	} else if !filepath.IsAbs(strings.Fields(command)[0]) {
 		command = filepath.Join(workdir, command)

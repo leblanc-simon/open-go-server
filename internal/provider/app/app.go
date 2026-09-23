@@ -39,6 +39,38 @@ type Provider struct {
 	// après sauvegarde horodatée (§6.4). Sans lui, le refus n'aurait aucune porte
 	// de sortie et l'apply du projet resterait bloqué.
 	Force bool
+	// Owner résout le compte du projet, à qui appartiennent les liens gérés : ils
+	// vivent dans un répertoire de l'utilisateur (D70). Nil, ou en mode simulé,
+	// le propriétaire n'est pas changé.
+	Owner func(*model.Project) (uid, gid int, err error)
+}
+
+// linkOwner est le propriétaire des liens gérés d'un projet.
+func (p *Provider) linkOwner(proj *model.Project) fs.Owner {
+	if p.Owner == nil || (p.Exec != nil && p.Exec.Simulated()) {
+		return fs.KeepOwner
+	}
+	uid, gid, err := p.Owner(proj)
+	if err != nil {
+		return fs.KeepOwner
+	}
+	return fs.Owner{UID: uid, GID: gid}
+}
+
+// setLink pose un lien géré dans le répertoire des liens, sans jamais suivre de
+// lien : ce répertoire appartient à l'utilisateur, qui pourrait sinon y
+// substituer un lien et faire écrire root où il veut.
+func (p *Provider) setLink(proj *model.Project, name, target string) error {
+	return fs.SymlinkAt(proj.Spec.Layout.Root, model.LinkDir, name, target, p.linkOwner(proj), p.Force)
+}
+
+// readLink observe un lien géré par le même chemin sûr.
+func readLink(proj *model.Project, name string) string {
+	kind, target, err := fs.LinkStateAt(proj.Spec.Layout.Root, model.LinkDir, name)
+	if err != nil || kind != fs.EntrySymlink {
+		return ""
+	}
+	return target
 }
 
 // Name identifie le provider.
@@ -144,7 +176,7 @@ func (p *Provider) port(proj *model.Project, runtime string) (int, error) {
 type Observed struct {
 	RuntimeInstalled bool
 	LinkTarget       string
-	// BundleLinkTarget est la cible de .bin/bundle, propre à Ruby : l'unité y
+	// BundleLinkTarget est la cible du lien bundle, propre à Ruby : l'unité y
 	// invoque le lanceur, jamais l'interpréteur.
 	BundleLinkTarget string
 	// RunDirMode est le mode du répertoire d'exécution, ou zéro s'il est absent.
@@ -168,13 +200,9 @@ func (p *Provider) Observe(_ context.Context, proj *model.Project) (Observed, er
 	obs.Endpoint = endpoint
 	obs.RuntimeInstalled = at.Runtime == RuntimeGo ||
 		Installed(proj.Spec.Layout.Root, at.Runtime, proj.Spec.App.Runtime)
-	if target, err := os.Readlink(LinkPath(proj.Spec.Layout.Root, at.Runtime)); err == nil {
-		obs.LinkTarget = target
-	}
+	obs.LinkTarget = readLink(proj, LinkName(at.Runtime))
 	if at.Runtime == RuntimeRuby {
-		if target, err := os.Readlink(bundleLinkPath(proj)); err == nil {
-			obs.BundleLinkTarget = target
-		}
+		obs.BundleLinkTarget = readLink(proj, LinkBundle)
 	}
 	if info, err := os.Stat(p.Paths.ProjectRunDir(proj.ID())); err == nil && info.IsDir() {
 		obs.RunDirMode = info.Mode().Perm()
@@ -292,8 +320,8 @@ func (p *Provider) command(proj *model.Project, runtime string, endpoint Endpoin
 		// « bundle » est un exécutable, non un programme d'une ligne : « ruby -e »
 		// évaluerait ce mot comme du code (NameError) et puma ne démarrerait
 		// jamais. Contrairement au « -m » de Python, « -e » n'est pas un
-		// commutateur de module. D'où un second lien géré, à côté de .bin/ruby.
-		cmd := filepath.Join(proj.Spec.Layout.Root, ".bin", LinkBundle) + " exec puma"
+		// commutateur de module. D'où un second lien géré, à côté du lien ruby.
+		cmd := bundleLinkPath(proj) + " exec puma"
 		if entry != "" {
 			// L'entrypoint d'un projet Ruby est le fichier de configuration de puma :
 			// l'ignorer sans un mot, comme on le faisait, laissait croire qu'il
@@ -345,20 +373,20 @@ func (p *Provider) Plan(_ context.Context, proj *model.Project, obs Observed) ([
 
 	// 2. Le lien géré, qui rend la version effective indépendante de l'unité.
 	target := BinaryPath(proj.Spec.Layout.Root, at.Runtime, proj.Spec.App.Runtime)
-	link := LinkPath(proj.Spec.Layout.Root, at.Runtime)
+	name := LinkName(at.Runtime)
 	if obs.LinkTarget != target {
 		s := engine.NewStep("app/link/"+at.Runtime, engine.Create,
-			fmt.Sprintf("lien .bin/%s → %s", LinkName(at.Runtime), target))
+			fmt.Sprintf("lien %s/%s → %s", model.LinkDir, name, target))
 		if obs.LinkTarget != "" {
 			s.Action = engine.Update
 			previous := obs.LinkTarget
-			s.Compensate = func(context.Context) error { return replaceSymlink(link, previous) }
+			s.Compensate = func(context.Context) error { return p.setLink(proj, name, previous) }
 		}
-		s.Apply = func(context.Context) error { return replaceSymlink(link, target) }
+		s.Apply = func(context.Context) error { return p.setLink(proj, name, target) }
 		steps = append(steps, s)
 	} else {
 		steps = append(steps, engine.NewStep("app/link/"+at.Runtime, engine.NoOp,
-			fmt.Sprintf("lien .bin/%s", LinkName(at.Runtime))))
+			fmt.Sprintf("lien %s/%s", model.LinkDir, name)))
 	}
 
 	// 2 bis. Le lanceur de Ruby. L'unité invoque « bundle exec puma » : sans ce
@@ -512,24 +540,23 @@ func (p *Provider) runDirStep(proj *model.Project, obs Observed) *engine.Step {
 
 // bundleLinkPath renvoie le chemin du lien vers le lanceur de Ruby.
 func bundleLinkPath(proj *model.Project) string {
-	return filepath.Join(proj.Spec.Layout.Root, ".bin", LinkBundle)
+	return filepath.Join(model.BinDir(proj.Spec.Layout.Root), LinkBundle)
 }
 
-// bundleLinkStep pose .bin/bundle à côté de .bin/ruby.
+// bundleLinkStep pose le lien bundle à côté du lien ruby.
 func (p *Provider) bundleLinkStep(proj *model.Project, obs Observed) *engine.Step {
-	link := bundleLinkPath(proj)
 	target := BundlePath(proj.Spec.Layout.Root, proj.Spec.App.Runtime)
 	if obs.BundleLinkTarget == target {
-		return engine.NewStep("app/link/"+LinkBundle, engine.NoOp, "lien .bin/"+LinkBundle)
+		return engine.NewStep("app/link/"+LinkBundle, engine.NoOp, "lien "+model.LinkDir+"/"+LinkBundle)
 	}
 	s := engine.NewStep("app/link/"+LinkBundle, engine.Create,
-		fmt.Sprintf("lien .bin/%s → %s", LinkBundle, target))
+		fmt.Sprintf("lien %s/%s → %s", model.LinkDir, LinkBundle, target))
 	if obs.BundleLinkTarget != "" {
 		s.Action = engine.Update
 		previous := obs.BundleLinkTarget
-		s.Compensate = func(context.Context) error { return replaceSymlink(link, previous) }
+		s.Compensate = func(context.Context) error { return p.setLink(proj, LinkBundle, previous) }
 	}
-	s.Apply = func(context.Context) error { return replaceSymlink(link, target) }
+	s.Apply = func(context.Context) error { return p.setLink(proj, LinkBundle, target) }
 	return s
 }
 
@@ -604,23 +631,6 @@ func describeEndpoint(e Endpoint) string {
 		return "socket " + e.Socket
 	}
 	return e.Address
-}
-
-// replaceSymlink remplace un lien de façon atomique.
-func replaceSymlink(link, target string) error {
-	if err := fs.EnsureDir(filepath.Dir(link), 0o750, fs.KeepOwner); err != nil {
-		return err
-	}
-	tmp := link + ".ogs-tmp"
-	_ = os.Remove(tmp)
-	if err := os.Symlink(target, tmp); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, link); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	return nil
 }
 
 // ExposedPorts cherche les applications qui écoutent au-delà de la boucle locale.

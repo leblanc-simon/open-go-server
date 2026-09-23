@@ -16,7 +16,7 @@ C'est la référence : toute contribution s'y adosse.
 | Lot | Contenu | État |
 |---|---|---|
 | **L0** | Socle : nommage, modèle, validation, YAML, écriture atomique, base d'état, keystore, audit, moteur (plan/apply/diff/saga/verrou), provider système, CLI | **livré** |
-| **L1** | Web + PHP : templates surchargeables, pools multi-version 7.4→8.5 avec numérotation, vhosts Apache et Nginx, types Prestashop et Symfony 3.4→8, clé de déploiement, lien `.bin/php`, `php switch` avec garde-fou de compatibilité, rotation des logs | **livré** |
+| **L1** | Web + PHP : templates surchargeables, pools multi-version 7.4→8.5 avec numérotation, vhosts Apache et Nginx, types Prestashop et Symfony 3.4→8, clé de déploiement, lien `~/.local/bin/php`, `php switch` avec garde-fou de compatibilité, rotation des logs | **livré** |
 | **L2** | Bases MySQL/MariaDB et PostgreSQL : privilèges nommés, échappement des motifs de `GRANT`, keystore, multi-cluster PostgreSQL, dump/restore, `secrets env` | **livré** |
 | **L3** | TLS : ACME embarqué (lego), HTTP-01 et DNS-01 OVH, wildcard partagé pour les préproductions, timer de renouvellement, suspension après échecs répétés | **livré** |
 | **L4** | RabbitMQ : vhosts, utilisateurs, exchanges, files, bindings, policies, préréglage Messenger, arguments immuables détectés | **livré** |
@@ -163,7 +163,7 @@ l'application — pas dans une table figée. Une bascule incompatible est refus�
 le motif et sa source ; `--force` l'impose et le consigne. L'ordre d'application est
 structurant : nouveau pool, puis réécriture du vhost sur le nouveau socket, puis
 seulement retrait de l'ancien pool. Les fichiers cron et les unités systemd ne sont
-jamais réécrits, puisqu'ils invoquent `.bin/php`.
+jamais réécrits, puisqu'ils invoquent `~/.local/bin/php`.
 
 ### Bases de données et secrets
 
@@ -382,8 +382,13 @@ est transmis par `SOCKET_PATH`, et si le code l'ignore, l'attente de disponibili
   Linux, son groupe, les bases, le vhost RabbitMQ, le pool PHP, le vhost web, les unités systemd et le cron.
 - **Home** en `/home/<host effectif>`, en 0711, ses répertoires en 0710 ; le code applicatif dans `www/`, le docroot dépendant du
   type d'application (`www` pour Prestashop, `www/public` pour Symfony 4+, `www/web` pour Symfony 3.4).
-- **`logs/` et `.bin/` appartiennent à root** : l'utilisateur y lit mais n'y crée rien. Cela interdit de
-  substituer un fichier de log par un lien symbolique et d'obtenir une écriture root arbitraire.
+- **`logs/` appartient à root** : l'utilisateur y lit mais n'y crée rien. Cela interdit de substituer un
+  fichier de log par un lien symbolique et d'obtenir une écriture root arbitraire. La protection a une
+  limite connue, en cours d'arbitrage : le home appartenant à l'utilisateur, il peut renommer `logs/`
+  lui-même.
+- **Liens gérés dans `~/.local/bin`** (D70) : interpréteur PHP et runtimes, au compte de l'utilisateur et
+  sur son PATH. Le lien est rétabli à chaque apply ; root l'écrit sans jamais suivre de lien, et un fichier
+  posé à sa place n'est remplacé que sous `--force`.
 - **Traverser sans énumérer** : le home est en 0711 et les répertoires du projet en 0710. Servir un fichier
   n'exige que la traversée du répertoire et la lecture du fichier ; pouvoir lister le contenu ne sert qu'à
   explorer, ce dont personne n'a besoin — pas même le serveur web. Le bit de groupe du home est
@@ -428,7 +433,7 @@ est transmis par `SOCKET_PATH`, et si le code l'ignore, l'attente de disponibili
 
 ## Documentation
 
-- [`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md) — la référence : 69 décisions d'architecture
+- [`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md) — la référence : 70 décisions d'architecture
   arbitrées, spécification par module, plan de tests, découpage en lots.
 - [`docs/INSTALLATION.md`](docs/INSTALLATION.md) — installation, premier démarrage, sauvegarde, mise à jour.
 - [`docs/HOOKS.md`](docs/HOOKS.md) — raccorder l'outil au reste de l'exploitation.

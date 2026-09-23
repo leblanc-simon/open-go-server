@@ -55,7 +55,7 @@ func TestBuildUsesLockAndInterpreterLink(t *testing.T) {
 	}
 	// L'interpréteur passe par le lien géré : une bascule de version PHP ne doit
 	// pas exiger de réécrire les crons.
-	if !strings.Contains(text, filepath.Join(".bin", "php")) {
+	if !strings.Contains(text, filepath.Join(".local", "bin", "php")) {
 		t.Errorf("le lien d'interpréteur doit être employé :\n%s", text)
 	}
 	if strings.Contains(text, "/usr/bin/php8") {

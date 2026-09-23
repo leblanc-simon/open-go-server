@@ -12,8 +12,8 @@ Les commits ne mentionnent jamais l'assistance d'un outil d'IA.
 
 ## La référence
 
-[`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md) fait autorité : 69 décisions d'architecture
-arbitrées (D1–D69, tableau §2), spécification par module, plan de tests, découpage en lots. **Consulter le
+[`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md) fait autorité : 70 décisions d'architecture
+arbitrées (D1–D70, tableau §2), spécification par module, plan de tests, découpage en lots. **Consulter le
 tableau des décisions avant de proposer une architecture** — la plupart des questions « pourquoi pas
 plutôt… ? » y sont déjà tranchées, avec leur raison. Toute décision nouvelle s'y ajoute.
 
@@ -204,6 +204,14 @@ Ils ont tous coûté un défaut réel ; les tests unitaires ne les voyaient pas.
   ne peut pas être ôté — Unix retient la première classe applicable sans repli, donc un 0701 refuserait la
   traversée à `www-data` *parce qu'il est membre du groupe*. Un seul endroit décide de ces modes —
   `model.defaultDirs` : un provider qui les imposerait aussi ferait osciller le plan entre deux valeurs.
+- **Un répertoire root dans le home ne protège rien contre l'utilisateur** : le home lui appartient (D51),
+  donc il **renomme** un sous-répertoire root sans privilège et en recrée un à lui. C'est pourquoi les liens
+  gérés vivent dans `~/.local/bin`, au compte du projet (D70) — un `.bin/` root ne garantissait rien — et
+  pourquoi la protection de `logs/` (D29) a une faille ouverte, à arbitrer (§20). Corollaire : **quand root
+  écrit dans un répertoire de l'utilisateur, il ne suit jamais un lien** — `fs.SymlinkAt`, `LinkStateAt`,
+  `RemoveLinkAt` ouvrent chaque composant par `openat` avec `O_NOFOLLOW` et opèrent relativement au
+  descripteur. Écrire par le nom, c'est laisser l'utilisateur choisir où root crée ou supprime ; c'était le
+  cas du lien `.ssh/authorized_keys` jusqu'à D70.
 - **`/var/lib/ogs` en 0751**, pas 0750 : le serveur web doit traverser jusqu'au répertoire du challenge ACME.
 - Le client ACME écrit sous **`<webroot>/.well-known/acme-challenge/`** : Apache aliase ce répertoire,
   nginx prend le webroot et y accole l'URI. Les deux directives n'ont pas la même sémantique.

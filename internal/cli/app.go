@@ -280,6 +280,7 @@ func (a *App) buildProviders() (*providers, error) {
 	tmpl := template.New(a.Paths.TemplatesDir())
 	sys := a.systemProvider()
 	sys.Paths = a.Paths
+	sys.Force = a.Force
 	php := &php.Provider{
 		Paths:     a.Paths,
 		Exec:      a.Exec,
@@ -293,7 +294,8 @@ func (a *App) buildProviders() (*providers, error) {
 	}
 	sys.WebReload = "web:" + eng.Name()
 	appProv := &appprov.Provider{Paths: a.Paths, Exec: a.Exec, Templates: tmpl, Store: a.Store,
-		Installer: &appprov.Installer{Exec: a.Exec}, Force: a.Force}
+		Installer: &appprov.Installer{Exec: a.Exec}, Force: a.Force,
+		Owner: func(proj *model.Project) (int, int, error) { return sys.ResolveOwner(proj, "") }}
 	amqpProv := a.amqpProvider()
 	amqpPort := amqpProv.Port
 	dbProv := &db.Provider{Paths: a.Paths, Exec: a.Exec, Store: a.Store, Keys: a.Keys, AMQPPort: amqpPort}

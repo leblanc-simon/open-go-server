@@ -88,7 +88,7 @@ func TestPlanCreatesGroupUserAndDirs(t *testing.T) {
 		t.Errorf("le compte doit être créé avec le shell déclaré : %v", rec.Calls())
 	}
 	// L'arborescence est réellement créée.
-	for _, dir := range []string{"", "www", "var", "logs", ".bin", ".ssh"} {
+	for _, dir := range []string{"", "www", "var", "logs", ".local", ".local/bin", ".ssh"} {
 		path := filepath.Join(p.Spec.Layout.Root, dir)
 		info, err := os.Stat(path)
 		if err != nil {
@@ -109,11 +109,12 @@ func TestDirectoryModes(t *testing.T) {
 		"": 0o711,
 		// Les répertoires ne donnent au groupe qu'un droit de passage : servir un
 		// fichier n'exige pas de pouvoir lister ce qui l'entoure.
-		"www":  0o710,
-		"var":  0o700, // hors de portée de www-data
-		"logs": 0o710,
-		".bin": 0o710,
-		".ssh": 0o700,
+		"www":        0o710,
+		"var":        0o700, // hors de portée de www-data
+		"logs":       0o710,
+		".local":     0o700,
+		".local/bin": 0o700,
+		".ssh":       0o700,
 	}
 	for dir, want := range cases {
 		path := filepath.Join(p.Spec.Layout.Root, dir)
@@ -493,10 +494,10 @@ func TestBinPHPLink(t *testing.T) {
 	prov := &Provider{Paths: config.NewPaths(prefix), Exec: exec.NewRecorder(), Identity: NewFakeIdentity()}
 	apply(t, prov, p)
 
-	link := filepath.Join(p.Spec.Layout.Root, ".bin", "php")
+	link := filepath.Join(p.Spec.Layout.Root, ".local", "bin", "php")
 	target, err := os.Readlink(link)
 	if err != nil {
-		t.Fatalf("lien .bin/php absent : %v", err)
+		t.Fatalf("lien .local/bin/php absent : %v", err)
 	}
 	if want := filepath.Join(prefix, "usr", "bin", "php8.3"); target != want {
 		t.Errorf("cible du lien %q, attendue %q", target, want)
@@ -669,7 +670,7 @@ func etatConforme(t *testing.T, p *model.Project, uid, gid int) Observed {
 
 func TestPlanCorrigeUneDeriveDeProprietaire(t *testing.T) {
 	// Un « chown -R shopfr:shopfr /home/shop.fr » laisse les modes intacts : seul
-	// le propriétaire change. Sans comparaison, logs/ et .bin/ restent « conformes »
+	// le propriétaire change. Sans comparaison, logs/ reste « conforme »
 	// à jamais alors que l'utilisateur du projet peut désormais y substituer un
 	// lien symbolique au journal que le maître Apache ouvre en root (§7.1.2).
 	p, prov, _, _ := fixture(t)
@@ -687,7 +688,7 @@ func TestPlanCorrigeUneDeriveDeProprietaire(t *testing.T) {
 			corriges[s.Resource] = s.Summary
 		}
 	}
-	for _, dir := range []string{"logs", ".bin"} {
+	for _, dir := range []string{"logs"} {
 		res := "system/dir/" + filepath.Join(p.Spec.Layout.Root, dir)
 		resume, ok := corriges[res]
 		if !ok {
@@ -907,5 +908,103 @@ func TestLaCompensationNeSuitPasUnLien(t *testing.T) {
 	}
 	if got := info.Mode().Perm(); got != 0o755 {
 		t.Errorf("la cible du lien est passée en %04o : la compensation a suivi le lien", got)
+	}
+}
+
+func TestLAncienBinEstRetireApresLaMigration(t *testing.T) {
+	p, prov, _, _ := fixture(t)
+	legacy := filepath.Join(p.Spec.Layout.Root, ".bin")
+	if err := os.MkdirAll(legacy, 0o710); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("/usr/bin/php8.3", filepath.Join(legacy, "php")); err != nil {
+		t.Fatal(err)
+	}
+	s := prov.PlanLegacyBin(p)
+	if s == nil || s.Action != engine.Delete {
+		t.Fatalf("retrait de l'ancien .bin attendu, obtenu %v", s)
+	}
+	// Les unités réécrites doivent avoir été relues avant que le lien disparaisse.
+	if !s.FlushReloads || s.Critical {
+		t.Error("l'étape doit vider les rechargements en attente et rester non critique")
+	}
+	if err := s.Apply(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(legacy); !os.IsNotExist(err) {
+		t.Error("l'ancien .bin doit disparaître")
+	}
+	if prov.PlanLegacyBin(p) != nil {
+		t.Error("plus rien à retirer une fois la migration faite")
+	}
+}
+
+func TestLAncienBinGardeCeQuOgsNAPasPose(t *testing.T) {
+	p, prov, _, _ := fixture(t)
+	legacy := filepath.Join(p.Spec.Layout.Root, ".bin")
+	if err := os.MkdirAll(legacy, 0o710); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("/usr/bin/php8.3", filepath.Join(legacy, "php")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(legacy, "composer"), []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	err := prov.PlanLegacyBin(p).Apply(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "composer") {
+		t.Fatalf("le répertoire doit rester, en nommant ce qu'il contient : %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(legacy, "php")); !os.IsNotExist(err) {
+		t.Error("le lien géré doit être retiré même quand le répertoire reste")
+	}
+}
+
+func TestLeLienPhpRefuseUnFichierDeLUtilisateur(t *testing.T) {
+	// ~/.local/bin appartient à l'utilisateur : un fichier qu'il y a posé sous le
+	// nom « php » porte son travail, et n'est remplacé que sous --force.
+	p, prov, _, _ := fixture(t)
+	p.Spec.PHP.Pools = []model.Pool{{Name: model.MainPoolName, Version: "8.3"}}
+	dir := filepath.Join(p.Spec.Layout.Root, ".local", "bin")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "php"), []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s := prov.binStep(p)
+	if s.Critical || !strings.Contains(s.Summary, "un fichier occupe déjà ce nom") {
+		t.Fatalf("refus non critique attendu, obtenu %q (critique=%v)", s.Summary, s.Critical)
+	}
+	if err := s.Apply(context.Background()); err == nil || !strings.Contains(err.Error(), "--force") {
+		t.Errorf("le refus doit renvoyer à --force, obtenu %v", err)
+	}
+	prov.Force = true
+	if err := prov.binStep(p).Apply(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if target, err := os.Readlink(filepath.Join(dir, "php")); err != nil || !strings.HasSuffix(target, "php8.3") {
+		t.Errorf("--force doit poser le lien géré, obtenu %q (%v)", target, err)
+	}
+}
+
+func TestLeLienPhpNeSuitPasUnRepertoireSubstitue(t *testing.T) {
+	// L'utilisateur remplace ~/.local par un lien : root ne doit pas écrire là où
+	// il l'envoie.
+	p, prov, _, _ := fixture(t)
+	p.Spec.PHP.Pools = []model.Pool{{Name: model.MainPoolName, Version: "8.3"}}
+	ailleurs := t.TempDir()
+	if err := os.MkdirAll(p.Spec.Layout.Root, 0o711); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(ailleurs, filepath.Join(p.Spec.Layout.Root, ".local")); err != nil {
+		t.Fatal(err)
+	}
+	s := prov.binStep(p)
+	if err := s.Apply(context.Background()); err == nil {
+		t.Fatal("un répertoire substitué par un lien doit être refusé")
+	}
+	if entries, _ := os.ReadDir(ailleurs); len(entries) != 0 {
+		t.Errorf("root a écrit dans le répertoire désigné par l'utilisateur : %v", entries)
 	}
 }

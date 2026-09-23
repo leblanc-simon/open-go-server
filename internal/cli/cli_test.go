@@ -231,7 +231,8 @@ func TestFullLifecycle(t *testing.T) {
 		"www/public": 0o710,
 		"var":        0o700,
 		"logs":       0o710,
-		".bin":       0o710,
+		".local":     0o700,
+		".local/bin": 0o700,
 		".ssh":       0o700,
 	}
 	for rel, want := range modes {
@@ -590,12 +591,12 @@ func TestPHPSwitchRewritesVHostAndRemovesOldPoolLast(t *testing.T) {
 		t.Error("l'ancien pool doit avoir été supprimé")
 	}
 	// Le lien d'interpréteur suit la version.
-	target, err := os.Readlink(h.path("home", "shop.fr", ".bin", "php"))
+	target, err := os.Readlink(h.path("home", "shop.fr", ".local", "bin", "php"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !strings.HasSuffix(target, "php8.3") {
-		t.Errorf("lien .bin/php : %s", target)
+		t.Errorf("lien .local/bin/php : %s", target)
 	}
 }
 
@@ -1288,7 +1289,7 @@ func TestCronAndServiceLifecycle(t *testing.T) {
 	for _, want := range []string{
 		"0 3 * * * shopfr /usr/bin/flock -n",
 		filepath.Join("run", "ogs", "shopfr", "scheduler.lock"),
-		filepath.Join(".bin", "php"),
+		filepath.Join(".local", "bin", "php"),
 		filepath.Join("www", "bin", "console"),
 		"cron-scheduler.log 2>&1",
 		`MAILTO=""`,
@@ -2018,7 +2019,7 @@ func TestNodeApplicationFullCycle(t *testing.T) {
 	h.mustRun("apply", "appfr", "--yes")
 	unit := h.read(t, filepath.Join("etc", "systemd", "system", "ogs-appfr-app@.service"))
 	for _, want := range []string{
-		"ExecStart=", filepath.Join(".bin", "node"), "server.js",
+		"ExecStart=", filepath.Join(".local", "bin", "node"), "server.js",
 		"SOCKET_PATH=", "UMask=0007", "NoNewPrivileges=true",
 	} {
 		if !strings.Contains(unit, want) {
@@ -2034,7 +2035,7 @@ func TestNodeApplicationFullCycle(t *testing.T) {
 		t.Errorf("le challenge ACME doit échapper au proxy :\n%s", vhost)
 	}
 	// Le lien est en place et le runtime listé.
-	target, err := os.Readlink(h.path("home", "app.fr", ".bin", "node"))
+	target, err := os.Readlink(h.path("home", "app.fr", ".local", "bin", "node"))
 	if err != nil {
 		t.Fatalf("lien absent : %v", err)
 	}
@@ -2061,8 +2062,8 @@ func TestGoApplicationUsesPort(t *testing.T) {
 	if strings.Contains(unit, "0.0.0.0") {
 		t.Error("aucune écoute sur toutes les interfaces ne doit être suggérée")
 	}
-	if !strings.Contains(unit, filepath.Join(".bin", "app")) {
-		t.Errorf("le binaire doit passer par .bin/app :\n%s", unit)
+	if !strings.Contains(unit, filepath.Join(".local", "bin", "app")) {
+		t.Errorf("le binaire doit passer par .local/bin/app :\n%s", unit)
 	}
 }
 
@@ -2629,5 +2630,64 @@ func TestApplyRefuseUneUniteModifieeALaMain(t *testing.T) {
 	if baks, _ := filepath.Glob(h.path("var", "lib", "ogs", "backups",
 		"ogs-shopfr-veille@.service.ogs-bak-*")); len(baks) != 1 {
 		t.Fatalf("une sauvegarde attendue, %d trouvée(s)", len(baks))
+	}
+}
+
+func TestMigrationDesLiensVersLocalBin(t *testing.T) {
+	// Un projet déclaré avant D70 : son fichier porte .bin/ en root, son lien php
+	// y vit, et ses tâches le désignent. Un apply doit tout passer à
+	// ~/.local/bin, puis retirer l'ancien répertoire.
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("project", "create", "shop.fr", "--kind", "php-symfony", "--app-version", "6.4")
+	h.mustRun("cron", "add", "shopfr", "purge", "--schedule", "0 3 * * *", "--command", "bin/console app:purge")
+	h.mustRun("apply", "shopfr", "--yes")
+
+	decl := h.path("etc", "ogs", "projects", "shopfr.yaml")
+	data, err := os.ReadFile(decl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ancien := strings.Replace(string(data), "path: .ssh", "path: .bin\n        mode: \"0710\"\n        owner: root\n      - path: .ssh", 1)
+	if ancien == string(data) {
+		t.Fatalf("déclaration inattendue, impossible d'y réintroduire .bin :\n%s", data)
+	}
+	if err := os.WriteFile(decl, []byte(ancien), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	home := h.path("home", "shop.fr")
+	if err := os.RemoveAll(filepath.Join(home, ".local")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(home, ".bin"), 0o710); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("/usr/bin/php8.3", filepath.Join(home, ".bin", "php")); err != nil {
+		t.Fatal(err)
+	}
+
+	out := h.mustRun("apply", "shopfr", "--yes")
+	if !strings.Contains(out, "retrait de l'ancien") {
+		t.Errorf("l'apply doit annoncer le retrait de l'ancien .bin :\n%s", out)
+	}
+	if _, err := os.Lstat(filepath.Join(home, ".bin")); !os.IsNotExist(err) {
+		t.Error("l'ancien .bin doit avoir disparu")
+	}
+	if target, err := os.Readlink(filepath.Join(home, ".local", "bin", "php")); err != nil || target == "" {
+		t.Errorf("le lien php doit vivre dans .local/bin : %q (%v)", target, err)
+	}
+	cron := h.read(t, "etc/cron.d/ogs-shopfr")
+	if strings.Contains(cron, "/.bin/") || !strings.Contains(cron, "/.local/bin/php") {
+		t.Errorf("la tâche doit désigner le nouveau lien :\n%s", cron)
+	}
+	// « apply » n'écrit pas la déclaration : l'ancienne entrée y reste jusqu'au
+	// prochain enregistrement, mais la normalisation l'écarte à chaque chargement,
+	// et rien ne recrée .bin.
+	h.simulateSystemEffects("shopfr", "shop.fr", 1004)
+	if out := h.mustRun("apply", "shopfr", "--yes"); !strings.Contains(out, "aucun changement") {
+		t.Errorf("la migration faite, un apply rejoué doit être vide :\n%s", out)
+	}
+	if _, err := os.Lstat(filepath.Join(home, ".bin")); !os.IsNotExist(err) {
+		t.Error("l'ancien .bin ne doit pas être recréé")
 	}
 }

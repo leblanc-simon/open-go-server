@@ -241,6 +241,13 @@ func (a *App) buildPlan(ctx context.Context, provs *providers, p *model.Project)
 		}
 		plan.Add(sudoStep)
 	}
+
+	// L'ancien répertoire des liens (D70) part en tout dernier : les crons et les
+	// unités qui le désignaient viennent d'être réécrits, et l'étape attend que
+	// systemd les ait relus.
+	if s := provs.System.PlanLegacyBin(p); s != nil {
+		plan.Add(s)
+	}
 	return plan, nil
 }
 

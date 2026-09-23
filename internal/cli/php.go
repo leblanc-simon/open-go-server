@@ -82,8 +82,8 @@ func newPHPSwitchCommand(app *App) *cobra.Command {
 		Use:   "switch <id> <version>",
 		Short: "Changer la version PHP d'un projet",
 		Long: "Modifie la version du pool, puis applique : nouveau pool, vhost réécrit sur le\n" +
-			"nouveau socket, lien .bin/php mis à jour, ancien pool retiré ensuite. Les fichiers\n" +
-			"cron et les unités systemd ne sont pas réécrits : ils invoquent .bin/php.\n\n" +
+			"nouveau socket, lien ~/.local/bin/php mis à jour, ancien pool retiré ensuite. Les\n" +
+			"fichiers cron et les unités systemd ne sont pas réécrits : ils invoquent ce lien.\n\n" +
 			"La compatibilité est vérifiée d'après la contrainte PHP déclarée par l'application\n" +
 			"dans son composer.json. Une bascule incompatible est refusée sans --force.",
 		Args: cobra.ExactArgs(2),

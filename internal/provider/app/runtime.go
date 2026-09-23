@@ -55,14 +55,14 @@ func BinaryPath(root, runtime, version string) string {
 		return filepath.Join(root, "www", ".venv", "bin", "python")
 	case RuntimeGo:
 		// Aucun gestionnaire : le déploiement dépose un binaire, et le lien
-		// .bin/app permet de le remplacer atomiquement.
+		// « app » du répertoire des liens permet de le remplacer atomiquement.
 		return filepath.Join(root, "www", "app")
 	}
 	return ""
 }
 
 // LinkBundle est le nom du lien vers le lanceur de Ruby. Une unité n'invoque que
-// des liens de .bin/ (D30) : le CDC prévoit déjà ce pluriel pour Node (npm, npx).
+// des liens gérés (D30) : le CDC prévoit déjà ce pluriel pour Node (npm, npx).
 const LinkBundle = "bundle"
 
 // BundlePath renvoie le chemin de « bundle » d'une version de Ruby installée.
@@ -72,7 +72,7 @@ func BundlePath(root, version string) string {
 	return filepath.Join(filepath.Dir(BinaryPath(root, RuntimeRuby, version)), LinkBundle)
 }
 
-// LinkName renvoie le nom du lien dans .bin pour un runtime.
+// LinkName renvoie le nom du lien géré d'un runtime.
 func LinkName(runtime string) string {
 	if runtime == RuntimeGo {
 		return "app"
@@ -82,7 +82,7 @@ func LinkName(runtime string) string {
 
 // LinkPath renvoie le chemin du lien géré.
 func LinkPath(root, runtime string) string {
-	return filepath.Join(root, ".bin", LinkName(runtime))
+	return filepath.Join(model.BinDir(root), LinkName(runtime))
 }
 
 // Installed indique si la version demandée est présente.
@@ -104,7 +104,7 @@ func (i *Installer) Install(ctx context.Context, proj *model.Project, runtime, v
 	switch runtime {
 	case RuntimeGo:
 		return fmt.Errorf("le runtime go n'a pas de gestionnaire de versions : " +
-			"le déploiement dépose un binaire, et « .bin/app » pointe dessus")
+			"le déploiement dépose un binaire, et « ~/.local/bin/app » pointe dessus")
 	case RuntimeNode:
 		script := fmt.Sprintf(
 			`export NVM_DIR=%q; [ -s "$NVM_DIR/nvm.sh" ] || `+

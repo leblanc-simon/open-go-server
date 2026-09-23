@@ -33,6 +33,11 @@ func fixture(t *testing.T, kind model.AppKind) (*Provider, *model.Project) {
 	if err := proj.Normalize(filepath.Join(prefix, "home"), "preprod-pp.net"); err != nil {
 		t.Fatal(err)
 	}
+	// Le home existe avant tout plan applicatif : c'est le provider système qui le
+	// crée, et les liens gérés refusent de fabriquer la racine d'un projet.
+	if err := os.MkdirAll(proj.Spec.Layout.Root, 0o711); err != nil {
+		t.Fatal(err)
+	}
 	rec := exec.NewRecorder()
 	prov := &Provider{
 		Paths: paths, Exec: rec, Templates: template.New(paths.TemplatesDir()),
@@ -183,7 +188,7 @@ func TestBuildUnitPerRuntime(t *testing.T) {
 			t.Errorf("%s : le chemin du socket doit être transmis :\n%s", kind, text)
 		}
 		// Le lien géré est employé, jamais un binaire versionné.
-		if !strings.Contains(text, filepath.Join(".bin", cas.lien)) {
+		if !strings.Contains(text, filepath.Join(".local", "bin", cas.lien)) {
 			t.Errorf("%s : le lien géré doit être employé :\n%s", kind, text)
 		}
 		if strings.Contains(text, ".rbenv") || strings.Contains(text, ".nvm") {
@@ -201,8 +206,8 @@ func TestBuildGoUsesManagedBinaryLink(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := string(content)
-	if !strings.Contains(text, filepath.Join(".bin", "app")) {
-		t.Errorf("le binaire doit passer par .bin/app :\n%s", text)
+	if !strings.Contains(text, filepath.Join(".local", "bin", "app")) {
+		t.Errorf("le binaire doit passer par .local/bin/app :\n%s", text)
 	}
 	if !strings.Contains(text, "PORT=21001") || !strings.Contains(text, "HOST=127.0.0.1") {
 		t.Errorf("le port doit être transmis :\n%s", text)
@@ -313,7 +318,7 @@ func TestPlanIsIdempotent(t *testing.T) {
 func TestGoRuntimeHasNoVersionManager(t *testing.T) {
 	prov, proj := fixture(t, model.KindGo)
 	err := prov.Installer.Install(context.Background(), proj, RuntimeGo, "1.23")
-	if err == nil || !strings.Contains(err.Error(), ".bin/app") {
+	if err == nil || !strings.Contains(err.Error(), ".local/bin/app") {
 		t.Errorf("le message doit expliquer le fonctionnement : %v", err)
 	}
 }
@@ -463,7 +468,7 @@ func TestEntrypointRubyDesigneLaConfigurationPuma(t *testing.T) {
 }
 
 func TestPlanRubyPoseLeLienDuLanceur(t *testing.T) {
-	// L'unité n'invoque que des liens de .bin/ (D30) : le lanceur en exige un
+	// L'unité n'invoque que des liens gérés (D30) : le lanceur en exige un
 	// second, à côté de celui de l'interpréteur.
 	prov, proj := fixture(t, model.KindRuby)
 	proj.Spec.App.Runtime = "3.3.6"
@@ -483,7 +488,7 @@ func TestPlanRubyPoseLeLienDuLanceur(t *testing.T) {
 	if _, err := engine.Execute(ctx, plan, engine.Options{}); err != nil {
 		t.Fatal(err)
 	}
-	cible, err := os.Readlink(filepath.Join(proj.Spec.Layout.Root, ".bin", LinkBundle))
+	cible, err := os.Readlink(filepath.Join(proj.Spec.Layout.Root, ".local", "bin", LinkBundle))
 	if err != nil {
 		t.Fatalf("lien du lanceur absent : %v", err)
 	}

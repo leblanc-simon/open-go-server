@@ -124,7 +124,7 @@ func (p *Provider) unitContext(proj *model.Project, svc model.Service) (map[stri
 		return fallback
 	}
 	transport := params("transport", svc.Name)
-	interpreter := filepath.Join(proj.Spec.Layout.Root, ".bin", "php")
+	interpreter := filepath.Join(model.BinDir(proj.Spec.Layout.Root), "php")
 	env := map[string]string{}
 	at, err := proj.AppType()
 	if err != nil {

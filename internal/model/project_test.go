@@ -45,3 +45,36 @@ func TestNormalizeRefusesRelativeShell(t *testing.T) {
 		t.Errorf("le message doit nommer le champ fautif : %v", err)
 	}
 }
+
+func TestLAncienneEntreeBinEstRetireeALaNormalisation(t *testing.T) {
+	// Les déclarations antérieures à D70 portent .bin/ en root : la normalisation
+	// l'en retire, et déclare à la place le répertoire des liens de l'utilisateur.
+	p := New("shop.fr", naming.EnvProd, KindStatic)
+	p.Spec.Layout.Dirs = []Dir{{Path: ".bin", Mode: "0710", Owner: "root"}, {Path: "outils", Mode: "0700"}}
+	if err := p.Normalize("/home", "preprod-pp.net"); err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]Dir{}
+	for _, d := range p.Spec.Layout.Dirs {
+		seen[d.Path] = d
+	}
+	if _, ok := seen[".bin"]; ok {
+		t.Error("l'ancienne entrée .bin doit disparaître")
+	}
+	if d, ok := seen[LinkDir]; !ok || d.Owner != "" || d.Mode != "0700" {
+		t.Errorf("%s attendu au compte du projet en 0700, obtenu %+v", LinkDir, d)
+	}
+	if _, ok := seen["outils"]; !ok {
+		t.Error("une entrée de l'exploitant doit être conservée")
+	}
+
+	// Un .bin/ déclaré autrement l'a été par l'exploitant : il reste.
+	q := New("blog.fr", naming.EnvProd, KindStatic)
+	q.Spec.Layout.Dirs = []Dir{{Path: ".bin", Mode: "0750"}}
+	if err := q.Normalize("/home", "preprod-pp.net"); err != nil {
+		t.Fatal(err)
+	}
+	if q.Spec.Layout.Dirs[0].Path != ".bin" {
+		t.Error("un .bin/ déclaré par l'exploitant ne doit pas être retiré")
+	}
+}

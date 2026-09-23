@@ -146,7 +146,7 @@ fi
 
 # Le PHP en ligne de commande, sous l'identité du projet : c'est lui qui lit
 # /etc/php, et c'est pour lui que ce répertoire reste ouvert.
-ini=$(su -s /bin/bash shopfr -c "/home/shop.fr/.bin/php -r 'echo php_ini_loaded_file();'" 2>&1)
+ini=$(su -s /bin/bash shopfr -c "/home/shop.fr/.local/bin/php -r 'echo php_ini_loaded_file();'" 2>&1)
 echo "php.ini vu par le cron : ${ini:-aucun}"
 if [ -z "$ini" ] || [[ "$ini" == *"rror"* ]]; then
     echo "ÉCHEC : le PHP du projet ne lit plus son php.ini"

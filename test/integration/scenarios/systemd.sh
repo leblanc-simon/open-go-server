@@ -207,6 +207,51 @@ verrou=$(grep -o '\-\-\?[a-z]* [^ ]*ogs-shopfr[^ ]*\.lock' /etc/cron.d/ogs-shopf
 echo "verrou : ${verrou:-présent}"
 
 echo
+echo "--- les liens gérés vivent dans ~/.local/bin, au compte du projet (D70) ---"
+lien=/home/shop.fr/.local/bin/php
+proprietaires="$(stat -c %U /home/shop.fr/.local) $(stat -c %U /home/shop.fr/.local/bin) $(stat -c %U "$lien")"
+echo "  .local, .local/bin, php : $proprietaires"
+if [ "$proprietaires" != "shopfr shopfr shopfr" ]; then
+    echo "ÉCHEC : le répertoire des liens et le lien doivent appartenir au projet"
+    exit 1
+fi
+if [ "$(su -s /bin/bash shopfr -c "$lien -r 'echo PHP_MAJOR_VERSION;'" 2>&1)" = "" ]; then
+    echo "ÉCHEC : l'utilisateur du projet n'exécute pas son interpréteur"
+    exit 1
+fi
+# ~/.local appartient à l'utilisateur : il peut le remplacer par un lien vers un
+# répertoire de son choix. Root ne doit pas y écrire.
+su -s /bin/bash shopfr -c 'mv ~/.local ~/.local.vrai && mkdir -p /tmp/piege && ln -s /tmp/piege ~/.local'
+ogs apply shopfr --yes >/tmp/apply-piege.log 2>&1
+if [ -n "$(ls -A /tmp/piege)" ]; then
+    echo "ÉCHEC : root a écrit dans le répertoire désigné par l'utilisateur : $(ls -A /tmp/piege)"
+    exit 1
+fi
+grep -q "répertoire" /tmp/apply-piege.log || { cat /tmp/apply-piege.log; echo "ÉCHEC : le détour n'est pas signalé"; exit 1; }
+echo "  ~/.local remplacé par un lien : refusé, rien n'a été écrit ailleurs"
+su -s /bin/bash shopfr -c 'rm ~/.local && mv ~/.local.vrai ~/.local'
+
+echo
+echo "--- migration : l'ancien .bin/ disparaît, les services restent debout ---"
+# Un projet d'avant D70 : .bin/ en root, et sa déclaration dans le fichier.
+install -d -o root -g shopfr -m 0710 /home/shop.fr/.bin
+ln -s "$(readlink "$lien")" /home/shop.fr/.bin/php
+sed -i 's#^\(\s*\)- path: \.ssh#\1- path: .bin\n\1  mode: "0710"\n\1  owner: root\n\1- path: .ssh#' /etc/ogs/projects/shopfr.yaml
+grep -q "path: .bin" /etc/ogs/projects/shopfr.yaml || { echo "ÉCHEC : déclaration ancienne non reconstituée"; exit 1; }
+ogs apply shopfr --yes 2>&1 | grep -i "ancien" | head -2
+if [ -e /home/shop.fr/.bin ]; then
+    echo "ÉCHEC : l'ancien .bin/ est resté"
+    exit 1
+fi
+# La mise à l'échelle précédente a ramené le service à une instance.
+etat=$(systemctl is-active "ogs-shopfr-veille@1.service" 2>&1)
+if [ "$etat" != "active" ]; then
+    echo "ÉCHEC : l'instance 1 est $etat après la migration"
+    exit 1
+fi
+echo "  .bin/ retiré, instance toujours active"
+
+echo
 echo "--- suppression : plus rien ne subsiste dans systemd ---"
 ogs project delete shopfr --yes >/dev/null 2>&1
 systemctl daemon-reload
