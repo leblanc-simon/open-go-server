@@ -316,6 +316,71 @@ Les unités sont durcies : `/home` y est en lecture seule, hormis `www/var` du p
 d'exécution `/run/ogs/<id>`. Un worker qui doit écrire ailleurs échouera en « Read-only file system » —
 écrire sous `www/var`.
 
+## Migrer depuis un ancien serveur
+
+Deux situations, deux chemins :
+
+- les sites **restent sur la machine** et `ogs` doit les prendre en main : `ogs import scan`, puis
+  `ogs import adopt <id>`. Un projet adopté garde ses noms réels (compte, bases, pool) ;
+- les sites **changent de machine** : c'est une migration. Elle est décrite par un manifeste,
+  rempli d'après le modèle [`migration.yaml`](migration.yaml), et exécutée par [`migrer.sh`](migrer.sh),
+  sur la **nouvelle** machine et en root. La nouvelle machine tire fichiers et bases de l'ancienne par ssh : l'ancienne n'a besoin
+  d'aucun accès à la nouvelle.
+
+### Le manifeste
+
+Copier le modèle **hors du dépôt** avant de le remplir — rempli, il porte les adresses des serveurs et les
+noms des clients : `migrer.sh` exige donc son chemin (`-m`). Un bloc par site : où sont son code et ses données sur l'ancien serveur, ses bases, ses files RabbitMQ, ses
+tâches et workers à arrêter, les fichiers de configuration à réécrire, la mise en maintenance, les
+vérifications à rejouer — et sa **déclaration ogs complète**, déposée telle quelle dans
+`/etc/ogs/projects/`. Les consignes de remplissage sont en tête du fichier.
+
+Trois règles :
+
+- **aucun secret** dans le manifeste. Les bases de l'ancien serveur sont lues en root par son socket local ;
+  celles du nouveau sont créées par `ogs`, qui en génère les mots de passe. Une valeur `@ogs:DATABASE_URL`
+  (ou `@ogs:DATABASE_URL#password`, `#name`, `#user`…) est remplacée par ce que rend `ogs secrets env` ;
+- une valeur inconnue s'écrit `~ # À VÉRIFIER` : le script refuse le projet tant qu'il en reste une ;
+- `ogs import scan -o yaml`, lancé sur l'**ancien** serveur (le binaire est statique), inventorie vhosts,
+  pools, comptes, bases et crons sans rien modifier : un bon point de départ pour remplir chaque bloc.
+
+### Le déroulé
+
+```sh
+M=/root/migration.yaml                     # la copie remplie du modèle
+docs/migrer.sh -m $M controle vague:1                 # manifeste complet et cohérent
+docs/migrer.sh -m $M prealables tous                  # outils, doctor, accès ssh, bases, TTL
+docs/migrer.sh -m $M --executer declarer vague:1      # compte, pool, bases vides, vhost
+docs/migrer.sh -m $M --executer synchroniser vague:1  # fichiers, bases, configuration — répétable
+docs/migrer.sh -m $M verifier vague:1                 # vérifications, forcées vers la nouvelle IP
+docs/migrer.sh -m $M --executer basculer vague:1      # dans la fenêtre de maintenance
+docs/migrer.sh -m $M etat
+```
+
+**Sans `--executer`, rien n'est modifié** : chaque commande qui changerait quelque chose est affichée, et
+seules les lectures sont faites. Les sites sont groupés par **vague**, une vague partageant une fenêtre de
+maintenance ; commencer par une vague d'un petit site sans enjeu.
+
+- **Déclarer** dépose la déclaration **crons et services désactivés** : une tâche ne doit jamais tourner sur
+  les deux serveurs à la fois. Le certificat échoue tant que le DNS désigne l'ancien serveur — code 6,
+  attendu. Une zone chez OVH peut l'obtenir d'avance par `challenge: dns-01`.
+- **Synchroniser** ne coupe rien : l'ancien serveur continue de servir. La rejouer la veille de la bascule
+  réduit la dernière copie à presque rien.
+- **Basculer** met l'ancien site en maintenance, attend que ses files RabbitMQ soient vides, arrête ses
+  tâches et workers, fait la dernière copie, puis vérifie le nouveau site **avant** de toucher au DNS : en
+  cas d'échec, l'ancien serveur est rétabli et les visiteurs n'ont rien vu. Le script attend ensuite que le
+  DNS désigne la nouvelle machine — le changement d'enregistrement reste manuel —, réactive crons et
+  services, et `ogs apply` émet le certificat.
+- **Retour** (`migrer.sh -m $M --executer retour <id>`) désactive le projet sur la nouvelle machine et rétablit
+  tâches, workers et site sur l'ancienne. Les données écrites sur la nouvelle machine depuis la bascule ne
+  sont **pas** reportées.
+
+Ce que le script ne fait pas : modifier le DNS, corriger les chemins absolus écrits en dur dans le code ou
+la base (`chemins_en_dur`, listés par `controle`), et publier la nouvelle clé DKIM — `ogs` en génère une
+neuve, à publier par `ogs mail dkim records <id>` **avant** la bascule, sous un sélecteur différent de
+l'ancien. Abaisser le TTL des zones 48 h à l'avance, et prévenir les tiers qui filtrent sur l'adresse de
+l'ancien serveur (`dependances_externes`).
+
 ## Autres opérations courantes
 
 ```sh

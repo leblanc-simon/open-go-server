@@ -1,0 +1,377 @@
+# =============================================================================
+# Manifeste de migration : ancien serveur → serveur géré par ogs
+# =============================================================================
+#
+# Ce fichier décrit TOUTE la migration, site par site. Il a deux lecteurs :
+#
+#   1. le projet Claude qui connaît l'ancien serveur, qui le REMPLIT ;
+#   2. le script de migration, qui le LIT et enchaîne les phases décrites en bas
+#      de ce fichier (§ Déroulé) — chaque phase est rejouable sans dommage.
+#
+# Ce fichier est un MODÈLE, suivi par git : le copier hors du dépôt avant de le
+# remplir (par exemple /root/migration.yaml sur la cible) — rempli, il porte les
+# adresses des serveurs et les noms des clients.
+#
+# -----------------------------------------------------------------------------
+# Consignes pour qui remplit ce fichier
+# -----------------------------------------------------------------------------
+#
+# - AUCUN SECRET ICI : ni mot de passe, ni clé, ni jeton. Les bases de la source
+#   sont lues par `ssh root@source mysqldump` (socket local, authentification
+#   unix_socket / peer) ; les bases de la cible sont créées par ogs, qui génère
+#   et scelle leurs mots de passe (`ogs secrets env <id>` les rend). Là où un
+#   secret est nécessaire, écrire où il se trouve, jamais sa valeur.
+# - Une valeur inconnue s'écrit `~` avec un commentaire `# À VÉRIFIER : …`.
+#   Le script refuse de traiter un projet qui contient encore « À VÉRIFIER ».
+# - Le bloc `ogs:` de chaque projet est une déclaration ogs COMPLÈTE, déposée
+#   telle quelle dans /etc/ogs/projects/<id>.yaml. Syntaxe : docs/UTILISATION.md
+#   (§ 5, « Un projet complet »). Ne déclarer que ce qui diffère des défauts :
+#   utilisateur, home (/home/<host>), docroot, vhost et certificat sont déduits.
+# - L'identifiant ogs est dérivé du host : `shop.fr` → `shopfr` (points et tirets
+#   ôtés, ≤ 28 caractères). Il nomme utilisateur, groupe, base, pool, unités.
+# - Les tâches cron et les services sont déclarés NORMALEMENT dans `ogs:` : le
+#   script les pose désactivés (`enabled: false`) jusqu'à la bascule, pour
+#   qu'aucune tâche ne tourne sur les deux serveurs à la fois.
+# - Pour vérifier une déclaration sans rien toucher : `ogs plan -f <fichier>`.
+#
+# Aide au remplissage : le binaire ogs est statique. Copié sur l'ancien serveur,
+# `sudo ./ogs import scan -o yaml` y inventorie vhosts, pools, comptes, bases,
+# crons et unités SANS RIEN MODIFIER — un bon point de départ pour chaque projet.
+#
+# =============================================================================
+
+version: 1
+
+# -----------------------------------------------------------------------------
+# Les deux machines
+# -----------------------------------------------------------------------------
+source:
+  nom: ~                          # ex. srv-web-1
+  ssh: ~                          # ex. root@203.0.113.10 — joignable DEPUIS la cible
+  port_ssh: 22
+  ip_publique: ~                  # pour les listes blanches tierces (voir dependances_externes)
+  systeme: ~                      # ex. Debian 10
+  moteur_web: ~                   # apache | nginx
+  mysql: ~                        # ex. MySQL 5.7.42, MariaDB 10.3 — `mysql --version`
+  postgres: ~                     # ex. 11 — ou ~ si absent
+  php: []                         # versions installées, ex. ["7.4", "8.1"]
+  rabbitmq: ~                     # version, ou ~ si absent
+  supervision: ~                  # supervisor, systemd, pm2… — ce qui lance les workers
+
+cible:
+  nom: ~                          # ex. srv-web-9
+  ssh: ~                          # ex. root@198.51.100.20
+  ip_publique: ~
+  ip6_publique: ~
+  moteur_web: apache              # celui choisi à l'installation (D73)
+  mysql: ~                        # moteur installé sur la cible, pour juger la compatibilité
+  postgres: ~
+
+# -----------------------------------------------------------------------------
+# Réglages communs de la migration
+# -----------------------------------------------------------------------------
+migration:
+  # Répertoire de travail sur la cible (dumps, journaux de la migration).
+  # Sous /var/lib : un dump contient les données des clients.
+  travail: /var/lib/ogs-migration
+
+  # TTL à poser sur les enregistrements DNS AU MOINS 48 h avant la première
+  # bascule, pour que le changement d'adresse se propage en quelques minutes.
+  ttl_bascule: 300
+  ttl_final: 3600
+
+  # Où sont gérées les zones DNS. ogs ne sait émettre un certificat AVANT la
+  # bascule (challenge dns-01) que pour une zone chez OVH ; ailleurs, le
+  # certificat est émis juste après la bascule (http-01), et le site n'est
+  # servi qu'en HTTP le temps de l'émission (une à deux minutes).
+  dns:
+    - zone: ~                     # ex. shop.fr
+      hebergeur: ~                # ovh | gandi | cloudflare | client…
+      acces: ~                    # qui modifie la zone : nous, ou le client (délai !)
+
+  # Combien de temps l'ancien serveur reste allumé, en lecture seule, après la
+  # dernière bascule — c'est le retour arrière.
+  conservation_source_jours: 15
+
+# -----------------------------------------------------------------------------
+# Ce qui vaut pour toute la machine (à faire une fois, avant les projets)
+# -----------------------------------------------------------------------------
+parc:
+  # Clés SSH d'accès aux comptes de projet (déploiement, collègues, CI). Le
+  # trousseau commun /opt/default_authorized_keys est posé par install-server.sh ;
+  # ne lister ici que les clés PROPRES à un projet, dans le projet lui-même
+  # (`ogs.spec.user.authorizedKeys`). Rien à écrire ici si le trousseau suffit.
+  cles_communes_a_ajouter: []
+
+  # Règles de pare-feu que l'ancien serveur ouvrait et que la cible doit
+  # reproduire (ports d'administration, IP de confiance, consoles). Elles
+  # iront dans /etc/ogs/ufw.yaml.
+  pare_feu:
+    ip_de_confiance: []           # ex. ["192.0.2.0/24"] — bureau, VPN
+    ports_supplementaires: []     # ex. [{port: 15672, proto: tcp, depuis: "192.0.2.0/24", motif: "console RabbitMQ"}]
+
+  # Identifiants DNS OVH, si des certificats doivent être émis avant la bascule.
+  # Ne pas écrire les clés : dire où elles sont.
+  dns_provider_ovh: ~             # ex. « coffre de l'équipe, entrée OVH API du serveur »
+
+  # Relais de courrier sortant : l'ancien serveur envoyait-il par un relais
+  # (smarthost) ? La nouvelle IP doit y être autorisée, et figurer dans les SPF.
+  courrier:
+    relais: ~                     # ex. smtp.fournisseur.fr:587, ou « envoi direct »
+    spf_a_modifier: []            # zones dont le SPF cite l'IP de la source
+
+# -----------------------------------------------------------------------------
+# Les projets
+# -----------------------------------------------------------------------------
+# Un élément par site. Les projets sont basculés par VAGUE : même vague, même
+# fenêtre de maintenance. Commencer par une vague d'un petit site sans enjeu.
+projets:
+
+  # ===========================================================================
+  # Exemple complet — à dupliquer, puis à supprimer.
+  # ===========================================================================
+  - id: shopfr                    # identifiant ogs (dérivé du host)
+    vague: 1
+    criticite: haute              # haute | normale | basse — règle la fenêtre et la vérification
+    fenetre: ~                    # ex. « mardi 2026-10-06, 22 h – 23 h »
+    contact_client: ~             # qui prévenir, et le délai de prévenance
+
+    # --- État sur l'ancien serveur -------------------------------------------
+    source:
+      utilisateur: shop           # compte Linux qui possède les fichiers
+      racine: /var/www/shop       # ce qui devient /home/<host> sur la cible
+      # Répertoire du code, relatif à `racine`. Il est copié dans /home/<host>/www.
+      # Pour un déploiement par releases (Capistrano, Deployer), donner la
+      # release COURANTE résolue, et lister les répertoires partagés ci-dessous.
+      code: current
+      # Répertoires ou fichiers hors de `code` à reprendre, avec leur destination
+      # relative à /home/<host>. Typiquement les partagés d'un Deployer.
+      donnees_hors_code:
+        - de: shared/public/uploads
+          vers: www/public/uploads
+        - de: shared/.env.local
+          vers: www/.env.local
+      # Exclus de la copie : caches, journaux, sessions — reconstruits sur place.
+      exclure:
+        - var/cache/
+        - var/log/
+        - var/sessions/
+        - node_modules/           # seulement s'il est reconstruit par la CI
+      volume_estime: ~            # `du -sh` — règle la durée de la pré-synchronisation
+      # Fichiers de configuration applicative qui portent des identifiants de
+      # base, d'AMQP ou des chemins absolus. Ils sont réécrits après copie.
+      configuration:
+        - fichier: www/.env.local           # relatif à /home/<host> sur la CIBLE
+          format: dotenv                    # dotenv | parameters-yml | prestashop-php | wp-config | autre
+          cles:                             # clé du fichier → valeur attendue sur la cible
+            DATABASE_URL: "@ogs:DATABASE_URL"               # rendu par `ogs secrets env shopfr`
+            MESSENGER_TRANSPORT_DSN: "@ogs:MESSENGER_TRANSPORT_DSN"
+        # Formats autres que dotenv : une partie de l'URL s'extrait par « #partie »
+        # (user, password, host, port, name). Exemple PrestaShop :
+        # - fichier: www/app/config/parameters.php
+        #   format: prestashop-php
+        #   cles:
+        #     database_name: "@ogs:DATABASE_URL#name"
+        #     database_user: "@ogs:DATABASE_URL#user"
+        #     database_password: "@ogs:DATABASE_URL#password"
+      # Chemins absolus de l'ancien serveur écrits en dur dans le code, la base
+      # ou la configuration (ils changent : /var/www/shop → /home/shop.fr).
+      chemins_en_dur: []          # ex. [{ou: "table ps_configuration, PS_SHOP_PATH", valeur: "/var/www/shop"}]
+      # Mise en maintenance du site SUR LA SOURCE, pendant la bascule : commandes
+      # shell exécutées en root sur la source. `maintenance: aucune` si le site
+      # n'écrit rien (vitrine statique) — sinon les écritures faites entre la
+      # dernière copie et le changement de DNS sont perdues.
+      maintenance:
+        activer: "touch /var/www/shop/current/public/maintenance.flag"
+        desactiver: "rm -f /var/www/shop/current/public/maintenance.flag"
+
+    # Commandes exécutées SUR LA CIBLE après chaque synchronisation, sous le compte
+    # du projet, depuis /home/<host>/www, avec son PHP (~/.local/bin) en tête du
+    # PATH. Absent : cache:clear pour php-symfony, vidage de var/cache pour
+    # php-prestashop, rien sinon. `[]` : rien du tout.
+    apres_synchro:
+      - bin/console cache:clear
+
+    # --- Bases -----------------------------------------------------------------
+    bases:
+      - moteur: mysql             # mysql | mariadb | postgres
+        source: shop_prod         # nom sur l'ancien serveur
+        cible: shopfr             # nom déclaré dans `ogs.spec.databases` (défaut : l'identifiant)
+        taille: ~                 # Mo — au-delà de ~2 Go, prévoir la fenêtre en conséquence
+        charset: utf8mb4
+        collation: ~              # ATTENTION : utf8mb4_0900_* (MySQL 8) n'existe pas sous MariaDB
+        definers: false           # vues, triggers ou procédures avec DEFINER ? (réécrits vers l'utilisateur ogs)
+        evenements: false         # EVENT planifiés dans le moteur ?
+        tables_exclues: []        # ex. tables de journaux énormes et jetables
+
+    # --- Messages (RabbitMQ) ---------------------------------------------------
+    amqp:
+      present: false
+      vhost_source: ~             # vhost RabbitMQ sur la source, pour attendre le vidage des files
+      # Les messages en attente ne sont PAS copiés : les files doivent être
+      # vides à la bascule (workers de la source laissés tourner jusqu'au vidage).
+      transports: []              # ex. [async, mails] — `ogs amqp messenger shopfr --transport …`
+
+    # --- Tâches et workers de l'ancien serveur ---------------------------------
+    # Tels qu'ils tournent sur la source, pour les arrêter à la bascule. Leur
+    # équivalent ogs est déclaré dans `ogs.spec.crons` / `ogs.spec.services`.
+    arret_a_la_bascule:
+      crontab_utilisateur: true   # `crontab -l -u shop` non vide
+      fichiers_cron: []           # ex. [/etc/cron.d/shop]
+      # Arrêt et relance (retour arrière) de chaque worker, en root sur la source.
+      workers: []
+      #  - arreter: "supervisorctl stop 'shop-messenger:*'"
+      #    relancer: "supervisorctl start 'shop-messenger:*'"
+
+    # --- Courrier ----------------------------------------------------------------
+    courrier:
+      envoie: true
+      dkim_actuel: ~              # sélecteur actuel, ex. « default._domainkey.shop.fr », ou ~
+      # ogs génère une clé NEUVE (D69) : `ogs mail dkim records shopfr` donne
+      # l'enregistrement à publier AVANT la bascule, sous un sélecteur différent
+      # de l'actuel, pour que les deux coexistent.
+
+    # --- Dépendances extérieures -------------------------------------------------
+    # Tout ce qui, chez un tiers, connaît l'IP ou le nom de l'ancien serveur.
+    dependances_externes: []
+    #  - quoi: « API transporteur, liste blanche d'IP »
+    #    action: « ajouter l'IP de la cible, J-7 »
+    #  - quoi: « retour de paiement (webhook) vers https://shop.fr/payment/notify »
+    #    action: « rien : suit le DNS »
+
+    # --- Particularités ----------------------------------------------------------
+    # Tout ce qu'une copie de fichiers + base ne suffit pas à reproduire :
+    # extensions PHP, binaires (wkhtmltopdf, imagemagick), réglages php.ini,
+    # règles de réécriture propres à Apache à reporter en surcharge de vhost (D63),
+    # accès FTP, montages, etc.
+    particularites: []
+
+    # --- Vérification après bascule ------------------------------------------------
+    # Rejouées AVANT la bascule en forçant la résolution vers la cible
+    # (curl --resolve), puis APRÈS, par le DNS.
+    verifications:
+      - url: https://shop.fr/
+        statut: 200
+        contient: ~               # un texte stable de la page, ex. le nom de la boutique
+      - url: https://www.shop.fr/
+        statut: 301
+      - commande: "bin/console about"      # exécutée sous le compte du projet, depuis www/
+        attendu: "Environment  prod"
+
+    # --- Déclaration ogs, déposée telle quelle -------------------------------------
+    ogs:
+      apiVersion: ogs/v1
+      kind: Project
+      metadata:
+        name: shopfr
+        host: shop.fr
+        description: ~
+      spec:
+        app:
+          kind: php-symfony       # static | php-plain | php-prestashop | php-symfony | node | python | ruby | go
+          version: "6.4"
+        domains:
+          - name: shop.fr
+          - name: www.shop.fr
+            role: alias
+        php:
+          pools:
+            - name: web
+              version: "8.2"      # la version de la SOURCE, sauf décision contraire
+              preset: medium
+              settings: {}        # reprendre les php_admin_value du pool source
+        databases:
+          - engine: mariadb
+            name: shopfr
+            user: shopfr
+        crons:
+          - name: planificateur
+            schedule: "* * * * *"
+            command: bin/console schedule:run
+        services:
+          - name: messenger-async
+            template: symfony-messenger
+            instances: 2
+            params:
+              transport: async
+        # Si la zone est chez OVH : émettre le certificat avant la bascule.
+        # certificates:
+        #   - name: shopfr
+        #     domains: [shop.fr, www.shop.fr]
+        #     challenge: dns-01
+        #     dnsProvider: ovh
+
+# =============================================================================
+# Déroulé — ce que le script fait de ce fichier
+# =============================================================================
+#
+# Mis en œuvre par docs/migrer.sh, en simulation tant que --executer n'est pas
+# donné :  migrer.sh controle | prealables | declarer | synchroniser | verifier |
+#          basculer | retour | etat   [projet | vague:N | tous]
+#
+# Toutes les commandes s'exécutent sur la CIBLE, en root. La cible tire les
+# données de la source par ssh : la source n'a besoin d'aucun accès à la cible.
+# Chaque phase est rejouable ; elle s'arrête au premier code de retour autre
+# que 0 ou 6 (6 = succès partiel, typiquement un certificat pas encore émis).
+#
+# PHASE 0 — Préalables (une fois)
+#   - cible installée par docs/install-server.sh ; `ogs init` ; `ogs doctor` à 0 ;
+#   - /etc/ogs/ufw.yaml écrit depuis `parc.pare_feu`, `ogs firewall apply`, puis
+#     `ogs firewall confirm` depuis une SECONDE session ssh ;
+#   - `ogs cert dns-provider set ovh …` si des certificats partent en dns-01 ;
+#   - `ssh <source.ssh> true` depuis la cible (clé de la cible autorisée sur la source) ;
+#   - TTL des zones abaissés à `migration.ttl_bascule`, 48 h avant la vague 1.
+#
+# PHASE 1 — Déclarer (par projet, sans interruption de service)
+#   - refus si le projet contient « À VÉRIFIER » ;
+#   - extraire `ogs:` vers un fichier, y forcer `enabled: false` sur chaque cron
+#     et chaque service, `ogs plan -f` pour valider ;
+#   - le déposer dans /etc/ogs/projects/<id>.yaml ;
+#   - `ogs amqp messenger <id> --transport …` si `amqp.present` ;
+#   - `ogs apply <id> --yes` : compte, home, pool, bases vides, vhost.
+#     Le certificat http-01 échoue tant que le DNS pointe la source : code 6, attendu ;
+#   - `ogs mail dkim records <id>` → enregistrement à publier (hors script).
+#
+# PHASE 2 — Pré-synchroniser (par projet, répétable, sans interruption)
+#   - fichiers : rsync -rlptH --delete --chown=<id>:<id> depuis la source,
+#     `code` → /home/<host>/www, puis chaque `donnees_hors_code`, avec `exclure` ;
+#   - bases : `ssh source mysqldump --single-transaction --routines --triggers
+#     --events <source>` (postgres : `pg_dump --no-owner --no-privileges`),
+#     DEFINER réécrits vers l'utilisateur ogs, chargé dans la base `cible` ;
+#     au-delà de quelques Go, charger par un tube plutôt que par `ogs db restore`,
+#     qui lit le fichier entier en mémoire ;
+#   - configuration : chaque `configuration[].cles` réécrite, les `@ogs:VAR`
+#     résolues par `ogs secrets env <id>` ; `chemins_en_dur` corrigés ;
+#   - vidage des caches applicatifs (Symfony : bin/console cache:clear ;
+#     PrestaShop : var/cache/*), sous le compte du projet ;
+#   - `ogs apply <id> --yes` : repose les modes des répertoires que rsync a pu changer ;
+#   - `verifications` rejouées avec curl --resolve <domaine>:443:<ip cible>
+#     (-k tant que le certificat n'est pas émis).
+#   Rejouer cette phase la veille de la bascule réduit le delta final à presque rien.
+#
+# PHASE 3 — Basculer (par vague, dans la fenêtre)
+#   1. source en maintenance (page de maintenance, ou 503 au niveau du vhost) ;
+#   2. arrêt sur la source de `arret_a_la_bascule` (crontab sauvegardée puis vidée, fichiers de /etc/cron.d renommés, workers
+#      arrêtés APRÈS vidage des files AMQP) ;
+#   3. dernier rsync (delta) et dernier dump/chargement des bases ;
+#   4. configuration réécrite, caches vidés ;
+#   5. `verifications` par curl --resolve : en cas d'échec, on s'arrête ici,
+#      la source sort de maintenance, rien n'a été basculé ;
+#   6. DNS : A/AAAA de chaque domaine vers la cible (hors script si la zone est
+#      chez le client) ; attente de la propagation (dig @résolveur public) ;
+#   7. crons et services réactivés (`enabled` retiré du fichier du projet),
+#      `ogs apply <id> --yes` : certificat http-01 émis, vhost basculé en TLS,
+#      workers démarrés ;
+#   8. `verifications` par le DNS ; `ogs diff <id>` doit rendre « conforme ».
+#
+# PHASE 4 — Après
+#   - surveillance des journaux (/var/log/ogs-projects/<id>/) pendant 24 h ;
+#   - TTL remontés à `migration.ttl_final` ;
+#   - ancienne signature DKIM et ancienne IP retirées des SPF après une semaine ;
+#   - source éteinte après `migration.conservation_source_jours`.
+#
+# Retour arrière (avant l'étape 7 : trivial ; après : les données écrites sur la
+# cible depuis la bascule sont perdues sans reprise inverse)
+#   - DNS vers la source, source sortie de maintenance, crons et workers
+#     rétablis sur la source ; sur la cible, `ogs service stop <id>` et crons
+#     repassés à `enabled: false`.
