@@ -40,6 +40,9 @@ réconciliation idempotent amène le serveur dans l'état décrit.
   et comptes de supervision. Ni l'un ni l'autre n'est installé par ogs.
 - **Signature DKIM** du courrier sortant des projets (D69) : clés par domaine d'envoi, tables d'OpenDKIM
   dérivées du parc, enregistrement DNS à publier. Ni OpenDKIM ni le MTA ne sont installés par ogs.
+- **Pare-feu ufw** (D72), décrit par `/etc/ogs/ufw.yaml` : profils d'application dérivés des services
+  installés, accès par profil, sources nommées, adresses de confiance, bannissements, politiques par
+  défaut. ufw n'est pas installé par ogs, et sans `ufw.yaml` ogs n'y touche pas.
 
 ### 1.3 Hors périmètre
 
@@ -49,8 +52,9 @@ réconciliation idempotent amène le serveur dans l'état décrit.
   `ogs doctor` se contente de diagnostiquer ce qui manque.
 - DNS, messagerie, alerting. Le pare-feu et les métriques ne le sont plus tout à fait : ogs **écrit la
   configuration** de fail2ban et de Telegraf à partir du parc (D64), sans les installer, sans définir de
-  destination de métriques (D65) et sans écrire le moindre filtre. Rien d'autre — ni règles de pare-feu
-  posées directement, ni seuils d'alerte, ni tableaux de bord. La messagerie ne l'est plus tout à fait non
+  destination de métriques (D65) et sans écrire le moindre filtre. Le pare-feu est entré à son tour
+  (D72) : ogs pose les règles d'ufw que décrit `/etc/ogs/ufw.yaml`, et celles-là seulement — ni iptables
+  ou nftables en direct, ni autre pare-feu qu'ufw. Rien d'autre — ni seuils d'alerte, ni tableaux de bord. La messagerie ne l'est plus tout à fait non
   plus : ogs **signe** le courrier des projets qui le demandent (D69), mais ne configure ni le MTA, ni ses
   relais, ni `opendkim.conf`, et n'écrit ni SPF ni DMARC. Le DNS reste hors périmètre : ogs émet
   l'enregistrement DKIM, l'exploitant le publie.
@@ -150,6 +154,7 @@ Décisions arbitrées et figées pour la v1. Toute remise en cause est une évol
 | D69 | Signature DKIM | ogs **génère et garde** une clé DKIM par domaine d'envoi d'un projet qui la demande (`spec.mail.dkim`, **opt-in**), écrit la `KeyTable` et la `SigningTable` d'**OpenDKIM** à partir du parc entier et **émet l'enregistrement à publier** ; il ne touche **ni au DNS, ni au MTA, ni à `opendkim.conf`**. Clé **RSA-2048** générée en Go, scellée dans le keystore (`<projet>/dkim/<domaine>/<sélecteur>`) et écrite en **0600 opendkim:opendkim** ; sélecteur daté (`ogs202609`) ; rotation en **deux temps** — `rotate` prépare, `activate` bascule et refuse tant que l'enregistrement publié ne correspond pas à la clé, sauf `--force`. Étapes **non critiques** ; la préproduction est **refusée à la validation** | Révise §1.3, qui plaçait la messagerie hors périmètre, pour la raison de D64 : OpenDKIM a besoin de ce qu'ogs seul sait — quels domaines appartiennent à quel projet, et quand un projet disparaît. Le reste de la messagerie demeure dehors : ni MTA, ni relais, ni SPF — qui dépend des relais empruntés, qu'ogs ignore —, ni DMARC. **Le DNS reste hors périmètre malgré D53** : les identifiants OVH ne couvrent que la zone de préproduction, les zones des clients vivent ailleurs, et écrire dans la zone d'un client n'engage pas la même confiance que dans la sienne ; `doctor` vérifie ce qui est publié. **Pourquoi deux temps** : passer d'une clé qui se vérifie à une clé dont la partie publique n'est pas publiée casse la signature de tout envoi — sous un DMARC `p=reject` sans SPF aligné, le courrier est rejeté. À la **création**, en revanche, on signe aussitôt : une signature invérifiable ne vaut pas moins qu'une absence de signature, DMARC les traitant de même, et faire dépendre l'apply d'une résolution DNS rendrait le plan instable d'une exécution à l'autre. **Pourquoi sceller** : une clé DKIM, contrairement à un mot de passe, ne se régénère pas sans action extérieure — la perdre oblige à republier chez le client ; le keystore est la source de vérité et le fichier en dérive, donc un fichier disparu est réécrit, jamais recréé avec une clé neuve. Le fichier de clé ne peut porter l'en-tête d'ogs : il est comparé au contenu scellé, et un écart est traité comme une modification à la main (`--force`). **Régime de `/etc/opendkim`** : ogs pose lui-même le répertoire et ses sous-répertoires en 0750 root:opendkim, et les tables en 0640 root:opendkim — exactement ce qu'`ogs harden` exige (D56). Deux juges en désaccord feraient osciller l'apply et harden, l'un rouvrant ce que l'autre ferme ; et harden, récursif sur `/etc/opendkim`, ne change jamais le propriétaire d'un fichier ni ne desserre un mode, si bien qu'une clé en 0600 opendkim:opendkim reste lisible au démon. **Pourquoi 0600** : sous `RequireSafeKeys`, défaut d'OpenDKIM, une clé lisible au-delà de son propriétaire est refusée — le régime 0640 de D65 ne convient pas ici. Et le refus n'est pas un silence : l'essai réel l'a montré, une clé refusée **ou absente** ne laisse pas partir le courrier sans signature, OpenDKIM rend une erreur temporaire et **le MTA garde en file tout le courrier du domaine**. D'où deux règles : une table ne désigne jamais une clé dont le fichier manque, et le fichier d'un domaine qui cesse d'être signé n'est retiré qu'**après** le rechargement des tables, OpenDKIM gardant en mémoire celles qu'il a chargées. **Pourquoi des tables de parc** : OpenDKIM n'en accepte qu'une de chaque, et recalculées depuis un sous-ensemble elles retireraient de la signature tous les autres projets — la leçon de logrotate et de tmpfiles ; elles vivent donc dans le plan global, et `doctor` vérifie qu'`opendkim.conf`, laissé à l'administrateur comme `telegraf.conf` (D65), les référence bien. **Pourquoi pas la préproduction** : elle ne doit jamais pouvoir signer au nom du domaine de production — un envoi de test parti vers de vrais clients serait authentifié. **Pourquoi l'opt-in** : beaucoup de projets envoient par un relais tiers qui signe de sa propre clé ; signer par défaut créerait des clés dont aucun courrier ne se sert. **Pourquoi RSA** : ed25519 (RFC 8463) est encore trop peu vérifié pour servir seul. Piège : une clé RSA-2048 dépasse les 255 octets d'une chaîne TXT, l'enregistrement émis est donc découpé et `doctor` recolle les morceaux avant de comparer. **Pourquoi OpenDKIM plutôt que rspamd** : ses tables sont des fichiers plats, recalculables comme logrotate ou fail2ban, là où rspamd est une tout autre pièce à supposer présente |
 | D70 | Liens gérés | L'interpréteur PHP et les liens des runtimes (`node`, `python`, `ruby`, `bundle`, `app`) vivent dans **`~/.local/bin`**, qui appartient à **l'utilisateur du projet** (0700) ; `.bin/` disparaît, retiré à la migration une fois les unités relues. Root y écrit **par descripteurs ouverts sans suivre de lien** (`openat`, `O_NOFOLLOW`), et un fichier posé à la place d'un lien n'est remplacé que sous `--force` | Révise D30, D35 et §7.1.2. `~/.local/bin` est le répertoire que la convention XDG réserve aux exécutables de l'utilisateur, et que le `.profile` de Debian ajoute au PATH : le shell ouvert par D62 y trouve la version déclarée sans rien configurer. Il appartient à l'utilisateur parce que pip, pipx et bien d'autres y écrivent : le fermer les casserait. **Et le fermer ne protégerait rien** : l'essai l'a montré, le home appartenant à l'utilisateur (D51), un sous-répertoire root se **renomme** sans privilège, puis se remplace — `.bin/` n'a jamais garanti la version effective contre l'utilisateur, seulement contre l'accident. La garantie devient donc ce qu'elle était dans les faits : un **état réconcilié**, rétabli à chaque apply. Ce que la décision ajoute est la contrepartie d'écrire en root chez quelqu'un d'autre : chaque composant du chemin est ouvert sans suivre de lien, et le lien est posé relativement au descripteur — un `~/.local` remplacé par un lien vers un autre répertoire fait refuser l'étape au lieu d'y faire écrire root. Le même traitement vaut désormais pour `.ssh/authorized_keys` (D61), que root posait jusque-là par son nom dans un répertoire de l'utilisateur. La migration retire l'ancienne entrée `.bin` des déclarations à la normalisation — sous sa forme exacte seulement, un `.bin` déclaré autrement l'ayant été par l'exploitant — et l'ancien répertoire en **fin de plan**, après le vidage des rechargements : une unité réécrite mais pas encore relue par systemd désigne toujours l'ancien lien. Seuls les liens connus sont retirés, et le répertoire ne part que vide |
 | D71 | Journaux hors du home | Les journaux d'Apache, de nginx, de PHP-FPM et des crons vivent dans **`/var/log/ogs-projects/<id>/`** — racine réglable par **`logs.root`** —, chaîne entièrement root : la racine en **0711 root:root**, le répertoire du projet en **0750 root:<id>**, tous les fichiers **pré-créés** en 0640 (`root:<id>` pour ce qu'écrit un maître root, `<id>:<id>` pour `php-error.log` et `cron-<nom>.log`, écrits sous l'identité du projet). Le home ne porte qu'un lien de commodité, **`~/logs → /var/log/ogs-projects/<id>`**, qu'aucun processus root n'emprunte. `spec.layout.logDir` est refusé hors de la racine, `spec.crons[].log` n'est plus qu'un nom de fichier | Révise D29, D59 et §7.1.2, et referme la faille constatée le 23/09/2026 : le home appartenant à l'utilisateur (D51), il **renommait** le `logs/` root sans privilège et en recréait un à lui, où `apache-error.log` devenait un lien vers un fichier système que le maître du serveur web ouvrait en root à son redémarrage suivant — au plus tard à la rotation quotidienne. D29 protégeait d'une substitution *dans* `logs/`, pas *de* `logs/`. Désormais plus aucun composant du chemin n'appartient à l'utilisateur : il n'a plus rien à renommer. Le lien du home ne rouvre rien — lui seul le suit —, et il rend la lecture triviale : `tail -f ~/logs/apache-error.log`, `zless` sur les archives, qui gardent le mode du fichier roté. **Deux défauts antérieurs se referment du même coup**, vus en le préparant : `php-error.log` n'était **jamais écrit** — les workers, qui ouvrent `php_admin_value[error_log]` sous l'identité du projet, ne pouvaient pas créer le fichier dans un répertoire root, et PHP se rabattait sur le journal global de FPM, où se mêlaient les erreurs de tous les projets — et les droits annoncés au §14.5 étaient faux, les journaux sortant en 0644 root:root et `php-slow.log` en 0600, illisible au projet ; la pré-création rend les droits vrais. **Logrotate** : aucun `su`, et il ne faut jamais en ajouter — un répertoire non inscriptible par un groupe non root passe le contrôle de sécurité du répertoire parent, et le rendre inscriptible au projet, pour laisser une application y créer ses fichiers, ferait refuser la rotation et rouvrirait la faille ; `create` reste sans mode ni propriétaire, chaque fichier gardant le sien ; jamais un chemin passant par le home, ni un `olddir` dans le home, logrotate suivant le lien en root. **Le complément d'unité** du serveur web se réduit à une entrée fixe, conservée par prudence envers un `ProtectSystem=strict` : son contenu ne change plus à la création d'un projet, qui **ne redémarre donc plus le serveur web**. **Contrepartie** : les journaux quittent `/home` pour `/var`, qui porte aussi `/var/lib/mysql` et `/var/lib/postgresql` — un journal d'accès qui s'emballe peut remplir la partition et arrêter les bases. D'où `logs.root`, dont `doctor` contrôle la chaîne de propriété, et l'avertissement de `doctor` sur l'espace libre ; `maxsize` borne déjà chaque fichier. `www-data`, membre du groupe de chaque projet (D25), lit tous les journaux, comme auparavant. Les journaux applicatifs (`var/log/`) restent hors périmètre, gérés par l'application. **Migration**, sans perte de lignes : le nouveau répertoire est créé et les fichiers courants y sont copiés ; vhosts, pool, cron et complément d'unité sont réécrits puis rechargés, les serveurs ouvrant alors les nouveaux fichiers ; les lignes écrites dans l'ancien entre la copie et le rechargement sont ajoutées au nouveau, les fichiers rotés déplacés sous leur nom — logrotate poursuit la numérotation —, puis l'ancien `~/logs` est retiré et le lien posé à sa place. L'ancien répertoire vivant dans le home, l'utilisateur a pu le substituer : il n'est lu que par descripteur ouvert sans suivre de lien, **s'il appartient à root**, et seuls ses fichiers réguliers appartenant à root ou au projet sont repris — sans quoi root recopierait un `apache-error.log → /etc/shadow` dans un répertoire que ce même utilisateur lit. À défaut, rien n'est lu, et `doctor` le signale |
+| D72 | Pare-feu | ogs réconcilie **ufw** avec **`/etc/ogs/ufw.yaml`**, fichier distinct de `config.yaml` dont l'**absence** vaut « ogs ne touche pas à ufw ». Il écrit un seul fichier de profils, **`/etc/ufw/applications.d/ogs`**, aux profils préfixés **`ogs-`** et dérivés de ce qui est installé (unités systemd, `sshd_config`, `proftpd.conf`, `vsftpd.conf`, `redis.conf`…) ; toute règle passe par la **commande ufw**, jamais par `user.rules`. Une règle est à ogs si son commentaire commence par **`ogs:`** ; les autres sont laissées intactes et signalées. **Sources nommées** (propriétaire, adresses), adresses de **confiance** — une règle **par profil disponible**, et reprises dans l'`ignoreip` des prisons fail2ban —, **bannissements** placés en tête. Commentaire déclaré ou **engendré** d'après la source et son propriétaire. La **première activation** se défait d'elle-même au bout de `rollbackAfter` (5 min) faute de `ogs firewall confirm` ; une déclaration qui **couperait la session SSH** en cours, bannirait son adresse ou fermerait SSH à tous est refusée sauf `--force`. Une déclaration refusée ou invalide n'est **jamais tentée** : code 3 pour `ogs firewall`, avertissement (code 6) dans le plan global, **dont le reste s'applique**. Étapes **non critiques**, mais politiques et activation refusent de s'appliquer si une règle a échoué | Révise §1.3, qui plaçait les règles de pare-feu hors périmètre, pour la raison de D64 : ufw ne sait pas quels services tournent sur quels ports — un sshd sur 2200, le SFTP de proftpd sur 2222, la plage passive du FTP —, et ogs, lui, le lit. **Pourquoi un fichier à part** : il n'a pas le rythme de `config.yaml` — on bannit un soir de scan, on ouvre au poste d'un prestataire le temps d'une intervention —, et son absence est une décision que rien d'autre ne porte. **Pourquoi des profils ogs** : ceux des paquets (`OpenSSH`, `Apache Full`) figent des ports qu'ogs ne maîtrise pas, et `applications.d` leur appartient. **Pourquoi la commande et non le fichier** : `user.rules` est le reflet de ce qu'ufw a chargé, et le réécrire désaccorderait les deux jusqu'au prochain rechargement. **Pourquoi la marque** : sans elle, reconnaître ses règles demanderait un inventaire à tenir en plus d'ufw, qui se désaccorderait au premier `ufw delete` manuel ; avec elle, ce qui n'est pas marqué appartient à l'administrateur, sans exception. **Pourquoi une règle par profil pour la confiance**, plutôt qu'un `allow from` global : ce dernier ouvrirait aussi les ports qui ne doivent jamais sortir de la boucle locale — MariaDB, le vhost d'état (D66), les applications (D36) —, le jour où l'un d'eux écouterait ailleurs. **Pourquoi le retour automatique** : la session qui active un pare-feu mal écrit est celle qu'il coupe, et plus rien de ce qu'elle a lancé ne tourne pour réparer ; c'est donc systemd qui porte la désactivation (`systemd-run --on-active`). Seule la première activation l'arme (arbitrage du 24/09/2026) : une fois la confirmation obtenue depuis une nouvelle session, les apply suivants sont gardés par la vérification de la session. **Pourquoi le plan global ne s'arrête pas** : `project delete` recalcule par lui les prisons de fail2ban et la rotation des journaux (D68) ; une faute de frappe dans `ufw.yaml` ne doit pas priver le parc de ce recalcul — c'est la règle de `parcNonBloquante`. **Pourquoi en tête** : ufw retient la première règle qui correspond, et un refus posé après une autorisation plus large ne servirait jamais. Trois pièges d'ufw, tous invisibles à une lecture de sa sortie : il **refuse l'apostrophe** dans un commentaire — ogs la remplace par l'apostrophe typographique ; il **remplace en place** le commentaire d'une règle identique, mais `prepend` **ignore** une règle existante, si bien qu'un commentaire se corrige par la commande d'ajout ordinaire ; une règle d'application porte les ports du profil au moment où elle a été posée, d'où `ufw app update` quand un profil change — et ufw refuse une application inconnue **jusque dans `ufw delete`**, d'où le retrait des règles d'un profil **avant** de retirer le profil |
 
 ---
 
@@ -580,7 +585,11 @@ Fichiers générés en dehors de l'arborescence `ogs` (toujours marqués par un 
 /etc/cron.d/ogs-<id>
 /etc/opendkim/ogs/KeyTable                 clés DKIM de tout le parc (D69)
 /etc/opendkim/ogs/SigningTable             domaines signés de tout le parc (D69)
+/etc/ufw/applications.d/ogs                profils d'application ogs-* (D72)
 ```
+
+Les règles d'ufw ne sont pas des fichiers d'ogs : elles passent par la commande ufw et se reconnaissent à
+leur commentaire, qui commence par `ogs:` (§7.14).
 
 Les clés privées DKIM (`/etc/opendkim/keys/<id>/<domaine>/<sélecteur>.private`, 0600 opendkim:opendkim)
 sont écrites par ogs mais ne portent **pas** d'en-tête : un fichier PEM n'a pas de syntaxe de commentaire
@@ -2223,6 +2232,186 @@ n'est pas posée ne doit pas défaire un site par ailleurs fonctionnel.
 - `opendkim.conf` référence-t-il les deux tables d'ogs — sinon rien n'est signé, et rien ne le dit ;
 - une clé retirée des tables a-t-elle encore un enregistrement publié, à retirer à la main.
 
+### 7.14 Pare-feu ufw
+
+ogs réconcilie ufw avec `/etc/ogs/ufw.yaml` (D72). Sans ce fichier, il ne touche à rien : ni profil, ni
+règle, ni politique. Il n'installe pas ufw ; déclaré sans ufw présent, le pare-feu produit un
+avertissement (code 6) à chaque apply.
+
+#### Déclaration
+
+```yaml
+# /etc/ogs/ufw.yaml
+active: true                 # défaut ; false réconcilie règles et profils, ufw désactivé
+policy:
+  incoming: deny             # allow | deny | reject — défauts d'ufw : deny
+  outgoing: allow            #                                      allow
+  routed: deny               # tu : laissé à ufw
+logging: low                 # off | on | low | medium | high | full ; tu : laissé tel quel
+rollbackAfter: 5m            # retour automatique d'une première activation ; 0 s'en passe
+
+sources:                     # à qui appartiennent les adresses
+  bureau:
+    owner: "Agence de Nantes"
+    description: "sortie fibre et VPN"
+    addresses: [203.0.113.10, 2001:db8:42::/48]
+  acme:
+    owner: "ACME SARL"
+    addresses: [198.51.100.7]
+
+trusted: [bureau]            # accès à tous les profils disponibles, une règle par profil
+
+profiles:
+  ssh:  {allow: []}          # trusted suffit
+  web:  {allow: [any]}
+  mysql:
+    allow:
+      - acme                 # source nommée
+      - address: 192.0.2.10  # adresse, avec commentaire
+        comment: "réplica de secours"
+  redis: {ports: [6380/tcp]} # remplace les ports détectés
+  ftp:   {passive: "40000:40100"}
+  elastic:                   # hors catalogue : ports obligatoires
+    ports: [9200/tcp]
+    units: [elasticsearch]   # disponible si l'unité existe
+    allow: [bureau]
+
+ban:
+  - 192.0.2.66
+  - {address: 198.51.100.0/24, comment: "scan"}
+
+outgoing:                    # lu seulement si policy.outgoing ≠ allow
+  allow: [dns, https, http, ntp, smtp, submission, smtps, ssh, 5432/tcp]
+```
+
+Une entrée (`trusted`, `allow`, `ban`) s'écrit en chaîne — une adresse, un réseau, `any` ou le nom d'une
+source — ou en table pour porter un commentaire. Refusé au chargement (code 3) : une source inconnue, un
+réseau aux bits d'hôte non nuls (`10.0.0.5/24` : ufw le ramènerait à son réseau en IPv4 et non en IPv6,
+et la relecture ne correspondrait plus), `any` en confiance ou en bannissement, une adresse bannie qui en
+recouvre une autorisée, une liste ou une plage de ports sans protocole (ufw écarterait le profil entier
+d'un simple avertissement), un profil hors catalogue sans `ports`, une politique sortante fermée dont les
+sorties omettent `dns` ou `https`, une clé inconnue.
+
+#### Profils
+
+| Profil | Ports par défaut | Disponible si | Ports lus dans |
+|---|---|---|---|
+| `ssh` | 22/tcp | `ssh.service`, `sshd.service` | `sshd_config` et ses `Include` — chaque `Port` s'ajoute |
+| `sftp` | 2222/tcp | `proftpd.service` et un contexte `SFTPEngine on` | le `Port` de ce contexte |
+| `ftp` | 21/tcp + plage passive | proftpd (contexte hors SFTP, `Port` ≠ 0), vsftpd, pure-ftpd | `PassivePorts`, `pasv_min_port`/`pasv_max_port`, `PassivePortRange` |
+| `web` | 80,443/tcp | le moteur retenu | — |
+| `mysql` | 3306/tcp | mariadb, mysql, mysqld | — |
+| `postgresql` | 5432/tcp | postgresql | — |
+| `redis` | 6379/tcp | redis-server, redis | `redis.conf` ; `port 0` : indisponible |
+| `rabbitmq` | 5671,5672/tcp | rabbitmq-server | — |
+| `rabbitmq-management` | 15672/tcp | idem + greffon `rabbitmq_management` | — |
+| `smtp` | 25/tcp | postfix, exim4 | — |
+| `submission` | 465,587/tcp | postfix, exim4 | — |
+
+Le critère est l'**unité installée**, non son état : un service arrêté reste un service de la machine, et
+ses règles doivent exister le jour où on le redémarre. `profiles.<nom>.available` force la disponibilité
+ou l'interdit. Le SFTP servi par sshd n'est pas un profil distinct : c'est le port de sshd. ogs **lit** la
+configuration de proftpd, il ne l'écrit pas et ne crée aucun compte SFTP — l'arbitrage du 24/08/2026 sur
+l'accès SFTP reste entier.
+
+Le fichier de profils porte **tous** les profils, disponibles ou non : une définition ne coûte rien. Seul
+un profil disponible reçoit des règles. `ogs firewall profiles` les énumère avec leurs ports, leurs
+sources et la raison de leur disponibilité.
+
+#### Règles et commentaires
+
+| Famille | Commande | Commentaire engendré |
+|---|---|---|
+| accès | `ufw allow from <adresse> to any app ogs-<profil>` | `ogs: acme (ACME SARL)` ; `ogs: accès à mysql` ; `ogs: accès public à web` |
+| confiance | idem, pour chaque profil disponible | `ogs: confiance — bureau (Agence de Nantes)` |
+| bannissement | `ufw prepend deny from <adresse>` | `ogs: bannie` ; `ogs: bannie — scan` |
+| sortie | `ufw allow out <port>[/<proto>]` | `ogs: sortie dns` |
+
+Le commentaire dit ce qu'`ufw status` ne montre pas — le profil et l'adresse y sont déjà : à qui
+appartient l'adresse, et à quel titre elle est là. Un commentaire déclaré le remplace, toujours précédé de
+`ogs:`. Une adresse littérale couverte par une source en prend le propriétaire.
+
+La réconciliation relit `user.rules` et `user6.rules`, dont les lignes `### tuple ###` sont la
+représentation qu'ufw lui-même relit. Une règle voulue absente est posée ; présente sous un autre
+commentaire, elle est corrigée en place ; un refus précédé d'une autorisation est retiré puis replacé en
+tête. Une règle marquée qui n'est plus voulue est retirée — **après** les ajouts, pour qu'un changement
+d'adresse n'ouvre jamais de fenêtre sans accès. Une règle marquée mais retouchée à la main (une interface
+ajoutée, une journalisation) n'est ni reprise ni retirée : `doctor` la nomme.
+
+#### Ordre et gardes
+
+1. retrait des règles dont le profil disparaît, tant qu'ufw le connaît encore ;
+2. fichier de profils, puis `ufw app update` des profils dont les ports changent et qu'une règle emploie ;
+3. bannissements, accès, sorties ;
+4. politiques qui s'ouvrent (vers `allow`) ;
+5. retrait des règles devenues sans objet ;
+6. journalisation, politiques qui se ferment ;
+7. activation.
+
+Les étapes sont non critiques — le pare-feu est une ressource de parc, et son échec ne doit pas dérouler
+le reste du plan global —, mais tout ce qui retire un accès — retraits, politiques qui se ferment,
+activation — **refuse de s'appliquer si une règle a échoué** : retirer l'ancienne adresse quand la
+nouvelle n'a pas été autorisée déplacerait l'accès nulle part. Une politique qui s'ouvre passe avant les
+retraits : retirer les sorties permises sous une sortie encore fermée couperait DNS et ACME le temps de
+l'apply. Une règle dont le retrait échoue garde son profil défini, ufw refusant sinon à jamais de la
+retirer. Une règle de l'administrateur de même définition qu'une règle voulue la satisfait, et reste la
+sienne : ogs ne lui donne pas sa marque.
+
+Refusé au plan : une adresse IPv6 alors qu'`IPV6=no`, un FTP autorisé dont la plage passive est
+inconnue, un `web` fermé alors qu'un projet émet ses certificats par HTTP-01. Refusé sauf `--force` : une
+politique entrante fermée sans aucune source SSH, et — quand le plan retire un accès — une session SSH en
+cours qu'aucune règle SSH ne couvrirait, dont l'adresse serait bannie, ou un port où sshd **écoute
+réellement** (`ss -tlnp`) que le profil n'ouvre pas — aucune lecture de `sshd_config` ne couvre toutes ses
+syntaxes, et c'est ce port-là que la politique par défaut coupe. Limite connue : sous tmux ou screen, un
+shell garde le `SSH_CONNECTION` de la connexion qui l'a créé ; rattaché depuis une autre adresse, la garde
+contrôle l'ancienne. Un refus, comme un `ufw.yaml`
+invalide, n'est jamais tenté : `ogs firewall plan|apply` rend le code 3 ; le plan global en fait une
+étape non bloquante en échec — le reste du parc s'applique, et l'apply rend le code 6 en nommant le motif.
+`ogs firewall confirm` ne lit pas `ufw.yaml` : un fichier cassé depuis l'activation ne doit pas empêcher de
+garder un pare-feu qui fonctionne. L'adresse de la session est lue
+dans `SSH_CONNECTION` ; sudo l'effaçant (`env_reset`), ogs la cherche dans l'environnement de ses
+processus parents.
+
+#### Première activation
+
+Quand ufw passe d'inactif à actif, ogs programme d'abord `systemd-run --unit=ogs-ufw-rollback
+--on-active=<rollbackAfter> ufw --force disable`, puis active. `ogs firewall confirm`, lancé depuis une
+**nouvelle** session — c'est elle qui prouve que le pare-feu laisse passer l'administration —, arrête le
+minuteur. Faute de confirmation, ufw se désactive de lui-même. Un minuteur qui ne peut pas être programmé
+interdit l'activation ; `rollbackAfter: 0` s'en passe.
+
+#### fail2ban
+
+Les adresses de confiance rejoignent l'`ignoreip` de chaque prison `ogs-` (D68) : une adresse qui a accès
+à tout est d'ordinaire celle d'où l'on administre, et quelques mots de passe mal tapés suffiraient à la
+bannir. `ogs firewall apply` ne réconcilie que le pare-feu ; les prisons suivent au prochain `ogs apply`.
+
+#### Commandes
+
+```
+ogs firewall init                      ufw.yaml de départ d'après ce qui est installé
+ogs firewall status | profiles | rules | sources
+ogs firewall whois <adresse>           à qui elle appartient, ce qui lui est permis
+ogs firewall plan | apply              le pare-feu seul
+ogs firewall confirm                   confirme une première activation
+ogs firewall ban <adresse|source> [--comment] [--no-apply]
+ogs firewall unban <adresse|source> [--no-apply]
+```
+
+`ban` et `unban` écrivent `ufw.yaml` — il reste la source de vérité (D1) — en passant par l'arbre du
+document : les commentaires de l'exploitant, qui disent souvent pourquoi une adresse est là, survivent. Le
+document modifié est validé avant d'être écrit.
+
+#### Ce que `doctor` porte
+
+- ufw installé, actif si `ufw.yaml` le veut, activation en attente de confirmation ;
+- pour chaque profil disponible qui a des règles, un port qui n'écoute nulle part — le service arrêté, ou
+  un sshd déplacé que le profil n'ouvre pas — ou qui n'écoute que la boucle locale, où la règle n'ouvre
+  rien ;
+- Docker installé : il publie les ports de ses conteneurs par ses propres chaînes, examinées avant celles
+  d'ufw ;
+- les règles marquées mais retouchées, et le nombre de règles de l'administrateur, laissées intactes.
+
 ---
 
 ## 8. Secrets et keystore
@@ -2388,6 +2577,11 @@ ogs
 ├── mail dkim enable | disable <projet>
 ├── mail dkim show | records <projet>  clés DKIM et enregistrements à publier (§7.13)
 ├── mail dkim rotate | activate <projet>
+│
+├── firewall init | status | profiles | rules | sources   pare-feu ufw (§7.14)
+├── firewall whois <adresse>
+├── firewall plan | apply | confirm
+├── firewall ban | unban <adresse|source>
 │
 ├── cron add | remove | list | enable | disable | run
 │
@@ -2634,7 +2828,8 @@ indications de traçabilité, sans valeur de preuve puisque falsifiables par qui
 - `doctor` : vérifie paquets et binaires attendus, modules Apache/Nginx, plugin RabbitMQ management,
   accessibilité des sockets SGBD, permissions de `/etc/ogs` et de la clé maître, cohérence entre la base
   d'état et le système, présence des unités `ogs-renew`, versions PHP utilisables, clés DKIM et
-  enregistrements publiés (§7.13), chaîne de propriété et espace libre du répertoire des journaux (D71). Chaque anomalie est
+  enregistrements publiés (§7.13), chaîne de propriété et espace libre du répertoire des journaux (D71),
+  ports écoutés des profils du pare-feu et Docker en amont d'ufw (§7.14). Chaque anomalie est
   accompagnée de la commande de correction.
 
 ---
@@ -2888,6 +3083,18 @@ Scénarios exigés :
     d'un ancien `~/logs` reprend le contenu, journaux rotés compris, et Apache écrit ensuite au nouvel
     emplacement ; `doctor` signale une racine desserrée, que l'apply referme ; la suppression archive et
     retire les journaux.
+34. **Pare-feu** (D72), sous systemd, avec un vrai ufw et des **connexions réelles** : deux espaces réseau
+    reliés au conteneur par des paires veth tiennent lieu de clients, l'un de confiance, l'autre étranger,
+    et le verdict est ce que le noyau laisse passer. Un témoin sans pare-feu établit d'abord que tout
+    passe. ufw accepte le fichier de profils d'ogs, en-tête accentué compris, aux ports détectés — sshd sur
+    deux ports, SFTP de proftpd sur 2222 dans son `VirtualHost`, plage passive du FTP. La garde refuse
+    (code 3) une session SSH qu'aucune règle ne couvrirait. La première activation se défait d'elle-même
+    faute de confirmation ; confirmée, elle tient. Le plan relu est vide ; un commentaire corrigé l'est en
+    place, sans règle en double ; un port de profil changé entraîne ses règles, l'ancien port se fermant.
+    Un bannissement placé en tête bloque une adresse que le web ouvre à tous ; relu après une
+    autorisation, il est inopérant, et le plan le replace en tête. Une règle de l'administrateur survit,
+    une règle d'ogs orpheline part ; `doctor` signale un service qui n'écoute que la boucle locale ;
+    `active: false` désactive ufw.
 
 ### 16.3 Intégration continue
 
@@ -2932,7 +3139,7 @@ build multi-architecture. Les tests d'intégration sont obligatoires avant fusio
 | **L7 — TUI** | inspecteur, panneau de détail, actions contextuelles, suivi de logs, wizard de création | Création complète d'un projet depuis la TUI, parité avec la CLI |
 | **L8 — Import** | scan multi-sources, corrélation, adoption interactive, ressources non gérées | Adoption d'un serveur préconfiguré sans régression |
 | **L9 — Applications non-PHP** | types d'application, providers `runtime` (nvm, rbenv, pyenv, venv), templates de service Go/Node/Python/Ruby, vhosts de proxy, attente de disponibilité | Scénarios d'intégration 22 à 25 validés |
-| **L10 — Industrialisation** | hooks de parc et de projet, complétions dynamiques bash/zsh/fish, 96 pages de manuel engendrées, paquet `.deb` (nfpm), CI GitHub Actions, dix-sept scénarios d'intégration conteneurisés (Apache, PHP, nginx, hooks, MariaDB, PostgreSQL, RabbitMQ, ACME, systemd et cron, runtimes, durcissement, paquet, suppression, moteur web durci, supervision, signature DKIM, journaux), plus un scénario optionnel pour les runtimes qui compilent, documentation d'exploitation | Paquet installable, documentation publiée |
+| **L10 — Industrialisation** | hooks de parc et de projet, complétions dynamiques bash/zsh/fish, 96 pages de manuel engendrées, paquet `.deb` (nfpm), CI GitHub Actions, dix-huit scénarios d'intégration conteneurisés (Apache, PHP, nginx, hooks, MariaDB, PostgreSQL, RabbitMQ, ACME, systemd et cron, runtimes, durcissement, paquet, suppression, moteur web durci, supervision, signature DKIM, journaux, pare-feu), plus un scénario optionnel pour les runtimes qui compilent, documentation d'exploitation | Paquet installable, documentation publiée |
 
 ### Ce que les essais sur système réel ont corrigé
 
@@ -3053,6 +3260,16 @@ complet sans lui pour un parc exclusivement PHP.
 - **Historique à la migration** : **déplacé** dans le nouveau répertoire, fichiers rotés compris, pour que
   logrotate poursuive la numérotation (D71). ogs n'étant pas encore réellement en production, la migration
   n'a pas à ménager un parc existant, mais elle reste sans perte de lignes.
+
+**Points arbitrés le 24/09/2026** (D72) :
+
+- **Règles sans la marque d'ogs** : gardées et signalées, jamais purgées.
+- **Adresses de confiance et fail2ban** : reprises dans l'`ignoreip` de chaque prison `ogs-`.
+- **Retour automatique** : à la première activation seulement.
+- **Confiance** : une règle par profil disponible, non un `allow from` global.
+- **SFTP** : un profil distinct, servi par proftpd (mod_sftp), sur le port de son contexte
+  `SFTPEngine on` — 2222 d'ordinaire. ogs ouvre le port, il ne gère pas l'accès SFTP.
+- **Commentaires** : déclarés ou engendrés d'après la source nommée et son propriétaire.
 
 **Points restant à arbitrer** :
 
