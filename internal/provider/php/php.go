@@ -424,14 +424,91 @@ func (p *Provider) validate(ctx context.Context, version string) error {
 	return nil
 }
 
-// Reload recharge le gestionnaire de processus d'une version.
+// Reload met le gestionnaire de processus d'une version en accord avec ses
+// pools : rechargé s'il tourne, démarré s'il est arrêté, arrêté s'il n'a plus
+// aucun pool.
+//
+// Un simple « systemctl reload » ne suffit pas, parce que FPM refuse de tourner
+// sans pool (« No pool defined ») :
+//   - une version dont le pool de la distribution (www.conf) a été retiré reste
+//     arrêtée tant qu'aucun projet ne l'emploie. Le rechargement qui suit
+//     l'écriture du premier pool échouait alors sur une unité inactive, et le
+//     site répondait 503 sur un simple avertissement ;
+//   - recharger un maître dont le dernier pool vient de partir le tue : il relit
+//     sa configuration, n'y trouve rien à servir et s'arrête — en échec, au
+//     prochain démarrage comme à celui-ci.
+//
+// L'unité est donc activée au démarrage et désactivée à l'arrêt : une version
+// sans pool relancée au redémarrage de la machine tomberait en échec.
 func (p *Provider) Reload(ctx context.Context, version string) error {
 	if p.Exec.Simulated() {
 		return nil
 	}
 	unit := config.PHPUnit(version)
-	_, err := p.Exec.Run(ctx, exec.Command{Name: "systemctl", Args: []string{"reload", unit}})
-	return err
+	has, err := p.hasPools(version)
+	if err != nil {
+		return err
+	}
+	if !has {
+		if !p.unitActive(ctx, unit) {
+			return nil
+		}
+		if res, err := p.systemctl(ctx, "disable", "--now", unit); err != nil {
+			return fmt.Errorf("arrêt de %s, qui n'a plus aucun pool : %s", unit, firstError(res, err))
+		}
+		return nil
+	}
+	if p.unitActive(ctx, unit) {
+		if res, err := p.systemctl(ctx, "reload", unit); err != nil {
+			return fmt.Errorf("rechargement de %s : %s", unit, firstError(res, err))
+		}
+		return nil
+	}
+	// Arrêtée, jamais démarrée ou morte : le compteur d'échecs est acquitté
+	// d'abord, sans quoi systemd refuse le démarrage passé StartLimitBurst alors
+	// que la cause est levée.
+	_, _ = p.systemctl(ctx, "reset-failed", unit)
+	if res, err := p.systemctl(ctx, "enable", "--now", unit); err != nil {
+		return fmt.Errorf("démarrage de %s : %s", unit, firstError(res, err))
+	}
+	return nil
+}
+
+// hasPools dit si FPM trouvera au moins un pool pour cette version : tout
+// fichier .conf de pool.d, qu'il soit d'ogs ou de l'administrateur — c'est ce
+// qu'inclut php-fpm.conf.
+func (p *Provider) hasPools(version string) (bool, error) {
+	entries, err := os.ReadDir(p.Paths.PHPPoolDir(version))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	for _, e := range entries {
+		if !e.IsDir() && filepath.Ext(e.Name()) == ".conf" {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (p *Provider) unitActive(ctx context.Context, unit string) bool {
+	_, err := p.Exec.Run(ctx, exec.Command{Name: "systemctl", Args: []string{"is-active", "--quiet", unit}})
+	return err == nil
+}
+
+func (p *Provider) systemctl(ctx context.Context, args ...string) (exec.Result, error) {
+	return p.Exec.Run(ctx, exec.Command{Name: "systemctl", Args: args})
+}
+
+// firstError privilégie la sortie d'erreur de la commande, plus parlante que le
+// code de retour qu'elle a produit.
+func firstError(res exec.Result, err error) string {
+	if s := strings.TrimSpace(res.Stderr); s != "" {
+		return s
+	}
+	return err.Error()
 }
 
 func describeListen(bp *PoolPlan) string {

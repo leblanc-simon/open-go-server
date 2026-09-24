@@ -7,7 +7,7 @@ PostgreSQL, vhost et files RabbitMQ, pool PHP-FPM, vhost Apache ou Nginx, certif
 et services systemd. Un projet est décrit par un fichier YAML ; un moteur de réconciliation idempotent amène
 le serveur dans l'état décrit.
 
-Le cahier des charges technique complet — 73 décisions d'architecture arbitrées, spécification par module,
+Le cahier des charges technique complet — 74 décisions d'architecture arbitrées, spécification par module,
 plan de tests, découpage en lots — est dans [`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md).
 C'est la référence : toute contribution s'y adosse.
 
@@ -68,7 +68,7 @@ make integration-package   # installation, usage et désinstallation du .deb
 make integration-suppression # userdel n'aboutit que si les workers du pool sont déjà libérés
 make integration-web-durci # unité apache2 durcie (ProtectHome) : les journaux restent atteignables
 make integration-pare-feu  # ufw réel, connexions réelles : profils détectés, refus en tête, retour automatique
-make integration-all       # les dix-huit, à la suite
+make integration-all       # les dix-neuf, à la suite
 
 # Hors série : rbenv et pyenv compilent depuis les sources (un quart d'heure).
 make integration-runtimes-compiles
@@ -447,7 +447,7 @@ est transmis par `SOCKET_PATH`, et si le code l'ignore, l'attente de disponibili
 
 ## Documentation
 
-- [`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md) — la référence : 73 décisions d'architecture
+- [`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md) — la référence : 74 décisions d'architecture
   arbitrées, spécification par module, plan de tests, découpage en lots.
 - [`docs/INSTALLATION.md`](docs/INSTALLATION.md) — installation, premier démarrage, sauvegarde, mise à jour.
 - [`docs/HOOKS.md`](docs/HOOKS.md) — raccorder l'outil au reste de l'exploitation.

@@ -12,8 +12,8 @@ Les commits ne mentionnent jamais l'assistance d'un outil d'IA.
 
 ## La référence
 
-[`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md) fait autorité : 73 décisions d'architecture
-arbitrées (D1–D73, tableau §2), spécification par module, plan de tests, découpage en lots. **Consulter le
+[`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md) fait autorité : 74 décisions d'architecture
+arbitrées (D1–D74, tableau §2), spécification par module, plan de tests, découpage en lots. **Consulter le
 tableau des décisions avant de proposer une architecture** — la plupart des questions « pourquoi pas
 plutôt… ? » y sont déjà tranchées, avec leur raison. Toute décision nouvelle s'y ajoute.
 
@@ -43,12 +43,12 @@ make dev-demo                                   # crée ./dev, deux projets, pla
 
 ### Essais sur système réel
 
-Dix-huit scénarios conteneurisés éprouvent ce que les tests unitaires ne peuvent pas voir. Ils ont mis au jour
+Dix-neuf scénarios conteneurisés éprouvent ce que les tests unitaires ne peuvent pas voir. Ils ont mis au jour
 plus de trente défauts invisibles autrement (§18 du cahier des charges) : **y recourir avant de déclarer un
 provider fonctionnel**.
 
 ```sh
-make integration-all       # les dix-huit, à la suite
+make integration-all       # les dix-neuf, à la suite
 make integration-nginx     # un seul (voir SCENARIOS dans le Makefile)
 
 # Hors série : rbenv et pyenv compilent depuis les sources (un quart d'heure).
@@ -299,6 +299,11 @@ Ils ont tous coûté un défaut réel ; les tests unitaires ne les voyaient pas.
   qui libèrent les workers du pool. L'ordre inverse laissait compte, groupe et home en place — en annonçant
   un succès. Le scénario `suppression` le verrouille, et lui seul le voit : en mode simulé, ni `userdel` ni
   les rechargements n'atteignent le système.
+- **FPM refuse de tourner sans pool** (D74) : une version dont le `www.conf` de la distribution a été retiré reste
+  arrêtée tant qu'aucun projet ne l'emploie. `php.Provider.Reload` n'est donc pas un simple `systemctl reload` :
+  il **démarre et active** une unité arrêtée qui a des pools, **arrête et désactive** celle qui n'en a plus —
+  recharger un maître sans pool le tue. Le critère est tout `pool.d/*.conf`, pas seulement ceux d'ogs. Le
+  substitut `systemctl` démarrait l'unité sur `disable --now` : le scénario `fpm-sans-pool` l'a révélé.
 - **Le shell des comptes de projet est ouvert** — `/bin/bash` (D62), réglable par `user.shell` dans
   `/etc/ogs/config.yaml` et par `spec.user.shell`. Trois points à ne pas défaire : le défaut de la
   configuration est un défaut **de création**, le fichier du projet faisant autorité ensuite — le propager
@@ -393,7 +398,8 @@ Ils ont tous coûté un défaut réel ; les tests unitaires ne les voyaient pas.
   retirerait le jour où ufw.yaml cesserait de la demander.
 - **sudo efface `SSH_CONNECTION`** (`env_reset`, que `doctor` exige) : la garde contre la coupure de la
   session la cherche dans l'environnement des processus parents, et compare le profil ssh aux ports où
-  sshd **écoute réellement** (`ss -tlnp`) — `Port=2222`, `ListenAddress hôte:port`, aucune lecture de
+  sshd **écoute réellement** (`ss -tlnp`, et les `ListenStream` d'une `ssh.socket` active : sous l'activation
+  par socket d'Ubuntu, systemd tient seul le port jusqu'à la première connexion, et `ss` n'y montre aucun sshd) — `Port=2222`, `ListenAddress hôte:port`, aucune lecture de
   `sshd_config` ne couvre tout. Sans elle, un pare-feu mal écrit coupe
   la session qui l'active, et plus rien de ce qu'elle a lancé ne tourne pour réparer — d'où le minuteur
   systemd, qui ne dépend pas d'elle.

@@ -14,6 +14,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -882,24 +883,43 @@ func (p *Provider) validate(ctx context.Context, projects []*model.Project, prof
 
 // sshdListening rend les ports TCP où sshd écoute, lus par « ss ». En mode
 // simulé, ou si ss manque, rien : le contrôle se tait plutôt que d'inventer.
+//
+// Ubuntu démarre sshd par activation de socket (ssh.socket, depuis 22.10) : le
+// port est alors tenu par systemd, et « ss » n'y montre sshd qu'une fois une
+// première connexion reçue — avant, rien. Les ports d'une ssh.socket active sont
+// donc lus chez systemd. Une socket inactive ne dit rien : sshd peut tourner
+// seul, sur d'autres ports, et ses ListenStream n'écoutent pas.
 func (p *Provider) sshdListening(ctx context.Context) []string {
 	if p.simulated() {
 		return nil
 	}
-	res, err := p.Exec.Run(ctx, exec.Command{Name: "ss", Args: []string{"-Htlnp"}})
-	if err != nil {
-		return nil
+	var ports []string
+	if res, err := p.Exec.Run(ctx, exec.Command{Name: "ss", Args: []string{"-Htlnp"}}); err == nil {
+		ports = sshdPortsFromSS(res.Stdout)
 	}
-	return sshdPortsFromSS(res.Stdout)
+	if _, err := p.Exec.Run(ctx, exec.Command{
+		Name: "systemctl", Args: []string{"is-active", "--quiet", "ssh.socket"}}); err != nil {
+		return ports
+	}
+	res, err := p.Exec.Run(ctx, exec.Command{
+		Name: "systemctl", Args: []string{"show", "ssh.socket", "--property=Listen", "--value"}})
+	if err != nil {
+		return ports
+	}
+	for _, port := range socketStreamPorts(res.Stdout) {
+		ports = appendUnique(ports, port)
+	}
+	return ports
 }
 
 // sshdPortsFromSS relève les ports d'écoute des processus sshd dans une sortie
 // de « ss -Htlnp ». Seul le démon écoute ; « sshd-session » ne fait que servir
-// une connexion.
+// une connexion. sshd est cherché dans toute la liste des processus : sous
+// ssh.socket, systemd partage le descripteur et peut être nommé le premier.
 func sshdPortsFromSS(out string) []string {
 	var ports []string
 	for _, line := range strings.Split(out, "\n") {
-		if !strings.Contains(line, `(("sshd",`) {
+		if !strings.Contains(line, `("sshd",`) {
 			continue
 		}
 		f := strings.Fields(line)
@@ -912,6 +932,21 @@ func sshdPortsFromSS(out string) []string {
 			continue
 		}
 		ports = appendUnique(ports, local[i+1:])
+	}
+	return ports
+}
+
+// reSocketStream reconnaît une écoute TCP dans la propriété Listen d'une socket
+// systemd : « [::]:22 (Stream) », « 0.0.0.0:2222 (Stream) ». Un ListenStream
+// réduit à un port y est rendu sous la première forme.
+var reSocketStream = regexp.MustCompile(`:(\d+) \(Stream\)`)
+
+// socketStreamPorts relève les ports TCP d'une sortie de « systemctl show
+// --property=Listen --value ».
+func socketStreamPorts(out string) []string {
+	var ports []string
+	for _, m := range reSocketStream.FindAllStringSubmatch(out, -1) {
+		ports = appendUnique(ports, m[1])
 	}
 	return ports
 }

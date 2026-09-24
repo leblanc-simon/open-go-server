@@ -78,9 +78,12 @@ daemon-reload | daemon-reexec | preset | reset-failed)
     exit 0
     ;;
 enable | disable)
-    # L'activation ne fait que poser des liens, que rien ici ne consulte.
+    # L'activation ne fait que poser des liens, que rien ici ne consulte. Avec
+    # --now, « disable » arrête : le substitut démarrait l'unité dans les deux cas.
     if [ "$maintenant" = 1 ]; then
-        for u in $unites; do agir start "$u" || exit 1; done
+        action=start
+        [ "$verbe" = disable ] && action=stop
+        for u in $unites; do agir "$action" "$u" || exit 1; done
     fi
     exit 0
     ;;
@@ -95,7 +98,14 @@ is-active)
         case "$(nom "$u")" in
         apache2) pgrep -x apache2 >/dev/null || exit 3 ;;
         nginx) pgrep -x nginx >/dev/null || exit 3 ;;
-        php*-fpm) pgrep -f "php-fpm" >/dev/null || exit 3 ;;
+        # La version, pas tout « php-fpm » : un FPM d'une autre version rendrait
+        # active une unité arrêtée. Le maître réécrit son titre — « php-fpm:
+        # master process (/etc/php/<v>/fpm/php-fpm.conf) » —, d'où un motif qui
+        # reconnaît aussi le binaire « php-fpm<v> ».
+        php*-fpm)
+            v=$(nom "$u" | sed 's/^php\(.*\)-fpm$/\1/')
+            pgrep -f "php-fpm.*$v" >/dev/null || exit 3
+            ;;
         # Une unité d'ogs n'est jamais active ici : le dire évite qu'un scénario
         # conclue à tort qu'un service tourne.
         *) exit 3 ;;

@@ -2,6 +2,7 @@ package php
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -555,5 +556,111 @@ func TestCompensationRendLePoolPrecedent(t *testing.T) {
 	}
 	if string(après) != string(avant) {
 		t.Error("la compensation doit rendre le pool précédent")
+	}
+}
+
+// fpmRéel se déclare non simulé : Reload court-circuite sur un exécuteur simulé,
+// et c'est justement le dialogue avec systemd qu'il faut éprouver.
+type fpmRéel struct{ *exec.Recorder }
+
+func (f *fpmRéel) Simulated() bool { return false }
+
+// systemctlAppelés rend les appels à systemctl, arguments recollés.
+func systemctlAppelés(rec *exec.Recorder) []string {
+	var out []string
+	for _, c := range rec.Calls() {
+		if c.Name == "systemctl" {
+			out = append(out, strings.Join(c.Args, " "))
+		}
+	}
+	return out
+}
+
+// reloadFPM prépare une version 8.5, active ou non, avec ou sans pool, et
+// rend les appels à systemctl que produit son rechargement.
+func reloadFPM(t *testing.T, active, pool bool) ([]string, error) {
+	t.Helper()
+	prov, paths, _ := fixture(t, "8.5")
+	rec := exec.NewRecorder()
+	if !active {
+		rec.Errors["systemctl is-active"] = errors.New("inactive")
+	}
+	prov.Exec = &fpmRéel{rec}
+	if pool {
+		if err := fs.WriteAtomic(paths.PHPPoolFile("8.5", "shopfr"), []byte("[shopfr]\n"), 0o644, fs.KeepOwner); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Un fichier hors du masque de php-fpm.conf n'est pas un pool.
+	if err := fs.WriteAtomic(paths.PHPPoolFile("8.5", "www")+".dist", []byte("[www]\n"), 0o644, fs.KeepOwner); err != nil {
+		t.Fatal(err)
+	}
+	err := prov.Reload(context.Background(), "8.5")
+	return systemctlAppelés(rec), err
+}
+
+func TestReloadRechargeUnFPMActif(t *testing.T) {
+	calls, err := reloadFPM(t, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls[len(calls)-1] != "reload php8.5-fpm" {
+		t.Errorf("un FPM actif se recharge : %v", calls)
+	}
+}
+
+// Sans le pool www.conf de la distribution, FPM ne démarre pas tant qu'aucun
+// projet ne l'emploie : le premier pool doit le démarrer, et un reload échouait.
+func TestReloadDémarreUnFPMArrêtéAuPremierPool(t *testing.T) {
+	calls, err := reloadFPM(t, false, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(calls, " | ")
+	if strings.Contains(joined, "reload php8.5-fpm") {
+		t.Errorf("un FPM arrêté ne se recharge pas : %v", calls)
+	}
+	if !strings.Contains(joined, "reset-failed php8.5-fpm | enable --now php8.5-fpm") {
+		t.Errorf("le compteur d'échecs est acquitté, puis l'unité activée et démarrée : %v", calls)
+	}
+}
+
+// Recharger un maître sans pool le tue : il s'arrête proprement, et ne doit
+// pas repartir au prochain démarrage de la machine.
+func TestReloadArrêteUnFPMSansPool(t *testing.T) {
+	calls, err := reloadFPM(t, true, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(calls, " | ")
+	if strings.Contains(joined, "reload php8.5-fpm") || !strings.Contains(joined, "disable --now php8.5-fpm") {
+		t.Errorf("un FPM sans pool est arrêté et désactivé, jamais rechargé : %v", calls)
+	}
+}
+
+func TestReloadLaisseArrêtéUnFPMSansPool(t *testing.T) {
+	calls, err := reloadFPM(t, false, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range calls {
+		if !strings.HasPrefix(c, "is-active") {
+			t.Errorf("un FPM arrêté sans pool n'a rien à faire : %v", calls)
+		}
+	}
+}
+
+func TestReloadNommeLaCauseDUnDémarrageRefusé(t *testing.T) {
+	prov, paths, _ := fixture(t, "8.5")
+	rec := exec.NewRecorder()
+	rec.Errors["systemctl is-active"] = errors.New("inactive")
+	rec.Errors["systemctl enable"] = errors.New("code 1")
+	prov.Exec = &fpmRéel{rec}
+	if err := fs.WriteAtomic(paths.PHPPoolFile("8.5", "shopfr"), []byte("[shopfr]\n"), 0o644, fs.KeepOwner); err != nil {
+		t.Fatal(err)
+	}
+	err := prov.Reload(context.Background(), "8.5")
+	if err == nil || !strings.Contains(err.Error(), "démarrage de php8.5-fpm") {
+		t.Errorf("l'échec doit nommer le démarrage de l'unité : %v", err)
 	}
 }

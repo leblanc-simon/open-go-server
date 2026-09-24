@@ -631,3 +631,43 @@ ESTAB 0 0 10.0.0.1:22 10.0.0.9:5000 users:(("sshd-session",pid=300,fd=4))`
 		t.Errorf("ports de sshd : %v", got)
 	}
 }
+
+// Sous ssh.socket, systemd partage le descripteur d'écoute avec sshd, et ss
+// peut le nommer le premier.
+func TestPortsSSHEcoutesSystemdNomméLePremier(t *testing.T) {
+	out := `LISTEN 0 4096 0.0.0.0:22 0.0.0.0:* users:(("systemd",pid=1,fd=137),("sshd",pid=812,fd=3))`
+	if got := sshdPortsFromSS(out); len(got) != 1 || got[0] != "22" {
+		t.Errorf("ports de sshd : %v", got)
+	}
+}
+
+// ssReel se déclare non simulé : sshdListening se tait sur un exécuteur simulé.
+type ssReel struct{ *exec.Recorder }
+
+func (s *ssReel) Simulated() bool { return false }
+
+// Avant la première connexion, seul systemd tient le port d'une ssh.socket : ss
+// n'y montre aucun sshd, et la garde ne voyait rien.
+func TestPortsSSHEcoutesParSocketSystemd(t *testing.T) {
+	b := nouveauBanc(t, "{}", "ssh")
+	b.rec.Responses["ss -Htlnp"] = exec.Result{Stdout: `LISTEN 0 4096 0.0.0.0:2222 0.0.0.0:* users:(("systemd",pid=1,fd=137))
+LISTEN 0 511 0.0.0.0:80 0.0.0.0:* users:(("apache2",pid=9,fd=4))`}
+	b.rec.Responses["systemctl show"] = exec.Result{Stdout: "0.0.0.0:2222 (Stream)\n[::]:2222 (Stream)\n"}
+	b.prov.Exec = &ssReel{b.rec}
+	if got := b.prov.sshdListening(context.Background()); len(got) != 1 || got[0] != "2222" {
+		t.Errorf("ports de ssh.socket : %v", got)
+	}
+}
+
+// Une ssh.socket inactive n'écoute pas : ses ListenStream ne disent rien des
+// ports d'un sshd qui tourne seul.
+func TestPortsSSHSocketInactiveIgnorée(t *testing.T) {
+	b := nouveauBanc(t, "{}", "ssh")
+	b.rec.Responses["ss -Htlnp"] = exec.Result{Stdout: `LISTEN 0 128 0.0.0.0:2222 0.0.0.0:* users:(("sshd",pid=156,fd=6))`}
+	b.rec.Errors["systemctl is-active"] = errors.New("inactive")
+	b.rec.Responses["systemctl show"] = exec.Result{Stdout: "[::]:22 (Stream)\n"}
+	b.prov.Exec = &ssReel{b.rec}
+	if got := b.prov.sshdListening(context.Background()); len(got) != 1 || got[0] != "2222" {
+		t.Errorf("seuls les ports de sshd comptent : %v", got)
+	}
+}
