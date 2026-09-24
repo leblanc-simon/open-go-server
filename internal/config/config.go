@@ -646,6 +646,9 @@ const (
 	fail2banJailDir = "/etc/fail2ban/jail.d"
 	fail2banLog     = "/var/log/fail2ban.log"
 
+	ufwDir      = "/etc/ufw"
+	ufwDefaults = "/etc/default/ufw"
+
 	opendkimConf = "/etc/opendkim.conf"
 	opendkimDir  = "/etc/opendkim"
 	authLog      = "/var/log/auth.log"
@@ -667,8 +670,12 @@ func (p Paths) join(elem ...string) string {
 // Prefix expose le préfixe actif (vide en production).
 func (p Paths) Prefix() string { return p.prefix }
 
-func (p Paths) Etc() string           { return p.join(etcDir) }
-func (p Paths) ConfigFile() string    { return p.join(etcDir, "config.yaml") }
+func (p Paths) Etc() string        { return p.join(etcDir) }
+func (p Paths) ConfigFile() string { return p.join(etcDir, "config.yaml") }
+
+// UFWConfig est la déclaration du pare-feu (D72). Elle vit à part de
+// config.yaml, et son absence dit qu'ogs ne gère pas ufw.
+func (p Paths) UFWConfig() string     { return p.join(etcDir, "ufw.yaml") }
 func (p Paths) MasterKey() string     { return p.join(etcDir, "master.key") }
 func (p Paths) ProjectsDir() string   { return p.join(etcDir, "projects") }
 func (p Paths) ArchivedDir() string   { return p.join(etcDir, "projects", "archived") }
@@ -753,6 +760,20 @@ func (p Paths) OpenDKIMKeyTable() string  { return filepath.Join(p.OpenDKIMTable
 func (p Paths) OpenDKIMSigningTable() string {
 	return filepath.Join(p.OpenDKIMTablesDir(), "SigningTable")
 }
+
+// Chemins d'ufw (D72). ogs n'écrit qu'un fichier de profils, préfixé comme ses
+// profils eux-mêmes ; les règles passent par la commande ufw, seule à tenir
+// user.rules et le jeu de règles chargé en cohérence.
+func (p Paths) UFWAppsDir() string      { return p.join(ufwDir, "applications.d") }
+func (p Paths) UFWProfilesFile() string { return filepath.Join(p.UFWAppsDir(), "ogs") }
+func (p Paths) UFWUserRules() string    { return p.join(ufwDir, "user.rules") }
+func (p Paths) UFWUser6Rules() string   { return p.join(ufwDir, "user6.rules") }
+func (p Paths) UFWConf() string         { return p.join(ufwDir, "ufw.conf") }
+func (p Paths) UFWDefaults() string     { return p.join(ufwDefaults) }
+
+// Rooted place sous le préfixe un chemin système que Paths ne nomme pas : les
+// fichiers de configuration des services dont le pare-feu lit les ports.
+func (p Paths) Rooted(path string) string { return p.join(path) }
 
 // Fail2banLog est le journal de fail2ban, que la prison de récidive relit.
 func (p Paths) Fail2banLog() string { return p.join(fail2banLog) }

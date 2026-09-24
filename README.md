@@ -28,6 +28,7 @@ C'est la référence : toute contribution s'y adosse.
 | **L10** | Industrialisation : hooks de parc et de projet, complétions dynamiques, pages de manuel, paquet `.deb`, CI, scénarios d'intégration conteneurisés | **livré** |
 | **L11** | Supervision : prisons fail2ban et entrées Telegraf dérivées du parc, vhost d'état local, comptes de supervision MySQL, PostgreSQL et RabbitMQ | **livré** |
 | **L12** | Signature DKIM : une clé par domaine d'envoi, scellée dans le keystore, tables d'OpenDKIM dérivées du parc, enregistrements à publier, rotation en deux temps (D69) | **livré** |
+| **L13** | Pare-feu ufw décrit par `/etc/ogs/ufw.yaml` : profils dérivés des services installés, sources nommées, confiance, bannissements, politiques, retour automatique de la première activation (D72) | **livré** |
 
 ## Compilation
 
@@ -63,7 +64,8 @@ make integration-harden    # /etc et /home fermés aux utilisateurs, sans qu'auc
 make integration-package   # installation, usage et désinstallation du .deb
 make integration-suppression # userdel n'aboutit que si les workers du pool sont déjà libérés
 make integration-web-durci # unité apache2 durcie (ProtectHome) : les journaux restent atteignables
-make integration-all       # les quatorze, à la suite
+make integration-pare-feu  # ufw réel, connexions réelles : profils détectés, refus en tête, retour automatique
+make integration-all       # les dix-huit, à la suite
 
 # Hors série : rbenv et pyenv compilent depuis les sources (un quart d'heure).
 make integration-runtimes-compiles
@@ -116,6 +118,8 @@ ogs cert dns-provider set ovh --application-key …
 ogs amqp status | messenger | queue add | queue purge
 ogs amqp credentials set --user … --password …
 ogs cron add | remove | list | enable | disable | run
+ogs firewall init | status | profiles | rules | sources | whois <adresse>
+ogs firewall plan | apply | confirm | ban | unban <adresse|source>
 ogs service add | remove | list | start | stop | restart | scale | logs
 ogs my start | stop | restart | status      (surface déléguée par sudo)
 ogs site create <host> [--db] [--messenger] [--service] [--cron] [--runtime] …
@@ -421,6 +425,12 @@ est transmis par `SOCKET_PATH`, et si le code l'ignore, l'attente de disponibili
   l'enregistrement, `doctor` vérifie ce qui l'a été. La rotation ne bascule qu'une fois la nouvelle clé
   publiée : basculer vers une clé non publiée casserait la signature de tout envoi. Refusée en
   préproduction, qui signerait sinon au nom du domaine de production.
+- **Pare-feu** : sans `/etc/ogs/ufw.yaml`, ogs ne touche pas à ufw. Avec lui, il écrit ses propres
+  profils (`ogs-ssh`, `ogs-sftp`, `ogs-mysql`…) aux ports qu'il lit sur la machine — un sshd sur 2200, le
+  SFTP de proftpd sur 2222 —, et ne touche qu'aux règles dont le commentaire commence par `ogs:` ; celles
+  de l'administrateur restent intactes. La première activation se défait d'elle-même au bout de cinq
+  minutes faute de `ogs firewall confirm` lancé depuis une nouvelle session, et une déclaration qui
+  couperait la session SSH en cours est refusée.
 
 ## Codes de retour
 

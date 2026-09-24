@@ -45,6 +45,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         postfix \
         dnsmasq-base \
         python3-dkim \
+        ufw \
+        proftpd-core \
+        proftpd-mod-crypto \
+        openssh-server \
+        iproute2 \
+        netcat-openbsd \
     && a2enmod proxy proxy_fcgi proxy_http rewrite headers setenvif ssl status \
     && rm -rf /var/lib/apt/lists/*
 

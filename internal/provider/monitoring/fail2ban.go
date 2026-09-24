@@ -76,7 +76,7 @@ func (p *Provider) BuildFail2ban(projects []*model.Project) Fail2banData {
 		BanTime:  firstNonEmpty(mon.Fail2ban.BanTime, defaultBanTime),
 		FindTime: firstNonEmpty(mon.Fail2ban.FindTime, defaultFindTime),
 		MaxRetry: mon.Fail2ban.MaxRetry,
-		IgnoreIP: withLoopback(mon.Fail2ban.IgnoreIP),
+		IgnoreIP: withLoopback(append(append([]string{}, mon.Fail2ban.IgnoreIP...), p.TrustedIP...)),
 	}
 	if data.MaxRetry == 0 {
 		data.MaxRetry = defaultMaxRetry

@@ -272,6 +272,62 @@ monitoring:
       rabbitmq: false
 ```
 
+## Pare-feu : ufw
+
+`ogs` n'installe pas ufw, et **sans `/etc/ogs/ufw.yaml` il n'y touche pas**. Pour lui confier le pare-feu :
+
+```sh
+sudo ogs firewall init        # ufw.yaml de départ, d'après les services installés
+sudo ogs firewall profiles    # profils détectés : ports, disponibilité, sources
+sudo ogs firewall plan -v     # les commandes ufw qui seraient passées
+sudo ogs firewall apply
+```
+
+`init` fait de l'adresse de votre session SSH une source de confiance, qui a accès à tous les profils
+disponibles. S'il ne la trouve pas, SSH reste ouvert à tous : c'est à restreindre.
+
+### Confirmer la première activation
+
+Quand ufw passe d'inactif à actif, `ogs` programme sa désactivation au bout de cinq minutes
+(`rollbackAfter`). **Ouvrez une nouvelle session SSH** et lancez-y :
+
+```sh
+sudo ogs firewall confirm
+```
+
+C'est cette nouvelle session qui prouve que le pare-feu laisse passer l'administration. Une session ouverte
+avant l'activation survit à des règles qui refuseraient la suivante. Sans confirmation, ufw se désactive de
+lui-même, et le prochain `apply` le réactivera, de nouveau à confirmer.
+
+### Ce qu'ogs touche, et ce qu'il laisse
+
+| Élément | Géré par ogs |
+|---|---|
+| `/etc/ufw/applications.d/ogs` | oui : profils `ogs-ssh`, `ogs-sftp`, `ogs-mysql`… aux ports lus sur la machine |
+| règles dont le commentaire commence par `ogs:` | oui : posées, corrigées, retirées |
+| toute autre règle | **non** : laissée intacte, comptée par `ogs doctor` |
+| profils des paquets (`OpenSSH`, `Apache Full`…) | non |
+| politiques par défaut, journalisation | seulement si `ufw.yaml` les déclare, ou pour les défauts d'ufw (entrée `deny`, sortie `allow`) |
+
+Pour savoir à qui appartient une adresse, et ce qu'elle a le droit de faire :
+
+```sh
+sudo ogs firewall whois 198.51.100.7
+sudo ogs firewall ban 192.0.2.66 --comment "scan du 12/09"
+sudo ogs firewall unban 192.0.2.66
+```
+
+`ban` et `unban` écrivent `ufw.yaml` sans en perdre les commentaires, puis appliquent. Les adresses de
+confiance sont aussi ajoutées à l'`ignoreip` des prisons fail2ban d'ogs, au prochain `ogs apply`.
+
+### Deux pièges
+
+- **Docker publie les ports de ses conteneurs en amont d'ufw** : un port publié est ouvert quelles que soient
+  les règles. `ogs doctor` le signale.
+- **Un FTP sans plage passive connue est refusé** : la connexion passerait, et chaque transfert resterait
+  bloqué. Déclarez `profiles.ftp.passive`, ou `profiles.ftp.available: false` si proftpd ne sert qu'au
+  SFTP.
+
 ## Archives et rétention
 
 Supprimer un projet produit une archive dans `/var/lib/ogs/archives` : déclaration, fichiers générés,

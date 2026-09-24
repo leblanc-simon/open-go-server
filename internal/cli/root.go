@@ -89,6 +89,7 @@ func NewRootCommand() *cobra.Command {
 		newRuntimeCommand(app),
 		newAppCommand(app),
 		newMailCommand(app),
+		newFirewallCommand(app),
 	)
 	// Le générateur de scripts de complétion n'a pas besoin du système.
 	if c, _, err := root.Find([]string{"completion"}); err == nil && c != root {

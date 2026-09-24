@@ -19,6 +19,7 @@ import (
 	"leblanc.io/open-go-server/internal/hook"
 	"leblanc.io/open-go-server/internal/model"
 	appprov "leblanc.io/open-go-server/internal/provider/app"
+	"leblanc.io/open-go-server/internal/provider/firewall"
 	"leblanc.io/open-go-server/internal/provider/mail"
 	"leblanc.io/open-go-server/internal/provider/unit"
 	"leblanc.io/open-go-server/internal/spec"
@@ -360,6 +361,17 @@ func (a *App) buildGlobalPlan(ctx context.Context, provs *providers, targeted []
 		plan.Add(s)
 	}
 
+	// Pare-feu (D72) : après tout ce qui fait naître un service, pour que ses
+	// règles existent le jour où il écoute, et avant la rotation des journaux,
+	// dont le refus éventuel ne doit pas le priver de son tour.
+	fwSteps, err := a.firewallSteps(ctx, provs.Firewall, projects, false)
+	if err != nil {
+		return nil, err
+	}
+	for _, s := range fwSteps {
+		plan.Add(s)
+	}
+
 	// La rotation des journaux ferme la marche, et c'est un ordre, non une
 	// commodité : c'est le fichier de parc qu'un exploitant retouche le plus
 	// volontiers — un « compress », une taille —, donc l'étape qui a le plus de
@@ -375,6 +387,50 @@ func (a *App) buildGlobalPlan(ctx context.Context, provs *providers, targeted []
 	parcNonBloquante(step)
 	plan.Add(step)
 	return plan, nil
+}
+
+// firewallSteps calcule les étapes du pare-feu. Une déclaration invalide, ou qui
+// couperait un accès, n'est jamais tentée. Pour les commandes du pare-feu
+// (strict), c'est une erreur de validation, code 3 ; dans le plan global, une
+// étape non bloquante en échec : le reste du parc s'applique, et l'apply rend
+// le code 6 en nommant le motif.
+func (a *App) firewallSteps(ctx context.Context, fw *firewall.Provider, projects []*model.Project,
+	strict bool) ([]*engine.Step, error) {
+	if !fw.Managed() {
+		return nil, nil
+	}
+	obs, err := fw.Observe(ctx)
+	if err != nil {
+		if strict {
+			return nil, planErr(err)
+		}
+		return []*engine.Step{firewall.RefusedStep(err)}, nil
+	}
+	steps, err := fw.Plan(ctx, projects, obs)
+	if err != nil {
+		var ve *firewall.ValidationError
+		switch {
+		case !errors.As(err, &ve):
+			return nil, planErr(err)
+		case strict:
+			return nil, exitf(CodeValidation, "%v", err)
+		}
+		return []*engine.Step{firewall.RefusedStep(err)}, nil
+	}
+	return steps, nil
+}
+
+// announceRollback dit, après une activation d'ufw, qu'il faut la confirmer.
+// C'est la seule chose de l'apply que l'exploitant ne peut pas manquer : faute
+// de confirmation, le pare-feu retombe de lui-même.
+func (a *App) announceRollback(fw *firewall.Provider) {
+	if fw == nil || fw.Armed == 0 {
+		return
+	}
+	a.printf("\n⚠ ufw est actif. Depuis une NOUVELLE session SSH, confirmer dans les %s :\n"+
+		"    ogs firewall confirm\n"+
+		"  Sans confirmation, ufw se désactivera de lui-même : une session coupée par le pare-feu\n"+
+		"  ne pourrait pas le faire.\n", fw.Armed)
 }
 
 // parcNonBloquante rend non critiques les étapes de fichiers de portée parc que
@@ -783,6 +839,7 @@ func newApplyCommand(app *App) *cobra.Command {
 						return wrap(CodeError, err)
 					}
 					warnings += len(report.Warnings)
+					app.announceRollback(provs.Firewall)
 				}
 			}
 			if warnings > 0 {

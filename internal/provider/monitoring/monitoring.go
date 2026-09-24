@@ -58,6 +58,12 @@ type Provider struct {
 	WebEngine string
 	WebUnit   string
 
+	// TrustedIP porte les adresses de confiance du pare-feu (D72), ajoutées à
+	// l'« ignoreip » de chaque prison : une adresse qui a accès à tous les
+	// profils ne doit pas être bannie par une autre voie — c'est d'ordinaire
+	// celle d'où l'on administre, et quelques mots de passe mal tapés suffiraient.
+	TrustedIP []string
+
 	// Force autorise l'écrasement d'un fichier modifié à la main (§6.4). Sans
 	// elle, l'apply refuse — les deux fichiers de supervision sont recalculés en
 	// entier, et écraser sans le dire perdrait le travail de l'exploitant.

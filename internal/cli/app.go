@@ -22,6 +22,7 @@ import (
 	appprov "leblanc.io/open-go-server/internal/provider/app"
 	"leblanc.io/open-go-server/internal/provider/cron"
 	"leblanc.io/open-go-server/internal/provider/db"
+	"leblanc.io/open-go-server/internal/provider/firewall"
 	"leblanc.io/open-go-server/internal/provider/logrotate"
 	"leblanc.io/open-go-server/internal/provider/mail"
 	"leblanc.io/open-go-server/internal/provider/monitoring"
@@ -276,6 +277,7 @@ type providers struct {
 	Logrotate  *logrotate.Provider
 	Monitoring *monitoring.Provider
 	Mail       *mail.Provider
+	Firewall   *firewall.Provider
 	Engine     web.Engine
 }
 
@@ -328,6 +330,10 @@ func (a *App) buildProviders() (*providers, error) {
 	if a.Exec.Simulated() {
 		certs.Issuer = tlsprov.SelfSigned{}
 	}
+	fw, err := a.firewallProvider(eng.Unit())
+	if err != nil {
+		return nil, err
+	}
 	return &providers{
 		System: sys,
 		TLS:    certs,
@@ -355,14 +361,32 @@ func (a *App) buildProviders() (*providers, error) {
 			Store: a.Store, Keys: a.Keys,
 			DB: dbProv, AMQP: amqpProv, PHP: php,
 			WebEngine: eng.Name(), WebUnit: eng.Unit(),
-			Force: a.Force,
+			TrustedIP: fw.IgnoreIP(),
+			Force:     a.Force,
 		},
 		Mail: &mail.Provider{
 			Paths: a.Paths, Cfg: a.Cfg, Exec: a.Exec,
 			Store: a.Store, Keys: a.Keys, Force: a.Force,
 		},
-		Engine: eng,
+		Firewall: fw,
+		Engine:   eng,
 	}, nil
+}
+
+// firewallProvider construit le provider du pare-feu (D72). ufw.yaml est lu
+// ici, et non au démarrage, et une déclaration invalide n'est pas une erreur de
+// construction : elle arrête les commandes du pare-feu, pas « ogs apply » ni
+// « ogs project delete », dont le plan global la rend en avertissement. Absent,
+// le provider ne gère rien.
+func (a *App) firewallProvider(webUnit string) (*firewall.Provider, error) {
+	prov := &firewall.Provider{Paths: a.Paths, Exec: a.Exec, WebUnit: webUnit, Force: a.Force}
+	cfg, _, err := config.LoadUFW(a.Paths.UFWConfig())
+	if err != nil {
+		prov.LoadErr = fmt.Errorf("%s :\n%v", a.Paths.UFWConfig(), err)
+		return prov, nil
+	}
+	prov.Cfg = cfg
+	return prov, nil
 }
 
 // amqpProvider construit le provider RabbitMQ. Le client n'est branché que si

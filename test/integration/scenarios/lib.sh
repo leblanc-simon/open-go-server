@@ -23,12 +23,17 @@ PY
     # vhosts d'ogs, ou la page par défaut de Debian servie par le vainqueur
     # depuis /var/www/html. Le résultat dépendait d'une course.
     if [ -d /run/systemd/system ]; then
-        local autre=nginx
+        # Le moteur « apache » a pour unité « apache2 » : relancer « apache »
+        # visait une unité inexistante, en silence, et Apache restait « failed »
+        # jusqu'à ce qu'un apply d'ogs le relève — ce qui masquait le défaut dans
+        # tout scénario qui n'interroge pas le port 80 avant son premier apply.
+        local unite=$1 autre=nginx
+        [ "$1" = apache ] && unite=apache2
         [ "$1" = nginx ] && autre=apache2
         systemctl disable --now "$autre" >/dev/null 2>&1 || true
         # Passé StartLimitBurst, systemd refuse de démarrer alors que la cause est
         # levée : acquitter le compteur avant de relever le moteur retenu.
-        systemctl reset-failed "$1" >/dev/null 2>&1 || true
-        systemctl restart "$1" >/dev/null 2>&1 || true
+        systemctl reset-failed "$unite" >/dev/null 2>&1 || true
+        systemctl restart "$unite" >/dev/null 2>&1 || true
     fi
 }

@@ -43,12 +43,12 @@ make dev-demo                                   # crée ./dev, deux projets, pla
 
 ### Essais sur système réel
 
-Dix-sept scénarios conteneurisés éprouvent ce que les tests unitaires ne peuvent pas voir. Ils ont mis au jour
+Dix-huit scénarios conteneurisés éprouvent ce que les tests unitaires ne peuvent pas voir. Ils ont mis au jour
 plus de trente défauts invisibles autrement (§18 du cahier des charges) : **y recourir avant de déclarer un
 provider fonctionnel**.
 
 ```sh
-make integration-all       # les dix-sept, à la suite
+make integration-all       # les dix-huit, à la suite
 make integration-nginx     # un seul (voir SCENARIOS dans le Makefile)
 
 # Hors série : rbenv et pyenv compilent depuis les sources (un quart d'heure).
@@ -70,7 +70,10 @@ Deux pièges du harnais :
   l'autre** : les deux moteurs sont activés dans l'image, et sous un vrai systemd ils se disputent le
   port 80 au démarrage. Le perdant restait « failed » et le scénario interrogeait le vainqueur, qui n'avait
   jamais chargé les vhosts d'ogs et servait la page par défaut de Debian depuis `/var/www/html` — un
-  scénario dont le verdict dépendait d'une course.
+  scénario dont le verdict dépendait d'une course. Le moteur `apache` a pour unité `apache2` : la
+  fonction relançait longtemps une unité `apache` inexistante, en silence, et Apache restait « failed »
+  jusqu'au premier apply d'ogs, qui le relevait — seul le scénario `pare-feu`, qui interroge le port 80
+  avant tout apply, l'a vu.
 
 ## Architecture
 
@@ -183,6 +186,21 @@ reprennent entière — et l'écrit pour OpenDKIM ; le plan global écrit la `Ke
 **réécrit**, jamais régénéré, une clé neuve exigeant de republier chez le client. ogs ne touche ni au MTA,
 ni à `opendkim.conf`, ni au DNS ; la rotation (`rotate` puis `activate`) ne bascule qu'une fois
 l'enregistrement publié, vérifié par le résolveur.
+
+### Pare-feu : ufw.yaml, des profils à soi, des règles marquées
+
+`internal/provider/firewall` (D72) réconcilie ufw avec `/etc/ogs/ufw.yaml`, **dont l'absence vaut « ne
+touche à rien »**. Il écrit un seul fichier, `/etc/ufw/applications.d/ogs`, aux profils `ogs-*` dérivés de
+ce qui est installé (unités, `sshd_config`, `proftpd.conf`…) ; toute règle passe par la **commande ufw**,
+jamais par `user.rules`, que la réconciliation relit seulement — ses lignes `### tuple ###` sont ce
+qu'ufw lui-même relit. **Une règle est à ogs si son commentaire commence par `ogs:`**, et à
+l'administrateur sinon : ogs ne la touche pas. Les étapes sont non critiques, mais politiques et
+activation refusent de s'appliquer si une règle a échoué ; la première activation arme un minuteur
+systemd qui désactive ufw faute de `ogs firewall confirm`. Les adresses de confiance rejoignent
+l'`ignoreip` des prisons fail2ban (`monitoring.Provider.TrustedIP`). **Un `ufw.yaml` invalide ou refusé
+n'arrête pas le plan global** : il y devient une étape non bloquante en échec (`firewall.RefusedStep`),
+code 6, et seules les commandes `ogs firewall` rendent le code 3 — sans quoi une faute de frappe dans le
+pare-feu priverait `project delete` du recalcul des prisons et de la rotation (D68).
 
 ### Surfaces particulières
 
@@ -354,6 +372,31 @@ Ils ont tous coûté un défaut réel ; les tests unitaires ne les voyaient pas.
   lot L0 à l'ajout de `www-data` au groupe d'un projet, n'était routée nulle part : chaque création de
   projet rendait le code 6 sur un avertissement invisible. `TestToutesLesIntentionsDeRechargementSontRoutees`
   le verrouille.
+- **ufw refuse l'apostrophe droite dans un commentaire** — le français en est plein : `SanitizeUFWComment`
+  la remplace par l'apostrophe typographique. Il **remplace en place** le commentaire d'une règle
+  identique, mais `ufw prepend` **ignore** une règle existante : un commentaire se corrige par la commande
+  d'ajout ordinaire, jamais par `prepend`. Un refus doit précéder toute autorisation plus large — ufw
+  retient la première règle qui correspond —, d'où `prepend` à la pose et le replacement en tête d'un
+  refus relu trop bas.
+- **Une règle d'application porte les ports du profil au moment de sa pose** : réécrire le profil ne la
+  change pas, d'où `ufw app update` pour chaque profil dont les ports changent. Et ufw **refuse une
+  application inconnue jusque dans `ufw delete`** : la règle d'un profil qui disparaît part *avant* le
+  fichier de profils, et un profil qu'une règle de l'administrateur emploie reste défini. Un profil dont
+  une liste ou une plage de ports n'a pas de protocole est **écarté d'un simple avertissement** : la
+  validation l'exige.
+- **Un réseau aux bits d'hôte non nuls ne se relit pas comme il s'écrit** : ufw ramène `10.0.0.5/24` à
+  `10.0.0.0/24` en IPv4 mais le garde tel quel en IPv6 — le plan reposerait la règle à chaque apply. La
+  validation le refuse. Les adresses relues sont comparées **après analyse**, jamais comme chaînes.
+- **Tout ce qui retire un accès se garde**, pas seulement l'activation : retirer l'ancienne règle quand sa
+  remplaçante a échoué déplace l'accès nulle part. Et une règle de l'administrateur **de même définition**
+  qu'une règle voulue ne reçoit jamais la marque d'ogs — ufw remplaçant le commentaire en place, ogs la
+  retirerait le jour où ufw.yaml cesserait de la demander.
+- **sudo efface `SSH_CONNECTION`** (`env_reset`, que `doctor` exige) : la garde contre la coupure de la
+  session la cherche dans l'environnement des processus parents, et compare le profil ssh aux ports où
+  sshd **écoute réellement** (`ss -tlnp`) — `Port=2222`, `ListenAddress hôte:port`, aucune lecture de
+  `sshd_config` ne couvre tout. Sans elle, un pare-feu mal écrit coupe
+  la session qui l'active, et plus rien de ce qu'elle a lancé ne tourne pour réparer — d'où le minuteur
+  systemd, qui ne dépend pas d'elle.
 - Telegraf n'a **pas d'équivalent d'`apachectl -t`** : son option de test exécute réellement la collecte.
   Le rechargement se contente d'un constat en aval. Et un fragment que l'agent ne peut pas lire ne produit
   **aucune erreur** — il démarre, ne collecte rien, et se tait ; d'où le contrôle de `doctor`.

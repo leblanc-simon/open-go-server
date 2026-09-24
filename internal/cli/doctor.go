@@ -454,6 +454,7 @@ func (a *App) runChecks(ctx context.Context) []check {
 	}
 	a.monitoringChecks(add)
 	a.mailChecks(ctx, projects, add)
+	a.firewallChecks(ctx, add)
 	// Journaux des projets, hors du home (D71).
 	if provs, err := a.buildProviders(); err == nil {
 		for _, f := range provs.System.LogChecks(projects, a.logsRoot()) {
@@ -462,6 +463,33 @@ func (a *App) runChecks(ctx context.Context) []check {
 		provs.close()
 	}
 	return out
+}
+
+// firewallChecks porte les contrôles du pare-feu (D72). Une déclaration
+// invalide est un échec : elle arrêterait le prochain apply.
+func (a *App) firewallChecks(ctx context.Context, add func(name, status, detail, fix string)) {
+	fw, err := a.firewall()
+	if err != nil {
+		add("pare-feu", "échec", strings.ReplaceAll(err.Error(), "\n", " "), "corriger "+a.Paths.UFWConfig())
+		return
+	}
+	if !fw.Managed() {
+		return
+	}
+	obs, err := fw.Observe(ctx)
+	if err != nil {
+		add("pare-feu", "avertissement", err.Error(), "")
+		return
+	}
+	var listeners []string
+	if !a.Exec.Simulated() {
+		if l, err := a.listeners(); err == nil {
+			listeners = l
+		}
+	}
+	for _, f := range fw.Checks(obs, listeners) {
+		add(f.Name, f.Status, f.Detail, f.Fix)
+	}
 }
 
 // mailChecks porte les contrôles de la signature DKIM (D69) : ce que le plan ne

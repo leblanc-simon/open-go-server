@@ -39,8 +39,10 @@ done
 # suppression en fait partie : c'est le rechargement de PHP-FPM par systemd qui
 # libère les workers du projet, et donc son compte. DKIM aussi : OpenDKIM et
 # Postfix y tournent comme des services, et c'est leur rechargement qu'on éprouve.
+# Le pare-feu enfin : son retour automatique est un minuteur systemd, et ses
+# règles filtrent l'espace réseau du conteneur — jamais celui de la machine.
 case "$scenario" in
-systemd | runtimes | runtimes-compiles | harden | suppression | web-durci | dkim | journaux)
+systemd | runtimes | runtimes-compiles | harden | suppression | web-durci | dkim | journaux | pare-feu)
     # Le répertoire monté doit exister avant « docker run » : sinon Docker le crée
     # au nom de root, et la compilation de l'application du scénario runtimes, qui
     # passe après suppression dans la série, ne peut plus y écrire.
