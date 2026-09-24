@@ -168,7 +168,7 @@ func DetectEngine(requested, prefix string) (Engine, error) {
 	switch {
 	case apache.Installed() && nginx.Installed():
 		return nil, fmt.Errorf("Apache et Nginx sont tous deux installés : préciser lequel piloter " +
-			"(web.engine dans la configuration, ou spec.web.engine du projet)")
+			"(web.engine dans /etc/ogs/config.yaml)")
 	case apache.Installed():
 		return apache, nil
 	case nginx.Installed():

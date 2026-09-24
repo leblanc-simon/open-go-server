@@ -2763,3 +2763,14 @@ func TestMigrationDesJournauxHorsDuHome(t *testing.T) {
 		t.Errorf("les journaux du projet supprimé doivent partir :\n%s", out)
 	}
 }
+
+// Le moteur web se choisit pour la machine (web.engine de config.yaml) : site
+// create n'offre plus d'option qui l'écrirait dans le projet sans effet.
+func TestSiteCreateNOffrePlusLeChoixDuMoteur(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	out, code := h.run("site", "create", "shop.fr", "--kind", "static", "--engine", "nginx", "--dry-run")
+	if code != CodeUsage {
+		t.Errorf("--engine : code %d attendu %d\n%s", code, CodeUsage, out)
+	}
+}

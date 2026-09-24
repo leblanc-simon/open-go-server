@@ -188,8 +188,13 @@ type Pool struct {
 	Env      map[string]string `yaml:"env,omitempty"`
 }
 
-// Web décrit le moteur et les vhosts.
+// Web décrit les vhosts.
 type Web struct {
+	// Engine n'est conservé que pour relire les déclarations antérieures : le
+	// moteur web est un choix de machine (« web.engine » de config.yaml), et ce
+	// champ n'a jamais été lu. Normalize l'efface, si bien qu'il disparaît du
+	// fichier à sa prochaine écriture — le garder aurait laissé croire qu'un
+	// projet peut être servi par un autre moteur que ses voisins.
 	Engine string  `yaml:"engine,omitempty"`
 	VHosts []VHost `yaml:"vhosts,omitempty"`
 	// TLS porte le réglage de portée projet. Il est nécessaire parce que le vhost
@@ -403,6 +408,8 @@ func (p *Project) Normalize(homeRoot, prepDomain string, opts ...NormalizeOption
 	if err != nil {
 		return err
 	}
+
+	p.Spec.Web.Engine = ""
 
 	if p.Spec.App.Kind == "" {
 		p.Spec.App.Kind = KindStatic

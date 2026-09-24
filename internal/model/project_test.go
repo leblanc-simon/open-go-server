@@ -107,3 +107,17 @@ func TestLesJournauxQuittentLeHome(t *testing.T) {
 		t.Errorf("un choix de l'exploitant doit être conservé, obtenu %s", q.Spec.Layout.LogDir)
 	}
 }
+
+func TestNormalizeEffaceLeMoteurDeProjet(t *testing.T) {
+	// Le moteur web est un choix de machine : un spec.web.engine hérité d'une
+	// déclaration antérieure est relu sans erreur, puis effacé, pour ne plus
+	// laisser croire qu'il décide de quoi que ce soit.
+	p := New("shop.fr", naming.EnvProd, KindStatic)
+	p.Spec.Web.Engine = "nginx"
+	if err := p.Normalize("/home", "preprod-pp.net"); err != nil {
+		t.Fatal(err)
+	}
+	if p.Spec.Web.Engine != "" {
+		t.Errorf("spec.web.engine %q conservé : le moteur ne se choisit pas par projet", p.Spec.Web.Engine)
+	}
+}

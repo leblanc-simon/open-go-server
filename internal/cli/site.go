@@ -49,7 +49,6 @@ type siteOptions struct {
 	selfSigned bool
 	services   []string
 	crons      []string
-	engineName string
 	preset     string
 	apply      bool
 }
@@ -127,7 +126,6 @@ func newSiteCreateCommand(app *App) *cobra.Command {
 		"service à déclarer, sous la forme template:transport:instances (répétable)")
 	f.StringSliceVar(&opts.crons, "cron", nil,
 		"tâche à déclarer, sous la forme « expression:commande » (répétable)")
-	f.StringVar(&opts.engineName, "engine", "", "moteur web : apache ou nginx")
 	f.StringVar(&opts.preset, "preset", "", "dimensionnement du pool PHP")
 	f.BoolVar(&opts.apply, "apply", true, "appliquer immédiatement")
 	return cmd
@@ -158,9 +156,6 @@ func (a *App) buildSite(host string, opts siteOptions) (*model.Project, error) {
 	}
 	if opts.phpVersion != "" {
 		p.Spec.PHP.Pools = []model.Pool{{Name: model.MainPoolName, Version: opts.phpVersion}}
-	}
-	if opts.engineName != "" {
-		p.Spec.Web.Engine = opts.engineName
 	}
 	// Première normalisation : l'identifiant et le host effectif en découlent, et
 	// tout le reste s'y adosse.

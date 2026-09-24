@@ -48,6 +48,12 @@ func NewRootCommand() *cobra.Command {
 		},
 	}
 
+	// Une option inconnue ou mal formée est une erreur d'usage (code 2), non une
+	// erreur d'exécution : les sous-commandes héritent de ce traitement.
+	root.SetFlagErrorFunc(func(_ *cobra.Command, err error) error {
+		return wrap(CodeUsage, err)
+	})
+
 	f := root.PersistentFlags()
 	f.StringVar(&app.Prefix, "prefix", "", "préfixe appliqué à tous les chemins système (essai sans privilèges)")
 	f.StringVarP(&app.Format, "output", "o", "table", "format de sortie : table, json ou yaml")
