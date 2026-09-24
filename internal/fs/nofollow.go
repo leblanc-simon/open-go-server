@@ -3,7 +3,9 @@ package fs
 import (
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"golang.org/x/sys/unix"
@@ -244,4 +246,124 @@ func readDirNames(fd int) ([]string, error) {
 	}
 	unix.Close(dup)
 	return names, nil
+}
+
+// EnsureFile crée un fichier vide s'il manque, sans jamais suivre de lien, et
+// recale son mode et son propriétaire. Un fichier existant n'est ni tronqué ni
+// réécrit : les journaux pré-créés gardent leur contenu. Il rend vrai si quelque
+// chose a changé. Il ne sert que dans un répertoire qui appartient à root — celui
+// des journaux d'un projet (D71) — : ailleurs, le nom lui-même serait à la merci
+// de l'utilisateur.
+func EnsureFile(path string, mode os.FileMode, owner Owner) (bool, error) {
+	fd, err := unix.Open(path, unix.O_WRONLY|unix.O_APPEND|unix.O_CREAT|unix.O_NOFOLLOW|unix.O_CLOEXEC|unix.O_NONBLOCK,
+		uint32(mode.Perm()))
+	if err != nil {
+		return false, wrapNoFollow(path, err)
+	}
+	defer unix.Close(fd)
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		return false, err
+	}
+	if st.Mode&unix.S_IFMT != unix.S_IFREG {
+		return false, fmt.Errorf("%s n'est pas un fichier régulier", path)
+	}
+	changed := false
+	if os.FileMode(st.Mode).Perm() != mode.Perm() {
+		if err := unix.Fchmod(fd, uint32(mode.Perm())); err != nil {
+			return false, err
+		}
+		changed = true
+	}
+	uid, gid := owner.UID, owner.GID
+	if (uid >= 0 && uint32(uid) != st.Uid) || (gid >= 0 && uint32(gid) != st.Gid) {
+		if err := unix.Fchown(fd, uid, gid); err != nil {
+			return false, err
+		}
+		changed = true
+	}
+	return changed, nil
+}
+
+// DirEntryAt décrit une entrée lue par ListDirAt.
+type DirEntryAt struct {
+	Name    string
+	Regular bool
+	UID     uint32
+	Size    int64
+}
+
+// ListDirAt ouvre root/rel sans suivre de lien et en énumère les entrées, avec le
+// propriétaire du répertoire lui-même. Aucune entrée n'est suivie : un lien y
+// est rapporté comme non régulier.
+func ListDirAt(root, rel string) (dirUID uint32, entries []DirEntryAt, err error) {
+	fd, err := openDirAt(root, rel, false, 0, KeepOwner)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer unix.Close(fd)
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		return 0, nil, err
+	}
+	names, err := readDirNames(fd)
+	if err != nil {
+		return 0, nil, err
+	}
+	sort.Strings(names)
+	for _, n := range names {
+		var est unix.Stat_t
+		if err := unix.Fstatat(fd, n, &est, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+			continue
+		}
+		entries = append(entries, DirEntryAt{
+			Name: n, Regular: est.Mode&unix.S_IFMT == unix.S_IFREG, UID: est.Uid, Size: est.Size,
+		})
+	}
+	return st.Uid, entries, nil
+}
+
+// OpenFileAt ouvre en lecture le fichier régulier name de root/rel, sans suivre
+// de lien ni à l'entrée ni en chemin. Le propriétaire est rendu pour que
+// l'appelant juge de ce qu'il accepte de lire.
+func OpenFileAt(root, rel, name string) (*os.File, uint32, error) {
+	dir, err := openDirAt(root, rel, false, 0, KeepOwner)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer unix.Close(dir)
+	fd, err := unix.Openat(dir, name, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC|unix.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, 0, wrapNoFollow(filepath.Join(root, rel, name), err)
+	}
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		unix.Close(fd)
+		return nil, 0, err
+	}
+	if st.Mode&unix.S_IFMT != unix.S_IFREG {
+		unix.Close(fd)
+		return nil, 0, fmt.Errorf("%s n'est pas un fichier régulier", filepath.Join(root, rel, name))
+	}
+	return os.NewFile(uintptr(fd), filepath.Join(root, rel, name)), st.Uid, nil
+}
+
+// RemoveFileAt retire le fichier régulier name de root/rel, sans suivre de lien.
+func RemoveFileAt(root, rel, name string) error {
+	fd, err := openDirAt(root, rel, false, 0, KeepOwner)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(fd)
+	var st unix.Stat_t
+	if err := unix.Fstatat(fd, name, &st, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		if errors.Is(err, unix.ENOENT) {
+			return nil
+		}
+		return err
+	}
+	if st.Mode&unix.S_IFMT != unix.S_IFREG {
+		return fmt.Errorf("%s n'est pas un fichier régulier : refus de le supprimer", filepath.Join(root, rel, name))
+	}
+	return unix.Unlinkat(fd, name, 0)
 }

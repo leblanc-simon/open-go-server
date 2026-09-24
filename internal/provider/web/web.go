@@ -22,6 +22,10 @@ import (
 
 // Provider réconcilie les vhosts d'un projet.
 type Provider struct {
+	// LogsRoot est la racine des journaux des projets (D71), seule entrée du
+	// complément d'unité. Vide, les répertoires des projets sont énumérés.
+	LogsRoot string
+
 	Paths     config.Paths
 	Exec      exec.Executor
 	Templates *template.Set
@@ -746,19 +750,29 @@ func (p *Provider) DropInPath() string {
 func (p *Provider) PlanDropIn(ctx context.Context, projects []*model.Project) ([]*engine.Step, error) {
 	var body []byte
 	body = append(body, "[Service]\n"...)
-	seen := map[string]bool{}
-	dirs := make([]string, 0, len(projects))
-	for _, proj := range projects {
-		dir := proj.Spec.Layout.LogDir
-		if dir == "" || seen[dir] {
-			continue
+	// Une seule entrée, la racine des journaux (D71) : ils ont quitté /home, que
+	// ProtectHome montrait en lecture seule au seul service, et tout répertoire de
+	// journaux vit désormais sous cette racine — la validation le refuse ailleurs.
+	// L'entrée reste par prudence envers un ProtectSystem=strict, qui monterait
+	// /var en lecture seule. Son contenu ne dépend plus des projets : en créer un
+	// ne redémarre plus le serveur web.
+	if p.LogsRoot != "" {
+		body = append(body, "ReadWritePaths=-"+p.LogsRoot+"\n"...)
+	} else {
+		seen := map[string]bool{}
+		dirs := make([]string, 0, len(projects))
+		for _, proj := range projects {
+			dir := proj.Spec.Layout.LogDir
+			if dir == "" || seen[dir] {
+				continue
+			}
+			seen[dir] = true
+			dirs = append(dirs, dir)
 		}
-		seen[dir] = true
-		dirs = append(dirs, dir)
-	}
-	sort.Strings(dirs)
-	for _, dir := range dirs {
-		body = append(body, "ReadWritePaths=-"+dir+"\n"...)
+		sort.Strings(dirs)
+		for _, dir := range dirs {
+			body = append(body, "ReadWritePaths=-"+dir+"\n"...)
+		}
 	}
 	content := fs.Render(fs.Header{
 		Project: "parc", Resource: "web/dropin", Generated: p.now(),

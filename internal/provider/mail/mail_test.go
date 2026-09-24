@@ -683,3 +683,25 @@ func TestSansCleMaitreUnProjetNonSigneSePlanifie(t *testing.T) {
 		t.Errorf("les tables d'un parc sans signature ne doivent pas exiger le keystore : %v", err)
 	}
 }
+
+func TestLesTablesSontAuRegimeDeHarden(t *testing.T) {
+	// « ogs harden » ferme /etc/opendkim en 0750 et ses fichiers en 0640 : écrire
+	// les tables en 0644, ou le répertoire en 0755, ferait rouvrir à chaque apply
+	// ce que harden referme.
+	f := newFixture(t)
+	p := project(t, "shop.fr", &model.DKIM{Enabled: true})
+	run(t, f.plan(t, p))
+	tables(t, f, p)
+	for path, want := range map[string]os.FileMode{
+		f.paths.OpenDKIMKeyTable():              0o640,
+		f.paths.OpenDKIMSigningTable():          0o640,
+		f.paths.OpenDKIMTablesDir():             0o750,
+		filepath.Dir(f.paths.OpenDKIMKeysDir()): 0o750,
+		f.paths.OpenDKIMKeysDir():               0o750,
+	} {
+		info, err := os.Stat(path)
+		if err != nil || info.Mode().Perm() != want {
+			t.Errorf("%s : %04o attendu, obtenu %v (%v)", path, want, info.Mode().Perm(), err)
+		}
+	}
+}

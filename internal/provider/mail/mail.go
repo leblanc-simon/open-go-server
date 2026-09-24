@@ -243,7 +243,7 @@ func (p *Provider) writeKey(path string, k Key, obs Observed) error {
 // d'autre n'énumère.
 func (p *Provider) ensureKeyDirs(domainDir string, obs Observed) error {
 	root := p.Paths.OpenDKIMKeysDir()
-	if err := fs.EnsureDir(filepath.Dir(root), 0o755, fs.KeepOwner); err != nil {
+	if err := p.ensureOpenDKIMDir(obs); err != nil {
 		return err
 	}
 	for _, dir := range []string{root, filepath.Dir(domainDir), domainDir} {
@@ -259,6 +259,17 @@ func (p *Provider) ensureKeyDirs(domainDir string, obs Observed) error {
 // signer. Recharger ici ferait même valider par « opendkim -n » une
 // configuration qui désigne des tables pas encore écrites — le plan global les
 // pose après les projets — et avertir à tort au premier apply.
+
+// OpenDKIMDirMode est le mode de /etc/opendkim et des répertoires qu'ogs y pose.
+// C'est celui qu'« ogs harden » exige (hardening.Defaults) : EnsureDir repose le
+// mode d'un répertoire existant, et deux juges en désaccord feraient osciller
+// l'un et l'autre à chaque passage — l'apply rouvrant ce que harden ferme.
+const OpenDKIMDirMode = 0o750
+
+// ensureOpenDKIMDir pose /etc/opendkim en 0750 root:<groupe d'OpenDKIM>.
+func (p *Provider) ensureOpenDKIMDir(obs Observed) error {
+	return fs.EnsureDir(filepath.Dir(p.Paths.OpenDKIMKeysDir()), OpenDKIMDirMode, p.dirOwner(obs))
+}
 
 // keyFileStep réconcilie le fichier d'une clé scellée. Le fichier ne porte pas
 // d'en-tête : un PEM n'a pas de syntaxe de commentaire sur laquelle compter. La

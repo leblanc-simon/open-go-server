@@ -147,6 +147,21 @@ func Defaults(homeRoot string) []Target {
 			Risk: "aucun : logrotate tourne en root",
 		},
 		{
+			// Même régime que celui qu'ogs pose lui-même en écrivant les clés et
+			// les tables DKIM (mail.OpenDKIMDirMode, mail.TableMode) : deux juges en
+			// désaccord feraient osciller l'apply et harden. Récursif, parce que les
+			// clés privées vivent sous keys/ ; le propriétaire des fichiers n'est
+			// jamais changé et un mode n'est jamais desserré, si bien qu'une clé en
+			// 0600 opendkim:opendkim reste telle quelle — la donner à root la
+			// rendrait illisible au démon, qui retiendrait alors en file tout le
+			// courrier du domaine (D69).
+			Path: "/etc/opendkim", Owner: "root", Group: "opendkim", DirMode: 0o750, FileMode: 0o640,
+			Recursive: true,
+			Why:       "clés privées DKIM des projets, et tables qui désignent leurs domaines",
+			Risk: "un fichier posé ici à la main passe en 0640 au groupe opendkim : lisible par le " +
+				"démon, fermé aux utilisateurs des projets",
+		},
+		{
 			Path: "/etc/sudoers.d", Owner: "root", Group: "root", DirMode: 0o750,
 			Why:  "révèle les délégations accordées",
 			Risk: "aucun : sudo lit en root",

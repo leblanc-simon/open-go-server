@@ -21,7 +21,7 @@ func fixture(t *testing.T) (*model.Project, *Provider, *exec.Recorder, *FakeIden
 	t.Helper()
 	homeRoot := t.TempDir()
 	p := model.New("shop.fr", naming.EnvProd, model.KindStatic)
-	if err := p.Normalize(homeRoot, "preprod-pp.net"); err != nil {
+	if err := p.Normalize(homeRoot, "preprod-pp.net", model.WithLogsRoot(filepath.Join(t.TempDir(), "ogs-projects"))); err != nil {
 		t.Fatal(err)
 	}
 	rec := exec.NewRecorder()
@@ -111,7 +111,6 @@ func TestDirectoryModes(t *testing.T) {
 		// fichier n'exige pas de pouvoir lister ce qui l'entoure.
 		"www":        0o710,
 		"var":        0o700, // hors de portée de www-data
-		"logs":       0o710,
 		".local":     0o700,
 		".local/bin": 0o700,
 		".ssh":       0o700,
@@ -168,7 +167,7 @@ func TestPlanCorrectsDriftedMode(t *testing.T) {
 		Home: p.Spec.Layout.Root, Managed: true}
 	ident.Groups["shopfr"] = &GroupInfo{Name: "shopfr", GID: 1004, Members: []string{WebUser}}
 
-	logs := filepath.Join(p.Spec.Layout.Root, "logs")
+	logs := filepath.Join(p.Spec.Layout.Root, "var")
 	if err := os.Chmod(logs, 0o777); err != nil {
 		t.Fatal(err)
 	}
@@ -183,14 +182,14 @@ func TestPlanCorrectsDriftedMode(t *testing.T) {
 		plan.Add(s)
 	}
 	mutating := plan.Mutating()
-	if len(mutating) != 1 || !strings.Contains(mutating[0].Summary, "logs") {
+	if len(mutating) != 1 || !strings.Contains(mutating[0].Summary, "var") {
 		t.Fatalf("la dérive de mode doit produire exactement une étape, obtenu :\n%s", plan.String())
 	}
 	if _, err := engine.Execute(ctx, plan, engine.Options{}); err != nil {
 		t.Fatal(err)
 	}
 	info, _ := os.Stat(logs)
-	if info.Mode().Perm() != 0o710 {
+	if info.Mode().Perm() != 0o700 {
 		t.Errorf("mode non corrigé : %04o", info.Mode().Perm())
 	}
 }
@@ -295,8 +294,11 @@ func TestRollbackRemovesCreatedUserAndGroup(t *testing.T) {
 	}
 	// Les répertoires créés et restés vides sont retirés ; la racine contenant
 	// les sous-répertoires, elle peut subsister sans que ce soit une erreur.
-	if _, err := os.Stat(filepath.Join(p.Spec.Layout.Root, "logs")); !os.IsNotExist(err) {
-		t.Errorf("le répertoire logs devrait avoir été retiré : %v", err)
+	if _, err := os.Stat(p.Spec.Layout.LogDir); !os.IsNotExist(err) {
+		t.Errorf("le répertoire des journaux devrait avoir été retiré : %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(p.Spec.Layout.Root, "logs")); !os.IsNotExist(err) {
+		t.Errorf("le lien ~/logs devrait avoir été retiré : %v", err)
 	}
 }
 
@@ -486,7 +488,7 @@ func TestBinPHPLink(t *testing.T) {
 	homeRoot := t.TempDir()
 	p := model.New("shop.fr", naming.EnvProd, model.KindSymfony)
 	p.Spec.App.Version = "6.4"
-	if err := p.Normalize(homeRoot, "preprod-pp.net"); err != nil {
+	if err := p.Normalize(homeRoot, "preprod-pp.net", model.WithLogsRoot(filepath.Join(t.TempDir(), "ogs-projects"))); err != nil {
 		t.Fatal(err)
 	}
 	p.Spec.PHP.Pools[0].Version = "8.3"
@@ -670,10 +672,11 @@ func etatConforme(t *testing.T, p *model.Project, uid, gid int) Observed {
 
 func TestPlanCorrigeUneDeriveDeProprietaire(t *testing.T) {
 	// Un « chown -R shopfr:shopfr /home/shop.fr » laisse les modes intacts : seul
-	// le propriétaire change. Sans comparaison, logs/ reste « conforme »
-	// à jamais alors que l'utilisateur du projet peut désormais y substituer un
-	// lien symbolique au journal que le maître Apache ouvre en root (§7.1.2).
+	// le propriétaire change. Sans comparaison, un répertoire déclaré au nom de
+	// root reste « conforme » à jamais. Les journaux ont quitté le home (D71) : le
+	// mécanisme est éprouvé sur un répertoire root que l'exploitant déclare.
 	p, prov, _, _ := fixture(t)
+	p.Spec.Layout.Dirs = append(p.Spec.Layout.Dirs, model.Dir{Path: "outils", Mode: "0710", Owner: "root"})
 	// L'exécuteur réel : sous préfixe, ensureDir laisse le propriétaire en place
 	// (fs.KeepOwner), et comparer y ferait osciller le plan.
 	prov.Exec = &exec.Local{}
@@ -688,7 +691,7 @@ func TestPlanCorrigeUneDeriveDeProprietaire(t *testing.T) {
 			corriges[s.Resource] = s.Summary
 		}
 	}
-	for _, dir := range []string{"logs"} {
+	for _, dir := range []string{"outils"} {
 		res := "system/dir/" + filepath.Join(p.Spec.Layout.Root, dir)
 		resume, ok := corriges[res]
 		if !ok {
@@ -1006,5 +1009,176 @@ func TestLeLienPhpNeSuitPasUnRepertoireSubstitue(t *testing.T) {
 	}
 	if entries, _ := os.ReadDir(ailleurs); len(entries) != 0 {
 		t.Errorf("root a écrit dans le répertoire désigné par l'utilisateur : %v", entries)
+	}
+}
+
+func TestLesJournauxSontPreCreesHorsDuHome(t *testing.T) {
+	p, prov, _, _ := fixture(t)
+	prov.WebEngine = "apache"
+	p.Spec.PHP.Pools = []model.Pool{{Name: model.MainPoolName, Version: "8.3"}}
+	apply(t, prov, p)
+
+	dir := p.Spec.Layout.LogDir
+	if strings.HasPrefix(dir, p.Spec.Layout.Root) {
+		t.Fatalf("les journaux ne doivent pas vivre dans le home : %s", dir)
+	}
+	if info, err := os.Stat(dir); err != nil || info.Mode().Perm() != 0o750 {
+		t.Fatalf("répertoire des journaux attendu en 0750 : %v", err)
+	}
+	if info, err := os.Stat(filepath.Dir(dir)); err != nil || info.Mode().Perm() != 0o711 {
+		t.Fatalf("racine des journaux attendue en 0711 : %v", err)
+	}
+	// php-error.log surtout : sans lui, le worker ne peut rien créer dans un
+	// répertoire root, et PHP écrit dans le journal global de FPM.
+	for _, name := range []string{"apache-access.log", "apache-error.log", "php-error.log", "php-slow.log"} {
+		info, err := os.Stat(filepath.Join(dir, name))
+		if err != nil || info.Mode().Perm() != 0o640 {
+			t.Errorf("%s attendu pré-créé en 0640 : %v", name, err)
+		}
+	}
+	if target, err := os.Readlink(filepath.Join(p.Spec.Layout.Root, "logs")); err != nil || target != dir {
+		t.Errorf("~/logs doit désigner %s, obtenu %q (%v)", dir, target, err)
+	}
+}
+
+// legacyLayout reconstitue l'ancien ~/logs d'un projet d'avant D71.
+func legacyLayout(t *testing.T, p *model.Project) string {
+	t.Helper()
+	legacy := filepath.Join(p.Spec.Layout.Root, "logs")
+	if err := os.MkdirAll(legacy, 0o710); err != nil {
+		t.Fatal(err)
+	}
+	for name, content := range map[string]string{
+		"apache-error.log":      "ligne 1\n",
+		"apache-error.log.1":    "roté\n",
+		"apache-error.log.2.gz": "compressé",
+	} {
+		if err := os.WriteFile(filepath.Join(legacy, name), []byte(content), 0o640); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return legacy
+}
+
+func TestLaMigrationReprendLesJournauxSansPerte(t *testing.T) {
+	p, prov, _, _ := fixture(t)
+	if err := os.MkdirAll(p.Spec.Layout.Root, 0o711); err != nil {
+		t.Fatal(err)
+	}
+	legacy := legacyLayout(t, p)
+	if err := os.MkdirAll(p.Spec.Layout.LogDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	obs, _ := prov.Observe(context.Background(), p)
+	prepare, finish := prov.PlanLogMigration(p, obs)
+	if prepare == nil || finish == nil || !finish.FlushReloads {
+		t.Fatalf("deux étapes attendues, la seconde après les rechargements : %v %v", prepare, finish)
+	}
+	// Même sans vhost ni pool modifié, les serveurs doivent rouvrir leurs journaux
+	// au nouvel emplacement : sinon ils écrivent dans l'ancien fichier, que la
+	// seconde étape retire.
+	p.Spec.PHP.Pools = []model.Pool{{Name: model.MainPoolName, Version: "8.3"}}
+	prov.WebReload = "web:apache"
+	withReloads, _ := prov.PlanLogMigration(p, obs)
+	if strings.Join(withReloads.Reload, ",") != "web:apache,php:8.3" {
+		t.Errorf("rechargements attendus du serveur web et de FPM, obtenu %v", withReloads.Reload)
+	}
+	if err := prepare.Apply(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	// Entre la recopie et le rechargement, l'ancien fichier reçoit encore des
+	// lignes, et le nouveau commence à en recevoir.
+	appendTo := func(path, line string) {
+		f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		f.WriteString(line)
+		f.Close()
+	}
+	appendTo(filepath.Join(legacy, "apache-error.log"), "ligne 2\n")
+	if err := finish.Apply(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	dir := p.Spec.Layout.LogDir
+	got, _ := os.ReadFile(filepath.Join(dir, "apache-error.log"))
+	if string(got) != "ligne 1\nligne 2\n" {
+		t.Errorf("aucune ligne ne doit être perdue ni dupliquée, obtenu %q", got)
+	}
+	for _, name := range []string{"apache-error.log.1", "apache-error.log.2.gz"} {
+		if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
+			t.Errorf("%s doit suivre, sous son nom, pour que logrotate poursuive la numérotation", name)
+		}
+	}
+	info, err := os.Lstat(legacy)
+	if err != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("l'ancien répertoire doit avoir laissé place au lien : %v", err)
+	}
+	if target, _ := os.Readlink(legacy); target != dir {
+		t.Errorf("~/logs doit désigner %s, obtenu %s", dir, target)
+	}
+}
+
+func TestLaMigrationNeLitPasUnRepertoireSubstitue(t *testing.T) {
+	// Hors du mode simulé, un ancien logs/ qui n'appartient pas à root a été
+	// substitué par l'utilisateur : son contenu est choisi par lui — un
+	// « apache-error.log → /etc/shadow » —, et root ne doit rien en recopier dans
+	// un répertoire que ce même utilisateur lit.
+	if os.Geteuid() == 0 {
+		t.Skip("le répertoire de test appartient à root")
+	}
+	p, prov, _, _ := fixture(t)
+	prov.Exec = &exec.Local{}
+	if err := os.MkdirAll(p.Spec.Layout.Root, 0o711); err != nil {
+		t.Fatal(err)
+	}
+	legacy := legacyLayout(t, p)
+	secret := filepath.Join(t.TempDir(), "shadow")
+	if err := os.WriteFile(secret, []byte("secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(secret, filepath.Join(legacy, "php-error.log")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(p.Spec.Layout.LogDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	prepare, _ := prov.PlanLogMigration(p, Observed{})
+	err := prepare.Apply(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "n'appartient pas à root") {
+		t.Fatalf("un répertoire qui n'appartient pas à root doit être refusé, obtenu %v", err)
+	}
+	if entries, _ := os.ReadDir(p.Spec.Layout.LogDir); len(entries) != 0 {
+		t.Errorf("rien ne doit avoir été recopié : %v", entries)
+	}
+}
+
+func TestLaMigrationNeSuitPasUnLienPoseAuLieuDUnJournal(t *testing.T) {
+	p, prov, _, _ := fixture(t)
+	if err := os.MkdirAll(p.Spec.Layout.Root, 0o711); err != nil {
+		t.Fatal(err)
+	}
+	legacy := legacyLayout(t, p)
+	secret := filepath.Join(t.TempDir(), "shadow")
+	if err := os.WriteFile(secret, []byte("secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(secret, filepath.Join(legacy, "php-error.log")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(p.Spec.Layout.LogDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	obs, _ := prov.Observe(context.Background(), p)
+	prepare, finish := prov.PlanLogMigration(p, obs)
+	if err := prepare.Apply(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	err := finish.Apply(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "php-error.log") {
+		t.Fatalf("le lien doit rester, nommé, et l'ancien répertoire avec lui : %v", err)
+	}
+	if data, _ := os.ReadFile(filepath.Join(p.Spec.Layout.LogDir, "php-error.log")); strings.Contains(string(data), "secret") {
+		t.Error("root a recopié la cible du lien dans le répertoire des journaux")
 	}
 }

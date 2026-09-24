@@ -40,7 +40,7 @@ done
 # libère les workers du projet, et donc son compte. DKIM aussi : OpenDKIM et
 # Postfix y tournent comme des services, et c'est leur rechargement qu'on éprouve.
 case "$scenario" in
-systemd | runtimes | runtimes-compiles | harden | suppression | web-durci | dkim)
+systemd | runtimes | runtimes-compiles | harden | suppression | web-durci | dkim | journaux)
     # Le répertoire monté doit exister avant « docker run » : sinon Docker le crée
     # au nom de root, et la compilation de l'application du scénario runtimes, qui
     # passe après suppression dans la série, ne peut plus y écrire.

@@ -105,7 +105,7 @@ type Layout struct {
 type Dir struct {
 	Path  string `yaml:"path"`
 	Mode  string `yaml:"mode"`
-	Owner string `yaml:"owner,omitempty"` // vide = utilisateur du projet ; « root » pour logs/
+	Owner string `yaml:"owner,omitempty"` // vide = utilisateur du projet ; « root » sinon
 }
 
 // Domain est un nom de domaine servi.
@@ -345,7 +345,30 @@ func (p *Project) AppType() (AppType, error) {
 // Normalize remplit les valeurs déductibles : identifiant, host effectif, home,
 // utilisateur, arborescence et docroot. Les valeurs déjà renseignées sont
 // respectées, ce qui permet de surcharger n'importe quel défaut.
-func (p *Project) Normalize(homeRoot, prepDomain string) error {
+// DefaultLogsRoot est la racine des journaux des projets quand l'appelant n'en
+// fournit pas (D71) : l'importateur, les tests. La configuration du parc la règle
+// par « logs.root », que la CLI transmet par WithLogsRoot.
+const DefaultLogsRoot = "/var/log/ogs-projects"
+
+// NormalizeOption règle un défaut de la normalisation qui vient du parc.
+type NormalizeOption func(*normalizeOptions)
+
+type normalizeOptions struct{ logsRoot string }
+
+// WithLogsRoot fixe la racine des journaux, préfixe éventuel compris.
+func WithLogsRoot(root string) NormalizeOption {
+	return func(o *normalizeOptions) {
+		if root != "" {
+			o.logsRoot = root
+		}
+	}
+}
+
+func (p *Project) Normalize(homeRoot, prepDomain string, opts ...NormalizeOption) error {
+	options := normalizeOptions{logsRoot: DefaultLogsRoot}
+	for _, o := range opts {
+		o(&options)
+	}
 	if p.APIVersion == "" {
 		p.APIVersion = APIVersion
 	}
@@ -422,8 +445,12 @@ func (p *Project) Normalize(homeRoot, prepDomain string) error {
 	if p.Spec.User.Home == "" {
 		p.Spec.User.Home = p.Spec.Layout.Root
 	}
-	if p.Spec.Layout.LogDir == "" {
-		p.Spec.Layout.LogDir = filepath.Join(p.Spec.Layout.Root, "logs")
+	// Les journaux vivent hors du home (D71). Une déclaration antérieure porte
+	// l'ancien défaut, <home>/logs : elle est ramenée au nouveau, et la migration
+	// reprend le contenu de l'ancien répertoire. Un autre chemin a été choisi par
+	// l'exploitant ; c'est la validation qui dira s'il est acceptable.
+	if p.Spec.Layout.LogDir == "" || filepath.Clean(p.Spec.Layout.LogDir) == LegacyLogDir(p.Spec.Layout.Root) {
+		p.Spec.Layout.LogDir = filepath.Join(options.logsRoot, id)
 	}
 	if p.Spec.Layout.Mode == "" {
 		// 0711 : seul le propriétaire peut énumérer son home ; les autres ne
@@ -493,10 +520,20 @@ func BinDir(root string) string { return filepath.Join(root, filepath.FromSlash(
 // exacte : un .bin/ déclaré autrement l'a été par l'exploitant.
 var legacyBinDir = Dir{Path: LegacyLinkDir, Mode: "0710", Owner: "root"}
 
+// legacyLogsDir est l'entrée que les déclarations antérieures à D71 portent pour
+// logs/. Même règle que pour .bin/ : seule la forme exacte est retirée.
+var legacyLogsDir = Dir{Path: "logs", Mode: "0710", Owner: "root"}
+
+// LegacyLogDir est l'ancien répertoire des journaux d'un projet, dans son home.
+// Il ne sert plus qu'à la migration, et le nom y devient un lien (D71).
+func LegacyLogDir(root string) string { return filepath.Join(root, "logs") }
+
+// LogLink est le nom du lien de commodité posé dans le home vers les journaux.
+const LogLink = "logs"
+
 // defaultDirs complète l'arborescence attendue sans écraser les entrées déjà
-// déclarées. logs/ appartient à root : le projet ne doit pas pouvoir y créer
-// d'entrée, ce qui interdit la substitution d'un fichier de log par un lien
-// symbolique (§7.1.2). Les liens gérés, eux, vivent dans un répertoire de
+// déclarées. Les journaux n'y figurent plus : ils vivent hors du home (D71), un
+// répertoire root dans un home se renommant sans privilège. Les liens gérés vivent dans un répertoire de
 // l'utilisateur (D70) : ils sont un état réconcilié à chaque apply, non une
 // barrière — le home appartenant à l'utilisateur, un répertoire root en dessous
 // se renomme et se remplace sans le moindre privilège.
@@ -511,7 +548,6 @@ func (p *Project) defaultDirs(at AppType) []Dir {
 		{Path: "var", Mode: "0700"},
 		{Path: "var/tmp", Mode: "0700"},
 		{Path: "var/sessions", Mode: "0700"},
-		{Path: "logs", Mode: "0710", Owner: "root"},
 		{Path: ".local", Mode: "0700"},
 		{Path: LinkDir, Mode: "0700"},
 		{Path: ".ssh", Mode: "0700"},
@@ -522,7 +558,7 @@ func (p *Project) defaultDirs(at AppType) []Dir {
 	existing := make(map[string]bool, len(p.Spec.Layout.Dirs))
 	out := make([]Dir, 0, len(want)+len(p.Spec.Layout.Dirs))
 	for _, d := range p.Spec.Layout.Dirs {
-		if d == legacyBinDir {
+		if d == legacyBinDir || d == legacyLogsDir {
 			continue
 		}
 		existing[path.Clean(d.Path)] = true

@@ -40,7 +40,7 @@ ogs init --quiet
 choisir_moteur apache
 ogs site create php.test --kind php-plain --php "$version" --tls=false --yes 2>&1 | tail -6
 
-# Le complément d'unité doit avoir été écrit, et le journal du projet y figurer.
+# Le complément d'unité doit avoir été écrit, et la racine des journaux y figurer.
 dropin=/etc/systemd/system/apache2.service.d/ogs.conf
 if [ ! -f "$dropin" ]; then
     echo "ÉCHEC : $dropin absent"
@@ -48,8 +48,10 @@ if [ ! -f "$dropin" ]; then
 fi
 echo "complément d'unité :"
 grep -v '^#' "$dropin" | sed 's/^/  /'
-if ! grep -q 'ReadWritePaths=-/home/php.test/logs' "$dropin"; then
-    echo "ÉCHEC : le journal du projet n'est pas ouvert au moteur"
+# Les journaux ont quitté /home (D71) : le complément ne porte plus qu'une
+# entrée fixe, la racine des journaux, par prudence envers ProtectSystem=strict.
+if ! grep -q 'ReadWritePaths=-/var/log/ogs-projects$' "$dropin" || [ "$(grep -c ReadWritePaths "$dropin")" != 1 ]; then
+    echo "ÉCHEC : le complément doit porter la seule racine des journaux"
     exit 1
 fi
 

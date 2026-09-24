@@ -166,15 +166,16 @@ if ! echo "$sortie" | grep -qE "[0-9]{4}-[0-9]{2}-[0-9]{2}T"; then
 fi
 # Le journal de la tâche appartient au projet, mais le répertoire à root : la
 # tâche écrit dans un fichier pré-créé, elle n'en crée aucun.
-echo "journal : $(stat -c '%U:%G %a' /home/shop.fr/logs/cron-horodate.log), répertoire : $(stat -c '%U:%G %a' /home/shop.fr/logs)"
-if [ "$(stat -c %U /home/shop.fr/logs)" != "root" ]; then
+# Il vit hors du home (D71) : ~/logs n'en est qu'un lien, que stat ne suit pas.
+echo "journal : $(stat -c '%U:%G %a' /var/log/ogs-projects/shopfr/cron-horodate.log), répertoire : $(stat -c '%U:%G %a' /var/log/ogs-projects/shopfr)"
+if [ "$(stat -c %U /var/log/ogs-projects/shopfr)" != "root" ]; then
     echo "ÉCHEC : le répertoire des journaux doit appartenir à root"
     exit 1
 fi
 
 echo
 echo "--- tâche planifiée : déclenchement réel par cron ---"
-journal=/home/shop.fr/logs/cron-horodate.log
+journal=/var/log/ogs-projects/shopfr/cron-horodate.log
 : > "$journal"
 chown shopfr:shopfr "$journal"
 systemctl restart cron

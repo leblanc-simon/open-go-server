@@ -326,8 +326,14 @@ type Environment struct {
 	PresetDowngrade bool              `yaml:"presetDowngrade"`
 }
 
-// Logs paramètre la rotation.
+// Logs paramètre les journaux d'infrastructure des projets et leur rotation.
 type Logs struct {
+	// Root est la racine des répertoires de journaux des projets (D71). Elle vit
+	// hors de la racine des homes : un répertoire root dans un home se renomme sans
+	// privilège, et un journal que le maître du serveur web ouvre en root y
+	// devenait un lien vers un fichier système. Réglable pour poser les journaux
+	// sur une partition dédiée — /var porte aussi les bases.
+	Root     string `yaml:"root,omitempty"`
 	Rotate   int    `yaml:"rotate"`
 	MaxSize  string `yaml:"maxSize"`
 	Compress bool   `yaml:"compress"`
@@ -374,7 +380,7 @@ func Default() *Config {
 				PresetDowngrade: true,
 			},
 		},
-		Logs:       Logs{Rotate: 30, MaxSize: "200M", Compress: true},
+		Logs:       Logs{Root: DefaultLogsRoot, Rotate: 30, MaxSize: "200M", Compress: true},
 		Archives:   Archives{RetentionDays: 14},
 		Sudo:       Sudo{Style: "ogs", Verbs: []string{"start", "stop", "restart", "status"}},
 		Deployment: Deployment{KnownHosts: []string{"github.com", "gitlab.com"}},
@@ -463,6 +469,19 @@ func fusionner[T any](défauts map[string]T, déclarées map[string]map[string]a
 	return out, nil
 }
 
+// DefaultLogsRoot est la racine par défaut des journaux des projets (D71). Elle est
+// distincte de /var/log/ogs, qui porte le journal d'audit d'ogs et qu'il aurait
+// sinon fallu rendre traversable.
+const DefaultLogsRoot = "/var/log/ogs-projects"
+
+// LogsRoot renvoie la racine des journaux des projets, hors préfixe.
+func (c *Config) LogsRoot() string {
+	if c.Logs.Root == "" {
+		return DefaultLogsRoot
+	}
+	return filepath.Clean(c.Logs.Root)
+}
+
 // Shell renvoie le shell des comptes de projet, défaut du modèle appliqué.
 func (c *Config) Shell() string {
 	if c.User.Shell == "" {
@@ -480,6 +499,16 @@ func (c *Config) PrepDomain() string {
 func (c *Config) Validate() error {
 	if c.Naming.HomeRoot == "" || !filepath.IsAbs(c.Naming.HomeRoot) {
 		return fmt.Errorf("naming.homeRoot doit être un chemin absolu (valeur : %q)", c.Naming.HomeRoot)
+	}
+	// La racine des journaux ne doit pas pouvoir revenir sous les homes : c'est
+	// précisément ce que D71 referme. Le contrôle de la chaîne de propriété, lui,
+	// porte sur le disque et appartient à « doctor ».
+	if root := c.LogsRoot(); !filepath.IsAbs(root) || root == "/" {
+		return fmt.Errorf("logs.root doit être un chemin absolu autre que « / » (valeur : %q)", c.Logs.Root)
+	} else if home := filepath.Clean(c.Naming.HomeRoot); root == home || strings.HasPrefix(root, home+"/") {
+		return fmt.Errorf("logs.root (%s) ne peut pas vivre sous la racine des homes (%s) : "+
+			"l'utilisateur d'un projet y renommerait le répertoire de ses journaux, que le serveur "+
+			"web ouvre en root (D71)", root, home)
 	}
 	// Un shell relatif serait pris tel quel par useradd et rendrait le compte
 	// inutilisable sans un mot : le refuser au chargement, non à l'application.
@@ -746,6 +775,9 @@ func (p Paths) SudoersFile(id string) string { return filepath.Join(p.SudoersDir
 
 // ProjectRunDir renvoie le répertoire d'exécution d'un projet (verrous, sockets).
 func (p Paths) ProjectRunDir(id string) string { return filepath.Join(p.RunDir(), id) }
+
+// LogsRoot renvoie la racine des journaux des projets, préfixe appliqué.
+func (p Paths) LogsRoot(cfg *Config) string { return p.join(cfg.LogsRoot()) }
 
 // Home renvoie le home d'un projet à partir de son host effectif.
 func (p Paths) Home(cfg *Config, effectiveHost string) string {

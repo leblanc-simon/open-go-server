@@ -469,3 +469,27 @@ func TestDomainesDKIMSansActivationRefuses(t *testing.T) {
 		t.Fatalf("des domaines sans activation doivent être refusés, obtenu : %v", err)
 	}
 }
+
+func TestLesJournauxSontRefusesSousLesHomes(t *testing.T) {
+	// Un répertoire du home se renomme sans privilège : un journal que le serveur
+	// web ouvre en root ne peut pas y vivre (D71).
+	p := newProject(t, "shop.fr", naming.EnvProd, model.KindStatic)
+	p.Spec.Layout.LogDir = "/home/shop.fr/journaux"
+	if err := Project(p, "/home"); err == nil || !strings.Contains(err.Error(), "spec.layout.logDir") {
+		t.Fatalf("un répertoire de journaux sous les homes doit être refusé, obtenu %v", err)
+	}
+}
+
+func TestLeJournalDUneTacheNEstQuUnNom(t *testing.T) {
+	p := newProject(t, "shop.fr", naming.EnvProd, model.KindStatic)
+	p.Spec.Crons = []model.CronJob{{Name: "purge", Schedule: "0 3 * * *", Command: "bin/console x", Log: "purge.log"}}
+	if err := Project(p, "/home"); err != nil {
+		t.Fatalf("un nom de fichier doit être accepté : %v", err)
+	}
+	for _, log := range []string{"/etc/cron.d/x", "../x.log", "a b.log", ".."} {
+		p.Spec.Crons[0].Log = log
+		if err := Project(p, "/home"); err == nil || !strings.Contains(err.Error(), ".log") {
+			t.Errorf("%q doit être refusé, obtenu %v", log, err)
+		}
+	}
+}

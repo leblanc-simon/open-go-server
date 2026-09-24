@@ -158,9 +158,9 @@ func (p *Provider) jobs(proj *model.Project) ([]job, error) {
 		if logFile == "" {
 			logFile = "cron-" + decl.Name + ".log"
 		}
-		if !filepath.IsAbs(logFile) {
-			logFile = filepath.Join(logDir, logFile)
-		}
+		// Toujours un nom, jamais un chemin (D71) : la validation l'impose, et le
+		// fichier est pré-créé par root dans le répertoire des journaux du projet.
+		logFile = filepath.Join(logDir, filepath.Base(logFile))
 		enabled := decl.Enabled == nil || *decl.Enabled
 		out = append(out, job{
 			Name: decl.Name, Schedule: strings.TrimSpace(decl.Schedule),
@@ -222,8 +222,8 @@ func (p *Provider) Plan(_ context.Context, proj *model.Project) ([]*engine.Step,
 
 	var steps []*engine.Step
 	// Les fichiers de journal sont créés par ogs, avec le propriétaire attendu :
-	// le répertoire logs/ appartient à root, donc la tâche ne pourrait pas les
-	// créer elle-même (§7.1.2).
+	// le répertoire des journaux appartient à root (D71), donc la tâche ne
+	// pourrait pas les créer elle-même.
 	for _, j := range jobs {
 		j := j
 		if _, err := os.Stat(j.Log); err == nil {
@@ -303,10 +303,10 @@ func (p *Provider) Plan(_ context.Context, proj *model.Project) ([]*engine.Step,
 // createLog crée un fichier de journal appartenant à l'utilisateur du projet, de
 // sorte que la tâche puisse y écrire sans pouvoir remplacer le fichier.
 func (p *Provider) createLog(proj *model.Project, path string) error {
-	// MkdirAll plutôt qu'EnsureDir : le mode de logs/ est fixé par l'arborescence
-	// du projet, et l'imposer ici le remettrait à cette valeur à chaque apply — le
-	// plan resterait éternellement en écart entre les deux.
-	if err := os.MkdirAll(filepath.Dir(path), 0o710); err != nil {
+	// MkdirAll plutôt qu'EnsureDir : le répertoire des journaux est posé par le
+	// provider système (D71), seul juge de son mode — l'imposer ici aussi ferait
+	// osciller le plan entre deux valeurs.
+	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
 		return err
 	}
 	owner := fs.KeepOwner

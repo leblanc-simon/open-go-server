@@ -65,7 +65,8 @@ func project(t *testing.T, host string, kind model.AppKind, version, php string)
 	t.Helper()
 	p := model.New(host, naming.EnvProd, kind)
 	p.Spec.App.Version = version
-	if err := p.Normalize(filepath.Join(t.TempDir(), "home"), "preprod-pp.net"); err != nil {
+	if err := p.Normalize(filepath.Join(t.TempDir(), "home"), "preprod-pp.net",
+		model.WithLogsRoot(filepath.Join(t.TempDir(), "ogs-projects"))); err != nil {
 		t.Fatal(err)
 	}
 	if php != "" && len(p.Spec.PHP.Pools) > 0 {
@@ -180,7 +181,8 @@ func TestPrepAddsNoindex(t *testing.T) {
 	prov, _ := fixture(t, "nginx")
 	p := model.New("shop.fr", naming.EnvPrep, model.KindSymfony)
 	p.Spec.App.Version = "6.4"
-	if err := p.Normalize(filepath.Join(t.TempDir(), "home"), "preprod-pp.net"); err != nil {
+	if err := p.Normalize(filepath.Join(t.TempDir(), "home"), "preprod-pp.net",
+		model.WithLogsRoot(filepath.Join(t.TempDir(), "ogs-projects"))); err != nil {
 		t.Fatal(err)
 	}
 	p.Spec.PHP.Pools[0].Version = "8.5"
@@ -626,8 +628,8 @@ func TestPlanDropInListsLogDirs(t *testing.T) {
 	got := string(content)
 	for _, want := range []string{
 		"[Service]",
-		"ReadWritePaths=-/home/autre.fr/logs",
-		"ReadWritePaths=-/home/shop.fr/logs",
+		"ReadWritePaths=-/var/log/ogs-projects/autrefr",
+		"ReadWritePaths=-/var/log/ogs-projects/shopfr",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("%q attendu dans :\n%s", want, got)
@@ -635,7 +637,7 @@ func TestPlanDropInListsLogDirs(t *testing.T) {
 	}
 	// L'ordre est déterministe, sans quoi le fichier oscillerait entre deux états
 	// et chaque apply redémarrerait le serveur web.
-	if strings.Index(got, "autre.fr") > strings.Index(got, "shop.fr") {
+	if strings.Index(got, "autrefr") > strings.Index(got, "shopfr") {
 		t.Error("les répertoires doivent être triés")
 	}
 	// Deuxième passage : le fichier est conforme, donc aucune action — un
@@ -1634,5 +1636,42 @@ func TestCompensationDUneSuppressionDeVHostRetablitLeLienDActivation(t *testing.
 				t.Errorf("le lien d'activation pointe dans le vide : %v", err)
 			}
 		})
+	}
+}
+
+// Sous logs.root (D71), le complément ne porte qu'une entrée, fixe : créer un
+// projet ne change plus son contenu, donc ne redémarre plus le serveur web.
+func TestPlanDropInSousLaRacineDesJournaux(t *testing.T) {
+	p, _ := fixture(t, "apache")
+	p.LogsRoot = "/var/log/ogs-projects"
+	a := model.New("shop.fr", naming.EnvProd, model.KindStatic)
+	if err := a.Normalize("/home", "preprod-pp.net"); err != nil {
+		t.Fatal(err)
+	}
+	b := model.New("autre.fr", naming.EnvProd, model.KindStatic)
+	if err := b.Normalize("/home", "preprod-pp.net"); err != nil {
+		t.Fatal(err)
+	}
+	render := func(projects ...*model.Project) string {
+		steps, err := p.PlanDropIn(context.Background(), projects)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := steps[0].Apply(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		data, _ := os.ReadFile(p.DropInPath())
+		return string(data)
+	}
+	un := render(a)
+	if !strings.Contains(un, "ReadWritePaths=-/var/log/ogs-projects\n") || strings.Count(un, "ReadWritePaths") != 1 {
+		t.Errorf("une seule entrée, la racine, attendue :\n%s", un)
+	}
+	steps, err := p.PlanDropIn(context.Background(), []*model.Project{a, b})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if steps[0].Mutates() {
+		t.Error("un projet de plus ne doit rien changer au complément, donc ne rien redémarrer")
 	}
 }

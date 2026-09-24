@@ -43,12 +43,12 @@ make dev-demo                                   # crée ./dev, deux projets, pla
 
 ### Essais sur système réel
 
-Seize scénarios conteneurisés éprouvent ce que les tests unitaires ne peuvent pas voir. Ils ont mis au jour
+Dix-sept scénarios conteneurisés éprouvent ce que les tests unitaires ne peuvent pas voir. Ils ont mis au jour
 plus de trente défauts invisibles autrement (§18 du cahier des charges) : **y recourir avant de déclarer un
 provider fonctionnel**.
 
 ```sh
-make integration-all       # les seize, à la suite
+make integration-all       # les dix-sept, à la suite
 make integration-nginx     # un seul (voir SCENARIOS dans le Makefile)
 
 # Hors série : rbenv et pyenv compilent depuis les sources (un quart d'heure).
@@ -207,8 +207,8 @@ Ils ont tous coûté un défaut réel ; les tests unitaires ne les voyaient pas.
 - **Un répertoire root dans le home ne protège rien contre l'utilisateur** : le home lui appartient (D51),
   donc il **renomme** un sous-répertoire root sans privilège et en recrée un à lui. C'est pourquoi les liens
   gérés vivent dans `~/.local/bin`, au compte du projet (D70) — un `.bin/` root ne garantissait rien — et
-  pourquoi `logs/` quitte le home pour `/var/log/ogs-projects/<id>/` (D71, arbitrée, **pas encore
-  implémentée** : jusque-là, la faille de D29 reste ouverte). Corollaire : **quand root
+  pourquoi les journaux vivent sous `/var/log/ogs-projects/<id>/` (D71), chaîne entièrement root, le home
+  n'en portant qu'un lien `~/logs` qu'aucun processus root n'emprunte. Corollaire : **quand root
   écrit dans un répertoire de l'utilisateur, il ne suit jamais un lien** — `fs.SymlinkAt`, `LinkStateAt`,
   `RemoveLinkAt` ouvrent chaque composant par `openat` avec `O_NOFOLLOW` et opèrent relativement au
   descripteur. Écrire par le nom, c'est laisser l'utilisateur choisir où root crée ou supprime ; c'était le
@@ -337,6 +337,18 @@ Ils ont tous coûté un défaut réel ; les tests unitaires ne les voyaient pas.
   celles qu'il a chargées. Le fichier d'une clé, lui, est relu à chaque message : l'écrire ne demande
   aucun rechargement. Le critère de présence est `/etc/opendkim.conf` : le paquet Debian ne crée pas
   `/etc/opendkim`.
+- **Les journaux d'un projet sont pré-créés** (D71) : le répertoire n'est inscriptible que par root, donc
+  un worker PHP ne peut pas créer `php-error.log` — PHP se rabat alors, sans un mot, sur le journal global
+  de FPM —, et un maître root crée les siens avec son umask. Ne **jamais** rendre ce répertoire inscriptible
+  au groupe du projet : logrotate refuserait de le traiter sans `su`, et la substitution que D71 ferme
+  redeviendrait possible. Une migration de journaux doit **recharger** les serveurs même si aucun vhost ne
+  change : ils écrivent par leur descripteur dans le fichier qu'ils ont ouvert.
+- **Deux juges ne doivent jamais régler le même chemin** : ogs pose `/etc/opendkim` et ses tables au
+  régime qu'`ogs harden` exige (0750 / 0640 root:opendkim). `fs.EnsureDir` repose le mode d'un répertoire
+  existant : en désaccord, l'apply rouvrirait à chaque passage ce que harden referme.
+- **`systemd-tmpfiles --create` ne reçoit que le fichier d'ogs** : sans argument, il traite toute la
+  configuration de la machine, crée ce qu'elle déclare et rend 65 sur une ligne en double d'un fichier de
+  la distribution.
 - **Toute intention de rechargement doit être routée** par `reloadFunc`, et un rechargement en échec doit
   être **affiché** (`Options.OnReloadWarning`), pas seulement compté. L'intention nue `web`, émise depuis le
   lot L0 à l'ajout de `www-data` au groupe d'un projet, n'était routée nulle part : chaque création de

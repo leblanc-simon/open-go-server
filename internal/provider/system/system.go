@@ -45,6 +45,8 @@ type Provider struct {
 	// lieu, et chaque création de projet se soldait par un avertissement
 	// invisible et le code 6.
 	WebReload string
+	// WebEngine est le moteur retenu, qui nomme les journaux web pré-créés (D71).
+	WebEngine string
 }
 
 // Name identifie le provider.
@@ -274,6 +276,12 @@ func (p *Provider) Plan(_ context.Context, proj *model.Project, obs Observed) ([
 		steps = append(steps, s)
 	}
 	if s := p.binStep(proj); s != nil {
+		steps = append(steps, s)
+	}
+	// 7. Journaux, hors du home (D71) : la chaîne root, les fichiers pré-créés,
+	// et le lien de commodité du home.
+	steps = append(steps, p.logSteps(proj, obs)...)
+	if s := p.logLinkStep(proj); s != nil {
 		steps = append(steps, s)
 	}
 	return steps, nil

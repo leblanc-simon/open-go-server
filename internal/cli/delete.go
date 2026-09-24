@@ -413,12 +413,19 @@ func (a *App) removeUser(cmd *cobra.Command, provs *providers, p *model.Project)
 	if treeErr == nil {
 		treeErr = os.RemoveAll(p.Spec.Layout.Root)
 	}
+	// Les journaux vivent sous logs.root (D71), que la validation impose : ils
+	// partent avec le projet, après l'archive qui les a recueillis. Le contrôle est
+	// refait ici, la suppression étant récursive.
+	var logsErr error
+	if dir := filepath.Clean(p.Spec.Layout.LogDir); strings.HasPrefix(dir, a.logsRoot()+string(filepath.Separator)) {
+		logsErr = os.RemoveAll(dir)
+	}
 	// Le répertoire d'exécution est dérivé du préfixe et de l'identifiant, non du
 	// fichier de projet : il part quoi qu'il arrive à l'arborescence.
 	if err := os.RemoveAll(a.Paths.ProjectRunDir(p.ID())); err != nil {
-		return errors.Join(accountErr, treeErr, err)
+		return errors.Join(accountErr, treeErr, logsErr, err)
 	}
-	return errors.Join(accountErr, treeErr)
+	return errors.Join(accountErr, treeErr, logsErr)
 }
 
 // checkRemovableRoot est le rempart devant un geste sans retour. La racine vient
@@ -666,6 +673,13 @@ func (a *App) archiveProject(cmd *cobra.Command, provs *providers, p *model.Proj
 	// L'arborescence complète.
 	if err := w.AddTree("tree", "tree", p.Spec.Layout.Root); err != nil {
 		return "", nil, wrap(CodeError, err)
+	}
+	// Les journaux, qui ne vivent plus dans le home (D71) : ils partent avec le
+	// projet, comme lorsqu'ils étaient dans son arborescence.
+	if info, err := os.Stat(p.Spec.Layout.LogDir); err == nil && info.IsDir() {
+		if err := w.AddTree("logs", "logs", p.Spec.Layout.LogDir); err != nil {
+			return "", nil, wrap(CodeError, err)
+		}
 	}
 	for _, r := range removed {
 		w.Note(r)

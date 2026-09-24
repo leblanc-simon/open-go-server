@@ -161,7 +161,7 @@ grep -q '^\[sshd\]' "$jails" && echec "une prison non préfixée recouvrirait ce
 
 echo
 echo "--- un journal disparu est-il vu avant de bloquer le démon ? ---"
-journal=$(grep -o '/home/[^ ]*\.log' "$jails" | head -1)
+journal=$(grep -o '/var/log/ogs-projects/[^ ]*\.log' "$jails" | head -1)
 [ -n "$journal" ] || echec "aucune prison ne surveille le journal d'un projet"
 mv "$journal" "$journal.deplace"
 sortie=$(ogs doctor 2>&1)

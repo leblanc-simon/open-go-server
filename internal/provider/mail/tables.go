@@ -122,7 +122,7 @@ func (p *Provider) PlanTables(projects []*model.Project, obs Observed) ([]*engin
 			Resource:  t.resource,
 			Generated: p.now(),
 		}
-		s, err := p.tableStep(t.resource, t.summary, t.path, fs.Render(header, t.body, "#"))
+		s, err := p.tableStep(t.resource, t.summary, t.path, fs.Render(header, t.body, "#"), obs)
 		if err != nil {
 			return nil, err
 		}
@@ -179,7 +179,7 @@ func exists(path string) bool {
 
 // tableStep écrit une table gérée : inspection par empreinte, refus d'écraser
 // ce qu'un exploitant a retouché (§6.4), compensation par l'ancien contenu.
-func (p *Provider) tableStep(resource, summary, path string, content []byte) (*engine.Step, error) {
+func (p *Provider) tableStep(resource, summary, path string, content []byte, obs Observed) (*engine.Step, error) {
 	state, err := fs.Inspect(path, content)
 	if err != nil {
 		return nil, err
@@ -231,26 +231,30 @@ func (p *Provider) tableStep(resource, summary, path string, content []byte) (*e
 				return err
 			}
 		}
-		if err := fs.EnsureDir(filepath.Dir(filepath.Dir(path)), 0o755, fs.KeepOwner); err != nil {
+		if err := p.ensureOpenDKIMDir(obs); err != nil {
 			return err
 		}
-		if err := fs.EnsureDir(filepath.Dir(path), 0o755, fs.KeepOwner); err != nil {
+		if err := fs.EnsureDir(filepath.Dir(path), OpenDKIMDirMode, p.dirOwner(obs)); err != nil {
 			return err
 		}
-		// 0644 : les tables ne portent aucun secret — des noms de domaines et des
-		// chemins —, et OpenDKIM les relit sous son propre compte après avoir
-		// abandonné les privilèges.
-		return fs.WriteAtomic(path, content, 0o644, fs.KeepOwner)
+		// 0640 root:<groupe d'OpenDKIM> : les tables ne portent aucun secret, mais
+		// c'est le régime qu'« ogs harden » impose à /etc/opendkim — les écrire en
+		// 0644 ferait rouvrir à chaque apply ce que harden referme. OpenDKIM les
+		// relit sous son propre compte, par son groupe.
+		return fs.WriteAtomic(path, content, TableMode, p.dirOwner(obs))
 	}
 	s.Compensate = func(context.Context) error {
 		if previous == nil {
 			return os.Remove(path)
 		}
-		return fs.WriteAtomic(path, previous, 0o644, fs.KeepOwner)
+		return fs.WriteAtomic(path, previous, TableMode, p.dirOwner(obs))
 	}
 	s.Reload = []string{ReloadTarget}
 	return s, nil
 }
+
+// TableMode est le mode des tables d'OpenDKIM (voir tableStep).
+const TableMode = 0o640
 
 // removeStep retire une table devenue sans objet.
 func removeStep(resource, path string) *engine.Step {
@@ -267,7 +271,7 @@ func removeStep(resource, path string) *engine.Step {
 		}
 		return nil
 	}
-	s.Compensate = func(context.Context) error { return fs.WriteAtomic(path, previous, 0o644, fs.KeepOwner) }
+	s.Compensate = func(context.Context) error { return fs.WriteAtomic(path, previous, TableMode, fs.KeepOwner) }
 	return s
 }
 

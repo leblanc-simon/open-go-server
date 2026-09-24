@@ -9,6 +9,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"leblanc.io/open-go-server/internal/importer"
+	"leblanc.io/open-go-server/internal/model"
 	"leblanc.io/open-go-server/internal/provider/db"
 	"leblanc.io/open-go-server/internal/provider/mail"
 	"leblanc.io/open-go-server/internal/spec"
@@ -187,7 +188,7 @@ func newImportAdoptCommand(app *App) *cobra.Command {
 					args[0], orValue(strings.Join(available, ", "), "aucun"))
 			}
 
-			p, notes, err := importer.Adopt(*chosen, app.homeRoot(), app.Cfg.PrepDomain())
+			p, notes, err := importer.Adopt(*chosen, app.homeRoot(), app.Cfg.PrepDomain(), model.WithLogsRoot(app.logsRoot()))
 			if err != nil {
 				return exitf(CodeValidation, "%v", err)
 			}

@@ -35,6 +35,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         systemd \
         systemd-sysv \
         cron \
+        logrotate \
         python3-minimal \
         python3-pika \
         fail2ban \

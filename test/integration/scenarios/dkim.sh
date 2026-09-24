@@ -23,6 +23,9 @@ echec() { echo "ÉCHEC : $*"; exit 1; }
 # contrôle échoue — ici, les droits de /etc que le scénario ne durcit pas —, et
 # sous « pipefail » ce code ferait échouer tout « ogs doctor | grep -q ».
 docteur() { ogs doctor 2>&1 || true; }
+# durcir fait de même pour « harden », qui rend 6 tant qu'il reste à restreindre
+# ailleurs qu'à l'endroit examiné.
+durcir() { ogs harden "$@" 2>&1 || true; }
 
 echo "=== scénario : signature DKIM ==="
 
@@ -202,6 +205,28 @@ grep -q "$nouveau._domainkey.shop.fr" /etc/opendkim/ogs/SigningTable || echec "l
 [ -f "$cle" ] || echec "la clé remplacée doit rester en place pendant la rétention"
 [ "$(envoyer contact@shop.fr apres-rotation)" = signé ] || echec "courrier non signé après la bascule"
 verifier shopfr "$nouveau"
+
+echo
+echo "--- harden contrôle /etc/opendkim, sans reprendre les clés au démon ---"
+# ogs pose lui-même /etc/opendkim au régime que harden exige : deux juges en
+# désaccord feraient osciller l'apply et harden.
+durcir | grep "/etc/opendkim" | head -1
+durcir | grep "/etc/opendkim" | grep -q "conforme" ||
+    echec "ce qu'ogs écrit dans /etc/opendkim doit être conforme à harden"
+chmod 0755 /etc/opendkim
+chmod 0644 /etc/opendkim/ogs/SigningTable
+durcir | grep "/etc/opendkim" | grep -q "restreindre" ||
+    echec "harden ne voit pas /etc/opendkim desserré"
+durcir --apply --yes >/dev/null
+[ "$(stat -c '%a %G' /etc/opendkim)" = "750 opendkim" ] || echec "harden n'a pas refermé /etc/opendkim"
+[ "$(stat -c '%a %G' /etc/opendkim/ogs/SigningTable)" = "640 opendkim" ] || echec "harden n'a pas refermé la table"
+cle_active=$(ls /etc/opendkim/keys/shopfr/shop.fr/"$nouveau".private)
+[ "$(stat -c '%a %U:%G' "$cle_active")" = "600 opendkim:opendkim" ] ||
+    echec "harden a touché à la clé : $(stat -c '%a %U:%G' "$cle_active")"
+[ "$(envoyer contact@shop.fr apres-harden)" = signé ] || echec "courrier non signé après harden"
+ogs apply shopfr --yes 2>&1 | grep -qi "SigningTable\|KeyTable" &&
+    echec "l'apply réécrit les tables que harden vient de refermer : les deux se contredisent"
+echo "  /etc/opendkim refermé, clés intactes, signature toujours en place"
 
 echo
 echo "--- les tables portent tout le parc ---"

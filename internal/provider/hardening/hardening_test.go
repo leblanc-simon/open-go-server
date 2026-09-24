@@ -508,3 +508,60 @@ func TestNeReposePasLeBitSetgid(t *testing.T) {
 		t.Errorf("mode = %04o, attendu 0640", got)
 	}
 }
+
+func openDKIMTarget(t *testing.T) Target {
+	t.Helper()
+	for _, c := range Defaults("/home") {
+		if c.Path == "/etc/opendkim" {
+			return c
+		}
+	}
+	t.Fatal("/etc/opendkim absent de la table par défaut")
+	return Target{}
+}
+
+func TestOpenDKIMEstFermeSansToucherAuxCles(t *testing.T) {
+	// Les clés DKIM vivent sous /etc/opendkim : le répertoire se ferme aux
+	// utilisateurs des projets, mais une clé en 0600 au compte d'OpenDKIM ne doit
+	// être ni desserrée ni reprise — illisible au démon, elle retiendrait en file
+	// tout le courrier du domaine.
+	cible := openDKIMTarget(t)
+	if cible.DirMode != 0o750 || cible.FileMode != 0o640 || cible.Group != "opendkim" || !cible.Recursive {
+		t.Fatalf("cible inattendue : %+v", cible)
+	}
+	// Les comptes root et opendkim n'existent pas en test : la mécanique des modes
+	// est éprouvée seule, le propriétaire restant celui qui lance les tests.
+	cible.Owner, cible.Group = "", ""
+	p, prefix := fixture(t, cible)
+	racine := filepath.Join(prefix, "etc/opendkim")
+	creer(t, racine, 0o755)
+	creer(t, filepath.Join(racine, "keys/shopfr/shop.fr"), 0o750)
+	cle := filepath.Join(racine, "keys/shopfr/shop.fr/ogs202609.private")
+	if err := os.WriteFile(cle, []byte("clé"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	creer(t, filepath.Join(racine, "ogs"), 0o750)
+	table := filepath.Join(racine, "ogs/KeyTable")
+	if err := os.WriteFile(table, []byte("table"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	states := appliquer(t, p)
+	if states[0].Verdict != VerdictRestrict {
+		t.Fatalf("un /etc/opendkim en 0755 doit être à restreindre, obtenu %s", states[0].Verdict)
+	}
+	if info, _ := os.Stat(racine); info.Mode().Perm() != 0o750 {
+		t.Errorf("/etc/opendkim attendu en 0750, obtenu %04o", info.Mode().Perm())
+	}
+	if info, _ := os.Stat(table); info.Mode().Perm() != 0o640 {
+		t.Errorf("une table en 0644 doit passer en 0640, obtenu %04o", info.Mode().Perm())
+	}
+	if info, _ := os.Stat(cle); info.Mode().Perm() != 0o600 {
+		t.Errorf("la clé ne doit jamais être desserrée : %04o", info.Mode().Perm())
+	}
+	// Une fois fermé au régime qu'ogs pose lui-même, un second passage ne trouve
+	// plus rien : l'apply et harden ne se contredisent pas.
+	if again := p.Observe(); again[0].Verdict != VerdictOK {
+		t.Errorf("second passage : %s (%v)", again[0].Verdict, again[0].Loose)
+	}
+}

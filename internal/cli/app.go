@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/goccy/go-yaml"
@@ -230,14 +231,25 @@ func (a *App) prepare(p *model.Project) error {
 	if p.Spec.User.Shell == "" {
 		p.Spec.User.Shell = a.Cfg.Shell()
 	}
-	if err := p.Normalize(homeRoot, a.Cfg.PrepDomain()); err != nil {
+	logsRoot := a.logsRoot()
+	if err := p.Normalize(homeRoot, a.Cfg.PrepDomain(), model.WithLogsRoot(logsRoot)); err != nil {
 		return exitf(CodeValidation, "%s", err)
 	}
 	if err := validate.Project(p, homeRoot); err != nil {
 		return exitf(CodeValidation, "projet %s :\n%v", p.ID(), err)
 	}
+	// Le répertoire des journaux doit vivre sous logs.root, dont « doctor »
+	// contrôle la chaîne de propriété : ailleurs, rien ne garantit qu'aucun de ses
+	// composants n'appartienne à l'utilisateur (D71).
+	if dir := filepath.Clean(p.Spec.Layout.LogDir); !strings.HasPrefix(dir, logsRoot+string(filepath.Separator)) {
+		return exitf(CodeValidation, "projet %s :\nspec.layout.logDir : %s doit vivre sous %s (logs.root, D71)",
+			p.ID(), dir, logsRoot)
+	}
 	return nil
 }
+
+// logsRoot renvoie la racine des journaux des projets, préfixe appliqué.
+func (a *App) logsRoot() string { return filepath.Clean(a.Paths.LogsRoot(a.Cfg)) }
 
 // homeRoot renvoie la racine des homes, préfixe appliqué.
 func (a *App) homeRoot() string {
@@ -293,6 +305,7 @@ func (a *App) buildProviders() (*providers, error) {
 		return nil, err
 	}
 	sys.WebReload = "web:" + eng.Name()
+	sys.WebEngine = eng.Name()
 	appProv := &appprov.Provider{Paths: a.Paths, Exec: a.Exec, Templates: tmpl, Store: a.Store,
 		Installer: &appprov.Installer{Exec: a.Exec}, Force: a.Force,
 		Owner: func(proj *model.Project) (int, int, error) { return sys.ResolveOwner(proj, "") }}
@@ -334,6 +347,7 @@ func (a *App) buildProviders() (*providers, error) {
 			CertDir:     certStore.Dir,
 			ProxyTarget: appProv.ProxyTarget,
 			Force:       a.Force,
+			LogsRoot:    a.logsRoot(),
 		},
 		Logrotate: &logrotate.Provider{Paths: a.Paths, Templates: tmpl, Config: a.Cfg, Force: a.Force},
 		Monitoring: &monitoring.Provider{

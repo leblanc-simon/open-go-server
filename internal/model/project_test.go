@@ -78,3 +78,32 @@ func TestLAncienneEntreeBinEstRetireeALaNormalisation(t *testing.T) {
 		t.Error("un .bin/ déclaré par l'exploitant ne doit pas être retiré")
 	}
 }
+
+func TestLesJournauxQuittentLeHome(t *testing.T) {
+	// Une déclaration antérieure à D71 porte <home>/logs : elle est ramenée sous
+	// la racine des journaux, et l'ancienne entrée root de logs/ disparaît.
+	p := New("shop.fr", naming.EnvProd, KindStatic)
+	p.Spec.Layout.LogDir = "/home/shop.fr/logs"
+	p.Spec.Layout.Dirs = []Dir{{Path: "logs", Mode: "0710", Owner: "root"}}
+	if err := p.Normalize("/home", "preprod-pp.net", WithLogsRoot("/srv/journaux")); err != nil {
+		t.Fatal(err)
+	}
+	if p.Spec.Layout.LogDir != "/srv/journaux/shopfr" {
+		t.Errorf("répertoire des journaux attendu sous la racine configurée, obtenu %s", p.Spec.Layout.LogDir)
+	}
+	for _, d := range p.Spec.Layout.Dirs {
+		if d.Path == "logs" {
+			t.Error("l'ancienne entrée logs/ doit être retirée")
+		}
+	}
+	// Un répertoire choisi par l'exploitant est laissé : c'est la validation qui
+	// dira s'il est acceptable.
+	q := New("blog.fr", naming.EnvProd, KindStatic)
+	q.Spec.Layout.LogDir = "/srv/ailleurs/blog"
+	if err := q.Normalize("/home", "preprod-pp.net"); err != nil {
+		t.Fatal(err)
+	}
+	if q.Spec.Layout.LogDir != "/srv/ailleurs/blog" {
+		t.Errorf("un choix de l'exploitant doit être conservé, obtenu %s", q.Spec.Layout.LogDir)
+	}
+}

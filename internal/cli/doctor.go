@@ -454,6 +454,13 @@ func (a *App) runChecks(ctx context.Context) []check {
 	}
 	a.monitoringChecks(add)
 	a.mailChecks(ctx, projects, add)
+	// Journaux des projets, hors du home (D71).
+	if provs, err := a.buildProviders(); err == nil {
+		for _, f := range provs.System.LogChecks(projects, a.logsRoot()) {
+			add(f.Name, f.Status, f.Detail, f.Fix)
+		}
+		provs.close()
+	}
 	return out
 }
 

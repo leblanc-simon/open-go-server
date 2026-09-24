@@ -45,6 +45,13 @@ func (a *App) buildPlan(ctx context.Context, provs *providers, p *model.Project)
 	for _, s := range sysSteps {
 		plan.Add(s)
 	}
+	// Reprise de l'ancien ~/logs (D71) : la recopie précède la réécriture des
+	// vhosts et du pool, la fin vient en dernier, une fois les serveurs rechargés
+	// sur le nouvel emplacement.
+	logsPrepare, logsFinish := provs.System.PlanLogMigration(p, sysObs)
+	if logsPrepare != nil {
+		plan.Add(logsPrepare)
+	}
 
 	// Les bases viennent après l'utilisateur et avant les pools : une application
 	// n'a pas besoin de sa base pour que son pool existe, mais l'ordre du cahier
@@ -248,6 +255,9 @@ func (a *App) buildPlan(ctx context.Context, provs *providers, p *model.Project)
 	if s := provs.System.PlanLegacyBin(p); s != nil {
 		plan.Add(s)
 	}
+	if logsFinish != nil {
+		plan.Add(logsFinish)
+	}
 	return plan, nil
 }
 
@@ -447,8 +457,13 @@ func (a *App) reloadFunc(provs *providers) func(context.Context, string) error {
 			a.printf("  ↻ systemctl daemon-reload\n")
 			return a.systemctl(ctx, "daemon-reload")
 		case target == "systemd:tmpfiles":
-			a.printf("  ↻ systemd-tmpfiles --create\n")
-			return a.systemctlBin(ctx, "systemd-tmpfiles", "--create")
+			// Le seul fichier d'ogs, jamais toute la configuration : sans argument,
+			// systemd-tmpfiles traite chaque fichier de la machine, crée ce qu'ils
+			// déclarent — ce n'est pas à ogs de le décider — et rend 65 sur la
+			// moindre ligne en double d'un fichier de la distribution. Cet échec,
+			// longtemps compté sans être affiché, accompagnait chaque apply.
+			a.printf("  ↻ systemd-tmpfiles --create %s\n", a.Paths.TmpfilesFile())
+			return a.systemctlBin(ctx, "systemd-tmpfiles", "--create", a.Paths.TmpfilesFile())
 		case strings.HasPrefix(target, "systemd:restart-target:"):
 			id := strings.TrimPrefix(target, "systemd:restart-target:")
 			a.printf("  ↻ redémarrage des services de %s\n", id)

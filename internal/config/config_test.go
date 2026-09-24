@@ -289,3 +289,21 @@ func TestSignatureDKIMRefusDuChargement(t *testing.T) {
 		})
 	}
 }
+
+func TestLaRacineDesJournauxNePeutPasVivreSousLesHomes(t *testing.T) {
+	if Default().LogsRoot() != "/var/log/ogs-projects" {
+		t.Errorf("racine par défaut inattendue : %s", Default().LogsRoot())
+	}
+	for _, root := range []string{"/home/journaux", "journaux", "/"} {
+		c := Default()
+		c.Logs.Root = root
+		if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "logs.root") {
+			t.Errorf("logs.root %q doit être refusé, obtenu %v", root, err)
+		}
+	}
+	c := Default()
+	c.Logs.Root = "/srv/journaux"
+	if err := c.Validate(); err != nil {
+		t.Errorf("une racine hors des homes doit être acceptée : %v", err)
+	}
+}

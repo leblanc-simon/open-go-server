@@ -69,7 +69,8 @@ func fixture(t *testing.T) (*Provider, config.Paths) {
 func project(t *testing.T, host string, kind model.AppKind, phpVersion string) *model.Project {
 	t.Helper()
 	p := model.New(host, naming.EnvProd, kind)
-	if err := p.Normalize(filepath.Join(t.TempDir(), "home"), "preprod-pp.net"); err != nil {
+	if err := p.Normalize(filepath.Join(t.TempDir(), "home"), "preprod-pp.net",
+		model.WithLogsRoot(filepath.Join(t.TempDir(), "ogs-projects"))); err != nil {
 		t.Fatal(err)
 	}
 	if phpVersion != "" && len(p.Spec.PHP.Pools) > 0 {

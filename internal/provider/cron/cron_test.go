@@ -21,7 +21,8 @@ func fixture(t *testing.T) (*Provider, *model.Project) {
 	paths := config.NewPaths(prefix)
 	proj := model.New("shop.fr", naming.EnvProd, model.KindSymfony)
 	proj.Spec.App.Version = "6.4"
-	if err := proj.Normalize(filepath.Join(prefix, "home"), "preprod-pp.net"); err != nil {
+	if err := proj.Normalize(filepath.Join(prefix, "home"), "preprod-pp.net",
+		model.WithLogsRoot(filepath.Join(prefix, "var", "log", "ogs-projects"))); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.MkdirAll(proj.Spec.Layout.LogDir, 0o750); err != nil {

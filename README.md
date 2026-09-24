@@ -382,11 +382,11 @@ est transmis par `SOCKET_PATH`, et si le code l'ignore, l'attente de disponibili
   Linux, son groupe, les bases, le vhost RabbitMQ, le pool PHP, le vhost web, les unités systemd et le cron.
 - **Home** en `/home/<host effectif>`, en 0711, ses répertoires en 0710 ; le code applicatif dans `www/`, le docroot dépendant du
   type d'application (`www` pour Prestashop, `www/public` pour Symfony 4+, `www/web` pour Symfony 3.4).
-- **`logs/` appartient à root** : l'utilisateur y lit mais n'y crée rien. Cela interdit de substituer un
-  fichier de log par un lien symbolique et d'obtenir une écriture root arbitraire. La protection a une
-  limite connue : le home appartenant à l'utilisateur, il peut renommer `logs/` lui-même. D71 la referme en
-  sortant les journaux du home (`/var/log/ogs-projects/<id>/`, avec un lien `~/logs`) — décision arbitrée,
-  implémentation à venir.
+- **Journaux hors du home** (D71) : sous `/var/log/ogs-projects/<id>/` (réglable par `logs.root`), chaîne
+  entièrement root, fichiers pré-créés ; le home n'en porte qu'un lien `~/logs` pour la lecture, qu'aucun
+  processus root n'emprunte. Un répertoire root dans le home ne protégeait rien : l'utilisateur, qui possède
+  son home, le renommait et en recréait un à lui, où un journal que le serveur web ouvre en root devenait
+  un lien vers un fichier système.
 - **Liens gérés dans `~/.local/bin`** (D70) : interpréteur PHP et runtimes, au compte de l'utilisateur et
   sur son PATH. Le lien est rétabli à chaque apply ; root l'écrit sans jamais suivre de lien, et un fichier
   posé à sa place n'est remplacé que sous `--force`.

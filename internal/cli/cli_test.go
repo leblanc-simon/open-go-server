@@ -230,7 +230,6 @@ func TestFullLifecycle(t *testing.T) {
 		"www":        0o710,
 		"www/public": 0o710,
 		"var":        0o700,
-		"logs":       0o710,
 		".local":     0o700,
 		".local/bin": 0o700,
 		".ssh":       0o700,
@@ -244,6 +243,14 @@ func TestFullLifecycle(t *testing.T) {
 			t.Errorf("%s : mode %04o, attendu %04o", rel, got, want)
 		}
 	}
+	// Les journaux vivent hors du home (D71) : ~/logs n'en est qu'un lien.
+	logDir := h.path("var", "log", "ogs-projects", "shopfr")
+	if info, err := os.Stat(logDir); err != nil || info.Mode().Perm() != 0o750 {
+		t.Errorf("répertoire des journaux attendu en 0750 : %v", err)
+	}
+	if target, err := os.Readlink(h.path("home", "shop.fr", "logs")); err != nil || target != logDir {
+		t.Errorf("~/logs doit désigner %s, obtenu %q (%v)", logDir, target, err)
+	}
 
 	// 5. Idempotence, une fois les comptes réputés créés.
 	h.simulateSystemEffects("shopfr", "shop.fr", 1004)
@@ -256,7 +263,7 @@ func TestFullLifecycle(t *testing.T) {
 	}
 
 	// 6. Dérive : détectée par diff, corrigée par apply.
-	logs := h.path("home", "shop.fr", "logs")
+	logs := h.path("home", "shop.fr", "var")
 	if err := os.Chmod(logs, 0o777); err != nil {
 		t.Fatal(err)
 	}
@@ -264,12 +271,12 @@ func TestFullLifecycle(t *testing.T) {
 	if code != CodePartial {
 		t.Errorf("une dérive doit donner le code %d, obtenu %d\n%s", CodePartial, code, out)
 	}
-	if !strings.Contains(out, "0777 → 0710") {
+	if !strings.Contains(out, "0777 → 0700") {
 		t.Errorf("le diff doit expliciter l'écart :\n%s", out)
 	}
 	h.mustRun("apply", "shopfr", "--yes")
 	info, _ := os.Stat(logs)
-	if info.Mode().Perm() != 0o710 {
+	if info.Mode().Perm() != 0o700 {
 		t.Errorf("mode non corrigé : %04o", info.Mode().Perm())
 	}
 }
@@ -522,7 +529,7 @@ func TestLogrotateGathersProjectsInOneBlock(t *testing.T) {
 	if strings.Contains(rot, "/home/*/") {
 		t.Error("les chemins doivent être énumérés, pas globalisés")
 	}
-	for _, want := range []string{"boutique.fr/logs/php-error.log", "shop.fr/logs/apache-access.log"} {
+	for _, want := range []string{"ogs-projects/boutiquefr/php-error.log", "ogs-projects/shopfr/apache-access.log"} {
 		if !strings.Contains(rot, want) {
 			t.Errorf("chemin absent de la rotation : %s", want)
 		}
@@ -2283,9 +2290,9 @@ func TestApplyCiblePreserveLesFichiersDuParc(t *testing.T) {
 	h.mustRun("apply", "shopfr", "--yes")
 
 	for _, cas := range []struct{ rel, veut string }{
-		{filepath.Join("etc", "logrotate.d", "ogs"), "blog.fr"},
+		{filepath.Join("etc", "logrotate.d", "ogs"), "blogfr"},
 		{filepath.Join("etc", "tmpfiles.d", "ogs.conf"), "blogfr"},
-		{filepath.Join("etc", "fail2ban", "jail.d", "ogs.conf"), "blog.fr"},
+		{filepath.Join("etc", "fail2ban", "jail.d", "ogs.conf"), "blogfr"},
 		{filepath.Join("etc", "telegraf", "telegraf.d", "ogs.conf"), "blogfr"},
 		{filepath.Join("etc", "apache2", "sites-available", "ogs-status.conf"), "blogfr"},
 	} {
@@ -2355,7 +2362,7 @@ func TestCreationDeSitePreserveLesFichiersDuParc(t *testing.T) {
 	h.mustRunPartial("site", "create", "blog.fr", "--kind", "php-symfony", "--php", "8.5", "--yes")
 
 	rot := h.read(t, filepath.Join("etc", "logrotate.d", "ogs"))
-	if !strings.Contains(rot, "shop.fr") || !strings.Contains(rot, "blog.fr") {
+	if !strings.Contains(rot, "shopfr") || !strings.Contains(rot, "blogfr") {
 		t.Errorf("les deux sites doivent être tournés :\n%s", rot)
 	}
 	tmpfiles := h.read(t, filepath.Join("etc", "tmpfiles.d", "ogs.conf"))
@@ -2689,5 +2696,70 @@ func TestMigrationDesLiensVersLocalBin(t *testing.T) {
 	}
 	if _, err := os.Lstat(filepath.Join(home, ".bin")); !os.IsNotExist(err) {
 		t.Error("l'ancien .bin ne doit pas être recréé")
+	}
+}
+
+func TestMigrationDesJournauxHorsDuHome(t *testing.T) {
+	// Un projet déclaré avant D71 : sa déclaration désigne <home>/logs, et ses
+	// journaux y vivent, rotés compris. Un apply doit tout reprendre sous
+	// logs.root et laisser un lien à la place.
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("project", "create", "shop.fr", "--kind", "php-plain")
+	h.mustRun("apply", "shopfr", "--yes")
+
+	home := h.path("home", "shop.fr")
+	decl := h.path("etc", "ogs", "projects", "shopfr.yaml")
+	data, _ := os.ReadFile(decl)
+	nouveau := h.path("var", "log", "ogs-projects", "shopfr")
+	ancien := strings.Replace(string(data), "logDir: "+nouveau, "logDir: "+filepath.Join(home, "logs"), 1)
+	if ancien == string(data) {
+		t.Fatalf("déclaration inattendue :\n%s", data)
+	}
+	if err := os.WriteFile(decl, []byte(ancien), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(home, "logs")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(nouveau); err != nil {
+		t.Fatal(err)
+	}
+	legacy := filepath.Join(home, "logs")
+	if err := os.MkdirAll(legacy, 0o710); err != nil {
+		t.Fatal(err)
+	}
+	for name, content := range map[string]string{
+		"apache-access.log":   "accès récent\n",
+		"apache-access.log.1": "accès d'hier\n",
+	} {
+		if err := os.WriteFile(filepath.Join(legacy, name), []byte(content), 0o640); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	out := h.mustRun("apply", "shopfr", "--yes")
+	if !strings.Contains(out, "reprise des journaux") {
+		t.Errorf("l'apply doit annoncer la reprise :\n%s", out)
+	}
+	if got, _ := os.ReadFile(filepath.Join(nouveau, "apache-access.log")); string(got) != "accès récent\n" {
+		t.Errorf("journal courant mal repris : %q", got)
+	}
+	if got, _ := os.ReadFile(filepath.Join(nouveau, "apache-access.log.1")); string(got) != "accès d'hier\n" {
+		t.Errorf("journal roté mal repris : %q", got)
+	}
+	if target, err := os.Readlink(legacy); err != nil || target != nouveau {
+		t.Errorf("~/logs doit désormais être un lien vers %s : %q (%v)", nouveau, target, err)
+	}
+	if vhost := h.read(t, "etc/apache2/sites-available/shopfr.conf"); strings.Contains(vhost, home+"/logs") ||
+		!strings.Contains(vhost, nouveau) {
+		t.Errorf("le vhost doit journaliser sous logs.root :\n%s", vhost)
+	}
+
+	// La suppression archive les journaux puis les retire : ils ne vivent plus
+	// dans l'arborescence du projet.
+	out = h.mustRunPartial("project", "delete", "shopfr", "--yes")
+	if _, err := os.Stat(nouveau); !os.IsNotExist(err) {
+		t.Errorf("les journaux du projet supprimé doivent partir :\n%s", out)
 	}
 }

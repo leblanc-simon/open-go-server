@@ -178,6 +178,15 @@ func Project(p *model.Project, homeRoot string) error {
 			add(f+".owner", "seul « root » est admis comme propriétaire alternatif, obtenu %q", d.Owner)
 		}
 	}
+	// Les journaux vivent hors du home (D71) : le serveur web les ouvre en root, et
+	// un répertoire du home se renomme sans privilège — l'utilisateur y posait un
+	// journal devenu lien vers un fichier système.
+	if ld := filepath.Clean(p.Spec.Layout.LogDir); !filepath.IsAbs(ld) {
+		add("spec.layout.logDir", "chemin absolu attendu, obtenu %q", p.Spec.Layout.LogDir)
+	} else if isUnder(ld, filepath.Clean(homeRoot)) {
+		add("spec.layout.logDir", "ne peut pas vivre sous la racine des homes (%s) : "+
+			"l'utilisateur y renommerait le répertoire que le serveur web ouvre en root (D71)", ld)
+	}
 	if dr := p.Spec.Layout.Docroot; dr != "" && !isUnder(filepath.Clean(dr), root) {
 		add("spec.layout.docroot", "doit être sous %q, obtenu %q", root, dr)
 	}
@@ -414,6 +423,11 @@ func validateAMQP(p *model.Project, add func(string, string, ...any)) {
 	}
 }
 
+// interditsJournal énumère ce qui n'a rien à faire dans le nom du journal d'une
+// tâche : les caractères du nom de tâche, le point excepté — « purge.log » est
+// le nom attendu —, et la barre oblique en tête, qui en ferait un chemin.
+const interditsJournal = "/ \t\r\n%;&|<>()$`\"'\\*?[]{}#~!\x00"
+
 // interditsCron énumère ce qui n'a rien à faire dans le nom d'une tâche, lequel
 // sert à trois choses à la fois.
 //
@@ -459,6 +473,13 @@ func validateCrons(p *model.Project, add func(string, string, ...any)) {
 		if strings.ContainsAny(c.Command, "\n\r") {
 			add(f+".command", "la commande ne peut pas contenir de retour à la ligne")
 		}
+		// Le journal d'une tâche est pré-créé par root, au nom du projet : un
+		// chemin lui ferait poser ce fichier n'importe où. Seul un nom est admis,
+		// dans le répertoire des journaux du projet (D71).
+		if c.Log != "" && (c.Log == "." || c.Log == ".." || strings.ContainsAny(c.Log, interditsJournal)) {
+			add(f+".log", "nom de fichier attendu, sans chemin ni métacaractère, obtenu %q (D71)", c.Log)
+		}
+
 	}
 }
 

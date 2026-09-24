@@ -13,7 +13,7 @@ import (
 // ne renomme jamais : les ressources gardent leurs noms réels, l'identifiant ogs
 // n'étant qu'une clé de regroupement. Un renommage vers la convention canonique
 // est une opération distincte et destructrice.
-func Adopt(c Candidate, homeRoot, prepDomain string) (*model.Project, []string, error) {
+func Adopt(c Candidate, homeRoot, prepDomain string, opts ...model.NormalizeOption) (*model.Project, []string, error) {
 	if c.Host == "" {
 		return nil, nil, fmt.Errorf("candidat sans host : rien à adopter")
 	}
@@ -104,14 +104,16 @@ func Adopt(c Candidate, homeRoot, prepDomain string) (*model.Project, []string, 
 					"si elle doit être pilotée par ogs", r.Name))
 		}
 	}
-	if err := p.Normalize(homeRoot, prepDomain); err != nil {
+	if err := p.Normalize(homeRoot, prepDomain, opts...); err != nil {
 		return nil, nil, err
 	}
-	// La normalisation a pu compléter des chemins : on rétablit ceux du système.
+	// La normalisation a pu compléter des chemins : on rétablit ceux du système —
+	// sauf les journaux, qui rejoignent la racine du parc (D71) : les vhosts d'un
+	// projet adopté sont réécrits par ogs, et un répertoire de journaux dans le
+	// home se renomme sans privilège.
 	if c.Home != "" {
 		p.Spec.Layout.Root = c.Home
 		p.Spec.User.Home = c.Home
-		p.Spec.Layout.LogDir = filepath.Join(c.Home, "logs")
 	}
 	if c.Docroot != "" {
 		p.Spec.Layout.Docroot = c.Docroot
