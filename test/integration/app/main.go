@@ -3,9 +3,15 @@
 // désigné par SOCKET_PATH, ou à défaut sur le port donné par PORT, et rien
 // d'autre. Elle rend son identité, ce qui permet de vérifier sous quel compte le
 // service tourne réellement.
+//
+// L'option -ecoute l'emporte sur l'environnement : c'est ainsi qu'une application
+// custom reçoit son adresse, par un ${LISTEN_ADDR} que systemd développe dans
+// ExecStart (D75). MESSAGE, s'il est défini, est rendu dans la réponse : il vient
+// du fichier d'environnement du projet.
 package main
 
 import (
+	"flag"
 	"fmt"
 	"log"
 	"net"
@@ -14,13 +20,20 @@ import (
 	"os/user"
 )
 
+var adresse = flag.String("ecoute", "", "adresse TCP d'écoute, à la place de PORT")
+
 func main() {
+	flag.Parse()
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		nom := "inconnu"
 		if u, err := user.Current(); err == nil {
 			nom = u.Username
 		}
-		fmt.Fprintf(w, "application sous %s, écoute %s\n", nom, ecoute())
+		message := ""
+		if m := os.Getenv("MESSAGE"); m != "" {
+			message = ", message " + m
+		}
+		fmt.Fprintf(w, "application sous %s, écoute %s%s\n", nom, ecoute(), message)
 	})
 	// Une sonde distincte : le provider attend une réponse inférieure à 500 sur le
 	// chemin déclaré dans health.path.
@@ -37,6 +50,9 @@ func main() {
 }
 
 func ecoute() string {
+	if *adresse != "" {
+		return *adresse
+	}
 	if s := os.Getenv("SOCKET_PATH"); s != "" {
 		return "unix:" + s
 	}
@@ -60,6 +76,9 @@ func listener() (net.Listener, error) {
 			return nil, err
 		}
 		return l, nil
+	}
+	if *adresse != "" {
+		return net.Listen("tcp", *adresse)
 	}
 	port := os.Getenv("PORT")
 	if port == "" {

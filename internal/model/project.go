@@ -65,14 +65,23 @@ type Spec struct {
 
 // App décrit le type d'application et, pour les runtimes non-PHP, le processus.
 type App struct {
-	Kind       AppKind           `yaml:"kind"`
-	Version    string            `yaml:"version,omitempty"` // « auto » ou une version explicite
-	Runtime    string            `yaml:"runtime,omitempty"` // version du runtime (node, ruby, python)
-	Entrypoint string            `yaml:"entrypoint,omitempty"`
-	Listen     string            `yaml:"listen,omitempty"` // socket | port
-	Instances  int               `yaml:"instances,omitempty"`
-	Env        map[string]string `yaml:"env,omitempty"`
-	Health     *Health           `yaml:"health,omitempty"`
+	Kind       AppKind `yaml:"kind"`
+	Version    string  `yaml:"version,omitempty"` // « auto » ou une version explicite
+	Runtime    string  `yaml:"runtime,omitempty"` // version du runtime (node, ruby, python)
+	Entrypoint string  `yaml:"entrypoint,omitempty"`
+	// Command est la ligne ExecStart d'une application « custom » (D75), et
+	// d'elle seule : les autres types la déduisent de leur runtime. Les variables
+	// d'environnement y sont développées par systemd — ${PORT}, ${SOCKET_PATH}.
+	Command   string            `yaml:"command,omitempty"`
+	Listen    string            `yaml:"listen,omitempty"` // socket | port
+	Instances int               `yaml:"instances,omitempty"`
+	Env       map[string]string `yaml:"env,omitempty"`
+	// EnvFile branche sur l'unité le fichier d'environnement du projet,
+	// /etc/ogs/env/<id>.env (D75). Son emplacement n'est pas réglable : systemd
+	// le lit en root, et un fichier que l'utilisateur pourrait remplacer par un
+	// lien lui ferait lire les secrets d'un voisin.
+	EnvFile bool    `yaml:"envFile,omitempty"`
+	Health  *Health `yaml:"health,omitempty"`
 }
 
 // Health paramètre l'attente de disponibilité d'une application.

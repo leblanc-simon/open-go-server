@@ -131,21 +131,37 @@ func (s *Set) Extract(name string) (string, error) {
 // Funcs expose les fonctions utilisables dans les templates.
 func Funcs() texttemplate.FuncMap {
 	return texttemplate.FuncMap{
-		"snake":     func(s string) string { return strings.ReplaceAll(strings.ReplaceAll(s, "-", "_"), ".", "_") },
-		"kebab":     func(s string) string { return strings.ReplaceAll(strings.ReplaceAll(s, "_", "-"), ".", "-") },
-		"upper":     strings.ToUpper,
-		"lower":     strings.ToLower,
-		"join":      func(sep string, items []string) string { return strings.Join(items, sep) },
-		"truncate":  truncate,
-		"hash":      hash6,
-		"indent":    indent,
-		"quote":     func(s string) string { return `"` + strings.ReplaceAll(s, `"`, `\"`) + `"` },
-		"default":   func(fallback, v string) string { return orDefault(v, fallback) },
-		"sorted":    sortedKeys,
-		"hasPrefix": strings.HasPrefix,
-		"hasSuffix": strings.HasSuffix,
-		"contains":  strings.Contains,
+		"snake":      func(s string) string { return strings.ReplaceAll(strings.ReplaceAll(s, "-", "_"), ".", "_") },
+		"kebab":      func(s string) string { return strings.ReplaceAll(strings.ReplaceAll(s, "_", "-"), ".", "-") },
+		"upper":      strings.ToUpper,
+		"lower":      strings.ToLower,
+		"join":       func(sep string, items []string) string { return strings.Join(items, sep) },
+		"truncate":   truncate,
+		"hash":       hash6,
+		"indent":     indent,
+		"quote":      func(s string) string { return `"` + strings.ReplaceAll(s, `"`, `\"`) + `"` },
+		"default":    func(fallback, v string) string { return orDefault(v, fallback) },
+		"sorted":     sortedKeys,
+		"hasPrefix":  strings.HasPrefix,
+		"hasSuffix":  strings.HasSuffix,
+		"contains":   strings.Contains,
+		"systemdEnv": systemdEnv,
 	}
+}
+
+// systemdEnv rend l'affectation d'une directive Environment=. systemd découpe
+// la ligne sur les blancs : sans guillemets, « K=deux mots » définit K=deux et
+// écarte « mots » comme une affectation invalide, sans autre signe qu'une ligne
+// de journal. La citation n'est posée que si la valeur l'exige, de sorte qu'une
+// unité aux valeurs simples garde son rendu — et ne soit ni réécrite ni
+// redémarrée. Les « % » restent des spécificateurs : « INSTANCE=%i » est un
+// usage légitime.
+func systemdEnv(key, value string) string {
+	assignment := key + "=" + value
+	if !strings.ContainsAny(value, " \t\"'\\") {
+		return assignment
+	}
+	return `"` + strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(assignment) + `"`
 }
 
 func truncate(n int, s string) string {

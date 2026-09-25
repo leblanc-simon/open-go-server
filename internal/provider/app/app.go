@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"leblanc.io/open-go-server/internal/config"
@@ -132,8 +133,9 @@ func (p *Provider) Endpoint(proj *model.Project) (Endpoint, error) {
 	listen := proj.Spec.App.Listen
 	if listen == "" {
 		// Un binaire Go écoute sur un port : il n'a pas de convention de socket, et
-		// l'imposer supposerait une coopération du code applicatif.
-		if at.Runtime == RuntimeGo {
+		// l'imposer supposerait une coopération du code applicatif. Une commande
+		// custom est dans le même cas, ogs ne sachant rien de ce qu'elle lance.
+		if at.Runtime == RuntimeGo || at.Runtime == RuntimeCustom {
 			listen = "port"
 		} else {
 			listen = "socket"
@@ -184,7 +186,26 @@ type Observed struct {
 	UnitPresent bool
 	Listening   bool
 	Endpoint    Endpoint
+	// EnvFile est l'état du fichier d'environnement, observé seulement quand le
+	// projet le demande.
+	EnvFile EnvFileState
 }
+
+// EnvFileState décrit le fichier d'environnement d'un projet (D75).
+type EnvFileState struct {
+	Present bool
+	// Regular est faux pour un lien ou un répertoire : systemd suivrait le lien en
+	// root, et c'est précisément ce que l'emplacement réservé doit exclure.
+	Regular bool
+	Mode    os.FileMode
+	UID     int
+}
+
+// envFileMode est le mode du fichier d'environnement : systemd le lit en root
+// avant de changer d'identité, le projet n'a pas à le lire lui-même. C'est aussi
+// le régime qu'« ogs harden » impose sous /etc/ogs ; deux juges en désaccord sur
+// un même chemin feraient osciller le plan.
+const envFileMode os.FileMode = 0o600
 
 // Observe inspecte le runtime, le lien et le point d'écoute.
 func (p *Provider) Observe(_ context.Context, proj *model.Project) (Observed, error) {
@@ -198,9 +219,14 @@ func (p *Provider) Observe(_ context.Context, proj *model.Project) (Observed, er
 		return obs, err
 	}
 	obs.Endpoint = endpoint
-	obs.RuntimeInstalled = at.Runtime == RuntimeGo ||
+	obs.RuntimeInstalled = at.Runtime == RuntimeGo || !managed(at.Runtime) ||
 		Installed(proj.Spec.Layout.Root, at.Runtime, proj.Spec.App.Runtime)
-	obs.LinkTarget = readLink(proj, LinkName(at.Runtime))
+	if managed(at.Runtime) {
+		obs.LinkTarget = readLink(proj, LinkName(at.Runtime))
+	}
+	if proj.Spec.App.EnvFile {
+		obs.EnvFile = observeEnvFile(p.Paths.EnvFile(proj.ID()))
+	}
 	if at.Runtime == RuntimeRuby {
 		obs.BundleLinkTarget = readLink(proj, LinkBundle)
 	}
@@ -213,6 +239,22 @@ func (p *Provider) Observe(_ context.Context, proj *model.Project) (Observed, er
 	obs.Listening = p.listening(endpoint)
 	return obs, nil
 }
+
+// observeEnvFile relit le fichier sans suivre de lien.
+func observeEnvFile(path string) EnvFileState {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return EnvFileState{}
+	}
+	st := EnvFileState{Present: true, Regular: info.Mode().IsRegular(), Mode: info.Mode().Perm(), UID: -1}
+	if sys, ok := info.Sys().(*syscall.Stat_t); ok {
+		st.UID = int(sys.Uid)
+	}
+	return st
+}
+
+// UnitPath renvoie le chemin de l'unité applicative d'un projet.
+func (p *Provider) UnitPath(proj *model.Project) string { return p.unitPath(proj) }
 
 func (p *Provider) unitPath(proj *model.Project) string {
 	return filepath.Join(p.Paths.SystemdDir(),
@@ -250,6 +292,10 @@ func (p *Provider) Build(proj *model.Project, endpoint Endpoint) ([]byte, error)
 	if err != nil {
 		return nil, err
 	}
+	envFile := ""
+	if proj.Spec.App.EnvFile {
+		envFile = p.Paths.EnvFile(proj.ID())
+	}
 	env := map[string]string{}
 	for k, v := range proj.Spec.App.Env {
 		env[k] = v
@@ -272,6 +318,7 @@ func (p *Provider) Build(proj *model.Project, endpoint Endpoint) ([]byte, error)
 		"Workdir":     filepath.Join(proj.Spec.Layout.Root, "www"),
 		"Command":     command,
 		"Environment": env,
+		"EnvFile":     envFile,
 		"RestartSec":  "5",
 		"StopTimeout": "30",
 		"RunDir":      p.Paths.ProjectRunDir(proj.ID()),
@@ -292,6 +339,13 @@ func (p *Provider) command(proj *model.Project, runtime string, endpoint Endpoin
 	link := LinkPath(proj.Spec.Layout.Root, runtime)
 	entry := proj.Spec.App.Entrypoint
 	switch runtime {
+	case RuntimeCustom:
+		// Recopiée telle quelle : la validation en a écarté ce qui ferait déborder
+		// la ligne ExecStart, et systemd y développe ${PORT} ou ${SOCKET_PATH}.
+		if strings.TrimSpace(proj.Spec.App.Command) == "" {
+			return "", fmt.Errorf("le type custom exige une commande (spec.app.command)")
+		}
+		return strings.TrimSpace(proj.Spec.App.Command), nil
 	case RuntimeGo:
 		// Le lien pointe vers le binaire déployé : le remplacer puis redémarrer
 		// constitue une bascule atomique.
@@ -352,6 +406,35 @@ func (p *Provider) Plan(_ context.Context, proj *model.Project, obs Observed) ([
 	// n'est pas le sien.
 	steps = append(steps, p.runDirStep(proj, obs))
 
+	// Une application custom n'a ni runtime ni lien : ogs lance la commande
+	// déclarée, sans rien savoir de ce qu'elle désigne.
+	if managed(at.Runtime) {
+		runtimeSteps, err := p.runtimeSteps(proj, at, obs)
+		if err != nil {
+			return nil, err
+		}
+		steps = append(steps, runtimeSteps...)
+	}
+
+	// 3. Le fichier d'environnement, avant l'unité qui le nomme : systemd refuse
+	// de démarrer un service dont l'EnvironmentFile manque.
+	if proj.Spec.App.EnvFile {
+		steps = append(steps, p.envFileStep(proj, obs))
+	}
+
+	// 4. L'unité.
+	s, err := p.unitStep(proj, at, endpoint)
+	if err != nil {
+		return nil, err
+	}
+	steps = append(steps, s)
+
+	return steps, nil
+}
+
+// runtimeSteps produit l'installation du runtime et les liens gérés.
+func (p *Provider) runtimeSteps(proj *model.Project, at model.AppType, obs Observed) ([]*engine.Step, error) {
+	var steps []*engine.Step
 	// 1. Le runtime. Son installation télécharge depuis Internet : l'étape est non
 	// critique, et son échec laisse le site en place avec le service arrêté.
 	if !obs.RuntimeInstalled {
@@ -395,15 +478,82 @@ func (p *Provider) Plan(_ context.Context, proj *model.Project, obs Observed) ([
 	if at.Runtime == RuntimeRuby {
 		steps = append(steps, p.bundleLinkStep(proj, obs))
 	}
-
-	// 3. L'unité.
-	s, err := p.unitStep(proj, at, endpoint)
-	if err != nil {
-		return nil, err
-	}
-	steps = append(steps, s)
-
 	return steps, nil
+}
+
+// envFileHeader est le contenu d'un fichier d'environnement créé par ogs. Il
+// n'y est plus jamais écrit ensuite : le contenu appartient à l'exploitant.
+const envFileHeader = `# Variables d'environnement de l'application %s, lues par systemd
+# (EnvironmentFile=) avant le démarrage du service. Une affectation par ligne :
+#   NOM=valeur
+# ogs ne réécrit jamais ce fichier. Une modification ne prend effet qu'au
+# redémarrage : ogs service restart %s
+`
+
+// EnvFileSecret est le nom sous lequel le fichier d'environnement voyage, scellé,
+// dans l'archive d'un projet supprimé : il porte des secrets, et l'archive ne
+// doit pas les rendre en clair.
+const EnvFileSecret = "app/envfile"
+
+// CreateEnvFile crée le fichier d'environnement et son répertoire. Il ne remplace
+// jamais un fichier existant (O_EXCL) : un fichier apparu entre l'observation et
+// l'écriture est celui de l'exploitant, et il ne doit pas être vidé.
+func CreateEnvFile(path string, content []byte) error {
+	if err := fs.EnsureDir(filepath.Dir(path), 0o700, fs.KeepOwner); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, envFileMode)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(content); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
+}
+
+// envFileStep pose le fichier d'environnement s'il manque, et en resserre les
+// droits s'ils ont été ouverts. Il ne le réécrit jamais : ce qu'il contient —
+// des secrets, le plus souvent — est l'affaire de l'exploitant.
+func (p *Provider) envFileStep(proj *model.Project, obs Observed) *engine.Step {
+	path := p.Paths.EnvFile(proj.ID())
+	resource := "app/envfile/" + proj.ID()
+	st := obs.EnvFile
+	simulated := p.Exec != nil && p.Exec.Simulated()
+	switch {
+	case !st.Present:
+		s := engine.NewStep(resource, engine.Create,
+			fmt.Sprintf("fichier d'environnement %s (vide, %04o root:root)", path, envFileMode))
+		s.Apply = func(context.Context) error {
+			return CreateEnvFile(path, []byte(fmt.Sprintf(envFileHeader, proj.ID(), proj.ID())))
+		}
+		s.Compensate = func(context.Context) error { return os.Remove(path) }
+		return s
+	case !st.Regular:
+		s := engine.NewStep(resource, engine.Update,
+			"fichier d'environnement "+path+" — pas un fichier ordinaire")
+		s.Apply = func(context.Context) error {
+			return fmt.Errorf("%s n'est pas un fichier ordinaire : systemd le lirait en root "+
+				"en suivant le lien, ce que l'emplacement réservé doit exclure ; "+
+				"le remplacer par un fichier en %04o root:root", path, envFileMode)
+		}
+		return s
+	case st.Mode != envFileMode || (!simulated && st.UID != 0):
+		s := engine.NewStep(resource, engine.Update,
+			fmt.Sprintf("fichier d'environnement %s : droits ramenés à %04o root:root (%04o constaté)",
+				path, envFileMode, st.Mode))
+		s.Apply = func(context.Context) error {
+			if !simulated {
+				if err := os.Lchown(path, 0, 0); err != nil {
+					return err
+				}
+			}
+			return os.Chmod(path, envFileMode)
+		}
+		return s
+	}
+	return engine.NewStep(resource, engine.NoOp, "fichier d'environnement "+path)
 }
 
 // unitStep produit l'étape d'écriture de l'unité applicative. Elle suit le même
@@ -644,7 +794,7 @@ func ExposedPorts(listeners []string) []string {
 			continue
 		}
 		n, err := strconv.Atoi(port)
-		if err != nil || n < 21000 || n > 24999 {
+		if err != nil || n < 21000 || n > 25999 {
 			continue
 		}
 		if host == "127.0.0.1" || host == "::1" || host == "localhost" {

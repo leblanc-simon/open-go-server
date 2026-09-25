@@ -12,8 +12,8 @@ Les commits ne mentionnent jamais l'assistance d'un outil d'IA.
 
 ## La référence
 
-[`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md) fait autorité : 74 décisions d'architecture
-arbitrées (D1–D74, tableau §2), spécification par module, plan de tests, découpage en lots. **Consulter le
+[`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md) fait autorité : 75 décisions d'architecture
+arbitrées (D1–D75, tableau §2), spécification par module, plan de tests, découpage en lots. **Consulter le
 tableau des décisions avant de proposer une architecture** — la plupart des questions « pourquoi pas
 plutôt… ? » y sont déjà tranchées, avec leur raison. Toute décision nouvelle s'y ajoute.
 
@@ -403,6 +403,15 @@ Ils ont tous coûté un défaut réel ; les tests unitaires ne les voyaient pas.
   `sshd_config` ne couvre tout. Sans elle, un pare-feu mal écrit coupe
   la session qui l'active, et plus rien de ce qu'elle a lancé ne tourne pour réparer — d'où le minuteur
   systemd, qui ne dépend pas d'elle.
+- **`EnvironmentFile=` est lu par systemd en root**, avant le changement d'identité : un fichier que
+  l'utilisateur d'un projet peut remplacer par un lien lui ferait injecter les secrets d'un voisin. D'où
+  l'emplacement imposé du fichier d'environnement applicatif, `/etc/ogs/env/<id>.env` (D75), en 0600
+  root:root — le régime d'`ogs harden` sous `/etc/ogs` —, un lien à sa place refusé, et son contenu jamais
+  réécrit par ogs. Il l'emporte sur les `Environment=` de l'unité, `PORT` compris.
+- **`Environment=` se découpe sur les blancs** : `K=deux mots` définit `K=deux` et écarte `mots` sans autre
+  signe qu'une ligne de journal. La fonction de template `systemdEnv` cite l'affectation **seulement si la
+  valeur l'exige** — une valeur simple garde son rendu, et l'unité n'est ni réécrite ni redémarrée. Les `%`
+  restent des spécificateurs (`INSTANCE=%i`).
 - Telegraf n'a **pas d'équivalent d'`apachectl -t`** : son option de test exécute réellement la collecte.
   Le rechargement se contente d'un constat en aval. Et un fragment que l'agent ne peut pas lire ne produit
   **aucune erreur** — il démarre, ne collecte rien, et se tait ; d'où le contrôle de `doctor`.

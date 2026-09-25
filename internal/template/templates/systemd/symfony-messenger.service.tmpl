@@ -16,7 +16,7 @@ User={{ .User }}
 Group={{ .Group }}
 WorkingDirectory={{ .Workdir }}
 {{- range $key := sorted .Environment }}
-Environment={{ $key }}={{ index $.Environment $key }}
+Environment={{ systemdEnv $key (index $.Environment $key) }}
 {{- end }}
 # L'interpréteur passe par le lien géré : une bascule de version PHP ne réécrit
 # aucune unité (D30).

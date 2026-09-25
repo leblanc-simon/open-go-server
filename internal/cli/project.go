@@ -41,6 +41,8 @@ func newProjectCreateCommand(app *App) *cobra.Command {
 		hostOpt string
 		appVer  string
 		runtime string
+		command string
+		envFile bool
 		phpVer  string
 		withDB  string
 	)
@@ -66,6 +68,8 @@ func newProjectCreateCommand(app *App) *cobra.Command {
 			if runtime != "" {
 				p.Spec.App.Runtime = runtime
 			}
+			p.Spec.App.Command = command
+			p.Spec.App.EnvFile = envFile
 			if id != "" {
 				if err := naming.ValidateIdentifier(id); err != nil {
 					return exitf(CodeUsage, "%s", err)
@@ -145,6 +149,8 @@ func newProjectCreateCommand(app *App) *cobra.Command {
 	// la validation exige la version du runtime, et rien ne permettait de la
 	// donner autrement qu'en éditant le fichier à la main.
 	f.StringVar(&runtime, "runtime", "", "version du runtime pour Node, Ruby ou Python (exemple 22.14.0)")
+	f.StringVar(&command, "command", "", "commande lancée par le service d'un projet custom (exemple '/home/x/www/bin/serveur --port ${PORT}')")
+	f.BoolVar(&envFile, "env-file", false, "brancher /etc/ogs/env/<id>.env sur le service applicatif")
 	f.StringVar(&envName, "env", "prod", "environnement : prod ou prep")
 	f.StringVar(&id, "id", "", "forcer l'identifiant au lieu de le dériver du host")
 	f.StringVar(&hostOpt, "host", "", "host servi, s'il diffère du host canonique")

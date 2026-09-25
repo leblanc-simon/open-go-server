@@ -16,7 +16,7 @@ User={{ .User }}
 Group={{ .Group }}
 WorkingDirectory={{ .Workdir }}
 {{- range $key := sorted .Environment }}
-Environment={{ $key }}={{ index $.Environment $key }}
+Environment={{ systemdEnv $key (index $.Environment $key) }}
 {{- end }}
 ExecStart={{ .Command }}
 Restart=always

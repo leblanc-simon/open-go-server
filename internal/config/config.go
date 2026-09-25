@@ -682,6 +682,7 @@ func (p Paths) ArchivedDir() string   { return p.join(etcDir, "projects", "archi
 func (p Paths) TemplatesDir() string  { return p.join(etcDir, "templates") }
 func (p Paths) HooksDir() string      { return p.join(etcDir, "hooks") }
 func (p Paths) DNSCredsDir() string   { return p.join(etcDir, "credentials", "dns") }
+func (p Paths) EnvFilesDir() string   { return p.join(etcDir, "env") }
 func (p Paths) Lib() string           { return p.join(libDir) }
 func (p Paths) StateDB() string       { return p.join(libDir, "state.db") }
 func (p Paths) ACMEDir() string       { return p.join(libDir, "acme") }
@@ -793,6 +794,9 @@ func (p Paths) ProjectFile(id string) string { return filepath.Join(p.ProjectsDi
 
 // SudoersFile renvoie le chemin du fichier sudoers d'un projet.
 func (p Paths) SudoersFile(id string) string { return filepath.Join(p.SudoersDir(), "ogs-"+id) }
+
+// EnvFile est le fichier d'environnement d'un projet (D75).
+func (p Paths) EnvFile(id string) string { return filepath.Join(p.EnvFilesDir(), id+".env") }
 
 // ProjectRunDir renvoie le répertoire d'exécution d'un projet (verrous, sockets).
 func (p Paths) ProjectRunDir(id string) string { return filepath.Join(p.RunDir(), id) }

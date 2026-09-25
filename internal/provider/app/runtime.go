@@ -13,13 +13,19 @@ import (
 	"leblanc.io/open-go-server/internal/model"
 )
 
-// Runtimes gérés. Go n'en a pas : un binaire compilé est autonome.
+// Runtimes gérés. Go n'en a pas : un binaire compilé est autonome. « custom »
+// n'en a pas non plus, ni de lien géré : la commande déclarée est lancée telle
+// quelle (D75).
 const (
 	RuntimeGo     = "go"
 	RuntimeNode   = "node"
 	RuntimePython = "python"
 	RuntimeRuby   = "ruby"
+	RuntimeCustom = "custom"
 )
+
+// managed indique si ogs pose un lien vers le binaire du runtime.
+func managed(runtime string) bool { return runtime != RuntimeCustom }
 
 // Runtimes énumère les runtimes connus.
 func Runtimes() []string { return []string{RuntimeGo, RuntimeNode, RuntimePython, RuntimeRuby} }
@@ -105,6 +111,9 @@ func (i *Installer) Install(ctx context.Context, proj *model.Project, runtime, v
 	case RuntimeGo:
 		return fmt.Errorf("le runtime go n'a pas de gestionnaire de versions : " +
 			"le déploiement dépose un binaire, et « ~/.local/bin/app » pointe dessus")
+	case RuntimeCustom:
+		return fmt.Errorf("une application custom n'a pas de runtime géré : " +
+			"ogs lance la commande déclarée dans spec.app.command")
 	case RuntimeNode:
 		script := fmt.Sprintf(
 			`export NVM_DIR=%q; [ -s "$NVM_DIR/nvm.sh" ] || `+

@@ -50,6 +50,7 @@ code de retour 6.
 | `php-prestashop` | `www`              | PHP-FPM, réglages PHP adaptés, `.htaccess` actifs  |
 | `php-symfony`    | `www/public`       | PHP-FPM (`www/web` pour Symfony 3.4)               |
 | `node`, `python`, `ruby`, `go` | —    | un service supervisé, derrière un reverse-proxy   |
+| `custom`         | —                  | la commande de votre choix, supervisée de même    |
 
 Le code applicatif se dépose dans `/home/<host>/www`. Les journaux sont sous
 `/var/log/ogs-projects/<id>/`, accessibles depuis le home par le lien `~/logs`.
@@ -143,7 +144,44 @@ spec:
       timeout: 30s
 ```
 
-### 5. Un projet complet, écrit à la main
+### 5. Un service quelconque
+
+Quand aucun type ne convient — un binaire Rust, un serveur Java, un outil livré tout compilé —, `custom`
+supervise la commande que vous écrivez, sans installer de runtime ni poser de lien :
+
+```sh
+sudo ogs site create outil.fr --kind custom --env-file \
+    --command '/home/outil.fr/www/bin/serveur --listen ${LISTEN_ADDR}'
+```
+
+```yaml
+spec:
+  app:
+    kind: custom
+    command: /home/outil.fr/www/bin/serveur --listen ${LISTEN_ADDR}
+    envFile: true            # branche /etc/ogs/env/outilfr.env
+    instances: 1
+    env:
+      RUST_LOG: info
+```
+
+- **L'écoute** est un port local par défaut (`127.0.0.1:25xxx`) : ogs ne sait rien de la commande et ne
+  peut pas compter sur elle pour lire `SOCKET_PATH`. `listen: socket` reste possible si elle le fait.
+  L'adresse est transmise par `PORT`, `HOST` et `LISTEN_ADDR` (ou `SOCKET_PATH`), que systemd développe
+  dans la commande — `${PORT}`, `${LISTEN_ADDR}`. Un `%` y est un spécificateur systemd (`%i` : numéro
+  d'instance) ; un `%` littéral s'écrit `%%`.
+- **La commande** commence par un chemin absolu, sur une seule ligne. `runtime` et `entrypoint` sont
+  refusés : tout tient dans `command`.
+- **Le fichier d'environnement** vit dans `/etc/ogs/env/<id>.env`, et nulle part ailleurs : systemd le lit
+  en root avant de lancer le service, et un fichier placé dans le home pourrait être remplacé par un lien
+  vers les secrets d'un voisin. ogs le crée vide en `0600 root:root` et **ne le réécrit jamais** ; une
+  modification prend effet au redémarrage (`sudo ogs service restart outilfr`). Ses valeurs l'emportent
+  sur celles de `env` — y compris sur `PORT` : ne l'y redéfinissez pas. Il est archivé chiffré et supprimé
+  avec le projet. `envFile` vaut aussi pour `node`, `python`, `ruby` et `go`.
+- Un démon **sans HTTP** (consommateur de file, worker) ne relève pas de ce type, qui est toujours exposé
+  par le vhost : déclarez-le dans `spec.services`.
+
+### 6. Un projet complet, écrit à la main
 
 Pour un projet riche, le plus lisible est d'écrire le fichier directement, puis de le vérifier avant de le
 déposer :
@@ -232,7 +270,7 @@ spec:
 Ce qui est absent reste déduit : utilisateur, home, docroot `www/public`, vhosts principal et de
 redirection, certificat couvrant `boutique.fr` et `www.boutique.fr`.
 
-### 6. Une préproduction
+### 7. Une préproduction
 
 ```sh
 sudo ogs site clone shopfr --to prep          # copie aussi la base ; --with-data=false sinon

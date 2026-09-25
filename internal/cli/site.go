@@ -38,6 +38,8 @@ type siteOptions struct {
 	kind       string
 	appVersion string
 	runtime    string
+	command    string
+	envFile    bool
 	phpVersion string
 	env        string
 	id         string
@@ -113,6 +115,8 @@ func newSiteCreateCommand(app *App) *cobra.Command {
 	f.StringVar(&opts.kind, "kind", string(model.KindSymfony), "type d'application ("+kindsList()+")")
 	f.StringVar(&opts.appVersion, "app-version", "auto", "version applicative")
 	f.StringVar(&opts.runtime, "runtime", "", "version du runtime pour Node, Ruby ou Python (exemple 22.14.0)")
+	f.StringVar(&opts.command, "command", "", "commande lancée par le service d'un projet custom (exemple '/home/x/www/bin/serveur --port ${PORT}')")
+	f.BoolVar(&opts.envFile, "env-file", false, "brancher /etc/ogs/env/<id>.env sur le service applicatif")
 	f.StringVar(&opts.phpVersion, "php", "", "version PHP (défaut "+model.DefaultPHPVersion+")")
 	f.StringVar(&opts.env, "env", "prod", "environnement : prod ou prep")
 	f.StringVar(&opts.id, "id", "", "forcer l'identifiant")
@@ -145,6 +149,8 @@ func (a *App) buildSite(host string, opts siteOptions) (*model.Project, error) {
 	if opts.runtime != "" {
 		p.Spec.App.Runtime = opts.runtime
 	}
+	p.Spec.App.Command = opts.command
+	p.Spec.App.EnvFile = opts.envFile
 	if opts.appVersion != "" {
 		p.Spec.App.Version = opts.appVersion
 	}

@@ -13,8 +13,12 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/klauspost/compress/zstd"
+
+	"leblanc.io/open-go-server/internal/archive"
 	"leblanc.io/open-go-server/internal/config"
 	"leblanc.io/open-go-server/internal/model"
+	appprov "leblanc.io/open-go-server/internal/provider/app"
 	runtimeprov "leblanc.io/open-go-server/internal/provider/runtime"
 	"leblanc.io/open-go-server/internal/secret"
 	"leblanc.io/open-go-server/internal/store"
@@ -2071,6 +2075,76 @@ func TestGoApplicationUsesPort(t *testing.T) {
 	}
 	if !strings.Contains(unit, filepath.Join(".local", "bin", "app")) {
 		t.Errorf("le binaire doit passer par .local/bin/app :\n%s", unit)
+	}
+}
+
+func TestCustomApplicationLifecycle(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	command := "/home/api.fr/www/bin/serveur --listen ${LISTEN_ADDR}"
+	h.mustRun("project", "create", "api.fr", "--kind", "custom", "--command", command, "--env-file")
+	h.mustRun("apply", "apifr", "--yes")
+
+	unit := h.read(t, filepath.Join("etc", "systemd", "system", "ogs-apifr-app@.service"))
+	envFile := h.path("etc", "ogs", "env", "apifr.env")
+	for _, want := range []string{"ExecStart=" + command + "\n", "EnvironmentFile=" + envFile, "PORT=25001"} {
+		if !strings.Contains(unit, want) {
+			t.Errorf("%q absent de l'unité :\n%s", want, unit)
+		}
+	}
+	if _, err := os.Stat(envFile); err != nil {
+		t.Fatalf("le fichier d'environnement doit être créé : %v", err)
+	}
+	// Le contenu de l'exploitant survit aux apply suivants.
+	if err := os.WriteFile(envFile, []byte("JETON=secret-a-retrouver\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	h.mustRun("apply", "apifr", "--yes")
+	if data, _ := os.ReadFile(envFile); string(data) != "JETON=secret-a-retrouver\n" {
+		t.Fatalf("ogs a réécrit le fichier d'environnement : %q", data)
+	}
+
+	// La suppression emporte l'unité et le fichier, que l'archive garde scellé.
+	h.mustRun("project", "delete", "apifr", "--yes")
+	for _, gone := range []string{envFile, h.path("etc", "systemd", "system", "ogs-apifr-app@.service")} {
+		if _, err := os.Stat(gone); !os.IsNotExist(err) {
+			t.Errorf("%s doit disparaître avec le projet (%v)", gone, err)
+		}
+	}
+	entries, err := os.ReadDir(h.path("var", "lib", "ogs", "archives"))
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("archive attendue : %v %v", entries, err)
+	}
+	archivePath := h.path("var", "lib", "ogs", "archives", entries[0].Name())
+	compressed, err := os.ReadFile(archivePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dec, err := zstd.NewReader(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := dec.DecodeAll(compressed, nil)
+	dec.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(raw, []byte("project.yaml")) {
+		t.Fatal("archive illisible : la vérification suivante ne prouverait rien")
+	}
+	if bytes.Contains(raw, []byte("secret-a-retrouver")) {
+		t.Error("le fichier d'environnement ne doit pas voyager en clair dans l'archive")
+	}
+	if secrets, err := archive.Secrets(archivePath); err != nil || len(secrets[appprov.EnvFileSecret][1]) == 0 {
+		t.Errorf("le fichier d'environnement doit être scellé dans l'archive : %v", err)
+	}
+
+	h.mustRunPartial("project", "restore", archivePath, "--yes")
+	if data, err := os.ReadFile(envFile); err != nil || string(data) != "JETON=secret-a-retrouver\n" {
+		t.Fatalf("fichier d'environnement restauré : %q (%v)", data, err)
+	}
+	if info, _ := os.Stat(envFile); info.Mode().Perm() != 0o600 {
+		t.Errorf("mode restauré %04o, attendu 0600", info.Mode().Perm())
 	}
 }
 

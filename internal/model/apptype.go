@@ -19,6 +19,9 @@ const (
 	KindNode       AppKind = "node"
 	KindPython     AppKind = "python"
 	KindRuby       AppKind = "ruby"
+	// KindCustom est un processus supervisé quelconque : ogs n'y installe aucun
+	// runtime, et la commande à lancer est déclarée par spec.app.command (D75).
+	KindCustom AppKind = "custom"
 )
 
 // AppType décrit le comportement d'un type d'application.
@@ -66,13 +69,14 @@ var appTypes = map[AppKind]AppType{
 	KindNode:    {Kind: KindNode, VHostTemplate: "proxy", Runtime: "node"},
 	KindPython:  {Kind: KindPython, VHostTemplate: "proxy", Runtime: "python"},
 	KindRuby:    {Kind: KindRuby, VHostTemplate: "proxy", Runtime: "ruby"},
+	KindCustom:  {Kind: KindCustom, VHostTemplate: "proxy", Runtime: "custom"},
 }
 
 // Kinds énumère les types connus, triés pour un affichage stable.
 func Kinds() []AppKind {
 	return []AppKind{
 		KindPrestashop, KindSymfony, KindPHPPlain, KindStatic,
-		KindGo, KindNode, KindPython, KindRuby,
+		KindGo, KindNode, KindPython, KindRuby, KindCustom,
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -225,6 +226,7 @@ func Project(p *model.Project, homeRoot string) error {
 	}
 
 	validateDatabases(p, add)
+	validateApp(p, add)
 	validatePHP(p, add)
 	validateAMQP(p, add)
 	validateCrons(p, add)
@@ -335,6 +337,75 @@ func validateDatabases(p *model.Project, add func(string, string, ...any)) {
 			}
 		}
 	}
+}
+
+// reEnvName est le nom d'une variable d'environnement tel que systemd l'accepte.
+var reEnvName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+// validateApp contrôle la déclaration d'une application supervisée, et d'abord
+// la commande d'une application custom (D75), recopiée telle quelle dans
+// ExecStart.
+func validateApp(p *model.Project, add func(string, string, ...any)) {
+	at, err := model.Resolve(p.Spec.App.Kind, p.Spec.App.Version)
+	if err != nil {
+		return // déjà signalé sur spec.app.kind
+	}
+	app := p.Spec.App
+	if p.Spec.App.Kind == model.KindCustom {
+		command := strings.TrimSpace(app.Command)
+		switch {
+		case command == "":
+			add("spec.app.command", "le type custom exige la commande à lancer")
+		case strings.ContainsAny(command, "\n\r\x00"):
+			// Un saut de ligne ferait écrire à ogs une directive de plus dans l'unité.
+			add("spec.app.command", "la commande tient sur une seule ligne")
+		case !strings.HasPrefix(command, "/"):
+			// Le chemin absolu écarte aussi les préfixes d'ExecStart : « + » et « ! »
+			// lanceraient la commande en root, au mépris de User=.
+			add("spec.app.command", "le programme doit être désigné par un chemin absolu "+
+				"(obtenu %q) ; les variables s'écrivent ${PORT}, ${SOCKET_PATH}", strings.Fields(command)[0])
+		}
+		// Ignorés sans un mot, ils laisseraient croire qu'ils s'appliquent.
+		if app.Runtime != "" {
+			add("spec.app.runtime", "sans objet pour le type custom : ogs n'installe aucun runtime")
+		}
+		if app.Entrypoint != "" {
+			add("spec.app.entrypoint", "sans objet pour le type custom : la commande complète va dans spec.app.command")
+		}
+	} else if app.Command != "" {
+		add("spec.app.command", "réservé au type custom : le type %q déduit sa commande de son runtime", app.Kind)
+	}
+	if at.Runtime == "" {
+		if app.EnvFile {
+			add("spec.app.envFile", "le type %q n'a pas d'application supervisée", app.Kind)
+		}
+		return
+	}
+	switch app.Listen {
+	case "", "socket", "port":
+	default:
+		add("spec.app.listen", "attendu socket ou port, obtenu %q", app.Listen)
+	}
+	if app.Instances < 0 {
+		add("spec.app.instances", "nombre d'instances négatif (%d)", app.Instances)
+	}
+	for _, k := range sortedEnvKeys(app.Env) {
+		if !reEnvName.MatchString(k) {
+			add("spec.app.env", "nom de variable %q invalide", k)
+		}
+		if strings.ContainsAny(app.Env[k], "\n\r\x00") {
+			add("spec.app.env", "la valeur de %s tient sur une seule ligne", k)
+		}
+	}
+}
+
+func sortedEnvKeys(m map[string]string) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func validatePHP(p *model.Project, add func(string, string, ...any)) {

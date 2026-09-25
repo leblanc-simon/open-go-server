@@ -139,3 +139,22 @@ func TestHelpers(t *testing.T) {
 		t.Errorf("default : %q", got)
 	}
 }
+
+func TestSystemdEnvQuotesOnlyWhenNeeded(t *testing.T) {
+	cases := map[[2]string]string{
+		// Une valeur simple garde son rendu : les unités existantes ne changent pas.
+		{"APP_ENV", "prod"}:              `APP_ENV=prod`,
+		{"DSN", "amqp://u:p@h:5672/%2f"}: `DSN=amqp://u:p@h:5672/%2f`,
+		{"VIDE", ""}:                     `VIDE=`,
+		{"TITRE", "deux mots"}:           `"TITRE=deux mots"`,
+		{"GUILLEMET", `dit "oui"`}:       `"GUILLEMET=dit \"oui\""`,
+		{"CHEMIN", `C:\temp`}:            `"CHEMIN=C:\\temp"`,
+		{"APOSTROPHE", "l'appli"}:        `"APOSTROPHE=l'appli"`,
+		{"TAB", "a\tb"}:                  "\"TAB=a\tb\"",
+	}
+	for in, want := range cases {
+		if got := systemdEnv(in[0], in[1]); got != want {
+			t.Errorf("systemdEnv(%q, %q) = %s, attendu %s", in[0], in[1], got, want)
+		}
+	}
+}

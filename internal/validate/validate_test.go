@@ -493,3 +493,71 @@ func TestLeJournalDUneTacheNEstQuUnNom(t *testing.T) {
 		}
 	}
 }
+
+func TestCustomAppCommand(t *testing.T) {
+	cases := []struct {
+		name    string
+		mutate  func(*model.Project)
+		refused string
+	}{
+		{"commande absente", func(p *model.Project) {}, "exige la commande"},
+		{"chemin relatif", func(p *model.Project) { p.Spec.App.Command = "bin/serveur --port ${PORT}" }, "chemin absolu"},
+		// Les préfixes d'ExecStart « + » et « ! » lanceraient la commande en root.
+		{"préfixe privilégié", func(p *model.Project) { p.Spec.App.Command = "+/usr/bin/serveur" }, "chemin absolu"},
+		{"saut de ligne", func(p *model.Project) { p.Spec.App.Command = "/usr/bin/serveur\nUser=root" }, "une seule ligne"},
+		{"runtime ignoré", func(p *model.Project) {
+			p.Spec.App.Command = "/usr/bin/serveur"
+			p.Spec.App.Runtime = "22.11.0"
+		}, "spec.app.runtime"},
+		{"entrypoint ignoré", func(p *model.Project) {
+			p.Spec.App.Command = "/usr/bin/serveur"
+			p.Spec.App.Entrypoint = "server.js"
+		}, "spec.app.entrypoint"},
+		{"variable invalide", func(p *model.Project) {
+			p.Spec.App.Command = "/usr/bin/serveur"
+			p.Spec.App.Env = map[string]string{"NOM-INVALIDE": "x"}
+		}, "nom de variable"},
+		{"écoute inconnue", func(p *model.Project) {
+			p.Spec.App.Command = "/usr/bin/serveur"
+			p.Spec.App.Listen = "tcp"
+		}, "socket ou port"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			p := newProject(t, "api.fr", naming.EnvProd, model.KindCustom)
+			c.mutate(p)
+			err := Project(p, "/home")
+			if err == nil || !strings.Contains(err.Error(), c.refused) {
+				t.Fatalf("attendu un refus contenant %q, obtenu : %v", c.refused, err)
+			}
+		})
+	}
+
+	p := newProject(t, "api.fr", naming.EnvProd, model.KindCustom)
+	p.Spec.App.Command = "/home/api.fr/www/bin/serveur --listen ${LISTEN_ADDR}"
+	p.Spec.App.EnvFile = true
+	if err := Project(p, "/home"); err != nil {
+		t.Fatalf("une application custom complète doit être acceptée : %v", err)
+	}
+}
+
+func TestCommandAndEnvFileReservedToTheirKinds(t *testing.T) {
+	p := newProject(t, "api.fr", naming.EnvProd, model.KindNode)
+	p.Spec.App.Runtime = "22.11.0"
+	p.Spec.App.Command = "/usr/bin/node autre.js"
+	if err := Project(p, "/home"); err == nil || !strings.Contains(err.Error(), "réservé au type custom") {
+		t.Fatalf("une commande sur un type à runtime doit être refusée, obtenu : %v", err)
+	}
+	// Le fichier d'environnement vaut pour toute application supervisée…
+	p.Spec.App.Command = ""
+	p.Spec.App.EnvFile = true
+	if err := Project(p, "/home"); err != nil {
+		t.Fatalf("envFile doit être accepté pour Node : %v", err)
+	}
+	// … et pour elles seules.
+	s := newProject(t, "shop.fr", naming.EnvProd, model.KindStatic)
+	s.Spec.App.EnvFile = true
+	if err := Project(s, "/home"); err == nil || !strings.Contains(err.Error(), "spec.app.envFile") {
+		t.Fatalf("envFile sur un site statique doit être refusé, obtenu : %v", err)
+	}
+}

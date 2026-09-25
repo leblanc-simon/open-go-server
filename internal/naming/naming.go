@@ -325,13 +325,13 @@ func PoolNumber(phpVersion string, increment int) (int, error) {
 }
 
 // RuntimeCode associe un chiffre à chaque runtime applicatif (norme 2<code><incrément>).
-var RuntimeCode = map[string]int{"go": 1, "node": 2, "python": 3, "ruby": 4}
+var RuntimeCode = map[string]int{"go": 1, "node": 2, "python": 3, "ruby": 4, "custom": 5}
 
 // AppPort calcule le port d'une application non-PHP : 2<code runtime><incrément sur 3 chiffres>.
 func AppPort(runtime string, increment int) (int, error) {
 	code, ok := RuntimeCode[runtime]
 	if !ok {
-		return 0, fmt.Errorf("runtime %q inconnu (attendu : go, node, python ou ruby)", runtime)
+		return 0, fmt.Errorf("runtime %q inconnu (attendu : go, node, python, ruby ou custom)", runtime)
 	}
 	if increment < 1 || increment > 999 {
 		return 0, fmt.Errorf("incrément %d hors plage (1 à 999 par runtime)", increment)

@@ -139,6 +139,77 @@ if ! echo "$sortie" | grep -qi "gestionnaire de versions"; then
 fi
 
 echo
+echo "--- custom : la commande déclarée, son environnement et son fichier ---"
+# Le même binaire, lancé cette fois par une commande que l'exploitant écrit : ogs
+# n'y pose aucun lien, et c'est systemd qui développe ${LISTEN_ADDR} (D75).
+ogs site create autre.test --kind custom --env-file --tls=false --yes \
+    --command '/home/autre.test/www/app -ecoute ${LISTEN_ADDR}' 2>&1 |
+    grep -Ei "environnement|unité|⚠|✗" | head -6
+fichier=/etc/ogs/env/autretest.env
+if [ ! -f "$fichier" ] || [ -L "$fichier" ]; then
+    echo "ÉCHEC : le fichier d'environnement n'a pas été créé"
+    exit 1
+fi
+droits=$(stat -c '%a %U:%G' "$fichier")
+echo "fichier d'environnement : $droits"
+if [ "$droits" != "600 root:root" ]; then
+    echo "ÉCHEC : le fichier d'environnement doit être en 0600 root:root"
+    exit 1
+fi
+echo "MESSAGE=venu-du-fichier" >>"$fichier"
+# Une valeur à espaces, guillemets et apostrophe : systemd découpe Environment=
+# sur les blancs, et seule la citation la fait arriver entière au processus.
+python3 - <<'PYEOF'
+chemin = "/etc/ogs/projects/autretest.yaml"
+s = open(chemin).read()
+open(chemin, "w").write(s.replace("  app:\n",
+    "  app:\n    env:\n      TITRE: 'l''outil \"maison\" de test'\n", 1))
+PYEOF
+install -o autretest -g autretest -m 0750 /depot/app /home/autre.test/www/app
+ogs apply autretest --yes 2>&1 | grep -Ei "application|environnement|attente|⚠" | head -5
+if [ -e /home/autre.test/.local/bin/app ]; then
+    echo "ÉCHEC : une application custom ne doit recevoir aucun lien géré"
+    exit 1
+fi
+systemctl is-active 'ogs-autretest-app@1.service' || {
+    echo "ÉCHEC : le service custom n'est pas actif"
+    systemctl status 'ogs-autretest-app@1.service' --no-pager -l 2>&1 | tail -15
+    exit 1
+}
+pid=$(systemctl show -p MainPID --value 'ogs-autretest-app@1.service')
+titre=$(tr '\0' '\n' </proc/"$pid"/environ | grep '^TITRE=')
+echo "environnement du processus : $titre"
+if [ "$titre" != 'TITRE=l'"'"'outil "maison" de test' ]; then
+    echo "ÉCHEC : la valeur à espaces n'arrive pas entière au processus"
+    grep '^Environment=TITRE' /etc/systemd/system/ogs-autretest-app@.service
+    exit 1
+fi
+reponse=$(curl -s -H 'Host: autre.test' http://127.0.0.1/)
+echo "réponse : $reponse"
+# L'adresse vient de la ligne de commande développée, le message du fichier : si
+# systemd ne développait pas la variable, l'application écouterait sur un port
+# vide et ne répondrait pas du tout.
+if [[ "$reponse" != *"application sous autretest, écoute 127.0.0.1:25001, message venu-du-fichier"* ]]; then
+    echo "ÉCHEC : l'application custom n'est pas servie comme déclaré"
+    journalctl -u 'ogs-autretest-app@1.service' --no-pager -n 10 2>&1
+    exit 1
+fi
+# Un apply de plus ne touche pas au contenu de l'exploitant.
+ogs apply autretest --yes >/dev/null 2>&1
+if ! grep -q "MESSAGE=venu-du-fichier" "$fichier"; then
+    echo "ÉCHEC : ogs a réécrit le fichier d'environnement"
+    exit 1
+fi
+ogs project delete autretest --yes >/dev/null 2>&1
+for reste in "$fichier" /etc/systemd/system/ogs-autretest-app@.service; do
+    if [ -e "$reste" ]; then
+        echo "ÉCHEC : $reste survit au projet"
+        exit 1
+    fi
+done
+echo "commande développée, fichier lu, puis retirés avec le projet"
+
+echo
 echo "--- Node : installation réelle par nvm, dans le home du projet ---"
 # La version du runtime est donnée à la création : sans elle, la déclaration est
 # refusée à l'apply.
@@ -219,5 +290,6 @@ echo "homes, unités et répertoires d'exécution supprimés"
 
 echo
 echo "RÉSULTAT : une application Go est supervisée, écoute sur un socket 0660 sous"
-echo "           l'identité du projet et est servie par le vhost ; nvm installe"
-echo "           Node dans le home du projet, là où ogs l'attend."
+echo "           l'identité du projet et est servie par le vhost ; une application"
+echo "           custom reçoit sa commande et son fichier d'environnement ; nvm"
+echo "           installe Node dans le home du projet, là où ogs l'attend."

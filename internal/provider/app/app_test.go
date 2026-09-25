@@ -704,3 +704,175 @@ func TestUniteApplicativeEcraseeAvecForceApresSauvegarde(t *testing.T) {
 		t.Error("la compensation doit rendre l'unité d'origine")
 	}
 }
+
+// customFixture prépare une application custom : ni runtime ni entrypoint, une
+// commande déclarée.
+func customFixture(t *testing.T) (*Provider, *model.Project) {
+	t.Helper()
+	prov, proj := fixture(t, model.KindCustom)
+	proj.Spec.App.Runtime = ""
+	proj.Spec.App.Command = "/home/shop.fr/www/bin/serveur --listen ${LISTEN_ADDR}"
+	return prov, proj
+}
+
+func TestCustomRunsDeclaredCommandOnAPort(t *testing.T) {
+	prov, proj := customFixture(t)
+	if !Applies(proj) {
+		t.Fatal("une application custom relève du provider applicatif")
+	}
+	endpoint, err := prov.Endpoint(proj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// ogs ne sait rien de la commande : il ne peut pas compter sur elle pour lire
+	// SOCKET_PATH, et retient le port, dans la plage propre au type.
+	if endpoint.Unix() || endpoint.Address != "127.0.0.1:25001" {
+		t.Fatalf("point d'écoute : %+v, attendu 127.0.0.1:25001", endpoint)
+	}
+	body, err := prov.Build(proj, endpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unit := string(body)
+	for _, want := range []string{
+		"ExecStart=/home/shop.fr/www/bin/serveur --listen ${LISTEN_ADDR}\n",
+		"Environment=LISTEN_ADDR=127.0.0.1:25001", "Environment=PORT=25001",
+		"User=shopfr", "UMask=0007", "NoNewPrivileges=true",
+	} {
+		if !strings.Contains(unit, want) {
+			t.Errorf("%q absent de l'unité :\n%s", want, unit)
+		}
+	}
+	if strings.Contains(unit, "EnvironmentFile=") {
+		t.Errorf("aucun fichier d'environnement n'a été demandé :\n%s", unit)
+	}
+	if strings.Contains(unit, model.LinkDir) {
+		t.Errorf("une application custom ne passe par aucun lien géré :\n%s", unit)
+	}
+}
+
+func TestCustomPlanHasNoRuntimeNorLink(t *testing.T) {
+	prov, proj := customFixture(t)
+	obs, err := prov.Observe(context.Background(), proj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	steps, err := prov.Plan(context.Background(), proj, obs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var resources []string
+	for _, s := range steps {
+		resources = append(resources, s.Resource)
+		if strings.HasPrefix(s.Resource, "app/runtime/") || strings.HasPrefix(s.Resource, "app/link/") {
+			t.Errorf("étape inattendue pour une application custom : %s", s.Resource)
+		}
+	}
+	if !slices.Contains(resources, "app/unit/shopfr") {
+		t.Errorf("l'unité doit être écrite : %v", resources)
+	}
+	if err := prov.Installer.Install(context.Background(), proj, RuntimeCustom, "1"); err == nil ||
+		!strings.Contains(err.Error(), "spec.app.command") {
+		t.Errorf("l'installation d'un runtime custom doit être refusée et expliquée : %v", err)
+	}
+}
+
+// envFilePlan renvoie l'étape du fichier d'environnement d'un plan.
+func envFilePlan(t *testing.T, prov *Provider, proj *model.Project) *engine.Step {
+	t.Helper()
+	obs, err := prov.Observe(context.Background(), proj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	steps, err := prov.Plan(context.Background(), proj, obs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, s := range steps {
+		if s.Resource == "app/envfile/shopfr" {
+			// Il précède l'unité : systemd refuse de démarrer un service dont
+			// l'EnvironmentFile manque.
+			if i+1 >= len(steps) || steps[i+1].Resource != "app/unit/shopfr" {
+				t.Errorf("le fichier d'environnement doit précéder l'unité")
+			}
+			return s
+		}
+	}
+	t.Fatal("aucune étape de fichier d'environnement")
+	return nil
+}
+
+func TestEnvFileIsCreatedOnceAndNeverRewritten(t *testing.T) {
+	prov, proj := customFixture(t)
+	proj.Spec.App.EnvFile = true
+	path := prov.Paths.EnvFile(proj.ID())
+
+	s := envFilePlan(t, prov, proj)
+	if s.Action != engine.Create {
+		t.Fatalf("action %v, attendu une création", s.Action)
+	}
+	if err := s.Apply(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Errorf("mode %04o, attendu 0600 : le projet n'a pas à lire ce que systemd lit pour lui", info.Mode().Perm())
+	}
+	if dir, _ := os.Stat(filepath.Dir(path)); dir.Mode().Perm() != 0o700 {
+		t.Errorf("répertoire en %04o, attendu 0700 (régime d'ogs harden)", dir.Mode().Perm())
+	}
+
+	// Le contenu appartient à l'exploitant : ogs ne le touche plus.
+	if err := os.WriteFile(path, []byte("SECRET=valeur\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if s := envFilePlan(t, prov, proj); s.Action != engine.NoOp {
+		t.Errorf("un fichier conforme ne doit rien produire : %v %s", s.Action, s.Summary)
+	}
+	// Des droits ouverts sont resserrés, le contenu gardé.
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s = envFilePlan(t, prov, proj)
+	if s.Action != engine.Update {
+		t.Fatalf("des droits ouverts doivent être resserrés : %v", s.Action)
+	}
+	if err := s.Apply(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	data, _ := os.ReadFile(path)
+	info, _ = os.Stat(path)
+	if string(data) != "SECRET=valeur\n" || info.Mode().Perm() != 0o600 {
+		t.Errorf("après resserrement : %04o %q", info.Mode().Perm(), data)
+	}
+
+	body, err := prov.Build(proj, Endpoint{Address: "127.0.0.1:25001", Port: 25001})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), "EnvironmentFile="+path+"\n") {
+		t.Errorf("l'unité doit nommer le fichier, sans tiret — un fichier manquant doit se voir :\n%s", body)
+	}
+}
+
+func TestEnvFileRefusesSymlink(t *testing.T) {
+	// systemd lit le fichier en root en suivant le lien : un lien vers le .env
+	// d'un voisin lui ferait injecter les secrets de celui-ci.
+	prov, proj := customFixture(t)
+	proj.Spec.App.EnvFile = true
+	path := prov.Paths.EnvFile(proj.ID())
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(t.TempDir(), "voisin.env"), path); err != nil {
+		t.Fatal(err)
+	}
+	s := envFilePlan(t, prov, proj)
+	err := s.Apply(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "pas un fichier ordinaire") {
+		t.Fatalf("un lien doit être refusé, obtenu : %v", err)
+	}
+}

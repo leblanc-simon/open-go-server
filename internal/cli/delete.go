@@ -18,6 +18,7 @@ import (
 	"leblanc.io/open-go-server/internal/exec"
 	"leblanc.io/open-go-server/internal/hook"
 	"leblanc.io/open-go-server/internal/model"
+	appprov "leblanc.io/open-go-server/internal/provider/app"
 	"leblanc.io/open-go-server/internal/provider/cron"
 	"leblanc.io/open-go-server/internal/provider/system"
 	"leblanc.io/open-go-server/internal/provider/unit"
@@ -134,6 +135,13 @@ func newDeleteCommand(app *App) *cobra.Command {
 				} else if !os.IsNotExist(err) {
 					warn("%s : %v", file, err)
 				}
+			}
+			// Le fichier d'environnement porte des secrets : il ne survit pas au
+			// projet. L'archive en garde une copie scellée.
+			if err := os.Remove(app.Paths.EnvFile(p.ID())); err == nil {
+				removed = append(removed, app.Paths.EnvFile(p.ID()))
+			} else if !os.IsNotExist(err) {
+				warn("%s : %v", app.Paths.EnvFile(p.ID()), err)
 			}
 			// Les instances activées disparaissent avec leur répertoire .wants.
 			if err := os.RemoveAll(filepath.Join(app.Paths.SystemdDir(),
@@ -312,6 +320,11 @@ func (a *App) generatedFiles(provs *providers, p *model.Project) []string {
 	}
 	for _, svc := range p.Spec.Services {
 		files = append(files, filepath.Join(a.Paths.SystemdDir(), unit.ServiceName(p.ID(), svc.Name)))
+	}
+	// L'unité d'une application supervisée : oubliée, elle survivait au projet,
+	// invisible de « systemctl list-units » puisqu'aucune instance ne la charge.
+	if appprov.Applies(p) {
+		files = append(files, provs.App.UnitPath(p))
 	}
 	for _, vh := range provs.Web.VHostNames(p) {
 		files = append(files,
@@ -670,6 +683,23 @@ func (a *App) archiveProject(cmd *cobra.Command, provs *providers, p *model.Proj
 			}
 		}
 	}
+	// Le fichier d'environnement, scellé comme les secrets du keystore : il en
+	// porte, et le recopier en clair ferait de l'archive leur porte de sortie.
+	if data, err := os.ReadFile(a.Paths.EnvFile(p.ID())); err == nil {
+		if a.Keys == nil {
+			return "", nil, exitf(CodeError, "clé maître illisible : %s ne peut pas être "+
+				"archivé chiffré", a.Paths.EnvFile(p.ID()))
+		}
+		nonce, ciphertext, err := a.Keys.Seal(p.ID(), appprov.EnvFileSecret, data)
+		if err != nil {
+			return "", nil, wrap(CodeError, err)
+		}
+		if err := w.AddSecret(appprov.EnvFileSecret, nonce, ciphertext); err != nil {
+			return "", nil, wrap(CodeError, err)
+		}
+	} else if !os.IsNotExist(err) {
+		return "", nil, wrap(CodeError, err)
+	}
 	// L'arborescence complète.
 	if err := w.AddTree("tree", "tree", p.Spec.Layout.Root); err != nil {
 		return "", nil, wrap(CodeError, err)
@@ -753,6 +783,7 @@ func newRestoreCommand(app *App) *cobra.Command {
 					return wrap(CodeError, err)
 				}
 			}
+			app.restoreEnvFile(p, secrets)
 			if len(secrets) > 0 {
 				app.printf("✓ %d secret(s) réinjecté(s)\n", len(secrets))
 				if app.Keys != nil {
@@ -792,6 +823,31 @@ func newRestoreCommand(app *App) *cobra.Command {
 	}
 	cmd.Flags().BoolVar(&withData, "with-data", true, "recharger les sauvegardes de bases")
 	return cmd
+}
+
+// restoreEnvFile réécrit le fichier d'environnement archivé. Il voyage parmi les
+// secrets, et n'a pas à rester dans le keystore une fois rendu à son fichier.
+func (a *App) restoreEnvFile(p *model.Project, secrets map[string][2][]byte) {
+	pair, ok := secrets[appprov.EnvFileSecret]
+	if !ok {
+		return
+	}
+	path := a.Paths.EnvFile(p.ID())
+	if a.Keys == nil {
+		a.printf("⚠ clé maître illisible : %s n'est pas restauré\n", path)
+		return
+	}
+	data, err := a.Keys.Open(p.ID(), appprov.EnvFileSecret, pair[0], pair[1])
+	if err != nil {
+		a.printf("⚠ %s illisible avec la clé maître actuelle : non restauré\n", path)
+		return
+	}
+	if err := appprov.CreateEnvFile(path, data); err != nil {
+		a.printf("⚠ restauration de %s : %v\n", path, err)
+		return
+	}
+	_ = a.Store.DeleteSecret(p.ID(), appprov.EnvFileSecret)
+	a.printf("✓ fichier d'environnement restauré : %s\n", path)
 }
 
 // chownTree rend l'arborescence restaurée à l'utilisateur du projet.
