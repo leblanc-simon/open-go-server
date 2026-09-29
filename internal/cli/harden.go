@@ -88,6 +88,14 @@ func newHardenCommand(app *App) *cobra.Command {
 
 			reste := hardening.Restrict(states)
 			if reste == 0 {
+				// Un refus n'est pas un écart à corriger — il n'y a rien à appliquer,
+				// d'où le code 0 —, mais le compter parmi les conformes ferait croire
+				// fermé un répertoire resté ouvert faute du groupe de son service.
+				if n := hardening.Refused(states); n > 0 {
+					app.printf("\n✓ rien à restreindre ; %d répertoire(s) laissé(s) en l'état, "+
+						"motif dans la colonne CONSTATÉ\n", n)
+					return nil
+				}
 				app.printf("\n✓ tous les répertoires surveillés sont conformes\n")
 				return nil
 			}

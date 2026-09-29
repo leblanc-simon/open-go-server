@@ -3806,3 +3806,54 @@ func TestSiteCreateNOffrePlusLeChoixDuMoteur(t *testing.T) {
 		t.Errorf("--engine : code %d attendu %d\n%s", code, CodeUsage, out)
 	}
 }
+
+// Une cible de harden dont le groupe n'existe pas : le répertoire était fermé
+// sans le groupe du service, « ✓ » s'affichait sans que rien n'ait été posé, et
+// la même restriction revenait à chaque passage — code 6 à perpétuité.
+func TestHardenNAnnoncePasUnGroupeQuIlNaPasPose(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	conf := h.path("etc", "ogs", "config.yaml")
+	data, err := os.ReadFile(conf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cible := "hardening:\n  targets:\n    - path: /etc/monagent\n      owner: root\n" +
+		"      group: ogs-groupe-introuvable\n      dirMode: 0750\n"
+	modifie := strings.Replace(string(data), "hardening: {}\n", cible, 1)
+	if modifie == string(data) {
+		t.Fatalf("config.yaml sans « hardening: {} » : le test ne sait plus où poser sa cible")
+	}
+	if err := os.WriteFile(conf, []byte(modifie), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dir := h.path("etc", "monagent")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	out, code := h.run("harden")
+	if code != CodeOK {
+		t.Errorf("rien n'est à restreindre : code %d, attendu %d\n%s", code, CodeOK, out)
+	}
+	if !strings.Contains(out, "refusé") || !strings.Contains(out, "groupe ogs-groupe-introuvable introuvable") {
+		t.Errorf("le rapport doit dire la cible refusée, et pourquoi :\n%s", out)
+	}
+	if strings.Contains(out, "conformes") {
+		t.Errorf("une cible laissée ouverte ne se compte pas parmi les conformes :\n%s", out)
+	}
+	out = h.mustRun("harden", "--apply", "--yes")
+	if strings.Contains(out, "✓ /etc/monagent") {
+		t.Errorf("« ✓ » annoncé pour une restriction qui n'a pas eu lieu :\n%s", out)
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o755 {
+		t.Errorf("répertoire en %04o : fermé sans le groupe du service qui le lit", info.Mode().Perm())
+	}
+}

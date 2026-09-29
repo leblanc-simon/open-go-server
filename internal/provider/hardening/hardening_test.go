@@ -3,8 +3,11 @@ package hardening
 import (
 	"context"
 	"os"
+	"os/user"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 
 	"leblanc.io/open-go-server/internal/engine"
@@ -16,10 +19,79 @@ func fixture(t *testing.T, cibles ...Target) (*Provider, string) {
 	return &Provider{
 		Prefix:  prefix,
 		Targets: cibles,
-		// Les comptes système n'existent pas en test : la résolution échoue, et le
-		// provider doit s'en tenir au mode.
-		LookupIDs: func(string, string) (int, int, error) { return -1, -1, os.ErrNotExist },
+		// Seul root existe à coup sûr : les comptes des services, absents en test,
+		// font refuser la cible qui les nomme — fermer sans son groupe couperait le
+		// service. Les tests qui éprouvent un groupe le résolvent eux-mêmes.
+		LookupIDs: func(owner, group string) (int, int, error) {
+			for _, nom := range []string{owner, group} {
+				if nom != "" && nom != "root" {
+					return -1, -1, os.ErrNotExist
+				}
+			}
+			uid, gid := -1, -1
+			if owner != "" {
+				uid = 0
+			}
+			if group != "" {
+				gid = 0
+			}
+			return uid, gid, nil
+		},
 	}, prefix
+}
+
+// cibleParDefaut rend l'entrée de la table livrée pour chemin : les tests
+// éprouvent la table elle-même, non une copie qui pourrait s'en écarter.
+func cibleParDefaut(t *testing.T, chemin string) Target {
+	t.Helper()
+	for _, c := range Defaults("/home") {
+		if c.Path == chemin {
+			return c
+		}
+	}
+	t.Fatalf("%s absent de la table par défaut", chemin)
+	return Target{}
+}
+
+// auCompteDuTesteur pose la cible en remplaçant les comptes qu'elle nomme par
+// ceux qui lancent les tests, et les résout : root et les comptes des services
+// n'existent pas ici, et sans ce détour la mécanique — groupe conforme, bits
+// conservés — ne s'éprouverait qu'en root. Un propriétaire ou un groupe vide le
+// reste : c'est précisément ce que la table décide de laisser en place.
+func auCompteDuTesteur(t *testing.T, c Target) (*Provider, string) {
+	t.Helper()
+	moi, err := user.Current()
+	if err != nil {
+		t.Skipf("compte courant introuvable : %v", err)
+	}
+	groupe, err := user.LookupGroupId(strconv.Itoa(os.Getgid()))
+	if err != nil {
+		t.Skipf("groupe courant introuvable : %v", err)
+	}
+	if c.Owner != "" {
+		c.Owner = moi.Username
+	}
+	if c.Group != "" {
+		c.Group = groupe.Name
+	}
+	p, prefix := fixture(t, c)
+	p.LookupIDs = func(owner, group string) (int, int, error) {
+		uid, gid := -1, -1
+		if owner != "" {
+			if owner != moi.Username {
+				return -1, -1, os.ErrNotExist
+			}
+			uid = os.Getuid()
+		}
+		if group != "" {
+			if group != groupe.Name {
+				return -1, -1, os.ErrNotExist
+			}
+			gid = os.Getgid()
+		}
+		return uid, gid, nil
+	}
+	return p, prefix
 }
 
 func creer(t *testing.T, chemin string, mode os.FileMode) {
@@ -509,23 +581,12 @@ func TestNeReposePasLeBitSetgid(t *testing.T) {
 	}
 }
 
-func openDKIMTarget(t *testing.T) Target {
-	t.Helper()
-	for _, c := range Defaults("/home") {
-		if c.Path == "/etc/opendkim" {
-			return c
-		}
-	}
-	t.Fatal("/etc/opendkim absent de la table par défaut")
-	return Target{}
-}
-
 func TestOpenDKIMEstFermeSansToucherAuxCles(t *testing.T) {
 	// Les clés DKIM vivent sous /etc/opendkim : le répertoire se ferme aux
 	// utilisateurs des projets, mais une clé en 0600 au compte d'OpenDKIM ne doit
 	// être ni desserrée ni reprise — illisible au démon, elle retiendrait en file
 	// tout le courrier du domaine.
-	cible := openDKIMTarget(t)
+	cible := cibleParDefaut(t, "/etc/opendkim")
 	if cible.DirMode != 0o750 || cible.FileMode != 0o640 || cible.Group != "opendkim" || !cible.Recursive {
 		t.Fatalf("cible inattendue : %+v", cible)
 	}
@@ -564,4 +625,305 @@ func TestOpenDKIMEstFermeSansToucherAuxCles(t *testing.T) {
 	if again := p.Observe(); again[0].Verdict != VerdictOK {
 		t.Errorf("second passage : %s (%v)", again[0].Verdict, again[0].Loose)
 	}
+}
+
+func TestChaqueServiceGardeLeGroupeSousLequelIlLit(t *testing.T) {
+	// D56 : fermer un répertoire qu'un démon lit sous sa propre identité
+	// l'interromprait, donc le groupe cible est celui du service. La table l'avait
+	// oublié pour MariaDB (User=mysql : au redémarrage suivant, il ignorait en
+	// silence toute sa configuration et écoutait sur toutes les interfaces) et pour
+	// les workers du serveur web (.htpasswd en 500, RewriteMap sans effet, mod_md
+	// bloqué, apachectl -t au vert) ; elle prenait à Redis le répertoire qu'il
+	// réécrit, et à postgres celui où pg_createcluster crée une version. Le
+	// groupe doit au moins traverser et lire ; un propriétaire vide reste celui
+	// du paquet ; et le risque affiché nomme ce que l'exploitant doit savoir.
+	cas := []struct {
+		chemin, proprio, groupe string
+		bitsDuGroupe            os.FileMode
+		risque                  []string
+	}{
+		{"/etc/apache2", "root", "www-data", 0o050, []string{"www-data", "AuthUserFile", "RewriteMap", "mod_md"}},
+		{"/etc/nginx", "root", "www-data", 0o050, []string{"www-data", "auth_basic_user_file"}},
+		{"/etc/mysql", "root", "mysql", 0o050, []string{"serveur", "mysql"}},
+		{"/etc/postgresql", "", "postgres", 0o050, []string{"pg_wrapper", "5432", "-p"}},
+		{"/etc/rabbitmq", "root", "rabbitmq", 0o050, nil},
+		{"/etc/telegraf", "root", "telegraf", 0o050, nil},
+		{"/etc/redis", "", "redis", 0o070, []string{"réécrit"}},
+		{"/etc/ssl/private", "root", "ssl-cert", 0o010, nil},
+		{"/etc/opendkim", "root", "opendkim", 0o050, nil},
+	}
+	for _, c := range cas {
+		cible := cibleParDefaut(t, c.chemin)
+		if cible.Owner != c.proprio || cible.Group != c.groupe {
+			t.Errorf("%s : %s, attendu %s — le service qui y lit doit en garder l'accès",
+				c.chemin, OwnerLabel(cible), OwnerLabel(Target{Owner: c.proprio, Group: c.groupe}))
+		}
+		if cible.DirMode&c.bitsDuGroupe != c.bitsDuGroupe {
+			t.Errorf("%s : %04o ne laisse pas au groupe %s les droits %04o", c.chemin,
+				cible.DirMode, c.groupe, c.bitsDuGroupe)
+		}
+		if cible.DirMode&0o007 != 0 {
+			t.Errorf("%s : %04o laisse des droits aux autres, donc aux projets", c.chemin, cible.DirMode)
+		}
+		for _, mot := range c.risque {
+			if !strings.Contains(cible.Risk, mot) {
+				t.Errorf("%s : le risque affiché doit mentionner « %s » : %q", c.chemin, mot, cible.Risk)
+			}
+		}
+	}
+}
+
+// ecrireFichier pose un fichier au mode exact demandé, umask écarté.
+func ecrireFichier(t *testing.T, chemin string, mode os.FileMode) {
+	t.Helper()
+	if err := os.WriteFile(chemin, []byte("x\n"), mode); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(chemin, mode); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRedisGardeLeRepertoireQuIlReecrit(t *testing.T) {
+	// Debian livre /etc/redis en 2770 redis:redis : Redis réécrit sa configuration
+	// (CONFIG REWRITE, et Sentinel à chaque changement d'état) par un fichier
+	// temporaire renommé dans le répertoire, et le setgid fait hériter ce fichier
+	// du groupe redis. La table fermait ce répertoire en 0750 root:redis : « ERR
+	// Rewriting config file: Permission denied », et l'état de Sentinel perdu au
+	// redémarrage suivant, bascule comprise. Et un répertoire qui n'accorde rien
+	// aux autres n'a rien à cacher aux projets.
+	cas := []struct {
+		nom           string
+		avant, apres  os.FileMode
+		verdict       string
+		setgidAttendu bool
+	}{
+		{"régime du paquet", 0o770 | os.ModeSetgid, 0o770 | os.ModeSetgid, VerdictOK, true},
+		{"ouvert aux autres", 0o775 | os.ModeSetgid, 0o770 | os.ModeSetgid, VerdictRestrict, true},
+		// Rien n'est accordé : la cible admet l'écriture du groupe, mais un
+		// répertoire qui ne la portait pas ne la reçoit pas d'un outil de
+		// durcissement.
+		{"sans écriture du groupe", 0o755, 0o750, VerdictRestrict, false},
+	}
+	for _, c := range cas {
+		t.Run(c.nom, func(t *testing.T) {
+			p, prefix := auCompteDuTesteur(t, cibleParDefaut(t, "/etc/redis"))
+			dir := filepath.Join(prefix, "etc/redis")
+			creer(t, dir, c.avant)
+			if info, _ := os.Stat(dir); info.Mode()&os.ModeSetgid != c.avant&os.ModeSetgid {
+				t.Skip("le système de fichiers ne conserve pas le bit setgid")
+			}
+			for _, f := range []string{"redis.conf", "sentinel.conf"} {
+				ecrireFichier(t, filepath.Join(dir, f), 0o640)
+			}
+
+			states := appliquer(t, p)
+			if states[0].Verdict != c.verdict {
+				t.Errorf("verdict = %s, attendu %s", states[0].Verdict, c.verdict)
+			}
+			info, err := os.Stat(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := info.Mode() & (os.ModePerm | os.ModeSetgid); got != c.apres {
+				t.Errorf("répertoire en %v, attendu %v", got, c.apres)
+			}
+			if c.setgidAttendu && info.Mode()&os.ModeSetgid == 0 {
+				t.Error("le setgid a été retiré : le fichier que Redis réécrit perdrait le groupe redis")
+			}
+		})
+	}
+}
+
+// peutLire dit si un processus d'identité uid, membre des seuls groupes donnés,
+// lit rel sous base : la traversée de chaque répertoire du chemin, puis la
+// lecture du fichier, selon la règle Unix de la première classe applicable, sans
+// repli. Un lien est suivi, comme le démon le suit.
+func peutLire(t *testing.T, base, rel string, uid int, groupes map[int]bool) bool {
+	t.Helper()
+	chemin := base
+	composants := strings.Split(rel, "/")
+	for i, c := range composants {
+		chemin = filepath.Join(chemin, c)
+		info, err := os.Stat(chemin)
+		if err != nil {
+			return false
+		}
+		st := info.Sys().(*syscall.Stat_t)
+		droits := st.Mode
+		switch {
+		case int(st.Uid) == uid:
+			droits >>= 6
+		case groupes[int(st.Gid)]:
+			droits >>= 3
+		}
+		voulu := uint32(0o1)
+		if i == len(composants)-1 {
+			voulu = 0o4
+		}
+		if droits&voulu == 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func TestLetsencryptLaisseAuGroupeSslCertLaCleQuiLuiEstConfiee(t *testing.T) {
+	// Convention Debian pour confier une clé certbot à un démon non root : le
+	// groupe ssl-cert sur live/, archive/ et la clé, que certbot recopie d'une clé
+	// à la suivante. La table rendait tout à root, récursivement, en 0700/0600 : le
+	// démon perdait son certificat au redémarrage, et le groupe ne revenait plus.
+	cible := cibleParDefaut(t, "/etc/letsencrypt")
+	p, prefix := auCompteDuTesteur(t, cible)
+	sslCert := autreGroupe(t, os.Getgid())
+	le := filepath.Join(prefix, "etc/letsencrypt")
+	for _, d := range []string{"", "archive/shop.fr", "live/shop.fr", "renewal", "renewal-hooks/deploy"} {
+		creer(t, filepath.Join(le, d), 0o755)
+	}
+	for _, d := range []string{"archive", "live"} {
+		if err := os.Chown(filepath.Join(le, d), -1, sslCert); err != nil {
+			t.Skipf("chgrp impossible ici : %v", err)
+		}
+		creer(t, filepath.Join(le, d), 0o750)
+	}
+	fichiers := map[string]os.FileMode{
+		"archive/shop.fr/privkey1.pem":   0o640,
+		"archive/shop.fr/cert1.pem":      0o644,
+		"archive/shop.fr/fullchain1.pem": 0o644,
+		"renewal/shop.fr.conf":           0o644,
+		"renewal-hooks/deploy/reload.sh": 0o755,
+	}
+	for f, m := range fichiers {
+		ecrireFichier(t, filepath.Join(le, f), m)
+	}
+	cle := filepath.Join(le, "archive/shop.fr/privkey1.pem")
+	if err := os.Chown(cle, -1, sslCert); err != nil {
+		t.Skipf("chgrp impossible ici : %v", err)
+	}
+	for _, n := range []string{"privkey", "cert", "fullchain"} {
+		if err := os.Symlink("../../archive/shop.fr/"+n+"1.pem",
+			filepath.Join(le, "live/shop.fr/"+n+".pem")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Le démon : User=nobody, Group=ssl-cert.
+	demon := map[int]bool{sslCert: true}
+	lus := []string{
+		"letsencrypt/live/shop.fr/privkey.pem", "letsencrypt/live/shop.fr/fullchain.pem",
+		"letsencrypt/archive/shop.fr/privkey1.pem", "letsencrypt/archive/shop.fr/fullchain1.pem",
+	}
+	for _, rel := range lus {
+		if !peutLire(t, filepath.Join(prefix, "etc"), rel, 65534, demon) {
+			t.Fatalf("fixture : le démon doit lire %s avant harden", rel)
+		}
+	}
+
+	appliquer(t, p)
+
+	for _, rel := range lus {
+		if !peutLire(t, filepath.Join(prefix, "etc"), rel, 65534, demon) {
+			t.Errorf("après harden, le démon du groupe ssl-cert ne lit plus %s", rel)
+		}
+	}
+	for f, m := range fichiers {
+		info, err := os.Stat(filepath.Join(le, f))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode().Perm() != m {
+			t.Errorf("%s passé de %04o à %04o : les fichiers ne sont pas à reprendre", f, m, info.Mode().Perm())
+		}
+	}
+	if info, _ := os.Stat(cle); fileGID(info) != sslCert {
+		t.Errorf("la clé a perdu le groupe ssl-cert (gid %d, attendu %d)", fileGID(info), sslCert)
+	}
+	// La racine se ferme à l'énumération, jamais à la traversée.
+	if info, _ := os.Stat(le); info.Mode().Perm()&0o004 != 0 || info.Mode().Perm()&0o001 == 0 {
+		t.Errorf("racine en %04o : attendue traversable par tous et énumérable par personne",
+			info.Mode().Perm())
+	}
+}
+
+func TestUnCompteIntrouvableLaisseLeRepertoireEtLeDit(t *testing.T) {
+	// Le groupe du service est ce par quoi il lit une fois les autres écartés :
+	// sans lui, fermer le coupe. harden fermait quand même, annonçait « ✓ » sans
+	// avoir posé le groupe, puis réclamait la même restriction à chaque passage —
+	// code 6 et avertissement de doctor à perpétuité.
+	p, prefix := fixture(t, Target{Path: "/etc/monagent", Owner: "root", Group: "monagent", DirMode: 0o750})
+	dir := filepath.Join(prefix, "etc/monagent")
+	creer(t, dir, 0o755)
+
+	states := appliquer(t, p)
+	st := states[0]
+	if st.Verdict != VerdictRefused {
+		t.Fatalf("verdict = %s, attendu %s", st.Verdict, VerdictRefused)
+	}
+	if !strings.Contains(st.Reason, "groupe monagent") {
+		t.Errorf("le refus doit nommer le groupe manquant : %q", st.Reason)
+	}
+	if Restrict(states) != 0 || Refused(states) != 1 {
+		t.Errorf("à restreindre = %d, refusés = %d : attendu 0 et 1", Restrict(states), Refused(states))
+	}
+	for _, s := range p.Plan(states) {
+		if s.Mutates() {
+			t.Errorf("une étape modifie une cible refusée : %s", s.Summary)
+		}
+	}
+	if info, _ := os.Stat(dir); info.Mode().Perm() != 0o755 {
+		t.Errorf("mode = %04o : le répertoire a été fermé sans le groupe du service", info.Mode().Perm())
+	}
+}
+
+func TestNeSuitPasUnLienPoseEntreLeConstatEtLEcriture(t *testing.T) {
+	// La table laisse désormais des répertoires à leur service — /etc/redis à
+	// redis —, qui peut remplacer une entrée par un lien entre le constat et
+	// l'écriture. Écrire par le nom, c'est le laisser choisir sur quoi root pose
+	// un groupe et un mode.
+	t.Run("le répertoire", func(t *testing.T) {
+		p, prefix := fixture(t, Target{Path: "/etc/nginx", DirMode: 0o750})
+		dir := filepath.Join(prefix, "etc/nginx")
+		creer(t, dir, 0o755)
+		st := p.Observe()[0]
+
+		ailleurs := filepath.Join(prefix, "ailleurs")
+		creer(t, ailleurs, 0o777)
+		if err := os.Remove(dir); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(ailleurs, dir); err != nil {
+			t.Fatal(err)
+		}
+		if err := p.apply(st); err == nil {
+			t.Error("un lien posé à la place du répertoire doit faire échouer l'étape")
+		}
+		if info, _ := os.Stat(ailleurs); info.Mode().Perm() != 0o777 {
+			t.Errorf("la cible du lien a été modifiée (%04o)", info.Mode().Perm())
+		}
+	})
+	t.Run("un sous-répertoire", func(t *testing.T) {
+		p, prefix := fixture(t, Target{Path: "/etc/ogs", DirMode: 0o700, FileMode: 0o600, Recursive: true})
+		racine := filepath.Join(prefix, "etc/ogs")
+		creer(t, filepath.Join(racine, "sous"), 0o700)
+		ecrireFichier(t, filepath.Join(racine, "sous/f"), 0o644)
+		st := p.Observe()[0]
+		if len(st.Loose) != 1 {
+			t.Fatalf("le fichier trop ouvert doit être relevé : %v", st.Loose)
+		}
+
+		ailleurs := filepath.Join(prefix, "ailleurs")
+		creer(t, ailleurs, 0o755)
+		ecrireFichier(t, filepath.Join(ailleurs, "f"), 0o644)
+		if err := os.Rename(filepath.Join(racine, "sous"), filepath.Join(prefix, "ecarte")); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(ailleurs, filepath.Join(racine, "sous")); err != nil {
+			t.Fatal(err)
+		}
+		if err := p.apply(st); err != nil {
+			t.Fatalf("application : %v", err)
+		}
+		if info, _ := os.Stat(filepath.Join(ailleurs, "f")); info.Mode().Perm() != 0o644 {
+			t.Errorf("un fichier atteint par le lien a été modifié (%04o)", info.Mode().Perm())
+		}
+	})
 }

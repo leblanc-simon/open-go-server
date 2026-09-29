@@ -28,6 +28,10 @@ mkdir -p /etc/telegraf && chmod 0755 /etc/telegraf
 printf 'token = "secret-de-metriques"\n' > /etc/telegraf/telegraf.conf
 chmod 0644 /etc/telegraf/telegraf.conf
 groupadd -r telegraf 2>/dev/null
+# Un fichier d'authentification comme les guides le rangent : les workers, sous
+# www-data, l'ouvrent à chaque requête — non le maître au chargement.
+printf 'alice:$apr1$essai$0123456789abcdefghijkl\n' > /etc/nginx/ogs-essai.htpasswd
+chmod 0644 /etc/nginx/ogs-essai.htpasswd
 
 ogs site create shop.fr --kind php-symfony --app-version 6.4 --php "$version" \
     --db mysql --tls=false --yes >/dev/null 2>&1
@@ -94,7 +98,7 @@ echo "/etc/apache2 est resté en 0700"
 
 echo
 echo "--- après : ce qu'un utilisateur de projet peut voir ---"
-for d in /etc/apache2 /etc/mysql /etc/ogs /etc/telegraf /etc/cron.d /etc/logrotate.d; do
+for d in /etc/apache2 /etc/nginx /etc/mysql /etc/postgresql /etc/ogs /etc/telegraf /etc/cron.d /etc/logrotate.d; do
     [ -d "$d" ] || continue
     if su -s /bin/sh shopfr -c "ls $d" >/dev/null 2>&1; then
         echo "ÉCHEC : $d reste lisible ($(stat -c %a "$d"))"
@@ -107,6 +111,42 @@ if su -s /bin/sh shopfr -c 'cat /etc/telegraf/telegraf.conf' 2>/dev/null | grep 
     exit 1
 fi
 echo "  le jeton de métriques n'est plus lisible"
+
+echo
+echo "--- les démons gardent l'accès à leur configuration (D56) ---"
+# MariaDB lit ses fichiers d'options sous mysql (User=mysql dans l'unité) et ignore
+# sans un mot ceux qu'il ne peut pas ouvrir : au redémarrage suivant, il repartait
+# sur ses défauts, à l'écoute de toutes les interfaces. Le serveur du scénario,
+# lancé en root par mariadbd-safe avant le durcissement, ne le verrait pas : on
+# éprouve la lecture elle-même, sous l'identité du service.
+if [ "$(stat -c %G /etc/mysql)" != mysql ]; then
+    echo "ÉCHEC : /etc/mysql n'est pas au groupe mysql ($(stat -c %U:%G /etc/mysql))"
+    exit 1
+fi
+if ! su -s /bin/sh mysql -c '/usr/sbin/mariadbd --print-defaults' 2>/dev/null | grep -q -- '--bind-address'; then
+    echo "ÉCHEC : sous mysql, MariaDB ne lit plus ses fichiers d'options"
+    exit 1
+fi
+echo "  MariaDB, sous mysql : lit toujours bind-address"
+# Les workers du serveur web ouvrent à la requête ce qu'un auth_basic_user_file ou
+# un AuthUserFile désigne : fermé à www-data, le site protégé rendait une 500.
+if ! su -s /bin/sh www-data -c 'cat /etc/nginx/ogs-essai.htpasswd' >/dev/null 2>&1; then
+    echo "ÉCHEC : www-data ne lit plus un fichier d'authentification sous /etc/nginx ($(stat -c '%a %U:%G' /etc/nginx))"
+    exit 1
+fi
+echo "  www-data lit toujours /etc/nginx/ogs-essai.htpasswd"
+# PostgreSQL garde le propriétaire que le paquet lui donne — pg_createcluster lancé
+# sous postgres y crée une version —, et relit sa configuration fermée en
+# redémarrant ; « PostgreSQL : administrable », plus bas, en dépend.
+if [ "$(stat -c %U /etc/postgresql)" != postgres ]; then
+    echo "ÉCHEC : /etc/postgresql a été repris à postgres ($(stat -c %U:%G /etc/postgresql))"
+    exit 1
+fi
+if ! pg_ctlcluster "$(ls /etc/postgresql | head -1)" main restart >/dev/null 2>&1; then
+    echo "ÉCHEC : le cluster PostgreSQL ne redémarre plus sur sa configuration fermée"
+    exit 1
+fi
+echo "  /etc/postgresql reste à postgres, le cluster a redémarré"
 
 echo
 echo "--- la racine des homes : traversable, plus énumérable (D60) ---"
