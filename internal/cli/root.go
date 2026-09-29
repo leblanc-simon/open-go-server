@@ -30,6 +30,14 @@ func NewRootCommand() *cobra.Command {
 			if isCompletionRequest(cmd) {
 				return nil
 			}
+			// Une commande qui ne sait pas simuler refuse --dry-run, avant d'avoir
+			// rien préparé : l'ignorer, c'était agir quand on demandait de voir
+			// (R3-20). Voir dryrun.go.
+			if app.DryRun {
+				if err := refuseDryRun(cmd); err != nil {
+					return err
+				}
+			}
 			if cmd.Annotations["skip-setup"] == "true" {
 				return nil
 			}
@@ -58,7 +66,8 @@ func NewRootCommand() *cobra.Command {
 	f.StringVar(&app.Prefix, "prefix", "", "préfixe appliqué à tous les chemins système (essai sans privilèges)")
 	f.StringVarP(&app.Format, "output", "o", "table", "format de sortie : table, json ou yaml")
 	f.BoolVar(&app.Yes, "yes", false, "ne pas demander de confirmation")
-	f.BoolVar(&app.DryRun, "dry-run", false, "calculer le plan sans rien appliquer")
+	f.BoolVar(&app.DryRun, "dry-run", false,
+		"calculer sans rien appliquer ; refusé (code 2) par une commande qui ne sait pas simuler")
 	f.BoolVar(&app.Force, "force", false,
 		"écraser ou retirer les fichiers modifiés à la main, après sauvegarde dans /var/lib/ogs/backups")
 	f.BoolVar(&app.NonInteractive, "non-interactive", false, "échouer plutôt que de poser une question")

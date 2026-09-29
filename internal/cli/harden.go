@@ -105,6 +105,17 @@ func newHardenCommand(app *App) *cobra.Command {
 				return exitf(CodePartial, "%d répertoire(s) à restreindre", reste)
 			}
 
+			plan := &engine.Plan{Project: "système"}
+			for _, s := range prov.Plan(states) {
+				plan.Add(s)
+			}
+			// Sous --dry-run, les restrictions sont annoncées et rien n'est
+			// exécuté : l'exécution simulée du moteur finissait sur « ✓ 0
+			// répertoire(s) restreint(s) », qui se lisait comme un échec.
+			if app.DryRun {
+				app.printf("\n%s--dry-run : rien n'a été restreint.\n", plan.String())
+				return nil
+			}
 			if err := app.confirm(fmt.Sprintf(
 				"restreindre %d répertoire(s) du système ?", reste)); err != nil {
 				return err
@@ -112,12 +123,7 @@ func newHardenCommand(app *App) *cobra.Command {
 			if err := app.openStore(); err != nil {
 				return err
 			}
-			plan := &engine.Plan{Project: "système"}
-			for _, s := range prov.Plan(states) {
-				plan.Add(s)
-			}
 			report, err := engine.Execute(cmd.Context(), plan, engine.Options{
-				DryRun: app.DryRun,
 				OnStep: func(s *engine.Step, stepErr error) {
 					if stepErr == nil {
 						app.printf("  ✓ %s\n", s.Summary)

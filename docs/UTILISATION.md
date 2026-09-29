@@ -444,6 +444,10 @@ sudo ogs                                    # interface en mode texte
 
 Toutes les commandes acceptent `-o json` ou `-o yaml`, et `man ogs-<commande>` détaille chacune.
 
+`--dry-run` montre ce que ferait une commande qui sait simuler — `apply`, `site create`, `project create`,
+`cron add`, `php switch`… — sans rien toucher : ni fichier, ni compte, ni hook. Une commande qui ne le sait
+pas — `project delete`, `project restore`, `cert renew`… — refuse l'option (code 2) plutôt que de l'ignorer.
+
 ## Codes de retour
 
 | Code | Sens                                     | Code | Sens                          |

@@ -57,6 +57,11 @@ type Runner struct {
 	Timeout time.Duration
 	// Disabled coupe tous les hooks (--no-hooks).
 	Disabled bool
+	// DryRun résout le hook et l'annonce sans l'exécuter : aucun hook en
+	// --dry-run (D40). Les commandes qui simulent s'arrêtent avant leurs hooks, et
+	// les autres refusent l'option ; ce court-circuit tient la règle même pour un
+	// appelant qui l'oublierait.
+	DryRun bool
 	// RequireRootOwner exige que le script appartienne à root. Le contrôle protège
 	// contre une escalade vers root : hors root, il n'y a rien à escalader, et
 	// l'imposer empêcherait tout essai en mode préfixé.
@@ -193,6 +198,12 @@ func (r *Runner) Run(ctx context.Context, proj *model.Project, event string, hoo
 		return err
 	}
 	if script == "" {
+		return nil
+	}
+	if r.DryRun {
+		if r.Log != nil {
+			r.Log("  ↪ hook %s : %s — non exécuté (--dry-run)\n", event, script)
+		}
 		return nil
 	}
 	hookCtx.Event = event

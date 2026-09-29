@@ -117,6 +117,15 @@ su -s /bin/bash ordfr -c '
 ogs project delete ordfr --no-dump --yes >/dev/null 2>&1 || echec "suppression du second site"
 archive=$(archive_de ordfr)
 [ -n "$archive" ] || echec "aucune archive du second site"
+# --dry-run ne restaure rien (R3-20) : la commande ne sait pas simuler et refuse
+# l'option avant tout geste. Elle réécrivait la déclaration, recréait compte et
+# home, appliquait le projet et lançait postCreate.
+ogs project restore "$archive" --dry-run --yes >/dev/null 2>&1
+code=$?
+[ "$code" -eq 2 ] || echec "« project restore --dry-run » doit refuser l'option (code 2), obtenu $code"
+[ -e /etc/ogs/projects/ordfr.yaml ] && echec "« project restore --dry-run » a réécrit la déclaration"
+getent passwd ordfr >/dev/null && echec "« project restore --dry-run » a recréé le compte"
+[ -e /home/ord.fr ] && echec "« project restore --dry-run » a recréé le home"
 ogs project restore "$archive" --yes >/dev/null 2>&1
 code=$?
 [ "$code" -eq 0 ] || echec "restauration ordinaire : code $code"

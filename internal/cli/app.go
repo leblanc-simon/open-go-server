@@ -172,7 +172,7 @@ func (a *App) close() {
 // n'ont pas besoin de l'attelage complet des providers.
 func (a *App) hookRunner() *hook.Runner {
 	return &hook.Runner{
-		Exec: a.Exec, Dir: a.Paths.HooksDir(), Disabled: a.NoHooks,
+		Exec: a.Exec, Dir: a.Paths.HooksDir(), Disabled: a.NoHooks, DryRun: a.DryRun,
 		// Hors root, il n'y a rien à escalader : l'exiger interdirait tout essai.
 		RequireRootOwner: os.Getuid() == 0 && a.Prefix == "",
 		Log:              a.printf,

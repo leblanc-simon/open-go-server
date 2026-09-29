@@ -31,6 +31,33 @@ if ! grep -q '"host":"hooks.test"' /tmp/trace-hooks.json; then
     exit 1
 fi
 
+# Aucun hook en --dry-run (D40), et rien de supprimé : « project delete » ne sait
+# pas simuler, il refuse l'option (code 2) avant tout geste. Il supprimait le
+# projet pour de bon, preDelete et postDelete lancés en root (R3-20).
+echo "--- project delete --dry-run ---"
+for ev in pre-delete post-delete; do
+    printf '#!/bin/sh\necho "parc %s $OGS_PROJECT" >> /tmp/trace-hooks\n' "$ev" > /etc/ogs/hooks/$ev
+    chmod 0750 /etc/ogs/hooks/$ev
+done
+sortie=$(ogs project delete hookstest --dry-run --yes 2>&1)
+code=$?
+if [ "$code" -ne 2 ]; then
+    echo "ÉCHEC : « project delete --dry-run » doit refuser l'option (code 2), obtenu $code :"
+    echo "$sortie" | tail -3
+    exit 1
+fi
+if [ ! -d /home/hooks.test ] || ! getent passwd hookstest >/dev/null || [ ! -f /etc/ogs/projects/hookstest.yaml ]; then
+    echo "ÉCHEC : « project delete --dry-run » a démonté le site"
+    exit 1
+fi
+if grep -q "delete" $trace; then
+    echo "ÉCHEC : un hook a été lancé sous --dry-run :"
+    grep "delete" $trace
+    exit 1
+fi
+rm -f /etc/ogs/hooks/post-delete
+echo "$sortie" | tail -1
+
 # Un hook « pre » qui refuse doit arrêter l'opération.
 cat > /etc/ogs/hooks/pre-delete <<'HOOK'
 #!/bin/sh

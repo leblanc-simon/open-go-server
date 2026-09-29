@@ -2,6 +2,7 @@ package hook
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -154,6 +155,36 @@ func TestDisabledSkipsEverything(t *testing.T) {
 	}
 	if _, err := os.Stat(out); !os.IsNotExist(err) {
 		t.Error("--no-hooks doit tout court-circuiter")
+	}
+}
+
+func TestDryRunAnnonceLeHookSansLExecuter(t *testing.T) {
+	// Aucun hook en --dry-run (D40) : un hook s'exécute en root, et
+	// « project delete --dry-run » lançait preDelete et postDelete pour de bon
+	// (R3-20). Le court-circuit tient la règle même pour un appelant qui
+	// oublierait de tester l'option.
+	runner, proj, dir := fixture(t)
+	out := filepath.Join(dir, "ne-doit-pas-exister")
+	script := writeHook(t, dir, "pre.sh", "#!/bin/sh\ntouch "+out+"\n", 0o750)
+	proj.Spec.Hooks = map[string]string{PreDelete: "pre.sh"}
+	runner.DryRun = true
+	var journal strings.Builder
+	runner.Log = func(format string, args ...any) { fmt.Fprintf(&journal, format, args...) }
+	if err := runner.Run(context.Background(), proj, PreDelete, Context{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(out); !os.IsNotExist(err) {
+		t.Error("sous --dry-run, le hook ne doit pas être exécuté")
+	}
+	if !strings.Contains(journal.String(), script) || !strings.Contains(journal.String(), "non exécuté (--dry-run)") {
+		t.Errorf("le hook qui aurait tourné doit être nommé, et dit non exécuté :\n%s", journal.String())
+	}
+	// Un hook refusé l'est encore : la simulation dit ce que l'exécution
+	// rencontrerait.
+	writeHook(t, dir, "ouvert.sh", "#!/bin/sh\n", 0o777)
+	proj.Spec.Hooks = map[string]string{PreDelete: "ouvert.sh"}
+	if err := runner.Run(context.Background(), proj, PreDelete, Context{}); err == nil {
+		t.Error("sous --dry-run, un hook inscriptible par tous doit rester refusé")
 	}
 }
 
