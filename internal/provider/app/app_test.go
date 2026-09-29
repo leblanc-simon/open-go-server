@@ -360,6 +360,31 @@ type realExecutor struct{ *exec.Recorder }
 
 func (r *realExecutor) Simulated() bool { return false }
 
+func TestLaVersionDuRuntimeSInterrogeSousLIdentiteDuProjet(t *testing.T) {
+	// Le lien vit dans ~/.local/bin, à l'utilisateur (D70) : lancé en root, le
+	// binaire qu'il désigne serait celui que l'utilisateur a choisi.
+	_, proj := fixture(t, model.KindNode)
+	bin := filepath.Join(proj.Spec.Layout.Root, ".local", "bin")
+	if err := os.MkdirAll(bin, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(bin, "node")
+	if err := os.Symlink(BinaryPath(proj.Spec.Layout.Root, RuntimeNode, "22.11.0"), link); err != nil {
+		t.Fatal(err)
+	}
+	rec := exec.NewRecorder()
+	rec.Responses[link+" --version"] = exec.Result{Stdout: "v22.11.0\n"}
+	installer := &Installer{Exec: &realExecutor{rec}}
+	got, err := installer.Version(context.Background(), proj, RuntimeNode)
+	if err != nil || got != "22.11.0" {
+		t.Fatalf("version %q, %v", got, err)
+	}
+	calls := rec.Calls()
+	if len(calls) != 1 || calls[0].AsUser != proj.Spec.User.Name {
+		t.Errorf("le binaire lié doit tourner sous l'identité %s : %+v", proj.Spec.User.Name, calls)
+	}
+}
+
 func TestExposedPortsDetectsPublicListeners(t *testing.T) {
 	// Une application joignable depuis l'extérieur contourne le vhost, donc le
 	// TLS et l'authentification.

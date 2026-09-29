@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +13,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -19,6 +21,8 @@ import (
 
 	"leblanc.io/open-go-server/internal/archive"
 	"leblanc.io/open-go-server/internal/config"
+	"leblanc.io/open-go-server/internal/exec"
+	"leblanc.io/open-go-server/internal/fs"
 	"leblanc.io/open-go-server/internal/model"
 	appprov "leblanc.io/open-go-server/internal/provider/app"
 	runtimeprov "leblanc.io/open-go-server/internal/provider/runtime"
@@ -801,6 +805,39 @@ func TestPHPSwitchRefusesIncompatibleVersion(t *testing.T) {
 	out = h.mustRun("php", "switch", "ancienfr", "8.3", "--force")
 	if !strings.Contains(out, "forcée") {
 		t.Errorf("le forçage doit être signalé :\n%s", out)
+	}
+}
+
+func TestPHPSwitchNeSeDesarmePasParUnLien(t *testing.T) {
+	// composer.json n'est plus lu à travers un lien : un refus traité en simple
+	// avertissement laissait alors l'utilisateur désarmer le garde-fou à volonté,
+	// sous un « ✓ compatibilité vérifiée ». Il décide comme un fichier absent :
+	// par la table indicative, qui refuse PHP 8.3 à un Prestashop.
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("project", "create", "boutique.fr", "--kind", "php-prestashop", "--php", "7.4")
+	h.mustRun("apply", "boutiquefr", "--yes")
+	permissif := h.path("root", "composer.json")
+	if err := os.MkdirAll(filepath.Dir(permissif), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(permissif, []byte(`{"require":{"php":">=7.1"}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(permissif, h.path("home", "boutique.fr", "www", "composer.json")); err != nil {
+		t.Fatal(err)
+	}
+
+	out, code := h.run("php", "switch", "boutiquefr", "8.3")
+	if code != CodeValidation {
+		t.Fatalf("la table indicative doit refuser PHP 8.3 (code %d, attendu %d) :\n%s", code, CodeValidation, out)
+	}
+	if !strings.Contains(out, "lien symbolique") || !strings.Contains(out, "table indicative") {
+		t.Errorf("le refus doit dire que composer.json n'a pas été lu, et sur quoi il se fonde :\n%s", out)
+	}
+	out = h.mustRun("php", "switch", "boutiquefr", "8.1", "--dry-run")
+	if strings.Contains(out, "✓ compatibilité vérifiée") || !strings.Contains(out, "composer.json non lu") {
+		t.Errorf("une compatibilité jugée sans composer.json ne s'annonce pas vérifiée :\n%s", out)
 	}
 }
 
@@ -2377,6 +2414,435 @@ func TestSiteCloneToPrep(t *testing.T) {
 		if _, err := os.Stat(h.path("home", host)); err != nil {
 			t.Errorf("home %s absent : %v", host, err)
 		}
+	}
+	// La copie du contenu est une opération de fichiers : elle a lieu sous
+	// préfixe comme les autres écritures.
+	if data, err := os.ReadFile(h.path("home", "shop.preprod-pp.net", "www", "public", "index.php")); err != nil ||
+		string(data) != "<?php echo 'production';" {
+		t.Errorf("le contenu de www/ doit être recopié : %q, %v", string(data), err)
+	}
+}
+
+// secretDeRoot prépare, hors de tout home, un répertoire que ni la production ni
+// la préproduction ne devraient lire.
+func secretDeRoot(t *testing.T, h *harness) string {
+	t.Helper()
+	secret := h.path("root", "secret")
+	if err := os.MkdirAll(secret, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(secret, "shadow"), []byte("root:$6$hash-secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return secret
+}
+
+func TestLeCloneNeSuitAucunLienDuWWWSource(t *testing.T) {
+	// L'utilisateur de production possède son home (D51) : il remplace ~/www par
+	// un lien vers un répertoire que root seul lit. « cp -a www/. » lancé en root
+	// en recopiait la cible, que « chown -R » donnait ensuite à la préproduction.
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("site", "create", "shop.fr", "--kind", "static", "--yes")
+	secret := secretDeRoot(t, h)
+	srcWWW := h.path("home", "shop.fr", "www")
+	if err := os.Rename(srcWWW, srcWWW+".orig"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(secret, srcWWW); err != nil {
+		t.Fatal(err)
+	}
+
+	out, code := h.run("site", "clone", "shopfr", "--to", "prep", "--yes")
+	if code != CodePartial {
+		t.Errorf("une copie refusée est un succès partiel : code %d, attendu %d\n%s", code, CodePartial, out)
+	}
+	if !strings.Contains(out, "copie du contenu") || !strings.Contains(out, "lien symbolique") ||
+		!strings.Contains(out, "rien n'a été recopié") {
+		t.Errorf("le refus doit être dit, avec sa raison :\n%s", out)
+	}
+	dstWWW := h.path("home", "shop.preprod-pp.net", "www")
+	if _, err := os.Lstat(filepath.Join(dstWWW, "shadow")); !os.IsNotExist(err) {
+		t.Errorf("la cible du lien a été recopiée dans la préproduction : %v", err)
+	}
+}
+
+func TestLeCloneRecopieLesLiensCommeDesLiens(t *testing.T) {
+	// Sous www, un lien vers un fichier ou un répertoire de root : la copie porte
+	// le lien, jamais le contenu de sa cible — et ne descend pas dedans.
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("site", "create", "shop.fr", "--kind", "static", "--yes")
+	secret := secretDeRoot(t, h)
+	srcWWW := h.path("home", "shop.fr", "www")
+	if err := os.MkdirAll(filepath.Join(srcWWW, "assets", "css"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(srcWWW, "assets", "css", "site.css"), []byte("body{}"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	liens := map[string]string{
+		"fuite.txt":          filepath.Join(secret, "shadow"),
+		"dossier":            secret,
+		"assets/relatif.css": "css/site.css",
+		"assets/css/pendant": "/nulle/part",
+	}
+	for nom, cible := range liens {
+		if err := os.Symlink(cible, filepath.Join(srcWWW, filepath.FromSlash(nom))); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	h.mustRun("site", "clone", "shopfr", "--to", "prep", "--yes")
+	dstWWW := h.path("home", "shop.preprod-pp.net", "www")
+	data, err := os.ReadFile(filepath.Join(dstWWW, "assets", "css", "site.css"))
+	if err != nil || string(data) != "body{}" {
+		t.Errorf("un fichier ordinaire doit être recopié : %q, %v", string(data), err)
+	}
+	if info, err := os.Stat(filepath.Join(dstWWW, "assets", "css", "site.css")); err == nil && info.Mode().Perm() != 0o640 {
+		t.Errorf("le mode du fichier doit être repris : %04o", info.Mode().Perm())
+	}
+	for nom, cible := range liens {
+		chemin := filepath.Join(dstWWW, filepath.FromSlash(nom))
+		info, err := os.Lstat(chemin)
+		if err != nil {
+			t.Errorf("%s absent de la copie : %v", nom, err)
+			continue
+		}
+		if info.Mode()&os.ModeSymlink == 0 {
+			t.Errorf("%s doit rester un lien, la copie en a fait %v", nom, info.Mode())
+			continue
+		}
+		if got, _ := os.Readlink(chemin); got != cible {
+			t.Errorf("%s : cible %q, attendue %q", nom, got, cible)
+		}
+	}
+	// Rien de la cible n'a été recopié, ni sous le lien ni à côté.
+	err = filepath.Walk(dstWWW, func(path string, info os.FileInfo, err error) error {
+		if err == nil && info.Mode().IsRegular() {
+			if data, _ := os.ReadFile(path); strings.Contains(string(data), "hash-secret") {
+				t.Errorf("%s porte le contenu d'un fichier de root", path)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+// cpReel lance réellement /bin/cp, comme exec.Local le ferait en root, et se
+// contente d'enregistrer le reste — un chown vers un autre compte échouerait sans
+// root. Il garde la copie du clone de revenir à « cp -a » sans que l'essai le voie.
+type cpReel struct {
+	local  exec.Local
+	appels []exec.Command
+}
+
+func (e *cpReel) Simulated() bool { return false }
+
+func (e *cpReel) Run(ctx context.Context, c exec.Command) (exec.Result, error) {
+	e.appels = append(e.appels, c)
+	if c.Name == "/bin/cp" {
+		return e.local.Run(ctx, c)
+	}
+	return exec.Result{}, nil
+}
+
+// cloneHorsSimulation prépare le chemin réel de la copie du clone de shopfr : un
+// exécuteur non simulé, et des comptes aux uid donnés — celui de l'essai pour que
+// les chown aboutissent sans root. Il rend l'application et les deux projets.
+func cloneHorsSimulation(t *testing.T, h *harness, uidSource, uidCible int) (*App, *model.Project, *model.Project) {
+	t.Helper()
+	gid := os.Getgid()
+	var passwd, group strings.Builder
+	for _, c := range []struct {
+		nom, home string
+		uid       int
+	}{
+		{"shopfr", h.path("home", "shop.fr"), uidSource},
+		{"shopfrprep", h.path("home", "shop.preprod-pp.net"), uidCible},
+	} {
+		fmt.Fprintf(&passwd, "%s:x:%d:%d:ogs=%s:%s:/bin/bash\n", c.nom, c.uid, gid, c.nom, c.home)
+		fmt.Fprintf(&group, "%s:x:%d:\n", c.nom, gid)
+	}
+	if err := os.WriteFile(h.path("etc", "passwd"), []byte(passwd.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(h.path("etc", "group"), []byte(group.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	app := newApp()
+	var out bytes.Buffer
+	app.Prefix, app.Out, app.Err = h.prefix, &out, &out
+	if err := app.setup(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(app.close)
+	app.Exec = &cpReel{}
+	source, err := app.loadProject("shopfr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := app.loadProject("shopfrprep")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return app, source, target
+}
+
+func TestLaCopieDuCloneHorsSimulationNeSuitPasLeLien(t *testing.T) {
+	// Le chemin réel, hors mode simulé : « cp -a <www>/. » lancé en root recopiait
+	// la cible du lien, puis « chown -R » la donnait à la préproduction.
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("site", "create", "shop.fr", "--kind", "static", "--yes")
+	h.mustRun("site", "clone", "shopfr", "--to", "prep", "--yes")
+	secret := secretDeRoot(t, h)
+	srcWWW := h.path("home", "shop.fr", "www")
+	if err := os.Rename(srcWWW, srcWWW+".orig"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(secret, srcWWW); err != nil {
+		t.Fatal(err)
+	}
+
+	app, source, target := cloneHorsSimulation(t, h, os.Getuid(), os.Getuid())
+	if _, err := app.copyTree(context.Background(), source, target); !errors.Is(err, fs.ErrNotDirectory) {
+		t.Errorf("un www source lié doit faire refuser la copie, obtenu %v", err)
+	}
+	if _, err := os.Lstat(h.path("home", "shop.preprod-pp.net", "www", "shadow")); !os.IsNotExist(err) {
+		t.Errorf("la cible du lien a été recopiée dans la préproduction : %v", err)
+	}
+}
+
+func TestLaCopieDuCloneNeRecopieQueLesFichiersDuCompteSource(t *testing.T) {
+	// Un lien physique vers /etc/shadow, posé dans le www de la production, n'a
+	// plus qu'un lien une fois que le useradd du clone a réécrit /etc/shadow par
+	// renommage : seul son propriétaire le trahit. Le compte source est celui que
+	// l'identité résout, non le propriétaire de www — ici, les fichiers comme www
+	// appartiennent à l'essai, et le compte source est un autre.
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("site", "create", "shop.fr", "--kind", "static", "--yes")
+	h.mustRun("site", "clone", "shopfr", "--to", "prep", "--yes")
+	durshadow := h.path("home", "shop.fr", "www", "durshadow")
+	if err := os.WriteFile(durshadow, []byte("root:$6$hash-secret\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+
+	app, source, target := cloneHorsSimulation(t, h, os.Getuid()+1, os.Getuid())
+	skipped, err := app.copyTree(context.Background(), source, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(strings.Join(skipped.Named, "\n"), "durshadow") {
+		t.Errorf("un fichier d'un autre compte que la source doit être écarté : %+v", skipped)
+	}
+	if _, err := os.Lstat(h.path("home", "shop.preprod-pp.net", "www", "durshadow")); !os.IsNotExist(err) {
+		t.Errorf("le fichier étranger a été recopié dans la préproduction : %v", err)
+	}
+}
+
+func TestLeCloneDitEtCompteLesEntreesEcartees(t *testing.T) {
+	// Une entrée écartée laisse la préproduction incomplète : l'avertissement ne
+	// suffit pas, le code de retour doit le dire, et rien ne doit l'annoncer
+	// comme copiée — pas même un nom d'entrée, qui est aux mains de l'utilisateur
+	// de la production et forgeait, affiché tel quel, une ligne « ✓ ».
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("site", "create", "shop.fr", "--kind", "static", "--yes")
+	for _, nom := range []string{"tube", "x : fichier spécial\n✓ contenu copié : tout va bien\n\x1b[1A"} {
+		if err := syscall.Mkfifo(h.path("home", "shop.fr", "www", nom), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	out, code := h.run("site", "clone", "shopfr", "--to", "prep", "--yes")
+	if code != CodePartial {
+		t.Errorf("une entrée écartée est un succès partiel : code %d, attendu %d\n%s", code, CodePartial, out)
+	}
+	if !strings.Contains(out, "non recopié") || !strings.Contains(out, "tube") ||
+		!strings.Contains(out, "contenu copié en partie") {
+		t.Errorf("l'entrée écartée doit être nommée, et la copie dite partielle :\n%s", out)
+	}
+	for _, ligne := range strings.Split(out, "\n") {
+		if strings.HasPrefix(ligne, "✓ contenu copié") {
+			t.Errorf("une copie incomplète ne doit pas s'annoncer comme faite : %q", ligne)
+		}
+	}
+	if strings.Contains(out, "\x1b") || !strings.Contains(out, "2 entrée(s) écartée(s)") {
+		t.Errorf("les noms écartés doivent être cités, sans échappement, et comptés :\n%s", out)
+	}
+}
+
+// annuleDesLaCopie est un contexte qui se dit annulé dès que le www de
+// destination n'est plus vide : l'apply qui précède la copie n'y écrit rien, et
+// l'interruption tombe donc en pleine copie.
+type annuleDesLaCopie struct {
+	context.Context
+	www string
+}
+
+func (c annuleDesLaCopie) Err() error {
+	if entrees, _ := os.ReadDir(c.www); len(entrees) > 0 {
+		return context.Canceled
+	}
+	return nil
+}
+
+// runSous exécute une commande comme run, sous le contexte ctx — celui que main
+// annule sur SIGINT et SIGTERM.
+func (h *harness) runSous(ctx context.Context, args ...string) (string, int) {
+	h.t.Helper()
+	var out bytes.Buffer
+	root := NewRootCommand()
+	root.SetOut(&out)
+	root.SetErr(&out)
+	root.SetArgs(append([]string{"--prefix", h.prefix}, args...))
+	err := root.ExecuteContext(ctx)
+	if err != nil {
+		out.WriteString("\nogs : " + err.Error() + "\n")
+	}
+	return out.String(), ExitCode(err)
+}
+
+func TestUnCloneInterrompuRendLeCodeDAnnulation(t *testing.T) {
+	// « cp -a » mourait avec son groupe de processus ; la copie faite dans le
+	// processus ne consultait pas le contexte. main captant SIGINT et SIGTERM,
+	// Ctrl-C restait sans effet jusqu'au bout de la copie — que le locataire
+	// allonge à volonté —, qui s'annonçait ensuite faite, code 0.
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("site", "create", "shop.fr", "--kind", "static", "--yes")
+	srcWWW := h.path("home", "shop.fr", "www")
+	for _, nom := range []string{"a.txt", "b.txt", "c.txt"} {
+		if err := os.WriteFile(filepath.Join(srcWWW, nom), []byte(nom), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	dstWWW := h.path("home", "shop.preprod-pp.net", "www")
+	out, code := h.runSous(annuleDesLaCopie{Context: context.Background(), www: dstWWW},
+		"site", "clone", "shopfr", "--to", "prep", "--yes")
+	if code != CodeCancelled {
+		t.Errorf("une copie interrompue à la demande rend le code %d, obtenu %d\n%s", CodeCancelled, code, out)
+	}
+	if !strings.Contains(out, "copie interrompue à la demande") || !strings.Contains(out, "n'en porte qu'une partie") {
+		t.Errorf("l'interruption doit être dite, avec ce qu'elle laisse :\n%s", out)
+	}
+	for _, ligne := range strings.Split(out, "\n") {
+		if strings.HasPrefix(ligne, "✓ contenu copié") || strings.Contains(ligne, "créé depuis") {
+			t.Errorf("une copie interrompue ne doit pas s'annoncer faite : %q", ligne)
+		}
+	}
+	if _, err := os.Lstat(filepath.Join(dstWWW, "c.txt")); !os.IsNotExist(err) {
+		t.Errorf("la copie a continué après l'interruption : %v", err)
+	}
+}
+
+func TestLaCopieInterrompueNeSeDitPasRefusee(t *testing.T) {
+	// Un lien ou une entrée absente rencontrés en cours de copie s'affichaient
+	// comme à la racine — « rien n'est recopié à travers un lien », « source
+	// absente » — alors qu'une partie du contenu était déjà en place.
+	t.Run("fichier illisible", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("root lit un fichier en 0000 : l'échec ne se provoque pas ainsi")
+		}
+		h := newHarness(t)
+		h.mustRun("init")
+		h.mustRun("site", "create", "shop.fr", "--kind", "static", "--yes")
+		srcWWW := h.path("home", "shop.fr", "www")
+		if err := os.WriteFile(filepath.Join(srcWWW, "a.txt"), []byte("a"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(srcWWW, "zz.txt"), []byte("z"), 0o000); err != nil {
+			t.Fatal(err)
+		}
+		out, code := h.run("site", "clone", "shopfr", "--to", "prep", "--yes")
+		if code != CodePartial {
+			t.Errorf("une copie interrompue est un succès partiel : code %d, attendu %d\n%s", code, CodePartial, out)
+		}
+		if !strings.Contains(out, "copie du contenu interrompue") || strings.Contains(out, "rien n'a été recopié") {
+			t.Errorf("la copie doit se dire interrompue, non refusée :\n%s", out)
+		}
+		if data, err := os.ReadFile(h.path("home", "shop.preprod-pp.net", "www", "a.txt")); err != nil ||
+			string(data) != "a" {
+			t.Errorf("ce qui précède l'interruption est en place : %q, %v", string(data), err)
+		}
+	})
+	t.Run("lien dans la destination", func(t *testing.T) {
+		h := newHarness(t)
+		h.mustRun("init")
+		h.mustRun("site", "create", "shop.fr", "--kind", "static", "--yes")
+		h.mustRun("site", "clone", "shopfr", "--to", "prep", "--yes")
+		secret := secretDeRoot(t, h)
+		srcWWW := h.path("home", "shop.fr", "www")
+		if err := os.WriteFile(filepath.Join(srcWWW, "a.txt"), []byte("a"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(filepath.Join(srcWWW, "zz"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(srcWWW, "zz", "f"), []byte("f"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		// Le compte de préproduction pose un lien là où la source a un répertoire.
+		if err := os.Symlink(secret, h.path("home", "shop.preprod-pp.net", "www", "zz")); err != nil {
+			t.Fatal(err)
+		}
+
+		app, source, target := cloneHorsSimulation(t, h, os.Getuid(), os.Getuid())
+		_, err := app.copyTree(context.Background(), source, target)
+		if !errors.Is(err, fs.ErrNotDirectory) {
+			t.Fatalf("un répertoire de destination lié doit arrêter la copie : %v", err)
+		}
+		if errors.Is(err, errNotCopied) || strings.Contains(err.Error(), "rien n'a été recopié") {
+			t.Errorf("une copie commencée ne doit pas se dire refusée : %v", err)
+		}
+		if _, err := os.Lstat(filepath.Join(secret, "f")); !os.IsNotExist(err) {
+			t.Errorf("root a écrit dans la cible du lien : %v", err)
+		}
+	})
+}
+
+func TestLaRotationDeCleRefuseUnSshLie(t *testing.T) {
+	// « ogs user key rotate » tourne hors de tout plan. L'utilisateur remplace son
+	// .ssh par un lien : la rotation lisait l'ancienne clé à travers lui, la
+	// sauvegardait, puis — hors simulation — supprimait et recréait la paire dans
+	// le répertoire visé.
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("project", "create", "shop.fr", "--kind", "static")
+	h.mustRun("apply", "shopfr", "--yes")
+	cible := h.path("root", ".ssh")
+	if err := os.MkdirAll(cible, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for nom, contenu := range map[string]string{"id_ed25519": "CLÉ PRIVÉE DE ROOT\n", "id_ed25519.pub": "CLÉ PUBLIQUE DE ROOT\n"} {
+		if err := os.WriteFile(filepath.Join(cible, nom), []byte(contenu), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ssh := h.path("home", "shop.fr", ".ssh")
+	if err := os.RemoveAll(ssh); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(cible, ssh); err != nil {
+		t.Fatal(err)
+	}
+
+	out, code := h.run("user", "key", "rotate", "shopfr", "--yes")
+	if code == CodeOK {
+		t.Errorf("la rotation doit refuser un .ssh lié :\n%s", out)
+	}
+	if strings.Contains(out, "DE ROOT") {
+		t.Errorf("une clé a été lue à travers le lien :\n%s", out)
+	}
+	if copies, _ := os.ReadDir(h.path("var", "lib", "ogs", "backups")); len(copies) != 0 {
+		t.Errorf("la clé de la cible a été sauvegardée : %v", copies)
+	}
+	out, code = h.run("user", "key", "show", "shopfr")
+	if code == CodeOK || strings.Contains(out, "DE ROOT") {
+		t.Errorf("« user key show » ne doit rien lire à travers le lien (code %d) :\n%s", code, out)
 	}
 }
 

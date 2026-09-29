@@ -1,8 +1,10 @@
 package php
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -113,7 +115,7 @@ func TestConstraintPlatformWins(t *testing.T) {
 	}
 }
 
-func TestCheckCompatibility(t *testing.T) {
+func TestCheck(t *testing.T) {
 	root := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(root, "www"), 0o755); err != nil {
 		t.Fatal(err)
@@ -123,7 +125,8 @@ func TestCheckCompatibility(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, "www", "composer.json"), []byte(composer), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	ok, detail, err := CheckCompatibility(root, "php-symfony", "8.3")
+	v, err := Check(root, "php-symfony", "8.3")
+	ok, detail := v.OK, v.Detail
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -133,30 +136,31 @@ func TestCheckCompatibility(t *testing.T) {
 	if detail == "" {
 		t.Error("le motif du refus doit être explicite")
 	}
-	if ok, _, _ := CheckCompatibility(root, "php-symfony", "7.4"); !ok {
+	if v, _ := Check(root, "php-symfony", "7.4"); !v.OK {
 		t.Error("PHP 7.4 doit être accepté")
 	}
 }
 
-func TestCheckCompatibilityFallsBackWithoutComposer(t *testing.T) {
+func TestCheckFallsBackWithoutComposer(t *testing.T) {
 	root := t.TempDir()
-	ok, detail, err := CheckCompatibility(root, "php-prestashop", "8.3")
+	v, err := Check(root, "php-prestashop", "8.3")
+	ok, detail := v.OK, v.Detail
 	if err != nil {
 		t.Fatal(err)
 	}
 	if ok {
 		t.Errorf("la table indicative doit refuser PHP 8.3 pour Prestashop (%s)", detail)
 	}
-	if ok, _, _ := CheckCompatibility(root, "php-prestashop", "7.4"); !ok {
+	if v, _ := Check(root, "php-prestashop", "7.4"); !v.OK {
 		t.Error("PHP 7.4 doit convenir à Prestashop")
 	}
 	// Type inconnu de la table : on n'invente pas de contrainte.
-	if ok, _, _ := CheckCompatibility(root, "static", "8.5"); !ok {
+	if v, _ := Check(root, "static", "8.5"); !v.OK {
 		t.Error("sans contrainte connue, la version doit être acceptée")
 	}
 }
 
-func TestCheckCompatibilityToleratesBrokenComposer(t *testing.T) {
+func TestCheckToleratesBrokenComposer(t *testing.T) {
 	// Un composer.json illisible ne doit pas bloquer l'exploitation : il produit
 	// un avertissement, pas un refus.
 	root := t.TempDir()
@@ -166,11 +170,107 @@ func TestCheckCompatibilityToleratesBrokenComposer(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, "www", "composer.json"), []byte("{cassé"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	ok, detail, err := CheckCompatibility(root, "php-symfony", "8.3")
+	v, err := Check(root, "php-symfony", "8.3")
+	ok, detail := v.OK, v.Detail
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !ok {
 		t.Errorf("un composer.json illisible ne doit pas bloquer : %s", detail)
+	}
+}
+
+func TestLaContrainteNeSeLitPasATraversUnLien(t *testing.T) {
+	// « php switch » lit composer.json en root, dans le www que l'utilisateur du
+	// projet possède : un lien, sur le fichier ou sur www, faisait lire à root
+	// n'importe quel fichier du système — et en afficher la contrainte.
+	ailleurs := t.TempDir()
+	composer := `{"require":{"php":"^5.6 SECRET"}}`
+	if err := os.WriteFile(filepath.Join(ailleurs, "composer.json"), []byte(composer), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Run("composer.json lié", func(t *testing.T) {
+		root := t.TempDir()
+		if err := os.MkdirAll(filepath.Join(root, "www"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(filepath.Join(ailleurs, "composer.json"),
+			filepath.Join(root, "www", "composer.json")); err != nil {
+			t.Fatal(err)
+		}
+		c, _, err := Constraint(root)
+		if err == nil || c != "" {
+			t.Errorf("un composer.json lié doit être refusé : contrainte %q, erreur %v", c, err)
+		}
+	})
+	t.Run("www lié", func(t *testing.T) {
+		root := t.TempDir()
+		if err := os.Symlink(ailleurs, filepath.Join(root, "www")); err != nil {
+			t.Fatal(err)
+		}
+		c, _, err := Constraint(root)
+		if err == nil || c != "" {
+			t.Errorf("un www lié doit être refusé : contrainte %q, erreur %v", c, err)
+		}
+		// Le refus ne bloque pas l'exploitation et n'affiche rien de la cible.
+		v, err := Check(root, "php-symfony", "8.3")
+		ok, detail := v.OK, v.Detail
+		if err != nil || !ok || strings.Contains(detail, "SECRET") {
+			t.Errorf("refus attendu en avertissement, sans rien de la cible : %v %q %v", ok, detail, err)
+		}
+	})
+}
+
+func TestUnComposerIllisibleDecideParLaTableIndicative(t *testing.T) {
+	// Un composer.json illisible ou refusé passait sans contrôle, là où un
+	// fichier absent consultait la table indicative : remplacer le fichier par un
+	// lien suffisait à désarmer le garde-fou, et le verdict s'annonçait vérifié.
+	cas := map[string]func(t *testing.T, www string){
+		"lien": func(t *testing.T, www string) {
+			permissif := filepath.Join(t.TempDir(), "composer.json")
+			if err := os.WriteFile(permissif, []byte(`{"require":{"php":">=7.1"}}`), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(permissif, filepath.Join(www, "composer.json")); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"cassé": func(t *testing.T, www string) {
+			if err := os.WriteFile(filepath.Join(www, "composer.json"), []byte("{cassé"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		},
+		// Au-delà de la borne, le fichier n'est pas lu — creux, il ne coûterait
+		// rien à l'utilisateur et root le lisait en entier. Valide et permissif,
+		// il ne doit pas pour autant décider.
+		"démesuré": func(t *testing.T, www string) {
+			data := append([]byte(`{"require":{"php":">=7.1"}}`), bytes.Repeat([]byte(" "), maxComposerSize)...)
+			if err := os.WriteFile(filepath.Join(www, "composer.json"), data, 0o644); err != nil {
+				t.Fatal(err)
+			}
+		},
+	}
+	for nom, prepare := range cas {
+		t.Run(nom, func(t *testing.T) {
+			root := t.TempDir()
+			www := filepath.Join(root, "www")
+			if err := os.MkdirAll(www, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			prepare(t, www)
+			v, err := Check(root, "php-prestashop", "8.3")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if v.OK || !strings.Contains(v.Detail, "table indicative") {
+				t.Errorf("la table indicative doit refuser PHP 8.3 à un Prestashop : %+v", v)
+			}
+			if v.Unread == nil {
+				t.Error("le verdict doit dire que composer.json n'a pas été lu")
+			}
+			if v, _ := Check(root, "php-prestashop", "8.1"); !v.OK || v.Unread == nil {
+				t.Errorf("une version de la table passe, sans s'annoncer vérifiée sur l'application : %+v", v)
+			}
+		})
 	}
 }

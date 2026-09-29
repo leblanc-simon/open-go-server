@@ -2,11 +2,13 @@ package system
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
+	"unicode"
+	"unicode/utf8"
 
 	"leblanc.io/open-go-server/internal/engine"
 	"leblanc.io/open-go-server/internal/exec"
@@ -17,11 +19,18 @@ import (
 // KeyName est le nom de la clé de déploiement.
 const KeyName = "id_ed25519"
 
-// KeyPath renvoie le chemin de la clé privée d'un projet.
-func KeyPath(root string) string { return filepath.Join(root, ".ssh", KeyName) }
+// sshDir est le répertoire des clés, relatif au home du projet.
+const sshDir = ".ssh"
 
-// PublicKeyPath renvoie le chemin de la clé publique.
-func PublicKeyPath(root string) string { return KeyPath(root) + ".pub" }
+// maxKeySize borne ce que root lit d'un fichier de clé. .ssh appartient au
+// projet, qui donne à ses fichiers la taille qu'il veut : une clé creuse de
+// plusieurs Gio ne lui coûte rien, et la rotation la lisait en mémoire puis la
+// réécrivait pleine dans les sauvegardes, sur /var. Une paire ed25519 tient en
+// quelques centaines d'octets ; seize Kio couvrent tout ce qu'écrit ssh-keygen.
+const maxKeySize = 16 << 10
+
+// KeyPath renvoie le chemin de la clé privée d'un projet.
+func KeyPath(root string) string { return filepath.Join(root, sshDir, KeyName) }
 
 // keyStep génère la paire ed25519 de déploiement. La clé privée reste sur le
 // serveur : le déploiement se fait en tirage, la clé publique étant déclarée en
@@ -60,10 +69,14 @@ func (p *Provider) keyStep(proj *model.Project) *engine.Step {
 	s := engine.NewStep(resource, engine.Create,
 		fmt.Sprintf("clé de déploiement ed25519 (%s)", path))
 	s.Critical = false
-	s.Apply = func(ctx context.Context) error { return p.generateKey(ctx, proj, path) }
+	s.Apply = func(ctx context.Context) error { return p.generateKey(ctx, proj) }
+	// La compensation vient après coup, quand l'utilisateur a eu tout le temps
+	// de remplacer .ssh par un lien : un os.Remove par le nom supprimerait alors
+	// la clé du répertoire visé — celle de root comprise.
+	root := proj.Spec.Layout.Root
 	s.Compensate = func(context.Context) error {
-		_ = os.Remove(path)
-		_ = os.Remove(path + ".pub")
+		_ = fs.RemoveFileAt(root, sshDir, KeyName)
+		_ = fs.RemoveFileAt(root, sshDir, KeyName+".pub")
 		return nil
 	}
 	return s
@@ -75,7 +88,7 @@ func (p *Provider) keyStep(proj *model.Project) *engine.Step {
 // un répertoire que l'utilisateur du projet possède lui donnerait une écriture
 // root sur le chemin de son choix, et le chown qui suivait la cible du lien la
 // lui remettait.
-func (p *Provider) generateKey(ctx context.Context, proj *model.Project, path string) error {
+func (p *Provider) generateKey(ctx context.Context, proj *model.Project) error {
 	dir, err := os.MkdirTemp("", "ogs-keygen-")
 	if err != nil {
 		return err
@@ -98,54 +111,101 @@ func (p *Provider) generateKey(ctx context.Context, proj *model.Project, path st
 	if err != nil {
 		return err
 	}
-	return installKeyPair(gen, path, uid, gid)
+	owner := fs.Owner{UID: uid, GID: gid}
+	// Le plan a vérifié .ssh, mais à l'observation : entre elle et cette étape,
+	// l'utilisateur a pu le remplacer par un lien. Le répertoire est donc rouvert
+	// et contrôlé ici, et c'est par ce descripteur que la paire est posée.
+	ssh, err := openSSHDir(proj, owner)
+	if err != nil {
+		return err
+	}
+	defer ssh.Close()
+	return installKeyPair(gen, ssh, owner)
 }
 
-// installKeyPair pose la paire générée à sa place définitive, clé publique
-// comprise : elle est tout aussi exposée, un lien à sa place faisant tronquer
-// puis donner au projet le fichier visé.
-func installKeyPair(gen, path string, uid, gid int) error {
+// installKeyPair pose la paire générée à sa place définitive, par le descripteur
+// de .ssh — clé publique comprise : elle est tout aussi exposée, un lien à sa
+// place faisant tronquer puis donner au projet le fichier visé. DirAt.WriteFile
+// délie le nom puis le recrée en O_CREAT|O_EXCL|O_NOFOLLOW, mode et propriétaire
+// posés sur le descripteur.
+func installKeyPair(gen string, ssh *fs.DirAt, owner fs.Owner) error {
 	for _, f := range []struct {
-		src, dst string
-		mode     os.FileMode
+		src, name string
+		mode      os.FileMode
 	}{
-		{gen, path, 0o600},
-		{gen + ".pub", path + ".pub", 0o644},
+		{gen, KeyName, 0o600},
+		{gen + ".pub", KeyName + ".pub", 0o644},
 	} {
 		data, err := os.ReadFile(f.src)
 		if err != nil {
 			return err
 		}
-		if err := installKeyFile(f.dst, data, f.mode, uid, gid); err != nil {
+		if err := ssh.WriteFile(f.name, data, f.mode, owner); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// installKeyFile écrit un fichier de clé sans jamais suivre de lien. Le chemin
-// est délié d'abord, puis créé en O_CREAT|O_EXCL|O_NOFOLLOW : l'ouverture échoue
-// si quoi que ce soit occupe le chemin entre les deux — un lien reposé par
-// l'utilisateur du projet compris, .ssh étant à lui. Le mode et le propriétaire
-// sont posés sur le descripteur, non sur le chemin, qui peut changer entre deux
-// appels.
-func installKeyFile(path string, data []byte, mode os.FileMode, uid, gid int) error {
-	_ = os.Remove(path)
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, mode)
-	if err != nil {
-		return fmt.Errorf("écriture de %s : %w", path, err)
+// keyOwner est le compte auquel reviennent le .ssh d'un projet et ses clés. En
+// mode simulé, rien n'est ni contrôlé ni changé : sous préfixe, l'arborescence
+// appartient à qui fait tourner l'essai, et les comptes n'existent pas.
+func keyOwner(ex exec.Executor, proj *model.Project, ident Identity) (fs.Owner, error) {
+	if ex.Simulated() {
+		return fs.KeepOwner, nil
 	}
-	defer f.Close()
-	if _, err := f.Write(data); err != nil {
-		return err
+	u, err := ident.LookupUser(proj.Spec.User.Name)
+	if err != nil || u == nil {
+		return fs.KeepOwner, fmt.Errorf("utilisateur %s introuvable", proj.Spec.User.Name)
 	}
-	if err := f.Chmod(mode); err != nil {
-		return err
+	g, err := ident.LookupGroup(proj.Spec.User.Group)
+	if err != nil || g == nil {
+		return fs.KeepOwner, fmt.Errorf("groupe %s introuvable", proj.Spec.User.Group)
 	}
-	if err := f.Chown(uid, gid); err != nil {
-		return err
+	return fs.Owner{UID: u.UID, GID: g.GID}, nil
+}
+
+// openSSHDir ouvre le .ssh d'un projet sans suivre de lien, ni en chemin ni au
+// dernier composant, et refuse un répertoire qui n'appartient pas à owner.
+//
+// Le home appartient à l'utilisateur (D51) : il renomme son .ssh sans privilège
+// et pose à la place un lien vers le répertoire de son choix — /root/.ssh,
+// /etc/apt/apt.conf.d. Un contrôle du seul dernier composant (os.Lstat sur la
+// clé) laisse ce lien être résolu, et root y supprimait puis créait la paire,
+// qu'il donnait ensuite au projet. Un vrai répertoire qui ne lui appartient pas
+// est refusé de même : l'utilisateur peut aussi renommer en .ssh un répertoire
+// de root resté dans son home. Toutes les opérations qui suivent — contrôle,
+// sauvegarde, remplacement, relecture — passent par le descripteur rendu, donc
+// par le répertoire constaté ici.
+func openSSHDir(proj *model.Project, owner fs.Owner) (*fs.DirAt, error) {
+	root := proj.Spec.Layout.Root
+	path := filepath.Join(root, sshDir)
+	ssh, err := fs.OpenDirAt(root, sshDir)
+	switch {
+	case errors.Is(err, fs.ErrNotDirectory):
+		return nil, fmt.Errorf("%s n'est pas un répertoire véritable (lien symbolique ?) : ogs n'y lit ni "+
+			"n'y écrit la clé de déploiement — le rétablir, puis « ogs apply %s »", path, proj.ID())
+	case errors.Is(err, os.ErrNotExist):
+		return nil, fmt.Errorf("%s absent : « ogs apply %s » le crée (%w)", path, proj.ID(), err)
+	case err != nil:
+		return nil, err
 	}
-	return f.Close()
+	if owner.UID >= 0 {
+		uid, _, err := ssh.Owner()
+		if err != nil {
+			ssh.Close()
+			return nil, err
+		}
+		if int(uid) != owner.UID {
+			// L'apply rend .ssh au projet (dirSteps) : c'est lui qui répare, non
+			// cette commande, qui n'a pas de plan pour le dire.
+			ssh.Close()
+			return nil, fmt.Errorf("%s appartient à l'uid %d, non à %s (uid %d) : ogs n'y lit ni n'y écrit "+
+				"la clé de déploiement — le rendre au projet (« ogs apply %s » le fait), puis relancer",
+				path, uid, proj.Spec.User.Name, owner.UID, proj.ID())
+		}
+	}
+	return ssh, nil
 }
 
 // AuthorizedKeysPath renvoie le chemin des clés autorisées d'un projet.
@@ -213,8 +273,12 @@ func (p *Provider) authorizedKeysStep(proj *model.Project) *engine.Step {
 		fmt.Sprintf("clés autorisées liées à %s", source))
 	s.Critical = false
 	s.Apply = func(context.Context) error { return p.linkAuthorizedKeys(proj, link, source) }
+	// Ni os.Remove par le nom, qui suivrait un .ssh remplacé par un lien d'ici
+	// au rollback et retirerait l'authorized_keys du répertoire visé — celui de
+	// root compris —, ni la suppression d'autre chose qu'un lien : c'est un lien
+	// que l'étape a posé.
 	s.Compensate = func(context.Context) error {
-		_ = os.Remove(link)
+		_ = fs.RemoveLinkAt(proj.Spec.Layout.Root, sshDir, filepath.Base(link))
 		return nil
 	}
 	return s
@@ -361,39 +425,123 @@ func orValue(v, fallback string) string {
 	return v
 }
 
-// PublicKey lit la clé publique de déploiement d'un projet.
-func PublicKey(root string) (string, error) {
-	data, err := os.ReadFile(PublicKeyPath(root))
+// errNoDeployKey dit l'absence de clé, et ce qui la crée.
+var errNoDeployKey = errors.New("aucune clé de déploiement : lancer « ogs apply » pour la générer")
+
+// PublicKey lit la clé publique de déploiement d'un projet, par le descripteur de
+// son .ssh (openSSHDir) et sans suivre de lien : « user key show » tourne en
+// root, et un os.ReadFile par le nom affichait à l'exploitant le contenu de tout
+// fichier que root peut lire, pour peu que .ssh ou la clé soit un lien — ou un
+// lien physique, d'où le refus d'une clé qui n'appartient pas au projet. La
+// lecture est bornée (maxKeySize) : une clé creuse démesurée ne remplit ni la
+// mémoire ni le terminal. Et une clé qui n'est pas du texte imprimable n'est pas
+// affichée (keyText).
+func PublicKey(ex exec.Executor, proj *model.Project, ident Identity) (string, error) {
+	owner, err := keyOwner(ex, proj, ident)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return "", fmt.Errorf("aucune clé de déploiement : lancer « ogs apply » pour la générer")
+		// Un projet déclaré mais jamais appliqué n'a ni compte ni clé : c'est
+		// l'absence de la clé qu'il faut dire, et ce qui la crée. Le constat se
+		// fait sans rien lire ni suivre.
+		if kind, _, lerr := fs.LinkStateAt(proj.Spec.Layout.Root, sshDir, KeyName+".pub"); lerr == nil &&
+			kind == fs.EntryAbsent {
+			return "", errNoDeployKey
 		}
 		return "", err
 	}
-	return string(data), nil
+	ssh, err := openSSHDir(proj, owner)
+	if err == nil {
+		defer ssh.Close()
+		var data []byte
+		if data, _, err = ssh.ReadFile(KeyName+".pub", owner.UID, maxKeySize); err == nil {
+			if !keyText(data) {
+				return "", fmt.Errorf("%s n'est pas une clé publique affichable (caractère de contrôle ou "+
+					"octet invalide) : ogs ne l'affiche pas — la retirer, puis « ogs apply %s » en génère une",
+					filepath.Join(ssh.Path(), KeyName+".pub"), proj.ID())
+			}
+			return string(data), nil
+		}
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return "", errNoDeployKey
+	}
+	return "", err
+}
+
+// keyText dit si une clé publique lue dans .ssh peut s'afficher telle quelle :
+// « user key show » et « user key rotate » la rendent brute, pour qu'elle se
+// copie. Le fichier appartient au projet, qui y écrit ce qu'il veut, et un saut
+// de ligne ou une séquence d'échappement forgeraient des lignes dans le terminal
+// de l'exploitant. Une clé publique est du texte imprimable, sur une ligne ; un
+// octet qui n'est pas de l'UTF-8 compte comme un contrôle, un terminal en 8 bits
+// lisant 0x9b comme l'introducteur d'une séquence.
+func keyText(data []byte) bool {
+	s := strings.TrimSuffix(string(data), "\n")
+	return utf8.ValidString(s) && !strings.ContainsFunc(s, unicode.IsControl)
 }
 
 // RotateKey régénère la paire de déploiement en conservant l'ancienne clé
 // publique, afin qu'elle puisse être retirée chez l'hébergeur du dépôt.
+//
+// La commande tourne hors de tout plan : aucun contrôle de l'arborescence ne la
+// précède. Tout passe donc par le descripteur de .ssh qu'ouvre openSSHDir, qui
+// refuse un lien et un répertoire étranger au projet.
 //
 // backupDir est le répertoire où atterrit l'ancienne clé privée — jamais le .ssh
 // du projet : c'est lui qui le possède, et le nom horodaté de la copie se devine
 // à la seconde près, si bien qu'un lien posé d'avance à ce nom ferait écrire par
 // root le contenu de la clé là où le projet l'aurait décidé.
 func RotateKey(ctx context.Context, ex exec.Executor, proj *model.Project, ident Identity, backupDir string) (old string, err error) {
-	root := proj.Spec.Layout.Root
-	path := KeyPath(root)
-	// Le contrôle vient avant toute lecture : la sauvegarde lit par os.ReadFile,
-	// donc à travers un lien, et recopierait le contenu d'un fichier de root dans
-	// un répertoire que le projet lit. Même invariant qu'à la génération (§7.1.2).
-	for _, f := range []string{path, path + ".pub"} {
-		if info, lerr := os.Lstat(f); lerr == nil && !info.Mode().IsRegular() {
+	owner, err := keyOwner(ex, proj, ident)
+	if err != nil {
+		return "", err
+	}
+	ssh, err := openSSHDir(proj, owner)
+	if err != nil {
+		return "", err
+	}
+	defer ssh.Close()
+	// Le contrôle vient avant toute lecture : une clé remplacée par un lien, un
+	// répertoire ou une FIFO n'est ni lue, ni sauvegardée, ni remplacée. Même
+	// invariant qu'à la génération (§7.1.2). Une clé qui n'appartient pas au
+	// projet ne l'est pas davantage : ce peut être un lien physique vers celle
+	// d'un autre compte, dont l'ancienne clé publique serait affichée. Ni une clé
+	// démesurée, que root lirait en mémoire puis réécrirait dans les sauvegardes.
+	for _, name := range []string{KeyName, KeyName + ".pub"} {
+		e, present, err := ssh.Entry(name)
+		if err != nil {
+			return "", err
+		}
+		path := filepath.Join(ssh.Path(), name)
+		switch {
+		case !present:
+		case !e.Regular:
 			return "", fmt.Errorf("%s existe et n'est pas un fichier régulier : le retirer "+
-				"avant de renouveler la clé de déploiement", f)
+				"avant de renouveler la clé de déploiement", path)
+		case owner.UID >= 0 && int(e.UID) != owner.UID:
+			return "", fmt.Errorf("%s appartient à l'uid %d, non à %s : le retirer, ou le rendre au projet, "+
+				"avant de renouveler la clé de déploiement", path, e.UID, proj.Spec.User.Name)
+		case e.Size > maxKeySize:
+			return "", fmt.Errorf("%s fait %d octets, bien plus qu'une clé : le retirer avant de renouveler "+
+				"la clé de déploiement", path, e.Size)
 		}
 	}
-	old, _ = PublicKey(root)
-	if _, err := fs.BackupTo(path, backupDir, nowFunc()); err != nil && !os.IsNotExist(err) {
+	// Relues par le descripteur, avec les mêmes contrôles : entre l'examen et la
+	// lecture, l'utilisateur a pu mettre autre chose sous le même nom.
+	switch data, _, err := ssh.ReadFile(KeyName+".pub", owner.UID, maxKeySize); {
+	case err == nil && !keyText(data):
+		return "", fmt.Errorf("%s n'est pas une clé publique affichable (caractère de contrôle ou octet "+
+			"invalide) : le retirer avant de renouveler la clé de déploiement", filepath.Join(ssh.Path(), KeyName+".pub"))
+	case err == nil:
+		old = string(data)
+	case !errors.Is(err, os.ErrNotExist):
+		return "", err
+	}
+	switch data, perm, err := ssh.ReadFile(KeyName, owner.UID, maxKeySize); {
+	case err == nil:
+		if _, err := fs.BackupDataTo(KeyName, data, perm, backupDir, nowFunc()); err != nil {
+			return old, err
+		}
+	case !errors.Is(err, os.ErrNotExist):
 		return old, err
 	}
 	dir, err := os.MkdirTemp("", "ogs-keygen-")
@@ -412,15 +560,7 @@ func RotateKey(ctx context.Context, ex exec.Executor, proj *model.Project, ident
 	if ex.Simulated() {
 		return old, nil
 	}
-	u, err := ident.LookupUser(proj.Spec.User.Name)
-	if err != nil || u == nil {
-		return old, fmt.Errorf("utilisateur %s introuvable", proj.Spec.User.Name)
-	}
-	g, err := ident.LookupGroup(proj.Spec.User.Group)
-	if err != nil || g == nil {
-		return old, fmt.Errorf("groupe %s introuvable", proj.Spec.User.Group)
-	}
-	return old, installKeyPair(gen, path, u.UID, g.GID)
+	return old, installKeyPair(gen, ssh, owner)
 }
 
 func hostname() string {

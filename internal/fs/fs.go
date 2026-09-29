@@ -526,6 +526,15 @@ func BackupTo(path, dir string, now time.Time) (string, error) {
 	return dst, nil
 }
 
+// BackupDataTo sauvegarde, sous le nom horodaté de base, un contenu déjà lu par
+// l'appelant — dans les mêmes conditions que BackupTo, par writeBackup : jamais
+// sur une autre sauvegarde, jamais à travers un lien. Il sert quand l'original
+// vit dans un répertoire qu'un non-root possède : BackupTo le lirait par son nom,
+// donc à travers un lien, là où l'appelant le lit par un descripteur (DirAt).
+func BackupDataTo(base string, data []byte, perm os.FileMode, dir string, now time.Time) (string, error) {
+	return writeBackup(dir, base, data, perm, now)
+}
+
 // backupName construit le nom horodaté d'une sauvegarde. Il n'est pas exposé :
 // personne d'autre n'a de nom à composer, et le plan — seul endroit qui annonce
 // une sauvegarde à l'exploitant — s'affiche avant que l'horodatage existe. Il

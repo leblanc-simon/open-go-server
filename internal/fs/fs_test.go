@@ -220,6 +220,33 @@ func TestBackupToNEcraseJamaisUneAutreSauvegarde(t *testing.T) {
 	}
 }
 
+// Deux rotations de la clé de déploiement dans la même seconde : la seconde
+// sauvegarde écrasait la première, et l'ancienne clé privée était perdue.
+func TestBackupDataToNEcraseJamaisUneAutreSauvegarde(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "backups")
+	now := time.Date(2026, 8, 23, 3, 4, 5, 0, time.UTC)
+	contenus := map[string]string{}
+	for _, cle := range []string{"première clé\n", "seconde clé\n"} {
+		dst, err := BackupDataTo("id_ed25519", []byte(cle), 0o600, dir, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, pris := contenus[dst]; pris {
+			t.Fatalf("%s a servi deux fois", dst)
+		}
+		contenus[dst] = cle
+	}
+	for dst, want := range contenus {
+		info, err := os.Stat(dst)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if data, _ := os.ReadFile(dst); string(data) != want || info.Mode().Perm() != 0o600 {
+			t.Errorf("%s contient %q en %04o, attendu %q en 0600", dst, data, info.Mode().Perm(), want)
+		}
+	}
+}
+
 func TestEnsureDirFixesMode(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "logs")
 	if err := EnsureDir(dir, 0o750, KeepOwner); err != nil {

@@ -1,6 +1,8 @@
 package cli
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -12,7 +14,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"leblanc.io/open-go-server/internal/engine"
-	"leblanc.io/open-go-server/internal/exec"
+	"leblanc.io/open-go-server/internal/fs"
 	"leblanc.io/open-go-server/internal/hook"
 	"leblanc.io/open-go-server/internal/model"
 	"leblanc.io/open-go-server/internal/naming"
@@ -320,8 +322,15 @@ func newSiteCloneCommand(app *App) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "clone <id>",
 		Short: "Dupliquer un site vers un autre environnement",
-		Long: "Crée le projet de destination avec la même configuration, copie le contenu de\n" +
-			"www/ puis, si demandé, restaure un dump de la base source dans la base cible.",
+		Long: "Crée le projet de destination avec la même configuration, recopie le contenu de\n" +
+			"www/ sans suivre aucun lien et n'en reprend que les fichiers du compte source, puis,\n" +
+			"si demandé, restaure un dump de la base source dans la base cible.\n\n" +
+			"Un lien est recopié comme lien, et un www source remplacé par un lien fait refuser\n" +
+			"la copie. Les fichiers d'un autre compte (root, www-data), les fichiers spéciaux et\n" +
+			"ce qui se trouve au-delà de 1024 niveaux sont écartés et nommés, et la commande rend\n" +
+			"alors le code 6. Ni les ACL ni les attributs étendus ne sont reportés. Une\n" +
+			"interruption (Ctrl-C) arrête la copie et rend le code 9 : le projet de destination\n" +
+			"est créé, avec une partie du contenu seulement.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			source, err := app.loadProject(args[0])
@@ -367,12 +376,46 @@ func newSiteCloneCommand(app *App) *cobra.Command {
 				partial = err
 			}
 
-			// Copie du contenu applicatif, une fois l'arborescence en place.
+			// Copie du contenu applicatif, une fois l'arborescence en place. Une copie
+			// refusée laisse la préproduction sans contenu, une copie interrompue ou
+			// une entrée écartée la laisse incomplète : c'est un succès partiel, que le
+			// code de retour doit dire autant que l'avertissement.
 			srcWWW := filepath.Join(source.Spec.Layout.Root, "www")
 			dstWWW := filepath.Join(target.Spec.Layout.Root, "www")
-			if err := app.copyTree(cmd, srcWWW, dstWWW, target); err != nil {
+			skipped, err := app.copyTree(cmd.Context(), source, target)
+			for _, s := range skipped.Named {
+				app.printf("⚠ non recopié : %s\n", s)
+			}
+			if n := skipped.Count - len(skipped.Named); n > 0 {
+				app.printf("⚠ … et %d autre(s) entrée(s) non recopiée(s)\n", n)
+			}
+			switch {
+			case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+				// Une interruption demandée n'est pas un succès partiel : rien de ce
+				// qui suit — la copie des données comprise — ne doit se faire, et le
+				// projet créé ne doit pas s'annoncer comme un clone achevé.
+				_ = app.Audit.Record(target.ID(), "site", "site.clone", "interrompu",
+					"depuis "+source.ID()+" : copie du contenu interrompue à la demande")
+				return exitf(CodeCancelled, "copie interrompue à la demande — %s n'en porte qu'une partie ; "+
+					"le projet %s est créé : « ogs project delete %s » avant un nouveau clone",
+					dstWWW, target.ID(), target.ID())
+			case errors.Is(err, errNotCopied):
 				app.printf("⚠ copie du contenu : %v\n", err)
-			} else {
+				if partial == nil {
+					partial = exitf(CodePartial, "le contenu de %s n'a pas été recopié", srcWWW)
+				}
+			case err != nil:
+				app.printf("⚠ copie du contenu interrompue : %v — %s n'en porte qu'une partie\n", err, dstWWW)
+				if partial == nil {
+					partial = exitf(CodePartial, "le contenu de %s n'a été recopié qu'en partie", srcWWW)
+				}
+			case skipped.Count > 0:
+				app.printf("⚠ contenu copié en partie : %s → %s, %d entrée(s) écartée(s)\n",
+					srcWWW, dstWWW, skipped.Count)
+				if partial == nil {
+					partial = exitf(CodePartial, "%d entrée(s) de %s non recopiée(s)", skipped.Count, srcWWW)
+				}
+			default:
 				app.printf("✓ contenu copié : %s → %s\n", srcWWW, dstWWW)
 			}
 
@@ -431,27 +474,64 @@ func (a *App) cloneProject(source *model.Project, env naming.Env) (*model.Projec
 	return &clone, nil
 }
 
-// copyTree recopie une arborescence sous l'identité du projet cible.
-func (a *App) copyTree(cmd *cobra.Command, src, dst string, target *model.Project) error {
-	if _, err := os.Stat(src); err != nil {
-		return fmt.Errorf("source absente : %w", err)
+// errNotCopied marque une copie refusée avant d'avoir rien écrit : la
+// préproduction est sans contenu, et non avec une partie.
+var errNotCopied = errors.New("rien n'a été recopié")
+
+// copyTree recopie le www du projet source dans celui du projet cible, donne la
+// copie au projet cible, et rend compte des entrées écartées — toutes comptées,
+// les premières nommées : leur nombre est aux mains de l'utilisateur de la
+// production.
+//
+// Le www source appartient à l'utilisateur de la production, qui peut le
+// remplacer — lui ou n'importe lequel de ses sous-répertoires — par un lien vers
+// ce que root seul peut lire. « cp -a src/. dst » lancé en root suivait ce lien,
+// et le « chown -R » qui suivait donnait la copie au compte de préproduction,
+// dans un docroot servi. fs.CopyTreeAt ouvre chaque composant par un descripteur
+// sans suivre de lien : un lien est recopié comme lien, jamais traversé, et un
+// www source qui en est un fait refuser la copie. Il ne recopie que les fichiers
+// du compte source, résolu par l'identité et non déduit du propriétaire de www :
+// un lien physique vers un fichier d'un autre compte n'en est pas un. Les
+// propriétaires sont posés entrée par entrée, sur les descripteurs : il n'y a
+// plus de « chown -R » qui repasserait par les noms.
+//
+// La copie est une opération de fichiers, non une commande : sous préfixe, elle
+// a lieu comme les autres écritures, les propriétaires en moins — le compte
+// source est alors celui qui possède son www, l'essai lui-même.
+//
+// Une erreur rendue avant toute écriture porte errNotCopied. Toute autre arrête
+// une copie commencée : un lien ou une entrée absente rencontrés plus bas n'ont
+// pas le sens qu'ils ont à la racine, et « rien n'est recopié » ou « source
+// absente » y seraient faux.
+//
+// La copie suit ctx, que main annule sur SIGINT et SIGTERM : « cp -a » mourait
+// avec son groupe de processus, une copie faite dans le processus doit consulter
+// le contexte elle-même. Annulée, elle rend l'erreur du contexte, telle quelle.
+func (a *App) copyTree(ctx context.Context, source, target *model.Project) (fs.Skipped, error) {
+	srcUID, owner := -1, fs.KeepOwner
+	if !a.Exec.Simulated() {
+		uid, _, err := a.systemProvider().ResolveOwner(source, "")
+		if err != nil {
+			return fs.Skipped{}, fmt.Errorf("%w : %w", errNotCopied, err)
+		}
+		srcUID = uid
+		uid, gid, err := a.systemProvider().ResolveOwner(target, "")
+		if err != nil {
+			return fs.Skipped{}, fmt.Errorf("%w : %w", errNotCopied, err)
+		}
+		owner = fs.Owner{UID: uid, GID: gid}
 	}
-	if a.Exec.Simulated() {
-		a.printf("= mode simulé : la copie n'est pas exécutée\n")
-		return nil
+	skipped, err := fs.CopyTreeAt(ctx, source.Spec.Layout.Root, "www", target.Spec.Layout.Root, "www", srcUID, owner)
+	var root *fs.RootError
+	switch {
+	case !errors.As(err, &root):
+		return skipped, err
+	case errors.Is(err, fs.ErrNotDirectory):
+		return skipped, fmt.Errorf("%w, ogs ne suit aucun lien : %w", errNotCopied, err)
+	case root.Source && errors.Is(err, os.ErrNotExist):
+		return skipped, fmt.Errorf("%w, source absente : %w", errNotCopied, err)
 	}
-	// cp -a préserve les permissions et les liens ; le chown final rend le
-	// contenu au propriétaire du projet cible.
-	if _, err := a.Exec.Run(cmd.Context(), exec.Command{
-		Name: "/bin/cp", Args: []string{"-a", src + "/.", dst},
-	}); err != nil {
-		return err
-	}
-	_, err := a.Exec.Run(cmd.Context(), exec.Command{
-		Name: "/bin/chown",
-		Args: []string{"-R", target.Spec.User.Name + ":" + target.Spec.User.Group, dst},
-	})
-	return err
+	return skipped, fmt.Errorf("%w : %w", errNotCopied, err)
 }
 
 // cloneData transfère le contenu de la base source vers la base cible.

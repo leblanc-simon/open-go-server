@@ -106,6 +106,224 @@ if [ ! -f /home/garde.test/.ssh/authorized_keys ] \
 fi
 echo "authorized_keys posé à la main préservé (apply rend $code)"
 
+# Rotation de la clé de déploiement : hors de tout plan, elle ne peut compter que
+# sur elle-même. Elle doit poser la paire au compte du projet — un chown vers un
+# autre compte, que seul root réussit —, et refuser un .ssh remplacé par un lien,
+# que root suivrait jusque dans /root.
+ogs user key rotate keystest --yes >/dev/null 2>&1
+proprio=$(stat -c '%U:%G %a' /home/keys.test/.ssh/id_ed25519)
+if [ "$proprio" != "keystest:keystest 600" ]; then
+    echo "ÉCHEC : clé privée renouvelée en $proprio, attendu keystest:keystest 600"
+    exit 1
+fi
+mkdir -p /root/ssh-temoin
+echo "clé de root" > /root/ssh-temoin/id_ed25519
+mv /home/keys.test/.ssh /home/keys.test/.ssh.orig
+ln -s /root/ssh-temoin /home/keys.test/.ssh
+if ogs user key rotate keystest --yes >/dev/null 2>&1; then
+    echo "ÉCHEC : la rotation a accepté un .ssh remplacé par un lien"
+    exit 1
+fi
+if [ "$(cat /root/ssh-temoin/id_ed25519)" != "clé de root" ] || [ -e /root/ssh-temoin/id_ed25519.pub ]; then
+    echo "ÉCHEC : root a écrit dans la cible du lien"
+    ls -l /root/ssh-temoin | sed 's/^/  /'
+    exit 1
+fi
+rm /home/keys.test/.ssh
+mv /home/keys.test/.ssh.orig /home/keys.test/.ssh
+rm -rf /root/ssh-temoin
+echo "clé renouvelée au compte du projet, .ssh lié refusé"
+
+# Un lien physique ne se voit pas comme un lien : une clé publique liée à un
+# fichier de root n'est ni affichée par « user key show », ni reprise par la
+# rotation. Seul root pose ce lien sous fs.protected_hardlinks, mais c'est un
+# réglage de la machine, non une garantie — et seul un système réel donne à un
+# fichier du .ssh un autre propriétaire que le projet.
+cp -p /home/keys.test/.ssh/id_ed25519.pub /root/pub.orig
+echo "secret de root" > /root/temoin-cle
+chmod 600 /root/temoin-cle
+rm /home/keys.test/.ssh/id_ed25519.pub
+ln /root/temoin-cle /home/keys.test/.ssh/id_ed25519.pub
+if sortie=$(ogs user key show keystest 2>&1) || [[ "$sortie" == *"secret de root"* ]]; then
+    echo "ÉCHEC : « user key show » a lu une clé liée à un fichier de root"
+    echo "$sortie" | sed 's/^/  /'
+    exit 1
+fi
+if sortie=$(ogs user key rotate keystest --yes 2>&1) || [[ "$sortie" == *"secret de root"* ]]; then
+    echo "ÉCHEC : la rotation a repris une clé liée à un fichier de root"
+    echo "$sortie" | sed 's/^/  /'
+    exit 1
+fi
+if [ "$(cat /root/temoin-cle)" != "secret de root" ]; then
+    echo "ÉCHEC : le fichier de root a été réécrit"
+    exit 1
+fi
+rm /home/keys.test/.ssh/id_ed25519.pub /root/temoin-cle
+cp -p /root/pub.orig /home/keys.test/.ssh/id_ed25519.pub
+rm /root/pub.orig
+echo "clé liée physiquement à un fichier de root : ni lue, ni reprise"
+
+# Une clé creuse au compte du projet passe tous les autres contrôles : elle est à
+# lui, et ne lui coûte aucun bloc. Ni « show » ni la rotation ne la lisent — root
+# la lisait en mémoire, et la rotation la réécrivait pleine dans les sauvegardes,
+# sur /var. Le mode simulé ne voit ni blocs alloués ni sauvegardes réelles.
+cp -p /home/keys.test/.ssh/id_ed25519 /root/cle.orig
+cp -p /home/keys.test/.ssh/id_ed25519.pub /root/pub.orig
+avant=$(du -sk /var/lib/ogs/backups 2>/dev/null | cut -f1)
+truncate -s 1G /home/keys.test/.ssh/id_ed25519.pub
+if sortie=$(ogs user key show keystest 2>&1) || [ "${#sortie}" -gt 4096 ]; then
+    echo "ÉCHEC : « user key show » a rendu une clé publique creuse de 1 Gio (${#sortie} caractères)"
+    exit 1
+fi
+cp -p /root/pub.orig /home/keys.test/.ssh/id_ed25519.pub
+truncate -s 1G /home/keys.test/.ssh/id_ed25519
+if ogs user key rotate keystest --yes >/dev/null 2>&1; then
+    echo "ÉCHEC : la rotation a accepté une clé privée creuse de 1 Gio"
+    exit 1
+fi
+apres=$(du -sk /var/lib/ogs/backups 2>/dev/null | cut -f1)
+if [ "${apres:-0}" -gt $(( ${avant:-0} + 64 )) ]; then
+    echo "ÉCHEC : les sauvegardes ont grossi de $(( ${apres:-0} - ${avant:-0} )) Kio"
+    exit 1
+fi
+cp -p /root/cle.orig /home/keys.test/.ssh/id_ed25519
+rm /root/cle.orig /root/pub.orig
+echo "clé creuse démesurée : ni affichée, ni sauvegardée"
+
+# La clé publique est rendue brute dans le terminal de l'exploitant, pour qu'elle
+# se copie : une séquence d'échappement posée par le projet n'y est pas rendue.
+cp -p /home/keys.test/.ssh/id_ed25519.pub /root/pub.orig
+printf 'ssh-ed25519 AAAA forge\033[2J\n' > /home/keys.test/.ssh/id_ed25519.pub
+if sortie=$(ogs user key show keystest 2>&1) || [[ "$sortie" == *$'\e'* ]]; then
+    echo "ÉCHEC : « user key show » a rendu une clé publique portant une séquence d'échappement"
+    exit 1
+fi
+cp -p /root/pub.orig /home/keys.test/.ssh/id_ed25519.pub
+rm /root/pub.orig
+echo "clé publique non imprimable : non affichée"
+
+# Clone vers la préproduction : root recopie un www que le locataire possède. Il
+# n'en recopie que les fichiers du compte source — un lien physique vers un
+# fichier de root est écarté, et dit —, repose les liens physiques internes au
+# lieu de les écrire N fois, et garde creux un fichier creux : root n'écrit pas
+# plus que ce que le locataire occupe. Le mode simulé ne voit ni propriétaires
+# ni blocs alloués.
+www=/home/keys.test/www
+echo "secret de root" > /root/temoin-clone
+chmod 600 /root/temoin-clone
+ln /root/temoin-clone "$www/fuite"
+truncate -s 1G "$www/creux.bin"
+head -c 1048576 /dev/urandom > "$www/lie.bin"
+for i in $(seq 1 20); do ln "$www/lie.bin" "$www/lie-$i.bin"; done
+chown keystest:keystest "$www/creux.bin" "$www/lie.bin"
+# La profondeur aussi est aux mains du locataire, et une copie par descripteurs
+# n'a plus la borne de fait de « cp -a » (PATH_MAX) : au-delà de 1024 niveaux
+# sous www, le sous-arbre est écarté et dit. Et le nom d'une entrée écartée est
+# cité : un saut de ligne et une séquence d'échappement n'y forgent aucune ligne.
+( cd "$www" && mkdir profond && cd profond && for i in $(seq 1 1100); do mkdir a && cd a || exit 1; done )
+chown -R keystest:keystest "$www/profond"
+forge=$'x : fichier spécial\n✓ contenu copié : tout va bien\n\e[1A'
+mkfifo "$www/$forge"
+sortie=$(ogs site clone keystest --to prep --yes 2>&1)
+prep=$(getent passwd keystestprep | cut -d: -f6)
+if [ -z "$prep" ] || [ ! -f "$prep/www/lie.bin" ]; then
+    echo "ÉCHEC : la préproduction n'a pas reçu le contenu"
+    echo "$sortie" | tail -8 | sed 's/^/  /'
+    exit 1
+fi
+if [ -e "$prep/www/fuite" ] || [[ "$sortie" != *"non recopié"*"fuite"* ]]; then
+    echo "ÉCHEC : le lien physique vers un fichier de root a été recopié, ou écarté sans le dire"
+    ls -l "$prep/www" | sed 's/^/  /'
+    exit 1
+fi
+liens=$(stat -c %h "$prep/www/lie.bin")
+if [ "$liens" != 21 ] || [ "$(stat -c %i "$prep/www/lie.bin")" != "$(stat -c %i "$prep/www/lie-20.bin")" ]; then
+    echo "ÉCHEC : les liens physiques internes ont été dédoublés ($liens lien(s) sur la copie)"
+    exit 1
+fi
+alloue=$(du -k "$prep/www/creux.bin" | cut -f1)
+if [ "$(stat -c %s "$prep/www/creux.bin")" != 1073741824 ] || [ "$alloue" -gt 1024 ]; then
+    echo "ÉCHEC : le fichier creux a été recopié plein ($alloue Kio alloués)"
+    exit 1
+fi
+proprio=$(stat -c '%U:%G' "$prep/www/lie.bin")
+if [ "$proprio" != "keystestprep:keystestprep" ]; then
+    echo "ÉCHEC : la copie appartient à $proprio, attendu keystestprep:keystestprep"
+    exit 1
+fi
+borne="$prep/www/profond$(printf '/a%.0s' $(seq 1 1023))"
+if [ ! -d "$borne" ] || [ -e "$borne/a" ] || [[ "$sortie" != *"au-delà de 1024 niveaux"* ]]; then
+    echo "ÉCHEC : la copie n'a pas été bornée à 1024 niveaux, ou le sous-arbre écarté n'a pas été dit"
+    echo "$sortie" | grep -F niveaux | cut -c1-200 | sed 's/^/  /'
+    exit 1
+fi
+if [[ "$sortie" == *$'\e'* ]] || grep -q '^✓ contenu copié' <<<"$sortie"; then
+    echo "ÉCHEC : un nom d'entrée écartée a forgé une ligne de la sortie"
+    exit 1
+fi
+rm -rf "$www/profond" "$www/$forge"
+rm -f /root/temoin-clone "$www/fuite" "$www/creux.bin" "$www"/lie*.bin
+echo "clone : fichier de root écarté, liens physiques reposés, fichier creux gardé creux, profondeur bornée"
+
+# La copie du clone se fait dans le processus : « cp -a » mourait avec son groupe,
+# elle doit suivre l'annulation elle-même, et main capte SIGINT et SIGTERM. Le
+# locataire allonge la copie à volonté — des liens physiques qui alternent entre
+# deux branches profondes coûtent chacun une réouverture de la branche. Un
+# SIGTERM doit l'arrêter aussitôt, rendre le code 9, et ne laisser aucun
+# répertoire créé à root — en 0700, le projet ne pourrait ni le lire ni le vider.
+# Le mode simulé ne voit ni propriétaires ni signaux.
+ogs site create arret.test --kind static --tls=false --yes >/dev/null 2>&1
+www=/home/arret.test/www
+profond=$(printf '/a%.0s' $(seq 1 1023))
+for b in x1 x2; do
+    ( mkdir "$www/$b" && cd "$www/$b" && for i in $(seq 1 1023); do mkdir a && cd a || exit 1; done && echo f > f )
+done
+mkdir "$www/y"
+# Noms de même longueur : l'ordre de la copie, celui des noms, alterne alors
+# strictement entre les deux branches.
+for i in $(seq 1 4000); do ln "$www/x$(( i % 2 + 1 ))$profond/f" "$www/y/$(printf 'l%05d' "$i")"; done
+chown -R arrettest:arrettest "$www"
+ogs site clone arrettest --to prep --yes >/root/arret.log 2>&1 &
+pid=$!
+prep=
+for _ in $(seq 1 600); do
+    prep=$(getent passwd arrettestprep | cut -d: -f6)
+    if [ -n "$prep" ] && [ -d "$prep/www/y" ]; then break; fi
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.1
+done
+if [ -z "$prep" ] || [ ! -d "$prep/www/y" ] || ! kill -0 "$pid" 2>/dev/null; then
+    echo "ÉCHEC : la copie n'a pas atteint les liens alternés, ou s'est achevée avant le signal"
+    tail -5 /root/arret.log | sed 's/^/  /'
+    exit 1
+fi
+SECONDS=0
+kill -TERM "$pid"
+wait "$pid"
+code=$?
+if [ "$code" != 9 ] || [ "$SECONDS" -gt 5 ]; then
+    echo "ÉCHEC : un SIGTERM pendant la copie rend le code $code en $SECONDS s, attendu 9 aussitôt"
+    tail -5 /root/arret.log | sed 's/^/  /'
+    exit 1
+fi
+if grep -q '^✓ contenu copié' /root/arret.log || ! grep -q "copie interrompue à la demande" /root/arret.log; then
+    echo "ÉCHEC : la copie interrompue ne l'a pas dit, ou s'est annoncée faite"
+    tail -5 /root/arret.log | sed 's/^/  /'
+    exit 1
+fi
+restes=$(find "$prep/www" -user root -print -quit)
+if [ -n "$restes" ]; then
+    echo "ÉCHEC : la copie interrompue a laissé à root $(stat -c '%a %U' "$restes") : $restes" | cut -c1-200
+    exit 1
+fi
+copies=$(find "$prep/www/y" -maxdepth 1 -type f | wc -l)
+if [ "$copies" -ge 4000 ]; then
+    echo "ÉCHEC : la copie a continué après le signal ($copies liens sur 4000)"
+    exit 1
+fi
+rm -rf "$www"/x1 "$www"/x2 "$www"/y "$prep/www"/x1 "$prep/www"/x2 "$prep/www"/y /root/arret.log
+echo "clone interrompu par SIGTERM : code 9, $copies lien(s) sur 4000, aucun répertoire laissé à root"
+
 echo '<?php echo "php actif sous ", posix_getpwuid(posix_geteuid())["name"];' \
     > /home/php.test/www/index.php
 chown phptest:phptest /home/php.test/www/index.php

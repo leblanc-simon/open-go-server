@@ -157,9 +157,11 @@ func (i *Installer) runAs(ctx context.Context, user, script string) error {
 }
 
 // Version interroge le binaire lié pour connaître la version réellement en place.
-// Le lien appartenant à root mais pointant dans le home de l'utilisateur, celui-ci
-// peut en changer la cible : la version effective doit donc être vérifiée, non
-// supposée (§7.11.2).
+// Le lien vit dans ~/.local/bin, qui appartient à l'utilisateur (D70) : il en
+// change la cible à volonté, et la version effective doit donc être vérifiée, non
+// supposée (§7.11.2). Pour la même raison, le binaire est lancé sous l'identité
+// du projet, jamais en root : exécuter en root ce que désigne un lien de
+// l'utilisateur, c'est lui laisser choisir ce que root exécute.
 func (i *Installer) Version(ctx context.Context, proj *model.Project, runtime string) (string, error) {
 	link := LinkPath(proj.Spec.Layout.Root, runtime)
 	if _, err := os.Lstat(link); err != nil {
@@ -168,7 +170,7 @@ func (i *Installer) Version(ctx context.Context, proj *model.Project, runtime st
 	if i.Exec == nil || i.Exec.Simulated() {
 		return "", nil
 	}
-	res, err := i.Exec.Run(ctx, exec.Command{Name: link, Args: []string{"--version"}})
+	res, err := i.Exec.Run(ctx, exec.Command{Name: link, Args: []string{"--version"}, AsUser: proj.Spec.User.Name})
 	if err != nil {
 		return "", err
 	}

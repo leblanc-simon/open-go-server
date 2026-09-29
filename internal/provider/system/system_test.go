@@ -4,8 +4,10 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"leblanc.io/open-go-server/internal/config"
 	"leblanc.io/open-go-server/internal/engine"
@@ -788,37 +790,468 @@ func TestCleDeDeploiementEstGenereeHorsDeSsh(t *testing.T) {
 	}
 }
 
-func TestInstallKeyFileNeSuitPasUnLien(t *testing.T) {
+func TestInstallKeyPairNeSuitPasUnLien(t *testing.T) {
 	// La fenêtre que l'utilisateur du projet gagnerait sinon : reposer un lien
-	// entre le contrôle du plan et l'écriture de l'apply. Le chemin est délié puis
-	// recréé en O_CREAT|O_EXCL|O_NOFOLLOW, jamais suivi.
-	dir := t.TempDir()
-	temoin := filepath.Join(dir, "fichier-de-root")
+	// entre le contrôle du plan et l'écriture de l'apply. Le nom est délié puis
+	// recréé en O_CREAT|O_EXCL|O_NOFOLLOW par le descripteur de .ssh, jamais suivi.
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, ".ssh"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	temoin := filepath.Join(t.TempDir(), "fichier-de-root")
 	const contenu = "contenu de root\n"
 	if err := os.WriteFile(temoin, []byte(contenu), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	lien := filepath.Join(dir, KeyName)
+	lien := filepath.Join(root, ".ssh", KeyName)
 	if err := os.Symlink(temoin, lien); err != nil {
 		t.Fatal(err)
 	}
+	gen := filepath.Join(t.TempDir(), KeyName)
+	for f, data := range map[string]string{gen: "clé privée\n", gen + ".pub": "clé publique\n"} {
+		if err := os.WriteFile(f, []byte(data), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
 
-	if err := installKeyFile(lien, []byte("clé privée\n"), 0o600, -1, -1); err != nil {
+	ssh, err := fs.OpenDirAt(root, ".ssh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ssh.Close()
+	if err := installKeyPair(gen, ssh, fs.KeepOwner); err != nil {
 		t.Fatal(err)
 	}
 	data, err := os.ReadFile(temoin)
 	if err != nil || string(data) != contenu {
 		t.Errorf("la cible du lien a été écrasée : %q, %v", string(data), err)
 	}
-	info, err := os.Lstat(lien)
+	for name, mode := range map[string]os.FileMode{KeyName: 0o600, KeyName + ".pub": 0o644} {
+		info, err := os.Lstat(filepath.Join(root, ".ssh", name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !info.Mode().IsRegular() {
+			t.Errorf("%s devrait être un fichier régulier (%v)", name, info.Mode())
+		}
+		if got := info.Mode().Perm(); got != mode {
+			t.Errorf("%s : mode %04o, attendu %04o", name, got, mode)
+		}
+	}
+}
+
+// keygenFactice tient lieu de ssh-keygen sans être un exécuteur simulé : la
+// rotation va alors jusqu'à l'installation de la paire, que l'on veut éprouver.
+type keygenFactice struct{ appels []exec.Command }
+
+func (k *keygenFactice) Simulated() bool { return false }
+
+func (k *keygenFactice) Run(_ context.Context, c exec.Command) (exec.Result, error) {
+	k.appels = append(k.appels, c)
+	if c.Name == "ssh-keygen" {
+		out := c.Args[len(c.Args)-1]
+		if err := os.WriteFile(out, []byte("-----BEGIN OPENSSH PRIVATE KEY-----\nneuve\n"), 0o600); err != nil {
+			return exec.Result{}, err
+		}
+		if err := os.WriteFile(out+".pub", []byte("ssh-ed25519 NEUVE ogs=shopfr@test\n"), 0o644); err != nil {
+			return exec.Result{}, err
+		}
+	}
+	return exec.Result{}, nil
+}
+
+// identiteDeLEssai donne au projet l'uid et le gid de qui fait tourner l'essai :
+// les chown de l'installation aboutissent alors sans root.
+func identiteDeLEssai(ident *FakeIdentity) {
+	ident.Users["shopfr"] = &UserInfo{Name: "shopfr", UID: os.Getuid(), GID: os.Getgid(), Managed: true}
+	ident.Groups["shopfr"] = &GroupInfo{Name: "shopfr", GID: os.Getgid()}
+}
+
+// sshLie remplace le .ssh du projet par un lien vers un répertoire hors du home,
+// qui figure /root/.ssh et porte déjà une paire.
+func sshLie(t *testing.T, root string) string {
+	t.Helper()
+	cible := filepath.Join(t.TempDir(), "root-ssh")
+	if err := os.MkdirAll(cible, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for name, data := range map[string]string{KeyName: "CLÉ PRIVÉE DE ROOT\n", KeyName + ".pub": "CLÉ PUBLIQUE DE ROOT\n"} {
+		if err := os.WriteFile(filepath.Join(cible, name), []byte(data), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.MkdirAll(root, 0o711); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.RemoveAll(filepath.Join(root, ".ssh"))
+	if err := os.Symlink(cible, filepath.Join(root, ".ssh")); err != nil {
+		t.Fatal(err)
+	}
+	return cible
+}
+
+func TestRotationRefuseUnSshRemplaceParUnLien(t *testing.T) {
+	// « ogs user key rotate » tourne hors de tout plan : aucun contrôle de
+	// l'arborescence ne le précède. Un Lstat des seules clés laissait résoudre
+	// .ssh, et root supprimait puis recréait la paire dans le répertoire visé
+	// — /root/.ssh, /etc/apt/apt.conf.d —, qu'il donnait ensuite au projet.
+	p, _, _, ident := fixture(t)
+	identiteDeLEssai(ident)
+	cible := sshLie(t, p.Spec.Layout.Root)
+
+	kg := &keygenFactice{}
+	sauvegardes := filepath.Join(t.TempDir(), "backups")
+	old, err := RotateKey(context.Background(), kg, p, ident, sauvegardes)
+	if err == nil || !strings.Contains(err.Error(), "lien symbolique") {
+		t.Fatalf("la rotation doit refuser un .ssh lié, obtenu %v", err)
+	}
+	if old != "" {
+		t.Errorf("l'ancienne clé a été lue à travers le lien : %q", old)
+	}
+	for name, attendu := range map[string]string{KeyName: "CLÉ PRIVÉE DE ROOT\n", KeyName + ".pub": "CLÉ PUBLIQUE DE ROOT\n"} {
+		data, err := os.ReadFile(filepath.Join(cible, name))
+		if err != nil || string(data) != attendu {
+			t.Errorf("%s a été touché dans la cible du lien : %q, %v", name, string(data), err)
+		}
+	}
+	if copies, _ := os.ReadDir(sauvegardes); len(copies) != 0 {
+		t.Errorf("%d copie(s) de la cible sauvegardée(s)", len(copies))
+	}
+	if len(kg.appels) != 0 {
+		t.Errorf("le refus doit précéder toute génération : %v", kg.appels)
+	}
+}
+
+func TestRotationRefuseUnSshQuiNAppartientPasAuProjet(t *testing.T) {
+	// Un vrai répertoire, mais pas celui du projet : l'utilisateur peut renommer
+	// en .ssh un répertoire de root resté dans son home.
+	p, _, _, ident := fixture(t)
+	ident.Users["shopfr"] = &UserInfo{Name: "shopfr", UID: os.Getuid() + 1, GID: os.Getgid(), Managed: true}
+	ident.Groups["shopfr"] = &GroupInfo{Name: "shopfr", GID: os.Getgid()}
+	ssh := filepath.Join(p.Spec.Layout.Root, ".ssh")
+	if err := os.MkdirAll(ssh, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(ssh, KeyName), []byte("CLÉ D'UN AUTRE\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	kg := &keygenFactice{}
+	// C'est .ssh lui-même que le refus nomme, avant d'examiner la moindre clé — et
+	// ce qui le répare : l'apply rend .ssh au projet.
+	_, err := RotateKey(context.Background(), kg, p, ident, filepath.Join(t.TempDir(), "b"))
+	if err == nil || !strings.Contains(err.Error(), ssh+" appartient à l'uid") {
+		t.Fatalf("la rotation doit refuser un .ssh étranger au projet, obtenu %v", err)
+	}
+	if !strings.Contains(err.Error(), "« ogs apply shopfr »") {
+		t.Errorf("le refus doit dire ce qui rend .ssh au projet : %v", err)
+	}
+	if data, _ := os.ReadFile(filepath.Join(ssh, KeyName)); string(data) != "CLÉ D'UN AUTRE\n" {
+		t.Errorf("la clé a été remplacée : %q", string(data))
+	}
+	if len(kg.appels) != 0 {
+		t.Errorf("le refus doit précéder toute génération : %v", kg.appels)
+	}
+}
+
+func TestUnSshEtrangerSansCleEstRefuse(t *testing.T) {
+	// Sans clé à examiner, seul le contrôle du répertoire parle : root créerait
+	// sinon la paire dans un .ssh qui n'est pas celui du projet — un répertoire
+	// de root que l'utilisateur a renommé dans son home —, et « show » dirait
+	// l'absence de clé au lieu du refus.
+	p, _, _, ident := fixture(t)
+	ident.Users["shopfr"] = &UserInfo{Name: "shopfr", UID: os.Getuid() + 1, GID: os.Getgid(), Managed: true}
+	ident.Groups["shopfr"] = &GroupInfo{Name: "shopfr", GID: os.Getgid()}
+	ssh := filepath.Join(p.Spec.Layout.Root, ".ssh")
+	if err := os.MkdirAll(ssh, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	kg := &keygenFactice{}
+	if _, err := RotateKey(context.Background(), kg, p, ident, filepath.Join(t.TempDir(), "b")); err == nil ||
+		!strings.Contains(err.Error(), ssh+" appartient à l'uid") {
+		t.Errorf("la rotation doit refuser un .ssh étranger, même vide : %v", err)
+	}
+	if len(kg.appels) != 0 {
+		t.Errorf("le refus doit précéder toute génération : %v", kg.appels)
+	}
+	if entries, _ := os.ReadDir(ssh); len(entries) != 0 {
+		t.Errorf("rien ne doit être écrit dans un .ssh étranger : %v", entries)
+	}
+	if _, err := PublicKey(kg, p, ident); err == nil || !strings.Contains(err.Error(), ssh+" appartient à l'uid") {
+		t.Errorf("« user key show » doit refuser un .ssh étranger, non dire la clé absente : %v", err)
+	}
+}
+
+// cleCreuse crée, dans le .ssh du projet, un fichier creux de size octets : il
+// n'occupe aucun bloc, et ne coûte donc rien à son propriétaire.
+func cleCreuse(t *testing.T, root, name string, size int64) {
+	t.Helper()
+	ssh := filepath.Join(root, ".ssh")
+	if err := os.MkdirAll(ssh, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	f := filepath.Join(ssh, name)
+	if err := os.WriteFile(f, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Truncate(f, size); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLaRotationNeLitPasUneCleDemesuree(t *testing.T) {
+	// Une clé creuse au compte du projet passe tous les autres contrôles : elle
+	// est à lui. La rotation la lisait en mémoire puis la réécrivait pleine dans
+	// les sauvegardes — de quoi épuiser la mémoire de root, ou remplir /var à
+	// chaque rotation.
+	p, _, _, ident := fixture(t)
+	identiteDeLEssai(ident)
+	cleCreuse(t, p.Spec.Layout.Root, KeyName, 8<<20)
+
+	kg := &keygenFactice{}
+	sauvegardes := filepath.Join(t.TempDir(), "backups")
+	if _, err := RotateKey(context.Background(), kg, p, ident, sauvegardes); err == nil ||
+		!strings.Contains(err.Error(), "octets") {
+		t.Fatalf("la rotation doit refuser une clé démesurée : %v", err)
+	}
+	if copies, _ := os.ReadDir(sauvegardes); len(copies) != 0 {
+		t.Errorf("une clé démesurée ne doit pas être sauvegardée : %v", copies)
+	}
+	if len(kg.appels) != 0 {
+		t.Errorf("le refus doit précéder toute génération : %v", kg.appels)
+	}
+}
+
+func TestLaClePubliqueDemesureeNEstPasLue(t *testing.T) {
+	p, _, _, ident := fixture(t)
+	identiteDeLEssai(ident)
+	cleCreuse(t, p.Spec.Layout.Root, KeyName+".pub", 8<<20)
+	if pub, err := PublicKey(&keygenFactice{}, p, ident); err == nil || len(pub) != 0 {
+		t.Errorf("« user key show » ne doit pas rendre une clé démesurée : %d octets, %v", len(pub), err)
+	}
+	// La rotation la refuse de même, sans rien lire ni générer.
+	kg := &keygenFactice{}
+	if _, err := RotateKey(context.Background(), kg, p, ident, filepath.Join(t.TempDir(), "b")); err == nil ||
+		len(kg.appels) != 0 {
+		t.Errorf("la rotation doit refuser une clé publique démesurée : %v, %v", err, kg.appels)
+	}
+}
+
+func TestLaClePubliqueNeSAfficheQueSiElleEstImprimable(t *testing.T) {
+	// La clé publique appartient au projet, et « show » comme « rotate » la
+	// rendent brute dans le terminal de l'exploitant : un saut de ligne et une
+	// séquence d'échappement y forgeaient des lignes, et un terminal en 8 bits lit
+	// 0x9b comme l'introducteur d'une séquence.
+	p, _, _, ident := fixture(t)
+	identiteDeLEssai(ident)
+	ssh := filepath.Join(p.Spec.Layout.Root, ".ssh")
+	if err := os.MkdirAll(ssh, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, forge := range []string{
+		"ssh-ed25519 AAAA ogs\n✓ clé vérifiée\n",
+		"ssh-ed25519 AAAA ogs\x1b[2J\n",
+		"ssh-ed25519 AAAA ogs\x9b2J\n",
+	} {
+		if err := os.WriteFile(filepath.Join(ssh, KeyName+".pub"), []byte(forge), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if pub, err := PublicKey(&keygenFactice{}, p, ident); err == nil || pub != "" {
+			t.Errorf("%q ne doit pas s'afficher : %q, %v", forge, pub, err)
+		}
+		kg := &keygenFactice{}
+		if old, err := RotateKey(context.Background(), kg, p, ident, filepath.Join(t.TempDir(), "b")); err == nil ||
+			old != "" || len(kg.appels) != 0 {
+			t.Errorf("la rotation doit refuser %q avant tout : %q, %v, %v", forge, old, err, kg.appels)
+		}
+	}
+	// Une clé ordinaire, commentaire accentué compris, s'affiche.
+	cle := "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI ogs=shopfr@hôte\n"
+	if err := os.WriteFile(filepath.Join(ssh, KeyName+".pub"), []byte(cle), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if pub, err := PublicKey(&keygenFactice{}, p, ident); err != nil || pub != cle {
+		t.Errorf("une clé imprimable doit s'afficher telle quelle : %q, %v", pub, err)
+	}
+}
+
+func TestRotationRemplaceLaPaireDansSsh(t *testing.T) {
+	p, _, _, ident := fixture(t)
+	identiteDeLEssai(ident)
+	ssh := filepath.Join(p.Spec.Layout.Root, ".ssh")
+	if err := os.MkdirAll(ssh, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for name, data := range map[string]string{KeyName: "ancienne privée\n", KeyName + ".pub": "ssh-ed25519 ANCIENNE\n"} {
+		if err := os.WriteFile(filepath.Join(ssh, name), []byte(data), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	sauvegardes := filepath.Join(t.TempDir(), "backups")
+	old, err := RotateKey(context.Background(), &keygenFactice{}, p, ident, sauvegardes)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !info.Mode().IsRegular() {
-		t.Errorf("%s devrait être un fichier régulier (%v)", lien, info.Mode())
+	if old != "ssh-ed25519 ANCIENNE\n" {
+		t.Errorf("ancienne clé publique : %q", old)
 	}
-	if got := info.Mode().Perm(); got != 0o600 {
-		t.Errorf("mode = %04o, attendu 0600", got)
+	for name, mode := range map[string]os.FileMode{KeyName: 0o600, KeyName + ".pub": 0o644} {
+		info, err := os.Lstat(filepath.Join(ssh, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := info.Mode().Perm(); !info.Mode().IsRegular() || got != mode {
+			t.Errorf("%s : %v, attendu un fichier régulier en %04o", name, info.Mode(), mode)
+		}
+	}
+	pub, err := PublicKey(&keygenFactice{}, p, ident)
+	if err != nil || !strings.Contains(pub, "NEUVE") {
+		t.Errorf("la nouvelle clé publique doit être relue : %q, %v", pub, err)
+	}
+	copies, _ := os.ReadDir(sauvegardes)
+	if len(copies) != 1 {
+		t.Fatalf("une sauvegarde de l'ancienne clé privée attendue, obtenu %v", copies)
+	}
+	data, _ := os.ReadFile(filepath.Join(sauvegardes, copies[0].Name()))
+	if string(data) != "ancienne privée\n" {
+		t.Errorf("sauvegarde : %q", string(data))
+	}
+}
+
+func TestDeuxRotationsDansLaMemeSecondeGardentLesDeuxCles(t *testing.T) {
+	// La sauvegarde porte un nom horodaté à la seconde : la seconde rotation
+	// écrasait celle de la première, et la clé privée d'origine était perdue.
+	p, _, _, ident := fixture(t)
+	identiteDeLEssai(ident)
+	fige := time.Date(2026, 8, 23, 3, 4, 5, 0, time.UTC)
+	avant := nowFunc
+	nowFunc = func() time.Time { return fige }
+	t.Cleanup(func() { nowFunc = avant })
+	ssh := filepath.Join(p.Spec.Layout.Root, ".ssh")
+	if err := os.MkdirAll(ssh, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(ssh, KeyName), []byte("clé d'origine\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	sauvegardes := filepath.Join(t.TempDir(), "backups")
+	for i := 0; i < 2; i++ {
+		if _, err := RotateKey(context.Background(), &keygenFactice{}, p, ident, sauvegardes); err != nil {
+			t.Fatal(err)
+		}
+	}
+	copies, _ := os.ReadDir(sauvegardes)
+	var contenus []string
+	for _, c := range copies {
+		data, _ := os.ReadFile(filepath.Join(sauvegardes, c.Name()))
+		contenus = append(contenus, string(data))
+	}
+	if len(copies) != 2 || !slices.Contains(contenus, "clé d'origine\n") {
+		t.Errorf("chaque rotation doit garder sa sauvegarde, la clé d'origine comprise : %q", contenus)
+	}
+}
+
+func TestLaClePubliqueDUnProjetJamaisAppliqueSeDitAbsente(t *testing.T) {
+	// Un projet déclaré mais jamais appliqué n'a ni compte ni clé : « user key
+	// show » doit dire l'absence de la clé et ce qui la crée, non celle du compte.
+	p, _, _, ident := fixture(t)
+	_, err := PublicKey(&keygenFactice{}, p, ident)
+	if err == nil || !strings.Contains(err.Error(), "aucune clé de déploiement") {
+		t.Errorf("l'absence de clé doit être dite : %v", err)
+	}
+	// Une clé présente sans compte connu reste, elle, un refus : rien n'est lu
+	// sans que son propriétaire ait été contrôlé.
+	ssh := filepath.Join(p.Spec.Layout.Root, ".ssh")
+	if err := os.MkdirAll(ssh, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(ssh, KeyName+".pub"), []byte("ssh-ed25519 ORPHELINE\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if pub, err := PublicKey(&keygenFactice{}, p, ident); err == nil || strings.Contains(pub, "ORPHELINE") {
+		t.Errorf("sans compte, la clé ne doit pas être lue : %q, %v", pub, err)
+	}
+}
+
+func TestLaClePubliqueNeSeLitPasATraversUnLien(t *testing.T) {
+	// « ogs user key show » tourne en root : un os.ReadFile par le nom affichait
+	// à l'exploitant n'importe quel fichier que root peut lire.
+	secret := filepath.Join(t.TempDir(), "shadow")
+	if err := os.WriteFile(secret, []byte("root:$6$HASH-SECRET:19000:0:99999:7:::\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Run("clé publique liée", func(t *testing.T) {
+		p, _, _, ident := fixture(t)
+		identiteDeLEssai(ident)
+		ssh := filepath.Join(p.Spec.Layout.Root, ".ssh")
+		if err := os.MkdirAll(ssh, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(secret, filepath.Join(ssh, KeyName+".pub")); err != nil {
+			t.Fatal(err)
+		}
+		pub, err := PublicKey(&keygenFactice{}, p, ident)
+		if err == nil || strings.Contains(pub, "HASH-SECRET") {
+			t.Errorf("la clé publique liée doit être refusée : %q, %v", pub, err)
+		}
+	})
+	t.Run(".ssh lié", func(t *testing.T) {
+		p, _, _, ident := fixture(t)
+		identiteDeLEssai(ident)
+		sshLie(t, p.Spec.Layout.Root)
+		pub, err := PublicKey(&keygenFactice{}, p, ident)
+		if err == nil || strings.Contains(pub, "DE ROOT") {
+			t.Errorf("un .ssh lié doit être refusé : %q, %v", pub, err)
+		}
+	})
+}
+
+func TestLaCompensationDeLaCleNeSuitPasUnSshLie(t *testing.T) {
+	// Entre l'apply et le rollback, l'utilisateur remplace .ssh par un lien : un
+	// os.Remove par le nom supprimait alors la paire du répertoire visé.
+	p, prov, _, _ := fixture(t)
+	root := p.Spec.Layout.Root
+	if err := os.MkdirAll(filepath.Join(root, ".ssh"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	s := prov.keyStep(p)
+	if s.Compensate == nil {
+		t.Fatal("la génération de la clé doit être compensable")
+	}
+	cible := sshLie(t, root)
+	if err := s.Compensate(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{KeyName, KeyName + ".pub"} {
+		if _, err := os.Lstat(filepath.Join(cible, name)); err != nil {
+			t.Errorf("%s a été supprimé dans la cible du lien : %v", name, err)
+		}
+	}
+}
+
+func TestLaCompensationDesClesAutoriseesNeSuitPasUnSshLie(t *testing.T) {
+	p, prov, _, _ := fixture(t)
+	declareCommonKeys(t, prov)
+	root := p.Spec.Layout.Root
+	if err := os.MkdirAll(filepath.Join(root, ".ssh"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	s := prov.authorizedKeysStep(p)
+	if s == nil || s.Compensate == nil {
+		t.Fatal("la pose du lien doit être compensable")
+	}
+	cible := sshLie(t, root)
+	if err := os.Symlink("/opt/clés-de-root", filepath.Join(cible, "authorized_keys")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Compensate(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(filepath.Join(cible, "authorized_keys")); err != nil {
+		t.Errorf("l'authorized_keys de la cible du lien a été supprimé : %v", err)
 	}
 }
 

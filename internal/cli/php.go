@@ -121,10 +121,11 @@ func newPHPSwitchCommand(app *App) *cobra.Command {
 			// Garde-fou de compatibilité : c'est la vérification la plus utile du
 			// module PHP. Passer un Symfony 3.4 en PHP 8 rend le site inaccessible
 			// immédiatement.
-			ok, detail, err := php.CheckCompatibility(p.Spec.Layout.Root, string(p.Spec.App.Kind), version)
+			verdict, err := php.Check(p.Spec.Layout.Root, string(p.Spec.App.Kind), version)
 			if err != nil {
 				return wrap(CodeError, err)
 			}
+			ok, detail := verdict.OK, verdict.Detail
 			if !ok {
 				if !app.Force {
 					return exitf(CodeValidation,
@@ -135,6 +136,9 @@ func newPHPSwitchCommand(app *App) *cobra.Command {
 				if app.Audit != nil {
 					_ = app.Audit.Record(id, "php/pool/"+target, "php.switch.force", "avertissement", detail)
 				}
+			} else if verdict.Unread != nil {
+				// Rien n'a été vérifié sur l'application elle-même : un ✓ le laisserait croire.
+				app.printf("⚠ composer.json non lu, compatibilité jugée sans lui : %s\n", detail)
 			} else {
 				app.printf("✓ compatibilité vérifiée : %s\n", detail)
 			}

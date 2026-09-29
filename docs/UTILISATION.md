@@ -281,6 +281,17 @@ La préproduction reçoit l'identifiant `shopfrprep`, un host sous le domaine de
 utilisateur, ses propres bases et un pool PHP plus modeste. Elle est servie par le certificat wildcard partagé des
 préproductions : aucun appel à l'autorité de certification.
 
+Le contenu de `www/` est recopié sans suivre aucun lien : un lien est recopié comme lien, et un `www` de
+production remplacé par un lien fait refuser la copie. Seuls sont recopiés les fichiers du compte de
+production : ce qui appartient à root ou à www-data est écarté et nommé dans la sortie, de même que les
+fichiers spéciaux et ce qui se trouve au-delà de 1024 niveaux, et la commande rend alors le code 6. Ni les
+ACL ni les attributs étendus ne sont reportés. Sur un projet adopté, rendre au compte de production les
+fichiers déployés en root avant le premier clone.
+
+Un Ctrl-C arrête la copie en chemin et rend le code 9 : la préproduction est créée, avec une partie du
+contenu seulement, et la base n'est pas copiée. `ogs project delete shopfrprep` la retire avant un nouveau
+clone.
+
 ## Les services
 
 Un service est un processus long — consommateur de file, worker — que systemd lance, supervise et relance

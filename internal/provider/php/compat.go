@@ -2,12 +2,20 @@ package php
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"leblanc.io/open-go-server/internal/fs"
 )
+
+// maxComposerSize borne ce que root lit de composer.json. Ceux des frameworks
+// tiennent en quelques dizaines de Kio ; un fichier plus gros qu'un Mio n'est pas
+// lu, et c'est la table indicative qui décide.
+const maxComposerSize = 1 << 20
 
 // composerFile décrit le sous-ensemble de composer.json qui nous intéresse.
 type composerFile struct {
@@ -22,11 +30,32 @@ type composerFile struct {
 // chaque sortie de framework, on lit ce que l'application exige réellement.
 // La plateforme configurée (config.platform.php) prime, car c'est celle sur
 // laquelle les dépendances ont été résolues.
+//
+// Le fichier est lu en root, par « php switch », dans un répertoire que
+// l'utilisateur du projet possède : ni www ni composer.json ne sont suivis s'ils
+// sont des liens, et un fichier spécial n'est pas lu. Un os.ReadFile par le nom
+// lisait n'importe quel fichier du système — et sans fin sur un lien vers
+// /dev/zero, ou pour toujours sur une FIFO. La lecture est bornée
+// (maxComposerSize) : un composer.json creux de plusieurs Gio ne coûte rien à
+// l'utilisateur, et root le lisait en entier en mémoire. Un refus rend une
+// erreur, que Check traite comme un fichier illisible.
+//
+// Le propriétaire du fichier n'est pas contrôlé : composer.json est une
+// déclaration de l'utilisateur, qui y écrit la contrainte qu'il veut, et un
+// projet adopté peut porter un composer.json déployé par root, que le refuser
+// ferait juger par la seule table indicative. Un lien physique vers le fichier
+// d'un autre compte n'en livrerait qu'une contrainte PHP, ou un caractère dans
+// l'erreur d'analyse.
 func Constraint(root string) (constraint, source string, err error) {
 	path := filepath.Join(root, "www", "composer.json")
-	data, err := os.ReadFile(path)
+	www, err := fs.OpenDirAt(root, "www")
+	var data []byte
+	if err == nil {
+		defer www.Close()
+		data, _, err = www.ReadFile("composer.json", -1, maxComposerSize)
+	}
 	if err != nil {
-		if os.IsNotExist(err) {
+		if errors.Is(err, os.ErrNotExist) {
 			return "", "", nil
 		}
 		return "", "", err
@@ -229,24 +258,47 @@ var fallbackConstraints = map[string]string{
 	"php-symfony":    ">=7.4",
 }
 
-// CheckCompatibility vérifie qu'une version PHP convient à l'application. Le
-// deuxième retour décrit la source de la décision, pour que le message d'erreur
-// soit vérifiable par l'administrateur.
-func CheckCompatibility(root, kind, version string) (ok bool, detail string, err error) {
-	constraint, source, err := Constraint(root)
-	if err != nil {
-		return true, err.Error(), nil // illisible : avertissement, pas blocage
-	}
-	if constraint == "" {
+// Verdict est la réponse du garde-fou de compatibilité.
+type Verdict struct {
+	// OK dit si la version convient.
+	OK bool
+	// Detail décrit la source de la décision, pour que le message soit
+	// vérifiable par l'administrateur.
+	Detail string
+	// Unread porte la raison pour laquelle composer.json n'a pas pu être lu —
+	// illisible, lien refusé —, nil s'il l'a été ou s'il est absent.
+	Unread error
+}
+
+// Check vérifie qu'une version PHP convient à l'application.
+//
+// Un composer.json qui ne peut pas être lu décide comme un composer.json absent :
+// par la table indicative. Le traiter en simple avertissement désarmait le
+// garde-fou, et à volonté depuis que ni un lien ni un fichier spécial ne sont
+// lus : il suffisait à l'utilisateur de remplacer le fichier par un lien pour
+// qu'un Symfony passe sans contrôle à une version qui le casse. Unread le dit,
+// pour que l'appelant ne l'annonce pas comme vérifié sur l'application.
+func Check(root, kind, version string) (Verdict, error) {
+	constraint, source, unread := Constraint(root)
+	if unread != nil || constraint == "" {
+		v := Verdict{OK: true, Detail: "aucune contrainte déclarée", Unread: unread}
 		if fb, has := fallbackConstraints[kind]; has {
 			ok, err := Satisfies(fb, version)
-			return ok, fmt.Sprintf("table indicative pour %s (%s)", kind, fb), err
+			if err != nil {
+				return v, err
+			}
+			v.OK, v.Detail = ok, fmt.Sprintf("table indicative pour %s (%s)", kind, fb)
+		} else if unread != nil {
+			v.Detail = "aucune table indicative pour " + kind
 		}
-		return true, "aucune contrainte déclarée", nil
+		if unread != nil {
+			v.Detail = fmt.Sprintf("%v — %s", unread, v.Detail)
+		}
+		return v, nil
 	}
-	ok, err = Satisfies(constraint, version)
+	ok, err := Satisfies(constraint, version)
 	if err != nil {
-		return true, fmt.Sprintf("contrainte %q non évaluable (%s)", constraint, source), nil
+		return Verdict{OK: true, Detail: fmt.Sprintf("contrainte %q non évaluable (%s)", constraint, source)}, nil
 	}
-	return ok, fmt.Sprintf("contrainte %q lue dans %s", constraint, source), nil
+	return Verdict{OK: ok, Detail: fmt.Sprintf("contrainte %q lue dans %s", constraint, source)}, nil
 }

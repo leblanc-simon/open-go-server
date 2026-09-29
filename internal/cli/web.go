@@ -110,7 +110,7 @@ func newUserKeyShowCommand(app *App) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			pub, err := system.PublicKey(p.Spec.Layout.Root)
+			pub, err := system.PublicKey(app.Exec, p, app.systemProvider().Identity)
 			if err != nil {
 				return exitf(CodeUsage, "%s", err)
 			}
@@ -149,7 +149,7 @@ func newUserKeyRotateCommand(app *App) *cobra.Command {
 			if err := app.openStore(); err == nil {
 				_ = app.Audit.Record(p.ID(), "system/deploy-key/"+p.ID(), "user.key.rotate", "ok", "")
 			}
-			pub, err := system.PublicKey(p.Spec.Layout.Root)
+			pub, err := system.PublicKey(app.Exec, p, provs.System.Identity)
 			if err == nil {
 				fmt.Fprint(app.Out, pub)
 			}
