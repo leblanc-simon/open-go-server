@@ -572,7 +572,7 @@ func TestLaCopieNEcritPasPlusQueLaSourceNOccupait(t *testing.T) {
 	}
 	defer unix.Close(out)
 
-	if err := copyData(context.Background(), out, in, taille, data); err == nil {
+	if err := copyData(context.Background(), out, in, taille, data, nil); err == nil {
 		t.Error("des données apparues pendant la copie doivent l'interrompre")
 	}
 	var st unix.Stat_t

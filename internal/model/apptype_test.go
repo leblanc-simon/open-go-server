@@ -1,6 +1,10 @@
 package model
 
-import "testing"
+import (
+	"path"
+	"strings"
+	"testing"
+)
 
 func TestResolveSymfonyVariants(t *testing.T) {
 	legacy, err := Resolve(KindSymfony, "3.4")
@@ -61,5 +65,79 @@ func TestSupportsMessenger(t *testing.T) {
 	}
 	if SupportsMessenger(KindPrestashop, "8") {
 		t.Error("Messenger ne s'applique pas à Prestashop")
+	}
+}
+
+// matchesAny dit si le chemin rel, relatif à www, est désigné par l'un des
+// motifs — composant par composant, comme le fait la garde de la copie.
+func matchesAny(t *testing.T, patterns []string, rel string) bool {
+	t.Helper()
+	for _, p := range patterns {
+		pc, rc := strings.Split(p, "/"), strings.Split(rel, "/")
+		if len(pc) != len(rc) {
+			continue
+		}
+		ok := true
+		for i := range pc {
+			m, err := path.Match(pc[i], rc[i])
+			if err != nil {
+				t.Fatalf("motif %q invalide : %v", p, err)
+			}
+			ok = ok && m
+		}
+		if ok {
+			return true
+		}
+	}
+	return false
+}
+
+func TestLaConfigurationDesTypesDesigneSesFichiersDeSecrets(t *testing.T) {
+	// Un clone ne recopie pas ce qu'un type range par convention dans la
+	// configuration d'un environnement ; il recopie ce qui n'en porte que les
+	// valeurs par défaut, versionnées — le .env de Symfony.
+	cas := []struct {
+		kind       AppKind
+		version    string
+		retenus    []string
+		recopiés   []string
+		sansConfig bool
+	}{
+		{KindSymfony, "7.2", []string{".env.local", ".env.local.php", ".env.prod.local",
+			"config/secrets/prod/prod.decrypt.private.php", "var/cache"},
+			[]string{".env", ".env.prod", "config/secrets/prod/prod.encrypt.public.php", "var/log", "public/index.php"}, false},
+		{KindSymfony, "3.4", []string{"app/config/parameters.yml", "var/cache"},
+			[]string{"app/config/parameters.yml.dist", "web/app.php"}, false},
+		{KindPrestashop, "8", []string{"app/config/parameters.php", "app/config/parameters.yml",
+			"config/settings.inc.php", "var/cache"}, []string{"index.php", "img", "config/defines.inc.php"}, false},
+		{KindNode, "", []string{".env", ".env.local", ".env.production", ".env.production.local"},
+			[]string{".env.example", "server.js"}, false},
+		{KindRuby, "", []string{".env", "config/master.key", "config/credentials/production.key"},
+			[]string{"config/credentials/production.yml.enc", "config/routes.rb"}, false},
+		{KindGo, "", []string{".env"}, []string{"serveur"}, false},
+		{KindPython, "", []string{".env"}, []string{"app.py"}, false},
+		{KindCustom, "", []string{".env"}, []string{"bin/serveur"}, false},
+		{KindPHPPlain, "", nil, []string{"wp-config.php", ".env"}, true},
+		{KindStatic, "", nil, []string{"index.html"}, true},
+	}
+	for _, c := range cas {
+		at, err := Resolve(c.kind, c.version)
+		if err != nil {
+			t.Fatal(err)
+		}
+		all := append(append([]string(nil), at.Config...), at.Cache...)
+		if c.sansConfig != (len(all) == 0) {
+			t.Errorf("%s : configuration %v", c.kind, all)
+		}
+		for _, rel := range c.retenus {
+			if !matchesAny(t, all, rel) {
+				t.Errorf("%s %s : %s doit être retenu d'un clone (%v)", c.kind, c.version, rel, all)
+			}
+		}
+		for _, rel := range c.recopiés {
+			if matchesAny(t, all, rel) {
+				t.Errorf("%s %s : %s doit être recopié (%v)", c.kind, c.version, rel, all)
+			}
+		}
 	}
 }

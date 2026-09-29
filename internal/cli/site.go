@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"text/tabwriter"
@@ -307,11 +309,29 @@ func (a *App) summarizeSite(p *model.Project) {
 			strings.Join(queueNames(p.Spec.AMQP), ", "))
 	}
 	for _, svc := range p.Spec.Services {
-		a.printf("  service      %s (%s, %d instance(s))\n", svc.Name, svc.Template, svc.Instances)
+		state := ""
+		if !isEnabled(svc.Enabled) {
+			state = ", désactivé"
+		}
+		a.printf("  service      %s (%s, %d instance(s)%s)\n", svc.Name, svc.Template, svc.Instances, state)
 	}
 	for _, c := range p.Spec.Crons {
-		a.printf("  tâche        %s (%s)\n", c.Name, c.Schedule)
+		state := ""
+		if !isEnabled(c.Enabled) {
+			state = ", désactivée"
+		}
+		a.printf("  tâche        %s (%s%s)\n", c.Name, c.Schedule, state)
 	}
+}
+
+// isEnabled lit le champ « enabled » d'une tâche ou d'un service : absent, il
+// vaut activé.
+func isEnabled(enabled *bool) bool { return enabled == nil || *enabled }
+
+// disabled rend une valeur « enabled: false » propre à son champ.
+func disabled() *bool {
+	off := false
+	return &off
 }
 
 func newSiteCloneCommand(app *App) *cobra.Command {
@@ -330,7 +350,21 @@ func newSiteCloneCommand(app *App) *cobra.Command {
 			"ce qui se trouve au-delà de 1024 niveaux sont écartés et nommés, et la commande rend\n" +
 			"alors le code 6. Ni les ACL ni les attributs étendus ne sont reportés. Une\n" +
 			"interruption (Ctrl-C) arrête la copie et rend le code 9 : le projet de destination\n" +
-			"est créé, avec une partie du contenu seulement.",
+			"est créé, avec une partie du contenu seulement.\n\n" +
+			"La copie ne retire que ce qu'ogs connaît de la source. Les fichiers où le type\n" +
+			"d'application range la configuration d'un environnement — .env.local de Symfony,\n" +
+			"parameters.php de Prestashop, .env d'une application Node — et ses caches compilés ne\n" +
+			"sont pas recopiés ; les mots de passe qu'ogs a générés pour les bases et le transport\n" +
+			"de la source, et les valeurs de son fichier d'environnement, sont masqués partout\n" +
+			"ailleurs, déclaration du projet comprise ; la racine de la source y est remplacée par\n" +
+			"celle de la destination. Le reste passe tel quel, et la sortie le dit : tout autre\n" +
+			"fichier de www (le .env versionné de Symfony compris), le reste d'une chaîne dont le\n" +
+			"mot de passe est masqué, le contenu de la base. Chaque fichier retenu ou expurgé,\n" +
+			"chaque variable déclarée reprise, chaque lien dont la cible sort de la destination,\n" +
+			"chaque secret qu'ogs n'a pas pu chercher est nommé, et la commande rend alors le code\n" +
+			"6 : la destination est à revoir, « ogs secrets env » en donne les chaînes de\n" +
+			"connexion. Les tâches et les services y sont repris désactivés. --dry-run annonce ce\n" +
+			"que la copie retiendra, masquera et reprendra.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			source, err := app.loadProject(args[0])
@@ -354,9 +388,24 @@ func newSiteCloneCommand(app *App) *cobra.Command {
 			}
 			app.printf("clone de %s vers %s (%s)\n", source.ID(), target.ID(), to)
 			app.summarizeSite(target)
+			// Ce que la source tient d'ogs ne passe pas à la destination, ni par sa
+			// déclaration — une variable d'environnement du pool, qu'elle recevrait
+			// de FPM avant toute configuration applicative —, ni par la copie de son
+			// contenu ; ce qui passe est nommé. --dry-run l'annonce : la garde ne
+			// fait que lire le keystore et le fichier d'environnement de la source.
+			if err := app.openStore(); err != nil {
+				return err
+			}
+			guard := app.cloneGuard(source)
+			declared := reviewDeclared(target, source, guard.Values)
+			withData = withData && len(source.Spec.Databases) > 0 && len(target.Spec.Databases) > 0
 			if app.DryRun {
+				app.describeCloneGuard(guard, declared, withData)
 				app.printf("\n--dry-run : rien n'a été écrit.\n")
 				return nil
+			}
+			for _, d := range declared.lines {
+				app.printf("⚠ %s\n", d)
 			}
 			// Le hook « preCreate » garde la porte : il peut refuser la création
 			// avant que rien n'ait été écrit.
@@ -382,13 +431,15 @@ func newSiteCloneCommand(app *App) *cobra.Command {
 			// code de retour doit dire autant que l'avertissement.
 			srcWWW := filepath.Join(source.Spec.Layout.Root, "www")
 			dstWWW := filepath.Join(target.Spec.Layout.Root, "www")
-			skipped, err := app.copyTree(cmd.Context(), source, target)
+			skipped, err := app.copyTree(cmd.Context(), source, target, guard.Guard)
 			for _, s := range skipped.Named {
 				app.printf("⚠ non recopié : %s\n", s)
 			}
 			if n := skipped.Count - len(skipped.Named); n > 0 {
 				app.printf("⚠ … et %d autre(s) entrée(s) non recopiée(s)\n", n)
 			}
+			copied := !errors.Is(err, errNotCopied)
+			guarded := app.reportCloneCopy(skipped, guard, copied)
 			switch {
 			case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
 				// Une interruption demandée n'est pas un succès partiel : rien de ce
@@ -415,14 +466,52 @@ func newSiteCloneCommand(app *App) *cobra.Command {
 				if partial == nil {
 					partial = exitf(CodePartial, "%d entrée(s) de %s non recopiée(s)", skipped.Count, srcWWW)
 				}
+			case len(guarded) > 0:
+				// Une copie expurgée, ou qui laisse passer ce qu'ogs sait désigner,
+				// n'est pas celle d'un contenu neutre : elle ne s'annonce pas comme
+				// faite, et le code de retour le dit (plus bas).
+				app.printf("⚠ contenu copié avec les réserves ci-dessus : %s → %s\n", srcWWW, dstWWW)
 			default:
 				app.printf("✓ contenu copié : %s → %s\n", srcWWW, dstWWW)
 			}
+			if err == nil {
+				if at, aerr := target.AppType(); aerr == nil {
+					if d := exposedInstaller(at, dstWWW); d != "" {
+						public := ""
+						if target.IsPrep() {
+							public = ", et une préproduction est publique (D57)"
+						}
+						app.printf("⚠ installeur exposé : %s/ est recopié, et %s n'a aucun fichier de configuration — "+
+							"une application %s y renvoie tout visiteur%s : écrire sa configuration avant de "+
+							"l'ouvrir, ou retirer %s/\n", filepath.Join(dstWWW, d), target.ID(), at.Kind, public, d)
+						guarded = append(guarded, "installeur exposé")
+					}
+				}
+			}
 
-			if withData && len(source.Spec.Databases) > 0 && len(target.Spec.Databases) > 0 {
+			dataCopied := false
+			if withData {
 				if err := app.cloneData(cmd, source, target); err != nil {
 					app.printf("⚠ copie des données : %v\n", err)
+				} else {
+					dataCopied = true
 				}
+			}
+			if n := declared.review; n > 0 {
+				guarded = append(guarded, fmt.Sprintf("%d champ(s) de la déclaration à revoir", n))
+			}
+			app.adviseCloneConfig(source, target, guard, skipped, declared, copied, dataCopied)
+			app.adviseDisabledTasks(source, target)
+			// Ce qui n'a pas été recopié tel quel, ce qui l'a été et qu'ogs sait
+			// désigner, ce qu'il n'a pas pu chercher : la destination est à revoir,
+			// un succès partiel, jamais un succès muet.
+			if len(guarded) > 0 {
+				review := fmt.Sprintf("%s à revoir avant usage : %s", target.ID(), strings.Join(guarded, ", "))
+				if partial != nil {
+					// Un avertissement de l'apply ne doit pas taire la garde.
+					review = partial.Error() + " ; " + review
+				}
+				partial = exitf(CodePartial, "%s", review)
 			}
 			_ = app.Audit.Record(target.ID(), "site", "site.clone", "ok", "depuis "+source.ID())
 			app.printf("\n✓ %s créé depuis %s\n", target.ID(), source.ID())
@@ -449,6 +538,29 @@ func (a *App) cloneProject(source *model.Project, env naming.Env) (*model.Projec
 	clone.Spec.Certificates = nil
 	clone.Spec.Databases = nil
 	clone.Spec.AMQP = nil
+	// Ce que la copie de la structure partagerait avec la source est dupliqué :
+	// la déclaration du clone est expurgée des secrets de la production
+	// (reviewDeclared), et ses tâches et services désactivés, sans toucher à ceux
+	// de la source.
+	clone.Spec.App.Env = maps.Clone(source.Spec.App.Env)
+	clone.Spec.PHP.Pools = slices.Clone(source.Spec.PHP.Pools)
+	for i := range clone.Spec.PHP.Pools {
+		clone.Spec.PHP.Pools[i].Env = maps.Clone(clone.Spec.PHP.Pools[i].Env)
+		clone.Spec.PHP.Pools[i].Settings = maps.Clone(clone.Spec.PHP.Pools[i].Settings)
+	}
+	// Tâches et services partent désactivés : sur une copie des données de la
+	// production, une relance, un envoi ou un import agiraient comme elle — sur
+	// ses vrais clients —, et ils tourneraient avant que la préproduction ait sa
+	// propre configuration. Ils se réactivent un à un (adviseDisabledTasks).
+	clone.Spec.Crons = slices.Clone(source.Spec.Crons)
+	for i := range clone.Spec.Crons {
+		clone.Spec.Crons[i].Enabled = disabled()
+	}
+	clone.Spec.Services = slices.Clone(source.Spec.Services)
+	for i := range clone.Spec.Services {
+		clone.Spec.Services[i].Params = maps.Clone(clone.Spec.Services[i].Params)
+		clone.Spec.Services[i].Enabled = disabled()
+	}
 	if err := a.prepare(&clone); err != nil {
 		return nil, err
 	}
@@ -507,7 +619,10 @@ var errNotCopied = errors.New("rien n'a été recopié")
 // La copie suit ctx, que main annule sur SIGINT et SIGTERM : « cp -a » mourait
 // avec son groupe de processus, une copie faite dans le processus doit consulter
 // le contexte elle-même. Annulée, elle rend l'erreur du contexte, telle quelle.
-func (a *App) copyTree(ctx context.Context, source, target *model.Project) (fs.Skipped, error) {
+//
+// La garde g retient de la copie la configuration et les secrets de la source
+// (cloneGuard) : fs.CopyTreeGuardedAt en rend compte avec le reste.
+func (a *App) copyTree(ctx context.Context, source, target *model.Project, g fs.Guard) (fs.Skipped, error) {
 	srcUID, owner := -1, fs.KeepOwner
 	if !a.Exec.Simulated() {
 		uid, _, err := a.systemProvider().ResolveOwner(source, "")
@@ -521,7 +636,8 @@ func (a *App) copyTree(ctx context.Context, source, target *model.Project) (fs.S
 		}
 		owner = fs.Owner{UID: uid, GID: gid}
 	}
-	skipped, err := fs.CopyTreeAt(ctx, source.Spec.Layout.Root, "www", target.Spec.Layout.Root, "www", srcUID, owner)
+	skipped, err := fs.CopyTreeGuardedAt(ctx, source.Spec.Layout.Root, "www", target.Spec.Layout.Root, "www",
+		srcUID, owner, g)
 	var root *fs.RootError
 	switch {
 	case !errors.As(err, &root):

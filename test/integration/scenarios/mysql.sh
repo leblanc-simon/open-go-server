@@ -62,6 +62,54 @@ if ! mariadb -h 127.0.0.1 -u shopfr -p"$motdepasse" shopfr \
 fi
 
 echo
+echo "--- clone : la préproduction ne reçoit pas le mot de passe de la production ---"
+# La configuration de l'application, écrite depuis « ogs secrets env » comme le
+# guide l'indique, était recopiée telle quelle : la préproduction écrivait dans
+# la base de la production. Un php-plain n'a pas de fichier de configuration
+# connu : ogs y masque le mot de passe qu'il a généré, où qu'il soit. Le mode
+# simulé ne voit ni le compte réel ni la base : seul ce scénario éprouve que ce
+# qui reste ne s'authentifie plus.
+www=/home/shop.fr/www
+ogs secrets env shopfr 2>/dev/null | grep '^DATABASE_URL=' > "$www/.env"
+printf "<?php return ['password' => '%s'];\n" "$motdepasse" > "$www/db.php"
+chown shopfr:shopfr "$www/.env" "$www/db.php"
+sortie=$(ogs site clone shopfr --to prep --yes 2>&1)
+code=$?
+prep=$(getent passwd shopfrprep | cut -d: -f6)
+if [ "$code" != 6 ] || [[ "$sortie" != *"secret retiré de la copie"*"db.php"* ]] || [ ! -f "$prep/www/db.php" ]; then
+    echo "ÉCHEC : le clone n'a pas dit le secret retiré (code $code)"
+    echo "$sortie" | tail -12 | sed 's/^/  /'
+    exit 1
+fi
+# La sortie dit ce qu'ogs n'a pas retiré : le reste de www, et la base copiée —
+# que seul un vrai moteur recopie.
+if [[ "$sortie" != *"shopfrprep reprend tel quel de shopfr"* ]] || \
+    [[ "$sortie" != *"copie de celle de shopfr"* ]] || [[ "$sortie" == *"ni les identifiants ni les secrets"* ]]; then
+    echo "ÉCHEC : le clone n'a pas dit ce qu'il reprend tel quel"
+    echo "$sortie" | tail -16 | sed 's/^/  /'
+    exit 1
+fi
+if grep -rqF -- "$motdepasse" "$prep/www"; then
+    echo "ÉCHEC : le mot de passe de la production a été recopié dans la préproduction"
+    grep -rlF -- "$motdepasse" "$prep/www" | sed 's/^/  /'
+    exit 1
+fi
+masque=$(sed -n "s/.*'password' => '\(.*\)'.*/\1/p" "$prep/www/db.php")
+if [ "${#masque}" != "${#motdepasse}" ] || \
+    mariadb -h 127.0.0.1 -u shopfr -p"$masque" shopfr -e 'SELECT 1' >/dev/null 2>&1; then
+    echo "ÉCHEC : le masque n'a pas la longueur du secret, ou il ouvre la base de la production"
+    exit 1
+fi
+preppass=$(ogs secrets show shopfrprep mysql/shopfrprep 2>/dev/null | tail -1)
+if ! mariadb -h 127.0.0.1 -u shopfrprep -p"$preppass" shopfrprep -e 'SELECT COUNT(*) FROM essai' >/dev/null 2>&1; then
+    echo "ÉCHEC : la préproduction n'atteint pas sa propre base, données copiées comprises"
+    exit 1
+fi
+ogs project delete shopfrprep --yes >/dev/null 2>&1
+rm -f "$www/.env" "$www/db.php"
+echo "clone : mot de passe de la production masqué, la préproduction travaille sur sa propre base"
+
+echo
 echo "--- l'échappement du motif de GRANT protège-t-il une base voisine ? ---"
 # Le nom côté « ON » est un motif où « _ » est un joker. Une base additionnelle
 # s'appelle « shopfr_stats » : sans échappement, le GRANT ouvrirait aussi

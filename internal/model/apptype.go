@@ -2,6 +2,7 @@ package model
 
 import (
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -46,7 +47,31 @@ type AppType struct {
 	PHPSettings map[string]string
 	// AllowOverride vaut vrai pour les applications s'appuyant sur .htaccess.
 	AllowOverride bool
+	// Config énumère, relatifs à www, les fichiers où le type range par
+	// convention la configuration d'un environnement : les identifiants et les
+	// adresses de ses bases et de son transport, mais aussi ses secrets — clé
+	// de l'application, clés d'API, clé du coffre. « site clone » ne les recopie
+	// pas : ceux de la production la désignent, et portent des secrets qu'ogs ne
+	// saurait ni reconnaître ni remplacer. Chaque composant est un motif au sens
+	// de path.Match.
+	Config []string
+	// Cache énumère, relatifs à www, les caches que le type compile depuis cette
+	// configuration, secrets compris, et qu'il reconstruit à la demande : ils ne
+	// sont pas recopiés non plus.
+	Cache []string
+	// Installer énumère, relatifs à www, les répertoires d'installation vers
+	// lesquels l'application renvoie tout visiteur quand elle ne trouve aucun de
+	// ses fichiers de configuration (Config). Un clone, qui ne recopie pas ces
+	// derniers, offre alors l'installeur à qui visite la préproduction, publique
+	// (D57), si l'un de ces répertoires a survécu à la mise en production.
+	Installer []string
 }
+
+// dotenvConfig est la configuration par variables d'environnement des
+// applications servies par un runtime : les bibliothèques dotenv de Node, de
+// Python, de Ruby et de Go lisent .env et ses variantes, qui y sont le lieu des
+// secrets — non celui des valeurs par défaut, comme chez Symfony.
+var dotenvConfig = []string{".env", ".env.local", ".env.*.local", ".env.production"}
 
 // appTypes est la table par défaut, surchargeable par /etc/ogs/apptypes.yaml.
 var appTypes = map[AppKind]AppType{
@@ -55,6 +80,14 @@ var appTypes = map[AppKind]AppType{
 	KindPrestashop: {
 		Kind: KindPrestashop, Docroot: "www", FrontController: "index.php",
 		VHostTemplate: "php-fpm", NeedsPHP: true, AllowOverride: true,
+		// parameters.php depuis la 1.7.4, parameters.yml avant elle,
+		// settings.inc.php pour la 1.6 : base, clés des cookies, secret.
+		Config: []string{"app/config/parameters.php", "app/config/parameters.yml", "config/settings.inc.php"},
+		Cache:  []string{"var/cache"},
+		// Sans configuration, config/config.inc.php redirige vers install/, ou
+		// install-dev/ dans une copie du dépôt, que Prestashop demande de retirer
+		// après l'installation.
+		Installer: []string{"install", "install-dev"},
 		// Prérequis Prestashop : les valeurs par défaut de PHP ne suffisent pas.
 		PHPSettings: map[string]string{
 			"php_admin_value[memory_limit]":        "512M",
@@ -64,12 +97,25 @@ var appTypes = map[AppKind]AppType{
 			"php_admin_value[max_execution_time]":  "300",
 		},
 	},
-	KindSymfony: {Kind: KindSymfony, Docroot: "www/public", FrontController: "index.php", VHostTemplate: "php-fpm", NeedsPHP: true, EnvVar: "APP_ENV"},
-	KindGo:      {Kind: KindGo, VHostTemplate: "proxy", Runtime: "go"},
-	KindNode:    {Kind: KindNode, VHostTemplate: "proxy", Runtime: "node"},
-	KindPython:  {Kind: KindPython, VHostTemplate: "proxy", Runtime: "python"},
-	KindRuby:    {Kind: KindRuby, VHostTemplate: "proxy", Runtime: "ruby"},
-	KindCustom:  {Kind: KindCustom, VHostTemplate: "proxy", Runtime: "custom"},
+	KindSymfony: {
+		Kind: KindSymfony, Docroot: "www/public", FrontController: "index.php", VHostTemplate: "php-fpm",
+		NeedsPHP: true, EnvVar: "APP_ENV",
+		// .env et .env.<environnement> sont versionnés et ne portent que des
+		// valeurs par défaut ; celles d'une machine vont dans les variantes
+		// « .local » ou dans leur compilation, .env.local.php, et la clé qui ouvre
+		// le coffre des secrets dans config/secrets. parameters.yml est la
+		// configuration de Symfony 3.4.
+		Config: []string{".env.local", ".env.local.php", ".env.*.local",
+			"config/secrets/*/*.decrypt.private.php", "app/config/parameters.yml"},
+		Cache: []string{"var/cache"},
+	},
+	KindGo:     {Kind: KindGo, VHostTemplate: "proxy", Runtime: "go", Config: dotenvConfig},
+	KindNode:   {Kind: KindNode, VHostTemplate: "proxy", Runtime: "node", Config: dotenvConfig},
+	KindPython: {Kind: KindPython, VHostTemplate: "proxy", Runtime: "python", Config: dotenvConfig},
+	KindRuby: {Kind: KindRuby, VHostTemplate: "proxy", Runtime: "ruby",
+		// master.key et les clés par environnement ouvrent les credentials de Rails.
+		Config: append(slices.Clone(dotenvConfig), "config/master.key", "config/credentials/*.key")},
+	KindCustom: {Kind: KindCustom, VHostTemplate: "proxy", Runtime: "custom", Config: dotenvConfig},
 }
 
 // Kinds énumère les types connus, triés pour un affichage stable.

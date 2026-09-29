@@ -619,8 +619,25 @@ func checkName(name string) error {
 // ligne de la sortie.
 func CopyTreeAt(ctx context.Context, srcRoot, srcRel, dstRoot, dstRel string, srcUID int,
 	owner Owner) (Skipped, error) {
+	return CopyTreeGuardedAt(ctx, srcRoot, srcRel, dstRoot, dstRel, srcUID, owner, Guard{})
+}
+
+// CopyTreeGuardedAt est CopyTreeAt sous la garde g : les entrées que désignent
+// ses chemins ne sont pas recopiées, et ses valeurs sont masquées dans tout
+// fichier recopié qui les porte (Guard). Les unes et les autres sont comptées, et
+// les premières nommées avec leur raison (Skipped.Withheld, Skipped.Masked). Le
+// masquage a lieu sur les morceaux lus, avant leur écriture : la copie d'un
+// fichier reste à root, en 0600, tant qu'elle n'est pas achevée, et le compte de
+// destination ne voit jamais le secret. Une garde invalide rend une *RootError :
+// rien n'est recopié.
+func CopyTreeGuardedAt(ctx context.Context, srcRoot, srcRel, dstRoot, dstRel string, srcUID int,
+	owner Owner, g Guard) (Skipped, error) {
 	if err := ctx.Err(); err != nil {
 		return Skipped{}, err
+	}
+	gd, err := newGuard(g)
+	if err != nil {
+		return Skipped{}, &RootError{Source: true, Err: err}
 	}
 	src, err := openDirAt(srcRoot, srcRel, false, 0, KeepOwner)
 	if err != nil {
@@ -643,7 +660,12 @@ func CopyTreeAt(ctx context.Context, srcRoot, srcRel, dstRoot, dstRel string, sr
 	root := &dirNode{}
 	c := &treeCopy{ctx: ctx, owner: owner, srcUID: uid, srcPath: filepath.Join(srcRoot, srcRel),
 		dstPath: filepath.Join(dstRoot, dstRel), links: map[inode]copied{},
-		open: []openDir{{node: root, fd: dst}}}
+		open: []openDir{{node: root, fd: dst}}, guard: gd,
+		srcRoot: filepath.Clean(srcRoot), dstRoot: filepath.Clean(dstRoot),
+		rootDepth: len(strings.Split(filepath.Clean(dstRel), "/"))}
+	if gd != nil && len(gd.values) > 0 {
+		c.masker = newMasker(gd)
+	}
 	defer c.forget()
 	err = c.dir(src, dst, root)
 	if errors.Is(err, unix.EMFILE) {
@@ -686,13 +708,37 @@ const maxShownPath = 256
 // croître la mémoire de root comme leur nombre multiplié par la profondeur.
 const maxSkippedNamed = 50
 
-// Skipped rend compte des entrées que CopyTreeAt a écartées.
+// Skipped rend compte de ce que CopyTreeAt n'a pas recopié tel quel : les
+// entrées qu'il a écartées, et celles que la garde d'une copie a retenues ou
+// expurgées (CopyTreeGuardedAt).
 type Skipped struct {
-	// Count est leur nombre.
+	// Count est le nombre d'entrées écartées.
 	Count int
 	// Named nomme les premières d'entre elles, maxSkippedNamed au plus, chacune
 	// avec sa raison.
 	Named []string
+	// Withheld est le nombre d'entrées que les chemins de la garde ont retenues ;
+	// WithheldNamed nomme les premières, avec leur raison.
+	Withheld      int
+	WithheldNamed []string
+	// Masked est le nombre de fichiers recopiés dont la garde a masqué une
+	// valeur ; MaskedNamed nomme les premiers, avec ce qui y a été masqué.
+	Masked      int
+	MaskedNamed []string
+	// Outside est le nombre de liens recopiés tels quels dont la cible sort de
+	// la destination : absolue, elle désigne depuis la copie ce qu'elle désignait
+	// depuis la source — le projet source lui-même, s'il y vit —, relative, elle
+	// remonte au-delà de la racine de destination. OutsideNamed nomme les
+	// premiers, avec leur cible.
+	Outside      int
+	OutsideNamed []string
+	// Exposed est le nombre de fichiers recopiés sous un nom que la garde ne
+	// désigne pas, avant qu'un autre de leurs noms, qu'elle désigne, ne soit
+	// rencontré : liés physiquement, ils portent le contenu d'un fichier retenu.
+	// ExposedNamed nomme les premiers. Rencontré avant, le nom retenu fait
+	// retenir les autres (Withheld).
+	Exposed      int
+	ExposedNamed []string
 }
 
 // RootError est l'échec d'ouverture d'une racine de CopyTreeAt — source, ou
@@ -765,6 +811,19 @@ type treeCopy struct {
 	// last est le dernier répertoire rouvert où la première copie d'un fichier
 	// lié a été retrouvée ; son descripteur appartient à treeCopy (forget).
 	last openDir
+	// guard est la garde de la copie, nil sans garde ; masker en masque les
+	// valeurs, nil si elle n'en a pas.
+	guard  *guard
+	masker *masker
+	// held associe aux fichiers retenus par la garde qui ont plusieurs noms la
+	// raison de retenir les autres.
+	held map[inode]string
+	// srcRoot et dstRoot sont les répertoires sous lesquels la copie a lieu — les
+	// racines des deux projets —, rootDepth le nombre de niveaux qui séparent
+	// dstRoot de la racine de la copie : ce qu'une cible relative peut remonter
+	// sans sortir de la destination (outside).
+	srcRoot, dstRoot string
+	rootDepth        int
 }
 
 // from et to composent, pour un message, le chemin cité de l'entrée name du
@@ -799,7 +858,12 @@ func quotedPath(root string, at *dirNode, name string) string {
 		parts, size = append(parts, n.name), size+len(n.name)+1
 	}
 	slices.Reverse(parts)
-	p := filepath.Join(parts...)
+	return quoteTail(filepath.Join(parts...), cut)
+}
+
+// quoteTail cite p, ou ses maxShownPath derniers octets précédés de « … » s'il
+// est plus long ou déjà coupé (cut).
+func quoteTail(p string, cut bool) string {
 	if !cut && len(p) <= maxShownPath {
 		return strconv.Quote(p)
 	}
@@ -820,6 +884,79 @@ func (c *treeCopy) skip(at *dirNode, name, reason string) {
 	}
 }
 
+// withhold retient l'entrée name du répertoire at, que la garde désigne. Les
+// retenues sont bornées comme les entrées écartées, mais à part : celles-ci ne
+// doivent pas taire celles-là.
+func (c *treeCopy) withhold(at *dirNode, name, reason string) {
+	c.skipped.Withheld++
+	if len(c.skipped.WithheldNamed) < maxSkippedNamed {
+		c.skipped.WithheldNamed = append(c.skipped.WithheldNamed, c.from(at, name)+" : "+reason)
+	}
+}
+
+// masked note que la copie de l'entrée name du répertoire at a été expurgée.
+func (c *treeCopy) masked(at *dirNode, name string, reasons []string) {
+	c.skipped.Masked++
+	if len(c.skipped.MaskedNamed) < maxSkippedNamed {
+		c.skipped.MaskedNamed = append(c.skipped.MaskedNamed, c.from(at, name)+" : "+strings.Join(reasons, ", "))
+	}
+}
+
+// hold retient les autres noms du fichier que la garde retient sous le nom name
+// du répertoire at : un lien physique ne doit pas faire passer sous un autre nom
+// un contenu retenu. Un autre nom déjà recopié — les noms se visitent dans
+// l'ordre, et « .env.backup » précède le « .env.local » qu'il double — l'a été à
+// tort, et il est nommé.
+func (c *treeCopy) hold(at *dirNode, name string, st *unix.Stat_t) {
+	node := nodeOf(st)
+	withheld := c.from(at, name)
+	why := "autre nom de " + withheld + ", que la garde retient"
+	if first, ok := c.links[node]; ok {
+		c.skipped.Exposed++
+		if len(c.skipped.ExposedNamed) < maxSkippedNamed {
+			c.skipped.ExposedNamed = append(c.skipped.ExposedNamed, c.from(first.dir, first.name)+
+				" : même fichier que "+withheld+", que la garde retient mais qu'elle a rencontré après lui — "+
+				"son contenu est recopié")
+		}
+	}
+	if c.held == nil {
+		c.held = map[inode]string{}
+	}
+	c.held[node] = why
+}
+
+// outside dit si la cible d'un lien posé dans le répertoire at sort de la
+// destination, et comment. La copie ne suit aucun lien, mais le projet de
+// destination les suivra : une cible absolue lui désigne ce qu'elle désignait
+// au projet source — ses propres fichiers, s'ils y vivent : la configuration
+// d'une application déployée avec un répertoire partagé hors de www —, une
+// cible relative qui remonte au-delà de sa racine désigne un autre projet. Une
+// cible relative qui reste sous la racine désigne, depuis la copie, les fichiers
+// du projet de destination : elle est à lui. L'analyse est lexicale : un lien
+// intermédiaire qui sortirait de la destination est lui-même nommé.
+func (c *treeCopy) outside(at *dirNode, target string) (string, bool) {
+	if filepath.IsAbs(target) {
+		clean := filepath.Clean(target)
+		if clean == c.srcRoot || strings.HasPrefix(clean, c.srcRoot+"/") {
+			return "cible absolue, dans le projet source " + strconv.Quote(c.srcRoot), true
+		}
+		return "cible absolue, hors de la copie", true
+	}
+	level := c.rootDepth + at.depth
+	for _, comp := range strings.Split(target, "/") {
+		switch comp {
+		case "", ".":
+		case "..":
+			if level--; level < 0 {
+				return "cible relative qui sort de " + strconv.Quote(c.dstRoot), true
+			}
+		default:
+			level++
+		}
+	}
+	return "", false
+}
+
 func (c *treeCopy) dir(src, dst int, at *dirNode) error {
 	names, err := readDirNames(src)
 	if err != nil {
@@ -836,6 +973,15 @@ func (c *treeCopy) dir(src, dst int, at *dirNode) error {
 				continue // retiré depuis l'énumération
 			}
 			return fmt.Errorf("%s : %w", c.from(at, name), err)
+		}
+		if c.guard != nil {
+			if reason, ok := c.guard.withheld(at, name); ok {
+				c.withhold(at, name, reason)
+				if st.Mode&unix.S_IFMT == unix.S_IFREG && st.Nlink > 1 {
+					c.hold(at, name, &st)
+				}
+				continue
+			}
 		}
 		switch st.Mode & unix.S_IFMT {
 		case unix.S_IFDIR:
@@ -918,6 +1064,10 @@ func (c *treeCopy) file(src, dst int, name string, at *dirNode) (err error) {
 	}
 	node := nodeOf(&st)
 	if st.Nlink > 1 {
+		if why, ok := c.held[node]; ok {
+			c.withhold(at, name, why)
+			return nil
+		}
 		if first, ok := c.links[node]; ok {
 			return c.hardlink(dst, name, at, first)
 		}
@@ -942,11 +1092,19 @@ func (c *treeCopy) file(src, dst int, name string, at *dirNode) (err error) {
 			removeIfSame(dst, name, &ost)
 		}
 	}()
-	if err := copyData(c.ctx, out, in, st.Size, data); err != nil {
+	if c.masker != nil {
+		c.masker.reset()
+	}
+	if err := copyData(c.ctx, out, in, st.Size, data, c.masker); err != nil {
 		return fmt.Errorf("copie de %s : %w", c.from(at, name), err)
 	}
 	if err := c.finish(out, &st, false); err != nil {
 		return fmt.Errorf("%s : %w", c.to(at, name), err)
+	}
+	if c.masker != nil {
+		if reasons := c.masker.reasons(); len(reasons) > 0 {
+			c.masked(at, name, reasons)
+		}
 	}
 	if st.Nlink > 1 {
 		c.links[node] = copied{dir: at, name: name, node: nodeOf(&ost)}
@@ -1124,8 +1282,8 @@ func dataSize(ctx context.Context, fd int, size int64) (int64, error) {
 // sur ext4 — en n'occupant jamais qu'une fenêtre. Root n'écrit donc jamais plus
 // que data, les données que dataSize a mesurées avant la copie : un fichier dont
 // les données grandissent en chemin interrompt la copie. ctx est consulté avant
-// chaque bloc.
-func copyData(ctx context.Context, out, in int, size, data int64) error {
+// chaque bloc, et m, s'il n'est pas nil, masque chaque bloc avant son écriture.
+func copyData(ctx context.Context, out, in int, size, data int64, m *masker) error {
 	buf := make([]byte, 128<<10)
 	var written int64
 	for off := int64(0); off < size; {
@@ -1157,6 +1315,11 @@ func copyData(ctx context.Context, out, in int, size, data int64) error {
 			if written += int64(n); written > data {
 				return fmt.Errorf("ses données ont dépassé pendant la copie les %d octets qu'elles occupaient "+
 					"avant elle", data)
+			}
+			if m != nil {
+				if err := m.mask(out, buf[:n], start); err != nil {
+					return err
+				}
 			}
 			for p := buf[:n]; len(p) > 0; {
 				w, err := unix.Pwrite(out, p, start)
@@ -1202,6 +1365,13 @@ func (c *treeCopy) link(src, dst int, name string, at *dirNode, st *unix.Stat_t)
 	}
 	if err := unix.UtimesNanoAt(dst, name, []unix.Timespec{st.Atim, st.Mtim}, unix.AT_SYMLINK_NOFOLLOW); err != nil {
 		return fmt.Errorf("%s : %w", c.to(at, name), err)
+	}
+	if reason, ok := c.outside(at, target); ok {
+		c.skipped.Outside++
+		if len(c.skipped.OutsideNamed) < maxSkippedNamed {
+			c.skipped.OutsideNamed = append(c.skipped.OutsideNamed,
+				c.from(at, name)+" → "+quoteTail(target, false)+" : "+reason)
+		}
 	}
 	return nil
 }

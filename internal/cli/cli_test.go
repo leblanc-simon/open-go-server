@@ -2493,7 +2493,20 @@ func TestLeCloneRecopieLesLiensCommeDesLiens(t *testing.T) {
 		}
 	}
 
-	h.mustRun("site", "clone", "shopfr", "--to", "prep", "--yes")
+	// La préproduction suivra ce que la copie ne suit pas : un lien dont la
+	// cible sort de la destination est nommé, et rend le code 6.
+	out, code := h.run("site", "clone", "shopfr", "--to", "prep", "--yes")
+	if code != CodePartial {
+		t.Errorf("code %d, attendu %d\n%s", code, CodePartial, out)
+	}
+	for _, nom := range []string{"fuite.txt", "dossier", "pendant"} {
+		if !strings.Contains(out, "⚠ lien recopié tel quel : ") || !strings.Contains(out, nom+"\" → ") {
+			t.Errorf("le lien %s doit être nommé :\n%s", nom, out)
+		}
+	}
+	if strings.Contains(out, "relatif.css\" → ") {
+		t.Errorf("un lien qui reste dans la copie ne doit pas être nommé :\n%s", out)
+	}
 	dstWWW := h.path("home", "shop.preprod-pp.net", "www")
 	data, err := os.ReadFile(filepath.Join(dstWWW, "assets", "css", "site.css"))
 	if err != nil || string(data) != "body{}" {
@@ -2608,7 +2621,7 @@ func TestLaCopieDuCloneHorsSimulationNeSuitPasLeLien(t *testing.T) {
 	}
 
 	app, source, target := cloneHorsSimulation(t, h, os.Getuid(), os.Getuid())
-	if _, err := app.copyTree(context.Background(), source, target); !errors.Is(err, fs.ErrNotDirectory) {
+	if _, err := app.copyTree(context.Background(), source, target, fs.Guard{}); !errors.Is(err, fs.ErrNotDirectory) {
 		t.Errorf("un www source lié doit faire refuser la copie, obtenu %v", err)
 	}
 	if _, err := os.Lstat(h.path("home", "shop.preprod-pp.net", "www", "shadow")); !os.IsNotExist(err) {
@@ -2632,7 +2645,7 @@ func TestLaCopieDuCloneNeRecopieQueLesFichiersDuCompteSource(t *testing.T) {
 	}
 
 	app, source, target := cloneHorsSimulation(t, h, os.Getuid()+1, os.Getuid())
-	skipped, err := app.copyTree(context.Background(), source, target)
+	skipped, err := app.copyTree(context.Background(), source, target, fs.Guard{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2791,7 +2804,7 @@ func TestLaCopieInterrompueNeSeDitPasRefusee(t *testing.T) {
 		}
 
 		app, source, target := cloneHorsSimulation(t, h, os.Getuid(), os.Getuid())
-		_, err := app.copyTree(context.Background(), source, target)
+		_, err := app.copyTree(context.Background(), source, target, fs.Guard{})
 		if !errors.Is(err, fs.ErrNotDirectory) {
 			t.Fatalf("un répertoire de destination lié doit arrêter la copie : %v", err)
 		}

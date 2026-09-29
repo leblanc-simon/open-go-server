@@ -292,6 +292,52 @@ Un Ctrl-C arrête la copie en chemin et rend le code 9 : la préproduction est c
 contenu seulement, et la base n'est pas copiée. `ogs project delete shopfrprep` la retire avant un nouveau
 clone.
 
+**La copie ne retire de la production que ce qu'ogs en connaît, et le dit.** Recopiée telle quelle, la
+configuration de l'application ferait travailler la préproduction sur la base et les files de la
+production, avec ses identifiants, et donnerait au compte de préproduction ses secrets. D'où quatre règles :
+
+- les fichiers où le type d'application range la configuration d'un environnement ne sont **pas
+  recopiés** — pour Symfony `.env.local`, `.env.local.php`, `.env.<env>.local`, la clé du coffre
+  (`config/secrets/<env>/*.decrypt.private.php`) et `app/config/parameters.yml` (3.4) ; pour Prestashop
+  `app/config/parameters.php`, `parameters.yml` et `config/settings.inc.php` ; pour Node, Python, Ruby,
+  Go et `custom` `.env`, `.env.local`, `.env.<env>.local`, `.env.production`, et `config/master.key` pour
+  Rails —, pas plus que le cache compilé depuis cette configuration (`var/cache`). Un autre nom que leur
+  donne un lien physique ne l'est pas davantage, ou il est nommé s'il a été recopié avant qu'ogs ne les
+  rencontre ;
+- les secrets qu'ogs connaît de la production — les mots de passe qu'il a générés pour ses bases et son
+  transport, les valeurs d'au moins douze caractères de son fichier d'environnement `/etc/ogs/env/<id>.env`
+  (D75) — sont **masqués** partout ailleurs — `OGS-SECRET-RETIRE-xxx…`, de même longueur —, dans les
+  fichiers recopiés comme dans la déclaration du projet (`spec.php.pools[].env`, `spec.app.env`, paramètres
+  de service, commandes des tâches). Un fichier qui en porte un reste en place : un WordPress privé de son
+  `wp-config.php` offrirait son assistant d'installation à qui visite la préproduction. Seul le secret est
+  masqué : la chaîne qui le portait nomme encore l'utilisateur et la base de la production, auxquels elle
+  ne se connecte plus ;
+- dans la déclaration, la **racine** de la production (`/home/shop.fr`) est remplacée par celle de la
+  préproduction : la commande d'une application `custom`, un répertoire de travail ;
+- les **tâches et services** sont repris **désactivés** : sur une copie des données, une relance ou un envoi
+  écrirait aux vrais clients. `ogs cron enable shopfrprep <tâche>` en réactive une ; un service se réactive
+  en retirant son `enabled: false` de `/etc/ogs/projects/shopfrprep.yaml`, puis `ogs apply shopfrprep`.
+
+**Le reste passe tel quel**, et la sortie le dit pour tout type d'application : un autre fichier de `www/` —
+le `.env` versionné de Symfony, un fichier de `config/`, les sels d'un `wp-config.php` —, le contenu de la
+base copiée (adresses et domaine du site, clés des modules de paiement, relais de courrier : pour Prestashop,
+`ps_configuration` et `ps_shop_url`). La sortie nomme en outre, un à un, ce qu'ogs sait désigner :
+
+- chaque fichier non recopié ou expurgé ;
+- chaque **variable déclarée** reprise — `spec.php.pools[web].env.STRIPE_KEY` —, masquée ou non : elle
+  parvient à l'application sans passer par sa configuration, et ogs n'en connaît pas le sens ;
+- chaque **lien** dont la cible sort de la préproduction — absolue, ou relative et remontant au-delà de son
+  home : la copie ne le suit pas, la préproduction le suivra, jusque dans le home de la production ;
+- chaque secret qu'ogs n'a pas pu chercher — un mot de passe absent du keystore, sur un projet adopté ;
+- pour Prestashop, un `install/` resté en place alors que la préproduction n'a aucune configuration :
+  Prestashop y renverrait tout visiteur.
+
+Chacun rend le code 6 : la préproduction est à revoir, et à configurer avec ses propres chaînes de connexion
+(`ogs secrets env shopfrprep`) ; un hook `postCreate` qui écrit son `.env.local` le voit conservé. Le
+fichier d'environnement de la production n'est jamais recopié : celui de la préproduction est créé vide.
+`ogs site clone shopfr --to prep --dry-run` annonce ce que la copie retiendra, masquera et reprendra, et
+quand le clone rendra le code 6.
+
 ## Les services
 
 Un service est un processus long — consommateur de file, worker — que systemd lance, supervise et relance
