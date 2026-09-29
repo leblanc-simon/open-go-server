@@ -1,6 +1,8 @@
 package fs
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -155,6 +157,66 @@ func TestBackupToNeCreeRienSurUnOriginalAbsent(t *testing.T) {
 	}
 	if _, err := os.Stat(dir); !os.IsNotExist(err) {
 		t.Errorf("le répertoire de sauvegarde n'avait pas lieu d'être créé")
+	}
+}
+
+// Le pool et le vhost d'un projet s'appellent tous deux shopfr.conf, et un même
+// apply les sauvegarde dans la même seconde : la seconde copie écrasait la
+// première, que le plan annonçait pourtant sauvegardée.
+func TestBackupToNEcraseJamaisUneAutreSauvegarde(t *testing.T) {
+	src := t.TempDir()
+	dir := filepath.Join(t.TempDir(), "backups")
+	now := time.Date(2026, 8, 23, 3, 4, 5, 0, time.UTC)
+	originaux := map[string]string{}
+	for _, sous := range []string{"pool.d", "sites-available"} {
+		path := filepath.Join(src, sous, "shopfr.conf")
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("retouche de "+sous+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		originaux[sous] = path
+	}
+	// Un lien posé d'avance au nom suivant n'est pas suivi : il est sauté.
+	cible := filepath.Join(t.TempDir(), "cible")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(cible, filepath.Join(dir, "shopfr.conf.ogs-bak-20260823-030405.2")); err != nil {
+		t.Fatal(err)
+	}
+
+	contenus := map[string]string{}
+	for _, path := range []string{originaux["pool.d"], originaux["sites-available"], originaux["pool.d"]} {
+		dst, err := BackupTo(path, dir, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, pris := contenus[dst]; pris {
+			t.Fatalf("%s a servi deux fois", dst)
+		}
+		data, _ := os.ReadFile(path)
+		contenus[dst] = string(data)
+	}
+	attendus := []string{
+		"shopfr.conf.ogs-bak-20260823-030405",
+		"shopfr.conf.ogs-bak-20260823-030405.1",
+		"shopfr.conf.ogs-bak-20260823-030405.3",
+	}
+	for _, nom := range attendus {
+		dst := filepath.Join(dir, nom)
+		want, ok := contenus[dst]
+		if !ok {
+			t.Errorf("sauvegarde %s absente ; obtenu %v", nom, contenus)
+			continue
+		}
+		if data, err := os.ReadFile(dst); err != nil || string(data) != want {
+			t.Errorf("%s contient %q (%v), attendu %q", nom, data, err, want)
+		}
+	}
+	if _, err := os.Lstat(cible); !os.IsNotExist(err) {
+		t.Errorf("la sauvegarde a suivi le lien posé à son nom : %v", err)
 	}
 }
 
@@ -392,5 +454,155 @@ func TestManagedProjectLitLeProjetDansLEnTete(t *testing.T) {
 	}
 	if got, err := ManagedProject(lien); got != "" || err != nil {
 		t.Errorf("lien : projet %q, erreur %v ; attendu aucun projet, sans erreur", got, err)
+	}
+}
+
+func TestInspectRemovalNeRetireQueCeQuOgsAEcritPourLeProjet(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name string, data []byte) string {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	intact := Render(header(), []byte("[shopfr]\n"), ";")
+	voisin := header()
+	voisin.Project = "shopfr_api"
+	parc := Header{Project: "3 projet(s)", Resource: "mail/dkim-keytable"}
+
+	cas := []struct {
+		nom, projet string
+		path        string
+		attendu     State
+	}{
+		{"fichier du projet, intact", "shopfr", write("intact.conf", intact), StateCurrent},
+		{"fichier du projet, retouché", "shopfr",
+			write("retouche.conf", append(append([]byte{}, intact...), "pm.max_children = 4\n"...)), StateHandEdited},
+		{"fichier posé à la main", "shopfr", write("main.conf", []byte("[shopfr_admin]\nuser = shopfr\n")), StateForeign},
+		{"fichier d'un autre projet", "shopfr", write("voisin.conf", Render(voisin, []byte("x\n"), ";")), StateForeign},
+		{"fichier de parc, sans identifiant attendu", "", write("parc", Render(parc, []byte("x\n"), "#")), StateCurrent},
+		{"fichier de parc sans la marque", "", write("parc-main", []byte("x\n")), StateForeign},
+		{"fichier absent", "shopfr", filepath.Join(dir, "absent.conf"), StateAbsent},
+		// Inspect cherche la marque dans les trois premières lignes : une ligne
+		// posée au-dessus de l'en-tête fait un fichier retouché, que --force
+		// retire, et non un fichier étranger qu'on ne pourrait jamais retirer.
+		{"ligne ajoutée au-dessus de l'en-tête", "shopfr",
+			write("dessus.conf", append([]byte("; posé à la main\n"), intact...)), StateHandEdited},
+		{"ligne ajoutée au-dessus de l'en-tête d'un autre projet", "shopfr",
+			write("dessus-voisin.conf", append([]byte("; posé à la main\n"), Render(voisin, []byte("x\n"), ";")...)),
+			StateForeign},
+	}
+	for _, c := range cas {
+		got, err := InspectRemoval(c.path, c.projet)
+		if err != nil {
+			t.Errorf("%s : erreur %v", c.nom, err)
+		}
+		if got != c.attendu {
+			t.Errorf("%s : %v, attendu %v", c.nom, got, c.attendu)
+		}
+	}
+
+	// Un lien vers un fichier du projet n'est pas ce qu'ogs a écrit : il n'est
+	// jamais pris pour lui, et le suivre ferait juger la cible à sa place.
+	lien := filepath.Join(dir, "lien.conf")
+	if err := os.Symlink(filepath.Join(dir, "intact.conf"), lien); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := InspectRemoval(lien, "shopfr"); got != StateForeign || err != nil {
+		t.Errorf("lien : %v (%v), attendu %v", got, err, StateForeign)
+	}
+	if got, err := InspectRemoval(dir, "shopfr"); got != StateForeign || err != nil {
+		t.Errorf("répertoire : %v (%v), attendu %v", got, err, StateForeign)
+	}
+}
+
+// La ressource range un fichier parmi ceux d'un provider : le vhost de
+// supervision porte « parc » à la place d'un projet, et « parc » est aussi un
+// identifiant valide.
+func TestManagedResourceLitLaRessourceDeLEnTete(t *testing.T) {
+	dir := t.TempDir()
+	cas := []struct {
+		nom, projet, ressource string
+		contenu                []byte
+	}{
+		{"vhost d'un projet", "shopfr", "web/vhost/shopfr",
+			Render(Header{Project: "shopfr", Resource: "web/vhost/shopfr"}, []byte("x\n"), "#")},
+		{"vhost de supervision", "parc", "web/status",
+			Render(Header{Project: "parc", Resource: "web/status", Template: "/etc/ogs/templates/status"},
+				[]byte("x\n"), "#")},
+		{"fichier posé à la main", "", "", []byte("# projet: shopfr  ressource: web/vhost/shopfr  empreinte: x\n")},
+		// La marque se cherche là où Inspect la cherche : ce qu'Inspect juge
+		// retouché reste attribué à son projet.
+		{"ligne ajoutée au-dessus de l'en-tête", "shopfr", "web/vhost/shopfr",
+			append([]byte("# posé à la main\n"),
+				Render(Header{Project: "shopfr", Resource: "web/vhost/shopfr"}, []byte("x\n"), "#")...)},
+		{"marque au-delà des trois premières lignes", "", "",
+			append([]byte("#\n#\n#\n"),
+				Render(Header{Project: "shopfr", Resource: "web/vhost/shopfr"}, []byte("x\n"), "#")...)},
+		{"marque sans ligne de projet", "", "", []byte("# Généré par ogs\nserver {}\n")},
+	}
+	for i, c := range cas {
+		path := filepath.Join(dir, fmt.Sprintf("f%d", i))
+		if err := os.WriteFile(path, c.contenu, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		projet, ressource, err := ManagedResource(path)
+		if err != nil || projet != c.projet || ressource != c.ressource {
+			t.Errorf("%s : %q, %q (%v), attendu %q, %q", c.nom, projet, ressource, err, c.projet, c.ressource)
+		}
+	}
+}
+
+// Le fichier d'un autre projet n'est jamais écrit pour celui-ci ; un fichier
+// sans la marque, absent ou du projet lui-même relève des cinq états.
+func TestCheckOwnerRefuseLeFichierDUnAutreProjet(t *testing.T) {
+	dir := t.TempDir()
+	voisin := filepath.Join(dir, "shop_api.conf")
+	if err := os.WriteFile(voisin, Render(Header{Project: "shop_api", Resource: "php/pool/shop_api"},
+		[]byte("[shop_api]\n"), ";"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	err := CheckOwner(voisin, "shop", "pool « api » de shop")
+	var owned *OwnerError
+	if !errors.As(err, &owned) || owned.Owner != "shop_api" || owned.Project != "shop" {
+		t.Fatalf("le fichier du voisin doit être refusé : %v", err)
+	}
+	if !strings.Contains(err.Error(), "--force compris") || !strings.Contains(err.Error(), "« ogs apply shop_api »") {
+		t.Errorf("le refus doit dire que --force n'y peut rien, et renvoyer au propriétaire : %v", err)
+	}
+	if !strings.HasPrefix(err.Error(), "pool « api » de shop : ") {
+		t.Errorf("le refus doit nommer ce qui voulait écrire : %v", err)
+	}
+	// Un propriétaire disparu n'a plus d'apply qui le retire : le message ne
+	// doit pas y renvoyer. L'appelant l'apprend après coup, et le message rendu
+	// doit le refléter.
+	owned.Gone = true
+	if msg := err.Error(); strings.Contains(msg, "ogs apply") || !strings.Contains(msg, "n'est plus déclaré") {
+		t.Errorf("propriétaire disparu : %s", msg)
+	}
+
+	// Retoucher le haut du fichier d'un voisin n'en fait pas un fichier sans
+	// maître : Inspect le tiendrait pour modifié à la main, et --force le
+	// réécrirait au compte du mauvais projet.
+	retouche := filepath.Join(dir, "shop_b2b.conf")
+	if err := os.WriteFile(retouche, append([]byte("; ajout\n"), Render(Header{Project: "shop_b2b",
+		Resource: "php/pool/shop_b2b"}, []byte("[shop_b2b]\n"), ";")...), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := CheckOwner(retouche, "shop", ""); !errors.As(err, &owned) || owned.Owner != "shop_b2b" {
+		t.Errorf("le fichier retouché du voisin doit être refusé : %v", err)
+	}
+
+	manuel := filepath.Join(dir, "shop_old.conf")
+	if err := os.WriteFile(manuel, []byte("[shop_old]\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct{ path, projet string }{
+		{voisin, "shop_api"}, {manuel, "shop"}, {filepath.Join(dir, "absent.conf"), "shop"},
+	} {
+		if err := CheckOwner(c.path, c.projet, ""); err != nil {
+			t.Errorf("%s pour %s : %v", c.path, c.projet, err)
+		}
 	}
 }

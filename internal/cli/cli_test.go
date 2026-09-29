@@ -501,6 +501,236 @@ func TestPrestashopAndSymfonyCoexist(t *testing.T) {
 	}
 }
 
+// Un identifiant qui en prolonge un autre (« shop_api » face à « shop », ou le
+// « <id>_<hachage> » d'un host tronqué) n'en fait pas une ressource du premier :
+// l'apply de shop retirait comme obsolètes le pool, le vhost et le lien
+// d'activation de son voisin, avec le code 0, et l'apply du parc les supprimait
+// puis les recréait à chaque passage.
+func TestApplyNeRetireJamaisLesFichiersDUnVoisinAuNomProche(t *testing.T) {
+	for _, cas := range []struct {
+		nom         string
+		court, long []string
+		idCourt     string
+		prefixeLong string
+	}{
+		{nom: "identifiant forcé",
+			court: []string{"shop.fr", "--id", "shop"}, long: []string{"api.shop.fr", "--id", "shop_api"},
+			idCourt: "shop", prefixeLong: "shop_api"},
+		{nom: "host tronqué",
+			court:   []string{"maboutiquedeventeen.li"},
+			long:    []string{"ma-boutique-de-vente-en-ligne-de-chaussures.fr"},
+			idCourt: "maboutiquedeventeenli", prefixeLong: "maboutiquedeventeenli_"},
+	} {
+		t.Run(cas.nom, func(t *testing.T) {
+			h := newHarness(t)
+			h.mustRun("init")
+			h.mustRun(append(append([]string{"project", "create"}, cas.court...),
+				"--kind", "php-symfony", "--php", "8.5")...)
+			h.mustRun(append(append([]string{"project", "create"}, cas.long...),
+				"--kind", "php-symfony", "--php", "8.5")...)
+			var long string
+			for _, f := range strings.Fields(h.mustRun("project", "list")) {
+				if strings.HasPrefix(f, cas.prefixeLong) {
+					long = f
+				}
+			}
+			if long == "" || long == cas.idCourt {
+				t.Fatalf("identifiant du voisin introuvable (préfixe %s)", cas.prefixeLong)
+			}
+			h.mustRunPartial("apply", long, "--yes")
+			fichiers := []string{
+				filepath.Join("etc", "php", "8.5", "fpm", "pool.d", long+".conf"),
+				filepath.Join("etc", "apache2", "sites-available", long+".conf"),
+				filepath.Join("etc", "apache2", "sites-enabled", long+".conf"),
+			}
+
+			plan := h.mustRun("plan", cas.idCourt)
+			if strings.Contains(plan, "obsolète") {
+				t.Errorf("le plan de %s ne doit rien retirer du voisin %s :\n%s", cas.idCourt, long, plan)
+			}
+			h.mustRunPartial("apply", cas.idCourt, "--yes")
+			for _, f := range fichiers {
+				if _, err := os.Lstat(h.path(f)); err != nil {
+					t.Errorf("%s du projet %s retiré par l'apply de %s : %v", f, long, cas.idCourt, err)
+				}
+			}
+			// Le parc converge : un second apply de tout le parc n'a plus rien à
+			// retirer ni à recréer.
+			h.mustRunPartial("apply", "--yes")
+			if plan := h.mustRun("plan"); strings.Contains(plan, "obsolète") {
+				t.Errorf("le parc ne converge pas :\n%s", plan)
+			}
+		})
+	}
+}
+
+// Le sens inverse : le vhost « b2b » ou le pool « api » ajoutés à la déclaration
+// de shop s'écrivent dans shop_b2b.conf et shop_api.conf, les fichiers
+// principaux de deux voisins. « apply shop » ne valide l'unicité que sur sa
+// cible : il réécrivait le fichier du voisin à son compte, avec le code 0 — le
+// pool de shop_api tournait sous l'utilisateur de shop. Le fichier d'un autre
+// projet est un conflit, --force compris.
+func TestApplyCibleNeReecritJamaisLeFichierDUnVoisin(t *testing.T) {
+	for _, cas := range []struct {
+		nom, host, voisin, fichier string
+		// ajout transforme la déclaration de shop.
+		ajout func(string) string
+	}{
+		{nom: "vhost", host: "b2b.shop.fr", voisin: "shop_b2b",
+			fichier: filepath.Join("etc", "apache2", "sites-available", "shop_b2b.conf"),
+			ajout: func(decl string) string {
+				return strings.Replace(decl, "  domains:\n    - name: shop.fr\n      role: primary\n",
+					"  domains:\n    - name: shop.fr\n      role: primary\n    - name: pro.shop.fr\n      role: alias\n"+
+						"  web:\n    vhosts:\n      - name: web\n        domains: [shop.fr]\n"+
+						"      - name: b2b\n        domains: [pro.shop.fr]\n", 1)
+			}},
+		{nom: "pool", host: "api.shop.fr", voisin: "shop_api",
+			fichier: filepath.Join("etc", "php", "8.5", "fpm", "pool.d", "shop_api.conf"),
+			ajout: func(decl string) string {
+				return decl + "      - name: api\n        version: \"8.5\"\n"
+			}},
+	} {
+		t.Run(cas.nom, func(t *testing.T) {
+			h := newHarness(t)
+			h.mustRun("init")
+			h.mustRun("project", "create", "shop.fr", "--id", "shop", "--kind", "php-symfony", "--php", "8.5")
+			h.mustRun("project", "create", cas.host, "--id", cas.voisin, "--kind", "php-symfony", "--php", "8.5")
+			h.mustRunPartial("apply", "--yes")
+			avant := h.read(t, cas.fichier)
+
+			decl := filepath.Join("etc", "ogs", "projects", "shop.yaml")
+			modifie := cas.ajout(h.read(t, decl))
+			if modifie == h.read(t, decl) {
+				t.Fatal("la déclaration de shop n'a pas été modifiée")
+			}
+			if err := os.WriteFile(h.path(decl), []byte(modifie), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			for _, args := range [][]string{
+				{"plan", "shop"},
+				{"apply", "shop", "--yes"},
+				{"apply", "shop", "--yes", "--force"},
+			} {
+				out, code := h.run(args...)
+				if code != CodeConflict {
+					t.Errorf("« ogs %s » : code %d, attendu %d (conflit) :\n%s",
+						strings.Join(args, " "), code, CodeConflict, out)
+				}
+				if !strings.Contains(out, "est le fichier du projet "+cas.voisin) {
+					t.Errorf("« ogs %s » doit nommer le propriétaire du fichier :\n%s", strings.Join(args, " "), out)
+				}
+			}
+			if got := h.read(t, cas.fichier); got != avant {
+				t.Errorf("le fichier de %s a été réécrit par shop :\n%s", cas.voisin, got)
+			}
+		})
+	}
+}
+
+// Le vhost de supervision porte « projet: parc » dans son en-tête, et « parc »
+// est un identifiant valide. Pour un projet ainsi nommé, ogs-status.conf passait
+// pour l'un de ses vhosts obsolètes : chaque apply le retirait, le plan global le
+// recréait, et le plan du projet n'était jamais vide.
+func TestUnProjetNommeParcNeRetirePasLeVHostDeSupervision(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("project", "create", "parc.fr", "--id", "parc", "--kind", "php-symfony", "--php", "8.5")
+	h.mustRunPartial("apply", "--yes")
+	status := filepath.Join("etc", "apache2", "sites-available", "ogs-status.conf")
+	avant := h.read(t, status)
+
+	if plan := h.mustRun("plan", "parc"); strings.Contains(plan, "obsolète") {
+		t.Errorf("le vhost de supervision n'est pas un vhost du projet parc :\n%s", plan)
+	}
+	out := h.mustRunPartial("apply", "parc", "--yes")
+	if strings.Contains(out, "obsolète") {
+		t.Errorf("l'apply de parc ne doit rien retirer :\n%s", out)
+	}
+	if got := h.read(t, status); got != avant {
+		t.Errorf("le vhost de supervision a été retiré puis recréé :\n%s", got)
+	}
+}
+
+// Le pool et le vhost d'un projet s'appellent tous deux shopfr.conf. Une bascule
+// de version sous --force réécrit le vhost retouché puis retire l'ancien pool
+// retouché, dans la même seconde : la seconde sauvegarde écrasait la première,
+// et la retouche du vhost était perdue alors que le plan l'annonçait sauvegardée.
+func TestUnApplyForceGardeChaqueSauvegardeDeMemeNom(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("project", "create", "shop.fr", "--kind", "php-symfony", "--app-version", "6.4", "--php", "8.5")
+	h.mustRun("apply", "shopfr", "--yes")
+	retouches := map[string]string{
+		filepath.Join("etc", "php", "8.5", "fpm", "pool.d", "shopfr.conf"): "pm.max_children = 4\n",
+		filepath.Join("etc", "apache2", "sites-available", "shopfr.conf"):  "# redirection provisoire\n",
+	}
+	attendus := map[string]bool{}
+	for f, ajout := range retouches {
+		contenu := h.read(t, f) + ajout
+		if err := os.WriteFile(h.path(f), []byte(contenu), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		attendus[contenu] = true
+	}
+
+	h.mustRun("php", "switch", "shopfr", "8.3", "--force")
+	out := h.mustRunPartial("apply", "shopfr", "--yes", "--force")
+	if !strings.Contains(out, "écrasement forcé") || !strings.Contains(out, "retrait forcé") {
+		t.Fatalf("l'apply doit réécrire le vhost et retirer l'ancien pool sous --force :\n%s", out)
+	}
+	baks, _ := filepath.Glob(filepath.Join(h.path("var", "lib", "ogs", "backups"), "shopfr.conf.ogs-bak-*"))
+	for _, b := range baks {
+		data, _ := os.ReadFile(b)
+		delete(attendus, string(data))
+	}
+	if len(attendus) != 0 {
+		t.Errorf("%d retouche(s) sans sauvegarde parmi %d copie(s) : %v", len(attendus), len(baks), baks)
+	}
+}
+
+// Un nom de fichier de vhost qu'Apache ne chargerait pas est une faute de
+// déclaration (code 3), non un conflit.
+func TestUnFichierDeVHostSansExtensionSurApacheEstUneErreurDeValidation(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("project", "create", "shop.fr", "--kind", "static")
+	decl := filepath.Join("etc", "ogs", "projects", "shopfr.yaml")
+	contenu := strings.Replace(h.read(t, decl), "metadata:\n", "metadata:\n  labels:\n    adopted: \"true\"\n", 1)
+	contenu = strings.Replace(contenu, "spec:\n",
+		"spec:\n  web:\n    vhosts:\n      - name: shop.fr\n        file: shop.fr\n        domains: [shop.fr]\n", 1)
+	if err := os.WriteFile(h.path(decl), []byte(contenu), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, code := h.run("plan", "shopfr")
+	if code != CodeValidation || !strings.Contains(out, "sites-enabled/*.conf") {
+		t.Errorf("code %d, attendu %d :\n%s", code, CodeValidation, out)
+	}
+}
+
+// Le fichier d'un projet qui n'est plus déclaré — laissé par une suppression —
+// est toujours refusé, mais le message ne renvoie plus à « ogs apply » d'un
+// projet disparu.
+func TestLeFichierDUnProjetDisparuNeRenvoiePasASonApply(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("project", "create", "api.shop.fr", "--id", "shop_api", "--kind", "php-symfony", "--php", "8.5")
+	h.mustRunPartial("apply", "--yes")
+	if err := os.Remove(h.path("etc", "ogs", "projects", "shop_api.yaml")); err != nil {
+		t.Fatal(err)
+	}
+	h.mustRun("project", "create", "shop.fr", "--id", "shop", "--kind", "php-symfony", "--php", "8.5")
+	decl := filepath.Join("etc", "ogs", "projects", "shop.yaml")
+	contenu := h.read(t, decl) + "      - name: api\n        version: \"8.5\"\n"
+	if err := os.WriteFile(h.path(decl), []byte(contenu), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, code := h.run("apply", "shop", "--yes", "--force")
+	if code != CodeConflict || !strings.Contains(out, "n'est plus déclaré") || strings.Contains(out, "ogs apply shop_api") {
+		t.Errorf("code %d, attendu %d, et un message sans renvoi à l'apply du disparu :\n%s", code, CodeConflict, out)
+	}
+}
+
 func TestLogrotateGathersProjectsInOneBlock(t *testing.T) {
 	h := newHarness(t)
 	h.mustRun("init")
@@ -2150,6 +2380,81 @@ func TestImportAdoptKeepsExistingNamesAndAnnouncesDrift(t *testing.T) {
 	}
 	if strings.Contains(out, "déjà servi par") {
 		t.Errorf("un projet adopté ne doit pas entrer en conflit avec ses propres vhosts :\n%s", out)
+	}
+}
+
+// Sur nginx, l'usage Debian est un vhost sans extension. Le scan tronquait
+// « shop.fr » et « shop.de » en un même vhost « shop » : le projet adopté
+// écrivait shop.conf, et son premier apply retirait comme obsolètes l'original
+// et le site voisin, sans --force ni sauvegarde, avec le code 0.
+func TestAdoptionNginxRepriseDuFichierDOrigineSansToucherAuVoisin(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	h.choisirNginx(t)
+	avail := filepath.Join("etc", "nginx", "sites-available")
+	enabled := filepath.Join("etc", "nginx", "sites-enabled")
+	for _, dir := range []string{avail, enabled} {
+		if err := os.MkdirAll(h.path(dir), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	origine := map[string]string{}
+	for _, site := range []string{"shop.fr", "shop.de"} {
+		docroot := h.path("var", "www", site, "public")
+		if err := os.MkdirAll(docroot, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		origine[site] = "server {\n    listen 80;\n    server_name " + site + ";\n    root " + docroot + ";\n}\n"
+		if err := os.WriteFile(h.path(avail, site), []byte(origine[site]), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink("../sites-available/"+site, h.path(enabled, site)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	h.mustRun("import", "adopt", "shopfr", "--yes")
+	decl := h.read(t, filepath.Join("etc", "ogs", "projects", "shopfr.yaml"))
+	if !strings.Contains(decl, "file: shop.fr") {
+		t.Errorf("la déclaration doit désigner le fichier réel :\n%s", decl)
+	}
+
+	plan, _ := h.run("plan", "shopfr")
+	if strings.Contains(plan, "obsolète") {
+		t.Errorf("le plan d'un projet adopté ne doit rien retirer :\n%s", plan)
+	}
+	// Sans --force, le vhost d'origine est refusé, et rien n'est retiré.
+	out, code := h.run("apply", "shopfr", "--yes")
+	if code == CodeOK {
+		t.Errorf("reprendre un vhost non géré doit exiger --force :\n%s", out)
+	}
+	for site, corps := range origine {
+		if got, err := os.ReadFile(h.path(avail, site)); err != nil || string(got) != corps {
+			t.Errorf("%s a été touché sans --force : %v", site, err)
+		}
+	}
+
+	h.mustRunPartial("apply", "shopfr", "--yes", "--force")
+	if got := h.read(t, filepath.Join(avail, "shop.fr")); !strings.Contains(got, "Généré par ogs") {
+		t.Errorf("le fichier d'origine doit être réécrit par ogs :\n%s", got)
+	}
+	if _, err := os.Stat(h.path(avail, "shop.conf")); !os.IsNotExist(err) {
+		t.Errorf("aucun second fichier ne doit apparaître à côté de l'original : %v", err)
+	}
+	if got := h.read(t, filepath.Join(avail, "shop.de")); got != origine["shop.de"] {
+		t.Errorf("le vhost du site voisin a été touché :\n%s", got)
+	}
+	for _, site := range []string{"shop.fr", "shop.de"} {
+		if _, err := os.Stat(h.path(enabled, site)); err != nil {
+			t.Errorf("le lien d'activation de %s doit rester en place : %v", site, err)
+		}
+	}
+	baks, _ := filepath.Glob(filepath.Join(h.path("var", "lib", "ogs", "backups"), "shop.fr.ogs-bak-*"))
+	if len(baks) != 1 {
+		t.Fatalf("une sauvegarde de l'original attendue, %d trouvée(s)", len(baks))
+	}
+	if saved, _ := os.ReadFile(baks[0]); string(saved) != origine["shop.fr"] {
+		t.Errorf("la sauvegarde doit porter l'original :\n%s", saved)
 	}
 }
 

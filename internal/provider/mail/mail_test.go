@@ -365,6 +365,68 @@ func TestUneTableModifieeALaMainEstRefusee(t *testing.T) {
 	}
 }
 
+// OpenDKIM désactivé, ogs retire ses tables — les siennes seulement, et comme
+// il les a écrites : une table retouchée ne part que sous --force, une table
+// sans la marque d'ogs est celle de l'administrateur.
+func TestOpenDKIMDesactiveNeRetireQueSesTablesIntactes(t *testing.T) {
+	f := newFixture(t)
+	p := project(t, "shop.fr", &model.DKIM{Enabled: true})
+	run(t, f.plan(t, p))
+	tables(t, f, p)
+	keyTable, signingTable := f.paths.OpenDKIMKeyTable(), f.paths.OpenDKIMSigningTable()
+	data, _ := os.ReadFile(keyTable)
+	retouchee := append(data, []byte("maison._domainkey.autre.fr autre.fr:maison:/etc/opendkim/maison.key\n")...)
+	if err := os.WriteFile(keyTable, retouchee, 0o640); err != nil {
+		t.Fatal(err)
+	}
+
+	steps, err := f.p.PlanTables([]*model.Project{p}, Observed{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range mutating(steps) {
+		err := s.Apply(context.Background())
+		if s.Resource == "mail/dkim-keytable" && (err == nil || !strings.Contains(err.Error(), "--force")) {
+			t.Errorf("la table retouchée doit être refusée, en nommant --force : %v", err)
+		}
+		if s.Resource == "mail/dkim-signingtable" && err != nil {
+			t.Errorf("la table intacte doit partir : %v", err)
+		}
+	}
+	if got, _ := os.ReadFile(keyTable); string(got) != string(retouchee) {
+		t.Error("la table retouchée a été retirée sans --force")
+	}
+	if _, err := os.Stat(signingTable); !os.IsNotExist(err) {
+		t.Errorf("la table intacte devait être retirée : %v", err)
+	}
+
+	// Une table posée par l'administrateur n'est jamais retirée, --force compris.
+	if err := os.WriteFile(signingTable, []byte("*@autre.fr maison._domainkey.autre.fr\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	f.p.Force = true
+	steps, err = f.p.PlanTables([]*model.Project{p}, Observed{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run(t, mutating(steps)[:1])
+	if _, err := os.Stat(keyTable); !os.IsNotExist(err) {
+		t.Errorf("la table retouchée devait partir sous --force : %v", err)
+	}
+	baks, _ := filepath.Glob(filepath.Join(f.paths.BackupsDir(), filepath.Base(keyTable)+".ogs-bak-*"))
+	if len(baks) != 1 {
+		t.Errorf("une sauvegarde de la table attendue, %d trouvée(s)", len(baks))
+	}
+	for _, s := range mutating(steps)[1:] {
+		if err := s.Apply(context.Background()); err == nil {
+			t.Errorf("%s : la table de l'administrateur doit être laissée en le disant", s.Resource)
+		}
+	}
+	if _, err := os.Stat(signingTable); err != nil {
+		t.Errorf("la table de l'administrateur a été retirée : %v", err)
+	}
+}
+
 func TestUneTableConformeResteConformeLaSecondeSuivante(t *testing.T) {
 	f := newFixture(t)
 	p := project(t, "shop.fr", &model.DKIM{Enabled: true})
@@ -506,6 +568,155 @@ func TestUnDomaineQuiNEstPlusSigneGardeSaCle(t *testing.T) {
 	run(t, f.plan(t, p))
 	if f.generate != 1 {
 		t.Errorf("la réactivation doit reprendre la clé scellée, non en engendrer une : %d génération(s)", f.generate)
+	}
+}
+
+// Le fichier d'une clé qui ne correspond plus à la clé scellée porte une clé
+// privée que le keystore ne connaît pas : ni le domaine qui cesse d'être signé,
+// ni l'expiration d'une clé remplacée ne l'emportent sans --force, copie faite.
+func TestUneCleRetoucheeNEstRetireeQueSousForce(t *testing.T) {
+	autreCle := keyPool(t)[3]
+	retoucher := func(t *testing.T, path string) {
+		t.Helper()
+		if err := os.WriteFile(path, []byte(autreCle), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	verifier := func(t *testing.T, f *fixture, step *engine.Step, path string) {
+		t.Helper()
+		if !strings.Contains(step.Summary, "modifié hors ogs") {
+			t.Fatalf("le retrait doit être refusé : %s", step.Summary)
+		}
+		if err := step.Apply(context.Background()); err == nil || !strings.Contains(err.Error(), "--force") {
+			t.Errorf("le refus doit nommer --force : %v", err)
+		}
+		if data, _ := os.ReadFile(path); string(data) != autreCle {
+			t.Fatal("la clé retouchée a été retirée sans --force")
+		}
+	}
+	sauvegarde := func(t *testing.T, f *fixture, path string) {
+		t.Helper()
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Errorf("la clé devait être retirée sous --force : %v", err)
+		}
+		baks, _ := filepath.Glob(filepath.Join(f.paths.BackupsDir(), filepath.Base(path)+".ogs-bak-*"))
+		if len(baks) != 1 {
+			t.Fatalf("une sauvegarde attendue, %d trouvée(s)", len(baks))
+		}
+		if data, _ := os.ReadFile(baks[0]); string(data) != autreCle {
+			t.Error("la sauvegarde doit porter la clé retouchée")
+		}
+	}
+
+	t.Run("domaine qui n'est plus signé", func(t *testing.T) {
+		f := newFixture(t)
+		p := project(t, "shop.fr", &model.DKIM{Enabled: true})
+		run(t, f.plan(t, p))
+		tables(t, f, p)
+		path := f.paths.OpenDKIMKeyFile(p.ID(), "shop.fr", "ogs202609")
+		retoucher(t, path)
+		p.Spec.Mail = nil
+		retrait := func() *engine.Step {
+			steps, err := f.p.PlanTables([]*model.Project{p}, f.observe(t))
+			if err != nil {
+				t.Fatal(err)
+			}
+			steps = mutating(steps)
+			return steps[len(steps)-1]
+		}
+		verifier(t, f, retrait(), path)
+		f.p.Force = true
+		s := retrait()
+		if !strings.Contains(s.Summary, "retrait forcé") {
+			t.Fatalf("le plan doit annoncer le retrait forcé : %s", s.Summary)
+		}
+		if err := s.Apply(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		sauvegarde(t, f, path)
+	})
+
+	t.Run("clé remplacée dont la rétention est écoulée", func(t *testing.T) {
+		f := newFixture(t)
+		p := project(t, "shop.fr", &model.DKIM{Enabled: true})
+		run(t, f.plan(t, p))
+		steps, err := f.p.Rotate(context.Background(), p, "", f.observe(t))
+		if err != nil {
+			t.Fatal(err)
+		}
+		run(t, steps)
+		pending, _ := f.p.Pending(p, "")
+		if err := f.p.Activate(p, pending).Apply(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		path := f.paths.OpenDKIMKeyFile(p.ID(), "shop.fr", "ogs202609")
+		retoucher(t, path)
+		f.now = f.now.Add(8 * 24 * time.Hour)
+		expiration := func() *engine.Step {
+			for _, s := range mutating(f.plan(t, p)) {
+				if s.Action == engine.Delete {
+					return s
+				}
+			}
+			t.Fatal("expiration attendue")
+			return nil
+		}
+		verifier(t, f, expiration(), path)
+		if keys, _ := f.p.ProjectKeys(p); len(keys) != 2 {
+			t.Errorf("un refus ne défait rien à moitié : la clé remplacée reste scellée, obtenu %v", keys)
+		}
+		f.p.Force = true
+		s := expiration()
+		if !strings.Contains(s.Summary, "retrait forcé") {
+			t.Fatalf("le plan doit annoncer le retrait forcé : %s", s.Summary)
+		}
+		if err := s.Apply(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		sauvegarde(t, f, path)
+	})
+}
+
+// L'expiration relit la clé au moment de la retirer, comme tout retrait : une
+// clé intacte au plan, remplacée avant la confirmation, partait sans copie — et
+// son secret avec elle.
+func TestLExpirationRelitLaCleAvantDeLaRetirer(t *testing.T) {
+	f := newFixture(t)
+	p := project(t, "shop.fr", &model.DKIM{Enabled: true})
+	run(t, f.plan(t, p))
+	steps, err := f.p.Rotate(context.Background(), p, "", f.observe(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	run(t, steps)
+	pending, _ := f.p.Pending(p, "")
+	if err := f.p.Activate(p, pending).Apply(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	f.now = f.now.Add(8 * 24 * time.Hour)
+	var expiration *engine.Step
+	for _, s := range mutating(f.plan(t, p)) {
+		if s.Action == engine.Delete {
+			expiration = s
+		}
+	}
+	if expiration == nil || strings.Contains(expiration.Summary, "hors ogs") {
+		t.Fatalf("une expiration ordinaire est attendue : %+v", expiration)
+	}
+
+	path := f.paths.OpenDKIMKeyFile(p.ID(), "shop.fr", "ogs202609")
+	autreCle := keyPool(t)[3]
+	if err := os.WriteFile(path, []byte(autreCle), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := expiration.Apply(context.Background()); err == nil || !strings.Contains(err.Error(), "--force") {
+		t.Errorf("la clé remplacée après le plan doit être refusée, en nommant --force : %v", err)
+	}
+	if data, _ := os.ReadFile(path); string(data) != autreCle {
+		t.Error("la clé remplacée après le plan a été retirée")
+	}
+	if keys, _ := f.p.ProjectKeys(p); len(keys) != 2 {
+		t.Errorf("la clé remplacée doit rester scellée, obtenu %v", keys)
 	}
 }
 

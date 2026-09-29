@@ -106,11 +106,21 @@ type Observed struct {
 }
 
 // Observe inspecte les vhosts existants et cherche les conflits de domaine.
+//
+// Un fichier n'est obsolète que si son en-tête le dit écrit par ogs pour ce
+// projet, et comme l'un de ses vhosts (fs.ManagedResource) — jamais d'après son
+// nom. L'attribution par préfixe (« <id>_* ») faisait retirer au premier apply
+// de « shop » le vhost de son voisin « shop_api », et à un projet adopté les
+// fichiers d'origine qu'un nom tronqué lui rattachait, le site voisin compris.
+// La ressource écarte le vhost de supervision, dont l'en-tête nomme « parc » —
+// un identifiant valide. Un fichier que rien ne rattache au projet reste une
+// configuration étrangère : elle n'est jamais retirée, et si elle sert l'un de
+// ses domaines, le plan s'arrête sur le conflit.
 func (p *Provider) Observe(_ context.Context, proj *model.Project) (Observed, error) {
 	obs := Observed{Conflicts: map[string]string{}}
 	wanted := map[string]bool{}
 	for _, vh := range p.vhosts(proj) {
-		wanted[filepath.Join(p.Engine.AvailableDir(), p.Engine.FileName(p.vhostName(proj, vh)))] = true
+		wanted[filepath.Join(p.Engine.AvailableDir(), p.vhostFile(proj, vh))] = true
 	}
 	entries, err := os.ReadDir(p.Engine.AvailableDir())
 	if err != nil {
@@ -128,10 +138,16 @@ func (p *Provider) Observe(_ context.Context, proj *model.Project) (Observed, er
 			continue
 		}
 		path := filepath.Join(p.Engine.AvailableDir(), e.Name())
-		if p.belongsTo(proj, e.Name()) {
-			if !wanted[path] {
-				obs.Stale = append(obs.Stale, path)
-			}
+		if wanted[path] {
+			// Le fichier voulu relève de Build et des cinq états : c'est là qu'un
+			// vhost adopté, qui ne porte pas encore la marque d'ogs, est refusé
+			// sans --force puis repris avec sauvegarde.
+			continue
+		}
+		// Un fichier illisible ne peut pas être attribué : il n'est pas retiré.
+		owner, resource, err := fs.ManagedResource(path)
+		if err == nil && owner == proj.ID() && strings.HasPrefix(resource, "web/vhost/") {
+			obs.Stale = append(obs.Stale, path)
 			continue
 		}
 		// Configuration étrangère : on cherche seulement si elle sert l'un de nos
@@ -171,85 +187,86 @@ func serverNames(content string) []string {
 	return out
 }
 
-func (p *Provider) belongsTo(proj *model.Project, filename string) bool {
-	base := strings.TrimSuffix(filename, filepath.Ext(filename))
-	// Un projet adopté conserve le nom réel de ses fichiers : la reconnaissance
-	// s'appuie donc sur les noms attendus, et non sur le seul préfixe canonique.
-	for _, name := range p.VHostNames(proj) {
-		if base == name {
-			return true
-		}
-	}
-	id := proj.ID()
-	return base == id || strings.HasPrefix(base, id+"_")
-}
-
-// vhosts renvoie les vhosts déclarés, ou celui déduit du projet. Un projet n'a
-// pas à déclarer son vhost : le type d'application et les domaines suffisent.
+// vhosts renvoie les vhosts déclarés, ou ceux déduits du projet
+// (model.Project.VHosts).
 func (p *Provider) vhosts(proj *model.Project) []model.VHost {
-	if len(proj.Spec.Web.VHosts) > 0 {
-		return proj.Spec.Web.VHosts
-	}
-	at, err := proj.AppType()
-	if err != nil {
-		return nil
-	}
-	var domains []string
-	var redirects []string
-	for _, d := range proj.Spec.Domains {
-		switch d.Role {
-		case "", "primary", "alias":
-			domains = append(domains, d.Name)
-		case "redirect":
-			redirects = append(redirects, d.Name)
-		}
-	}
-	if len(domains) == 0 {
-		return nil
-	}
-	main := model.VHost{
-		Name:     model.MainPoolName,
-		Template: at.VHostTemplate,
-		Domains:  domains,
-		Docroot:  proj.Spec.Layout.Docroot,
-	}
-	if at.NeedsPHP && len(proj.Spec.PHP.Pools) > 0 {
-		main.Pool = proj.Spec.PHP.Pools[0].Name
-	}
-	out := []model.VHost{main}
-	if len(redirects) > 0 {
-		out = append(out, model.VHost{
-			Name:     "redirect",
-			Template: "redirect",
-			Domains:  redirects,
-			Options:  map[string]any{"target": domains[0]},
-		})
-	}
-	return out
+	return proj.VHosts()
 }
 
-// vhostName traduit le nom logique d'un vhost en nom de fichier : le vhost
-// principal porte le nom nu du projet, les autres un suffixe de rôle. Un projet
-// adopté conserve en revanche le nom réel de ses fichiers : les renommer
-// reviendrait à recréer le vhost, et son domaine apparaîtrait en conflit avec
-// lui-même.
+// vhostName traduit le nom logique d'un vhost en nom de base de son fichier
+// (model.Project.VHostName).
 func (p *Provider) vhostName(proj *model.Project, vh model.VHost) string {
-	if vh.Name == "" || vh.Name == model.MainPoolName {
-		return proj.ID()
-	}
-	if proj.Metadata.Labels["adopted"] == "true" {
-		return vh.Name
-	}
-	return proj.ID() + "_" + vh.Name
+	return proj.VHostName(vh)
 }
 
-// VHostNames énumère les noms de fichiers de vhost d'un projet, pour que la
-// suppression sache quoi retirer.
+// vhostFile est le nom du fichier d'un vhost dans sites-available et
+// sites-enabled (model.Project.VHostFile) : le nom réel d'un vhost adopté, que
+// le nom suivi de l'extension ne désigne pas toujours.
+func (p *Provider) vhostFile(proj *model.Project, vh model.VHost) string {
+	return proj.VHostFile(vh)
+}
+
+// checkFile refuse le nom réel d'un vhost que le moteur ne chargerait pas.
+// Apache n'inclut que sites-enabled/*.conf, là où nginx prend tout
+// sites-enabled/* : un « file: shop.fr » sur Apache donnerait un vhost écrit,
+// activé, et jamais servi, sans un mot. L'import renseigne toujours le nom réel,
+// seule une déclaration éditée à la main est en cause ; et la validation du
+// projet ne peut pas le voir, le moteur étant celui de la machine (D73).
+func (p *Provider) checkFile(vh model.VHost) error {
+	if vh.File == "" || p.Engine.Name() != "apache" || strings.HasSuffix(vh.File, model.VHostExt) {
+		return nil
+	}
+	return &FileError{VHost: vh.Name, File: vh.File}
+}
+
+// conflictHint dit quoi faire d'une configuration étrangère qui sert déjà un
+// domaine du projet. Renvoyer à « ogs import » un projet déjà adopté le ferait
+// tourner en rond : c'est alors, le plus souvent, le fichier d'origine d'un
+// vhost qu'une adoption antérieure n'a pas relevé par son nom exact — le scan
+// réduisait « shop.fr » à « shop », et le projet cherche « shop.conf ». Le
+// désigner suffit ; ogs ne le devine pas, « shop.fr » et « shop.de » ayant pu
+// donner le même nom.
+func conflictHint(proj *model.Project, path string) string {
+	if proj.Metadata.Labels["adopted"] == "true" {
+		return fmt.Sprintf("si c'est le fichier d'origine d'un vhost adopté, le désigner par "+
+			"« file: %s » dans spec.web.vhosts ; sinon, retirer cette configuration", filepath.Base(path))
+	}
+	return "retirer cette configuration ou adopter le site avec « ogs import »"
+}
+
+// FileError signale un nom de fichier de vhost que le moteur de la machine ne
+// chargerait pas. C'est une faute de déclaration, que l'appelant rend comme
+// telle (code 3), et non un conflit.
+type FileError struct {
+	VHost, File string
+}
+
+func (e *FileError) Error() string {
+	return fmt.Sprintf("vhost %s : le fichier %s ne serait jamais chargé — Apache n'inclut que "+
+		"sites-enabled/*%s", e.VHost, e.File, model.VHostExt)
+}
+
+// VHostNames énumère les noms de vhost d'un projet, qui nomment leurs
+// répertoires de surcharge (RemoveIncludes). Leurs fichiers se nomment par
+// VHostFiles : le nom suivi de l'extension ne désigne pas celui d'un vhost
+// adopté sans extension, que la suppression laisserait derrière elle.
 func (p *Provider) VHostNames(proj *model.Project) []string {
 	vhosts := p.vhosts(proj)
 	out := make([]string, 0, len(vhosts))
 	for _, vh := range vhosts {
 		out = append(out, p.vhostName(proj, vh))
+	}
+	return out
+}
+
+// VHostFiles énumère les noms réels des fichiers de vhost d'un projet, dans
+// sites-available comme dans sites-enabled. Il diffère de FileName(VHostNames)
+// pour un vhost adopté dont le fichier ne porte pas l'extension du moteur.
+func (p *Provider) VHostFiles(proj *model.Project) []string {
+	vhosts := p.vhosts(proj)
+	out := make([]string, 0, len(vhosts))
+	for _, vh := range vhosts {
+		out = append(out, p.vhostFile(proj, vh))
 	}
 	return out
 }
@@ -358,12 +375,12 @@ func (p *Provider) Build(proj *model.Project, vh model.VHost) (*VHostPlan, error
 		Template:  p.Templates.OverridePath(p.Engine.TemplateName(tmpl)),
 	}, body, p.Engine.CommentPrefix())
 
-	path := filepath.Join(p.Engine.AvailableDir(), p.Engine.FileName(name))
+	path := filepath.Join(p.Engine.AvailableDir(), p.vhostFile(proj, vh))
 	state, err := fs.Inspect(path, content)
 	if err != nil {
 		return nil, err
 	}
-	enabledPath := filepath.Join(p.Engine.EnabledDir(), p.Engine.FileName(name))
+	enabledPath := filepath.Join(p.Engine.EnabledDir(), p.vhostFile(proj, vh))
 	_, enabledErr := os.Lstat(enabledPath)
 	return &VHostPlan{
 		Name: name, Path: path, EnabledPath: enabledPath, Content: content,
@@ -432,20 +449,36 @@ func (p *Provider) poolFor(proj *model.Project, vh model.VHost) (*php.PoolPlan, 
 func (p *Provider) Plan(_ context.Context, proj *model.Project, obs Observed) ([]*engine.Step, error) {
 	if len(obs.Conflicts) > 0 {
 		for domain, path := range obs.Conflicts {
-			return nil, fmt.Errorf("le domaine %s est déjà servi par %s : "+
-				"retirer cette configuration ou adopter le site avec « ogs import »", domain, path)
+			return nil, fmt.Errorf("le domaine %s est déjà servi par %s : %s", domain, path,
+				conflictHint(proj, path))
 		}
 	}
 	var steps []*engine.Step
 	for _, vh := range p.vhosts(proj) {
+		if err := p.checkFile(vh); err != nil {
+			return nil, err
+		}
 		bp, err := p.Build(proj, vh)
 		if err != nil {
+			return nil, err
+		}
+		// Le fichier d'un autre projet n'est jamais réécrit, --force compris : le
+		// vhost « b2b » de shop s'écrirait dans shop_b2b.conf, le vhost principal
+		// du projet shop_b2b, qui cesserait d'être servi.
+		if err := fs.CheckOwner(bp.Path, proj.ID(),
+			fmt.Sprintf("vhost « %s » de %s", vh.Name, proj.ID())); err != nil {
 			return nil, err
 		}
 		steps = append(steps, p.vhostStep(proj, bp)...)
 	}
 	for _, stale := range obs.Stale {
-		steps = append(steps, p.removeStep(stale))
+		s, err := p.removeStep(stale, proj.ID())
+		if err != nil {
+			return nil, err
+		}
+		if s != nil {
+			steps = append(steps, s)
+		}
 	}
 	return steps, nil
 }
@@ -633,51 +666,6 @@ func (p *Provider) PlanTLS(_ context.Context, proj *model.Project) []*engine.Ste
 		steps = append(steps, s)
 	}
 	return steps
-}
-
-func (p *Provider) removeStep(path string) *engine.Step {
-	name := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
-	s := engine.NewStep("web/vhost/"+name, engine.Delete, "vhost obsolète "+path)
-	enabled := filepath.Join(p.Engine.EnabledDir(), filepath.Base(path))
-	var backup []byte
-	// La cible du lien d'activation est relevée avec le corps : rendre le fichier
-	// sans le lien annonce un retour à l'état initial et laisse pourtant le vhost
-	// hors ligne — ni Apache ni nginx ne chargent sites-available, l'inclusion
-	// passe par le lien. Un domaine de redirection retiré puis rétabli par le
-	// déroulage servirait alors le site par défaut du moteur.
-	var cible string
-	var avaitLien bool
-	s.Apply = func(context.Context) error {
-		if data, err := os.ReadFile(path); err == nil {
-			backup = data
-		}
-		if dest, err := os.Readlink(enabled); err == nil {
-			cible, avaitLien = dest, true
-		}
-		_ = os.Remove(enabled)
-		return os.Remove(path)
-	}
-	s.Compensate = func(context.Context) error {
-		if backup == nil {
-			// Sans le corps, rétablir le lien le ferait pointer dans le vide : nginx
-			// tient l'inclusion d'un lien mort pour fatale, tout le parc avec lui.
-			return nil
-		}
-		if err := fs.WriteAtomic(path, backup, 0o644, fs.KeepOwner); err != nil {
-			return err
-		}
-		if !avaitLien {
-			return nil
-		}
-		// Une compensation en échec arrête tout le déroulage : un lien déjà en
-		// place n'est pas une erreur.
-		if err := os.Symlink(cible, enabled); err != nil && !os.IsExist(err) {
-			return err
-		}
-		return nil
-	}
-	s.Reload = []string{"web:" + p.Engine.Name()}
-	return s
 }
 
 // writeVHost écrit puis valide. La validation intervient avant l'activation :

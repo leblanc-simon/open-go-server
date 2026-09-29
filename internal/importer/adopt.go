@@ -71,7 +71,7 @@ func Adopt(c Candidate, homeRoot, prepDomain string, opts ...model.NormalizeOpti
 			// Le nom du fichier existant est conservé : le renommer reviendrait à
 			// recréer le vhost, et le domaine serait vu comme un conflit.
 			p.Spec.Web.VHosts = []model.VHost{{
-				Name: r.Name, Domains: c.Domains, Docroot: c.Docroot,
+				Name: r.Name, File: r.Attr("file"), Domains: c.Domains, Docroot: c.Docroot,
 			}}
 			if c.PHPVersion != "" {
 				p.Spec.Web.VHosts[0].Pool = model.MainPoolName

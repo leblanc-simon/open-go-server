@@ -23,6 +23,7 @@ import (
 	"leblanc.io/open-go-server/internal/exec"
 	"leblanc.io/open-go-server/internal/fs"
 	"leblanc.io/open-go-server/internal/model"
+	"leblanc.io/open-go-server/internal/provider/removal"
 	"leblanc.io/open-go-server/internal/provider/system"
 	"leblanc.io/open-go-server/internal/secret"
 	"leblanc.io/open-go-server/internal/store"
@@ -165,7 +166,11 @@ func (p *Provider) Plan(_ context.Context, proj *model.Project, obs Observed) ([
 		}
 		for _, k := range existing {
 			if k.State == StateRetired && p.expired(k) {
-				steps = append(steps, p.expireStep(proj.ID(), k))
+				s, err := p.expireStep(proj.ID(), k)
+				if err != nil {
+					return nil, err
+				}
+				steps = append(steps, s)
 				continue
 			}
 			s, err := p.keyFileStep(proj.ID(), k, obs)
@@ -349,21 +354,70 @@ func (p *Provider) permDrift(info os.FileInfo, obs Observed) string {
 // expireStep retire une clé remplacée dont la rétention est écoulée : son
 // fichier et son secret. Son enregistrement DNS, lui, est à retirer à la main —
 // « doctor » le signale tant qu'il est publié.
-func (p *Provider) expireStep(projectID string, k Key) *engine.Step {
+//
+// Le fichier suit le régime de son écriture : s'il ne correspond plus à la clé
+// scellée, il porte une clé que quelqu'un y a mise — une clé privée, que rien ne
+// permettrait de retrouver —, et l'expiration attend --force, copie faite. La clé
+// scellée reste alors en place : le refus ne défait rien à moitié.
+func (p *Provider) expireStep(projectID string, k Key) (*engine.Step, error) {
 	path := p.Paths.OpenDKIMKeyFile(projectID, k.Domain, k.Selector)
-	s := engine.NewStep("mail/dkim/"+k.Domain+"/"+k.Selector, engine.Delete,
-		fmt.Sprintf("clé DKIM remplacée de %s (sélecteur %s) — rétention écoulée, "+
-			"enregistrement %s à retirer du DNS", k.Domain, k.Selector, k.Name()))
+	resource := "mail/dkim/" + k.Domain + "/" + k.Selector
+	summary := fmt.Sprintf("clé DKIM remplacée de %s (sélecteur %s) — rétention écoulée, "+
+		"enregistrement %s à retirer du DNS", k.Domain, k.Selector, k.Name())
+	// refus rend le refus que vaut l'état du fichier, ou nil s'il peut partir.
+	refus := func(state fs.State) error {
+		switch {
+		case state == fs.StateForeign:
+			return fmt.Errorf("%s n'est pas un fichier ordinaire : ogs ne le retire pas, "+
+				"et la clé reste scellée — le retirer à la main", path)
+		case state == fs.StateHandEdited && !p.Force:
+			return fmt.Errorf("%s ne correspond plus à la clé scellée : relancer avec --force pour le "+
+				"retirer (l'original sera sauvegardé en %s) ; la clé reste scellée d'ici là",
+				path, p.backupPattern(path))
+		}
+		return nil
+	}
+	state, err := keyFileState(path, k)
+	if err != nil {
+		return nil, err
+	}
+	if err := refus(state); err != nil {
+		label := "fichier modifié hors ogs"
+		if state == fs.StateForeign {
+			label = "pas un fichier ordinaire"
+		}
+		s := engine.NewStep(resource, engine.Delete, summary+" — "+label)
+		s.Critical = false
+		s.Apply = func(context.Context) error { return err }
+		return s, nil
+	}
+	if state == fs.StateHandEdited {
+		summary += " — retrait forcé (sauvegarde " + p.backupPattern(path) + ")"
+	}
+	s := engine.NewStep(resource, engine.Delete, summary)
 	s.Critical = false
 	var previous []byte
 	var saved *sealed
 	s.Apply = func(context.Context) error {
-		var err error
+		// L'état est relu, comme pour tout retrait (removal.File) : une clé intacte
+		// au plan, remplacée avant la confirmation, partirait sans copie.
+		state, err := keyFileState(path, k)
+		if err != nil {
+			return err
+		}
+		if err := refus(state); err != nil {
+			return err
+		}
 		if saved, err = p.snapshot(projectID, k); err != nil {
 			return err
 		}
 		if data, err := os.ReadFile(path); err == nil {
 			previous = data
+		}
+		if state == fs.StateHandEdited {
+			if _, err := fs.BackupTo(path, p.Paths.BackupsDir(), p.now()); err != nil && !os.IsNotExist(err) {
+				return err
+			}
 		}
 		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 			return err
@@ -379,38 +433,58 @@ func (p *Provider) expireStep(projectID string, k Key) *engine.Step {
 		}
 		return fs.WriteAtomic(path, previous, 0o600, fs.KeepOwner)
 	}
-	return s
+	return s, nil
 }
 
 // removeFileStep retire le fichier d'une clé dont le domaine n'est plus signé.
 // La clé reste scellée : réactiver la signature doit retrouver l'enregistrement
-// déjà publié chez le client, non en exiger un nouveau.
+// déjà publié chez le client, non en exiger un nouveau. Un fichier qui ne
+// correspond plus à la clé scellée ne part que sous --force, copie faite : c'est
+// la clé privée de quelqu'un, et le keystore ne la connaît pas.
 //
 // L'étape vide les rechargements en attente avant de s'exécuter : les tables
 // qui désignaient la clé ont été réécrites juste avant, mais OpenDKIM garde en
 // mémoire celles qu'il a chargées, et retirer le fichier d'abord lui ferait
 // retenir le courrier du domaine jusqu'au rechargement.
-func (p *Provider) removeFileStep(projectID string, k Key, obs Observed) *engine.Step {
+func (p *Provider) removeFileStep(projectID string, k Key) (*engine.Step, error) {
 	path := p.Paths.OpenDKIMKeyFile(projectID, k.Domain, k.Selector)
-	current, err := os.ReadFile(path)
+	return removal.File{
+		Resource: "mail/dkim/" + k.Domain + "/" + k.Selector,
+		Summary: fmt.Sprintf("clé DKIM de %s (sélecteur %s) — domaine qui n'est plus signé, clé conservée "+
+			"dans le keystore", k.Domain, k.Selector),
+		Path:         path,
+		Inspect:      func() (fs.State, error) { return keyFileState(path, k) },
+		Force:        p.Force,
+		Backups:      p.Paths.BackupsDir(),
+		Now:          p.now,
+		FlushReloads: true,
+		NonCritical:  true,
+	}.Step()
+}
+
+// keyFileState juge le fichier d'une clé contre la clé scellée, qui fait foi :
+// un PEM ne peut pas porter l'en-tête d'ogs. Un fichier conforme se retire ; un
+// fichier qui en diffère a été retouché ; ce qui n'est pas un fichier ordinaire
+// n'est pas à ogs.
+func keyFileState(path string, k Key) (fs.State, error) {
+	info, err := os.Lstat(path)
+	if os.IsNotExist(err) {
+		return fs.StateAbsent, nil
+	}
 	if err != nil {
-		return nil
+		return fs.StateAbsent, err
 	}
-	s := engine.NewStep("mail/dkim/"+k.Domain+"/"+k.Selector, engine.Delete,
-		fmt.Sprintf("clé DKIM de %s (sélecteur %s) — domaine qui n'est plus signé, clé conservée "+
-			"dans le keystore", k.Domain, k.Selector))
-	s.Critical = false
-	s.Apply = func(context.Context) error {
-		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-			return err
-		}
-		return nil
+	if !info.Mode().IsRegular() {
+		return fs.StateForeign, nil
 	}
-	s.Compensate = func(context.Context) error {
-		return fs.WriteAtomic(path, current, 0o600, p.keyOwner(obs))
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fs.StateAbsent, err
 	}
-	s.FlushReloads = true
-	return s
+	if string(data) == k.PEM {
+		return fs.StateCurrent, nil
+	}
+	return fs.StateHandEdited, nil
 }
 
 // backupPattern nomme l'emplacement de la copie d'un écrasement forcé.

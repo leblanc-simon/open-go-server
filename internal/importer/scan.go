@@ -169,8 +169,17 @@ func (s *Scanner) scanVHosts() []Resource {
 		if len(domains) > 0 {
 			attrs["domains"] = strings.Join(dedupe(domains), ",")
 		}
+		// Le vhost garde le nom exact de son fichier, dans « file », et son nom
+		// n'en ôte que l'extension « .conf ». Retirer « la dernière extension »
+		// faisait de « shop.fr » et « shop.de » — l'usage Debian pour nginx, sans
+		// « .conf » — deux vhosts « shop » : le projet adopté écrivait
+		// « shop.conf » à côté de l'original, et son premier apply retirait comme
+		// obsolètes l'original et le site voisin. Le nom seul ne suffit pas à
+		// retrouver le fichier : « web » désigne le vhost principal, et le moteur
+		// ajoute son extension à tout nom.
+		attrs["file"] = e.Name()
 		out = append(out, Resource{
-			Kind: KindVHost, Name: strings.TrimSuffix(e.Name(), filepath.Ext(e.Name())),
+			Kind: KindVHost, Name: strings.TrimSuffix(e.Name(), ".conf"),
 			Path: path, Attributes: attrs,
 		})
 	}

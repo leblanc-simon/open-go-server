@@ -299,28 +299,457 @@ func TestObserveIgnoresForeignVHostsWithoutConflict(t *testing.T) {
 	}
 }
 
-func TestStaleVHostRemoved(t *testing.T) {
-	prov, _ := fixture(t, "apache")
-	p := project(t, "shop.fr", model.KindSymfony, "6.4", "8.5")
-	stale := filepath.Join(prov.Engine.AvailableDir(), "shopfr_ancien.conf")
-	if err := fs.WriteAtomic(stale, []byte("# ancien vhost\n"), 0o644, fs.KeepOwner); err != nil {
+// vhostEcritPour rend le contenu qu'ogs aurait écrit pour le projet id : c'est
+// l'en-tête, et non le nom, qui rattache un fichier à son projet.
+func vhostEcritPour(id, corps string) []byte {
+	return fs.Render(fs.Header{Project: id, Resource: "web/vhost/" + id, Generated: time.Now()},
+		[]byte(corps), "#")
+}
+
+// poserVHost écrit un fichier dans sites-available et, si actif, son lien
+// d'activation relatif, comme a2ensite.
+func poserVHost(t *testing.T, prov *Provider, nom string, contenu []byte, actif bool) (string, string) {
+	t.Helper()
+	chemin := filepath.Join(prov.Engine.AvailableDir(), nom)
+	if err := os.WriteFile(chemin, contenu, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	ctx := context.Background()
-	obs, _ := prov.Observe(ctx, p)
-	if len(obs.Stale) != 1 {
-		t.Fatalf("vhost obsolète non repéré : %+v", obs.Stale)
+	lien := filepath.Join(prov.Engine.EnabledDir(), nom)
+	if actif {
+		if err := os.Symlink(filepath.Join("..", "sites-available", nom), lien); err != nil {
+			t.Fatal(err)
+		}
 	}
-	steps, _ := prov.Plan(ctx, p, obs)
+	return chemin, lien
+}
+
+// appliquerVHosts observe, planifie et exécute les vhosts d'un projet.
+func appliquerVHosts(t *testing.T, prov *Provider, p *model.Project) (*engine.Plan, *engine.Report, error) {
+	t.Helper()
+	ctx := context.Background()
+	obs, err := prov.Observe(ctx, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	steps, err := prov.Plan(ctx, p, obs)
+	if err != nil {
+		t.Fatal(err)
+	}
 	plan := &engine.Plan{Project: p.ID()}
 	for _, s := range steps {
 		plan.Add(s)
 	}
-	if _, err := engine.Execute(ctx, plan, engine.Options{}); err != nil {
+	report, err := engine.Execute(ctx, plan, engine.Options{})
+	return plan, report, err
+}
+
+func TestStaleVHostRemoved(t *testing.T) {
+	prov, _ := fixture(t, "apache")
+	p := project(t, "shop.fr", model.KindSymfony, "6.4", "8.5")
+	stale, lien := poserVHost(t, prov, "shopfr_ancien.conf",
+		vhostEcritPour("shopfr", "<VirtualHost *:80>\n  ServerName ancien.shop.fr\n</VirtualHost>\n"), true)
+	obs, _ := prov.Observe(context.Background(), p)
+	if len(obs.Stale) != 1 {
+		t.Fatalf("vhost obsolète non repéré : %+v", obs.Stale)
+	}
+	if _, _, err := appliquerVHosts(t, prov, p); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(stale); !os.IsNotExist(err) {
 		t.Error("le vhost obsolète devrait avoir été supprimé")
+	}
+	// Le lien d'activation suit le sort du fichier : laissé derrière, il
+	// pointerait dans le vide, ce que nginx tient pour fatal.
+	if _, err := os.Lstat(lien); !os.IsNotExist(err) {
+		t.Errorf("le lien d'activation du vhost obsolète devait partir avec lui : %v", err)
+	}
+}
+
+// Le nom d'un vhost ne dit pas à qui il appartient : « shop_api.conf » semble
+// prolonger « shop » d'un rôle, et c'est le vhost principal du projet shop_api.
+// L'attribution par préfixe le faisait retirer, lien compris, par l'apply de shop.
+func TestObserveNAttribuePasLeVHostDUnVoisinParSonNom(t *testing.T) {
+	prov, _ := fixture(t, "apache")
+	shop := project(t, "shop.fr", model.KindSymfony, "6.4", "8.5")
+	shop.Metadata.Name = "shop"
+	chemin, lien := poserVHost(t, prov, "shop_api.conf",
+		vhostEcritPour("shop_api", "<VirtualHost *:80>\n  ServerName api.shop.fr\n</VirtualHost>\n"), true)
+
+	obs, err := prov.Observe(context.Background(), shop)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(obs.Stale) != 0 {
+		t.Errorf("le vhost du voisin ne doit pas être obsolète pour shop : %v", obs.Stale)
+	}
+	if _, _, err := appliquerVHosts(t, prov, shop); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range []string{chemin, lien} {
+		if _, err := os.Lstat(f); err != nil {
+			t.Errorf("%s du voisin a été retiré par l'apply de shop : %v", f, err)
+		}
+	}
+}
+
+// Un vhost posé à la main selon la convention ne porte pas la marque d'ogs : il
+// n'est jamais retiré, ni son lien, --force compris. S'il sert un domaine du
+// projet, c'est un conflit — le cas que l'attribution par nom masquait en le
+// rangeant parmi les obsolètes.
+func TestVHostPoseALaMainSelonLaConventionNEstJamaisRetire(t *testing.T) {
+	for _, cas := range []struct {
+		nom, domaine string
+		conflit      bool
+	}{
+		{"shopfr_maintenance.conf", "maintenance.shop.fr", false},
+		{"shopfr_old.conf", "shop.fr", true},
+	} {
+		t.Run(cas.nom, func(t *testing.T) {
+			prov, _ := fixture(t, "apache")
+			prov.Force = true
+			p := project(t, "shop.fr", model.KindSymfony, "6.4", "8.5")
+			corps := []byte("<VirtualHost *:80>\n  ServerName " + cas.domaine + "\n</VirtualHost>\n")
+			chemin, lien := poserVHost(t, prov, cas.nom, corps, true)
+			obs, err := prov.Observe(context.Background(), p)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(obs.Stale) != 0 {
+				t.Errorf("un vhost non géré ne doit pas être obsolète : %v", obs.Stale)
+			}
+			if got := obs.Conflicts[cas.domaine] == chemin; got != cas.conflit {
+				t.Errorf("conflit sur %s : %v, attendu %v (%v)", cas.domaine, got, cas.conflit, obs.Conflicts)
+			}
+			if cas.conflit {
+				if _, err := prov.Plan(context.Background(), p, obs); err == nil {
+					t.Error("un domaine servi par un vhost non géré doit interrompre le plan")
+				}
+				return
+			}
+			if _, _, err := appliquerVHosts(t, prov, p); err != nil {
+				t.Fatal(err)
+			}
+			if data, err := os.ReadFile(chemin); err != nil || string(data) != string(corps) {
+				t.Errorf("le vhost posé à la main a été touché : %v", err)
+			}
+			if _, err := os.Lstat(lien); err != nil {
+				t.Errorf("son lien d'activation a été retiré : %v", err)
+			}
+		})
+	}
+}
+
+// Un vhost d'ogs retouché à la main n'est retiré, comme il n'est écrasé, que
+// sous --force et après sauvegarde — lien d'activation compris.
+func TestRetraitDUnVHostRetoucheExigeForceEtSauvegarde(t *testing.T) {
+	prov, paths := fixture(t, "nginx")
+	p := project(t, "shop.fr", model.KindSymfony, "6.4", "8.5")
+	retouche := append(vhostEcritPour("shopfr", "server {\n  server_name ancien.shop.fr;\n}\n"),
+		"# réglage posé à la main\n"...)
+	chemin, lien := poserVHost(t, prov, "shopfr_ancien.conf", retouche, true)
+
+	plan, report, err := appliquerVHosts(t, prov, p)
+	if err != nil {
+		t.Fatalf("un retrait refusé ne doit pas défaire le reste de l'apply : %v", err)
+	}
+	if !strings.Contains(plan.String(), "modifié hors ogs") {
+		t.Fatalf("le plan doit annoncer le refus du retrait :\n%s", plan.String())
+	}
+	if !strings.Contains(strings.Join(report.Warnings, "\n"), "--force") {
+		t.Errorf("le refus doit nommer --force : %v", report.Warnings)
+	}
+	if data, _ := os.ReadFile(chemin); string(data) != string(retouche) {
+		t.Fatal("le vhost retouché a été retiré sans --force")
+	}
+	if _, err := os.Lstat(lien); err != nil {
+		t.Fatalf("le lien d'un vhost laissé en place doit rester : %v", err)
+	}
+
+	prov.Force = true
+	plan, _, err = appliquerVHosts(t, prov, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(plan.String(), "retrait forcé") {
+		t.Fatalf("le plan doit annoncer le retrait forcé :\n%s", plan.String())
+	}
+	for _, f := range []string{chemin, lien} {
+		if _, err := os.Lstat(f); !os.IsNotExist(err) {
+			t.Errorf("%s devait être retiré sous --force : %v", f, err)
+		}
+	}
+	baks, _ := filepath.Glob(filepath.Join(paths.BackupsDir(), "shopfr_ancien.conf.ogs-bak-*"))
+	if len(baks) != 1 {
+		t.Fatalf("une sauvegarde attendue dans %s, %d trouvée(s)", paths.BackupsDir(), len(baks))
+	}
+	if saved, _ := os.ReadFile(baks[0]); string(saved) != string(retouche) {
+		t.Errorf("la sauvegarde doit porter le vhost retouché :\n%s", saved)
+	}
+}
+
+// Seuls les liens qui désignent le fichier retiré partent avec lui : un fichier
+// régulier déposé dans sites-enabled sous le même nom n'est pas son activation.
+func TestLeRetraitDUnVHostNeRetireQueSesLiens(t *testing.T) {
+	prov, _ := fixture(t, "nginx")
+	p := project(t, "shop.fr", model.KindSymfony, "6.4", "8.5")
+	stale, _ := poserVHost(t, prov, "shopfr_ancien.conf",
+		vhostEcritPour("shopfr", "server {\n  server_name ancien.shop.fr;\n}\n"), false)
+	copie := filepath.Join(prov.Engine.EnabledDir(), "shopfr_ancien.conf")
+	if err := os.WriteFile(copie, []byte("server { server_name copie.shop.fr; }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Un lien d'un autre nom, absolu, vers le fichier retiré.
+	autre := filepath.Join(prov.Engine.EnabledDir(), "000-ancien")
+	if err := os.Symlink(stale, autre); err != nil {
+		t.Fatal(err)
+	}
+	// Un lien de même nom qu'un autre vhost retiré, mais qui désigne un autre
+	// fichier : c'est la cible qui fait l'activation, non le nom.
+	vieux, _ := poserVHost(t, prov, "shopfr_vieux.conf",
+		vhostEcritPour("shopfr", "server {\n  server_name vieux.shop.fr;\n}\n"), false)
+	ailleurs := filepath.Join(t.TempDir(), "ailleurs.conf")
+	if err := os.WriteFile(ailleurs, []byte("server { server_name ailleurs.fr; }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	homonyme := filepath.Join(prov.Engine.EnabledDir(), "shopfr_vieux.conf")
+	if err := os.Symlink(ailleurs, homonyme); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := appliquerVHosts(t, prov, p); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(copie); err != nil {
+		t.Errorf("le fichier régulier de sites-enabled a été retiré : %v", err)
+	}
+	if _, err := os.Lstat(autre); !os.IsNotExist(err) {
+		t.Errorf("le lien vers le vhost retiré devait partir avec lui : %v", err)
+	}
+	if _, err := os.Stat(vieux); !os.IsNotExist(err) {
+		t.Errorf("le vhost %s devait être retiré : %v", vieux, err)
+	}
+	if cible, err := os.Readlink(homonyme); err != nil || cible != ailleurs {
+		t.Errorf("le lien de même nom vers un autre fichier a été touché : %q, %v", cible, err)
+	}
+}
+
+// Un ancien vhost du projet dont l'exploitant a retouché le haut reste le sien :
+// la marque se cherche là où Inspect la cherche. Exigée en tête, elle faisait du
+// fichier une configuration étrangère servant un domaine du projet — le plan
+// s'arrêtait sur un conflit avec lui-même —, alors que le régime des cinq
+// états sait le retirer sous --force, sauvegarde faite.
+func TestUnVHostObsoleteRetoucheAuDessusDeSonEnTeteResteAuProjet(t *testing.T) {
+	prov, paths := fixture(t, "apache")
+	p := project(t, "shop.fr", model.KindSymfony, "6.4", "8.5")
+	contenu := append([]byte("# garder jusqu'à fin septembre\n"),
+		vhostEcritPour("shopfr", "<VirtualHost *:80>\n  ServerName shop.fr\n</VirtualHost>\n")...)
+	ancien, lien := poserVHost(t, prov, "shopfr_ancien.conf", contenu, true)
+
+	obs, err := prov.Observe(context.Background(), p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(obs.Conflicts) != 0 || len(obs.Stale) != 1 || obs.Stale[0] != ancien {
+		t.Fatalf("l'ancien vhost retouché doit être obsolète, non un conflit : %+v", obs)
+	}
+	plan, _, err := appliquerVHosts(t, prov, p)
+	if err != nil {
+		t.Fatalf("un retrait refusé ne doit pas défaire l'apply : %v", err)
+	}
+	if !strings.Contains(plan.String(), "modifié hors ogs") {
+		t.Errorf("le plan doit annoncer le refus :\n%s", plan.String())
+	}
+	if data, _ := os.ReadFile(ancien); string(data) != string(contenu) {
+		t.Fatal("le vhost retouché a été retiré sans --force")
+	}
+
+	prov.Force = true
+	if _, _, err := appliquerVHosts(t, prov, p); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range []string{ancien, lien} {
+		if _, err := os.Lstat(f); !os.IsNotExist(err) {
+			t.Errorf("%s devait être retiré sous --force : %v", f, err)
+		}
+	}
+	baks, _ := filepath.Glob(filepath.Join(paths.BackupsDir(), "shopfr_ancien.conf.ogs-bak-*"))
+	if len(baks) != 1 {
+		t.Fatalf("une sauvegarde attendue, %d trouvée(s)", len(baks))
+	}
+	if saved, _ := os.ReadFile(baks[0]); string(saved) != string(contenu) {
+		t.Errorf("la sauvegarde doit porter le vhost retouché :\n%s", saved)
+	}
+}
+
+// Un projet adopté avant que l'import ne relève le nom exact des fichiers porte
+// « name: shop » sans « file » : son fichier d'origine shop.fr lui paraît
+// étranger. Le renvoyer à « ogs import », qu'il a déjà passé, le ferait tourner
+// en rond ; le conflit dit comment désigner le fichier.
+func TestLeConflitDUnProjetAdopteDitCommentDesignerSonFichier(t *testing.T) {
+	prov, _ := fixture(t, "nginx")
+	p := project(t, "shop.fr", model.KindStatic, "", "")
+	p.Metadata.Labels = map[string]string{"adopted": "true"}
+	p.Spec.Web.VHosts = []model.VHost{{Name: "shop", Domains: []string{"shop.fr"}}}
+	poserVHost(t, prov, "shop.fr", []byte("server {\n  listen 80;\n  server_name shop.fr;\n}\n"), true)
+
+	obs, err := prov.Observe(context.Background(), p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = prov.Plan(context.Background(), p, obs)
+	if err == nil || !strings.Contains(err.Error(), "« file: shop.fr »") || strings.Contains(err.Error(), "ogs import") {
+		t.Errorf("le conflit doit dire de désigner le fichier d'origine : %v", err)
+	}
+
+	// Un projet qui n'est pas adopté garde le conseil d'origine.
+	delete(p.Metadata.Labels, "adopted")
+	if _, err := prov.Plan(context.Background(), p, obs); err == nil || !strings.Contains(err.Error(), "ogs import") {
+		t.Errorf("hors adoption, le conflit renvoie à l'import : %v", err)
+	}
+}
+
+// Un vhost nginx adopté garde son fichier, sans extension selon l'usage Debian :
+// c'est lui qui est réécrit, par --force et après sauvegarde. Le nom tronqué
+// (« shop ») faisait écrire shop.conf à côté, et retirer l'original comme le
+// site voisin shop.de.
+func TestVHostAdopteSansExtensionEstReprisEnPlace(t *testing.T) {
+	prov, paths := fixture(t, "nginx")
+	p := project(t, "shop.fr", model.KindStatic, "", "")
+	p.Metadata.Labels = map[string]string{"adopted": "true"}
+	p.Spec.Web.VHosts = []model.VHost{{Name: "shop.fr", File: "shop.fr", Domains: []string{"shop.fr"}}}
+	origine := []byte("server {\n  listen 80;\n  server_name shop.fr;\n}\n")
+	chemin, lien := poserVHost(t, prov, "shop.fr", origine, true)
+	voisinCorps := []byte("server {\n  listen 80;\n  server_name shop.de;\n}\n")
+	voisin, voisinLien := poserVHost(t, prov, "shop.de", voisinCorps, true)
+
+	obs, err := prov.Observe(context.Background(), p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(obs.Stale) != 0 || len(obs.Conflicts) != 0 {
+		t.Fatalf("ni obsolète ni conflit attendu : %+v", obs)
+	}
+	bp := buildMain(t, prov, p)
+	if bp.Path != chemin || bp.EnabledPath != lien {
+		t.Fatalf("le vhost adopté doit viser son fichier d'origine : %s, %s", bp.Path, bp.EnabledPath)
+	}
+
+	// Sans --force : le fichier d'origine, non géré, est refusé et laissé intact.
+	if _, _, err := appliquerVHosts(t, prov, p); err == nil {
+		t.Fatal("la reprise d'un vhost non géré doit exiger --force")
+	}
+	if data, _ := os.ReadFile(chemin); string(data) != string(origine) {
+		t.Fatal("le vhost d'origine a été touché sans --force")
+	}
+
+	prov.Force = true
+	if _, _, err := appliquerVHosts(t, prov, p); err != nil {
+		t.Fatal(err)
+	}
+	if owner, _ := fs.ManagedProject(chemin); owner != p.ID() {
+		t.Errorf("le fichier d'origine doit être réécrit par ogs pour %s, obtenu %q", p.ID(), owner)
+	}
+	if _, err := os.Stat(filepath.Join(prov.Engine.AvailableDir(), "shop.conf")); !os.IsNotExist(err) {
+		t.Errorf("aucun second fichier ne doit apparaître à côté de l'original : %v", err)
+	}
+	baks, _ := filepath.Glob(filepath.Join(paths.BackupsDir(), "shop.fr.ogs-bak-*"))
+	if len(baks) != 1 {
+		t.Fatalf("une sauvegarde de l'original attendue, %d trouvée(s)", len(baks))
+	}
+	if data, _ := os.ReadFile(voisin); string(data) != string(voisinCorps) {
+		t.Error("le vhost du site voisin a été touché")
+	}
+	if _, err := os.Lstat(voisinLien); err != nil {
+		t.Errorf("le lien du site voisin a été retiré : %v", err)
+	}
+	if got := prov.VHostFiles(p); len(got) != 1 || got[0] != "shop.fr" {
+		t.Errorf("fichiers du projet : %v, attendu [shop.fr]", got)
+	}
+}
+
+// Apache n'inclut que sites-enabled/*.conf : un vhost adopté dont le fichier
+// déclaré n'en porte pas l'extension serait écrit, activé et jamais servi.
+func TestPlanRefuseSurApacheUnFichierQuIlNeChargeraitPas(t *testing.T) {
+	prov, _ := fixture(t, "apache")
+	p := project(t, "shop.fr", model.KindStatic, "", "")
+	p.Metadata.Labels = map[string]string{"adopted": "true"}
+	p.Spec.Web.VHosts = []model.VHost{{Name: "shop.fr", File: "shop.fr", Domains: []string{"shop.fr"}}}
+	_, err := prov.Plan(context.Background(), p, Observed{})
+	if err == nil || !strings.Contains(err.Error(), "sites-enabled/*.conf") {
+		t.Fatalf("un fichier sans .conf doit être refusé sur Apache : %v", err)
+	}
+	// Une faute de déclaration, que l'appelant rend en code 3, non un conflit.
+	var fileErr *FileError
+	if !errors.As(err, &fileErr) || fileErr.File != "shop.fr" {
+		t.Errorf("le refus doit être une erreur de fichier typée : %T %v", err, err)
+	}
+	if _, err := os.Stat(filepath.Join(prov.Engine.AvailableDir(), "shop.fr")); !os.IsNotExist(err) {
+		t.Errorf("rien ne doit être écrit : %v", err)
+	}
+	p.Spec.Web.VHosts[0].File = "shop.fr.conf"
+	if _, err := prov.Plan(context.Background(), p, Observed{}); err != nil {
+		t.Errorf("un fichier en .conf doit être admis : %v", err)
+	}
+}
+
+// Le vhost « b2b » de shop s'écrit dans shop_b2b.conf, le vhost principal du
+// projet shop_b2b : l'en-tête le dit, et le fichier n'est jamais réécrit pour
+// shop — --force compris, qui reprend un fichier retouché ou étranger, non celui
+// d'un voisin.
+func TestPlanRefuseDEcrireLeVHostDUnAutreProjet(t *testing.T) {
+	prov, _ := fixture(t, "apache")
+	prov.Force = true
+	shop := project(t, "shop.fr", model.KindStatic, "", "")
+	shop.Metadata.Name = "shop"
+	shop.Spec.Web.VHosts = []model.VHost{
+		{Name: model.MainPoolName, Domains: []string{"shop.fr"}},
+		{Name: "b2b", Domains: []string{"pro.shop.fr"}},
+	}
+	voisin := vhostEcritPour("shop_b2b", "<VirtualHost *:80>\n  ServerName b2b.shop.fr\n</VirtualHost>\n")
+	chemin, _ := poserVHost(t, prov, "shop_b2b.conf", voisin, true)
+
+	obs, err := prov.Observe(context.Background(), shop)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = prov.Plan(context.Background(), shop, obs)
+	var owned *fs.OwnerError
+	if !errors.As(err, &owned) || owned.Owner != "shop_b2b" {
+		t.Fatalf("le fichier du voisin doit être un conflit nommant son propriétaire : %v", err)
+	}
+	if data, _ := os.ReadFile(chemin); string(data) != string(voisin) {
+		t.Error("le vhost du voisin a été touché")
+	}
+}
+
+// L'en-tête du vhost de supervision nomme « parc », qui est aussi un
+// identifiant valide : pour un projet ainsi nommé, ogs-status.conf passait pour
+// l'un de ses vhosts obsolètes. C'est la ressource inscrite qui le range.
+func TestObserveNeRangePasLeVHostDeSupervisionParmiCeuxDuProjetParc(t *testing.T) {
+	prov, _ := fixture(t, "nginx")
+	parc := project(t, "parc.fr", model.KindSymfony, "6.4", "8.5")
+	parc.Metadata.Name = "parc"
+	ctx := context.Background()
+	steps, err := prov.PlanStatus(ctx, []*model.Project{parc}, "127.0.0.1:8099", "/ogs-status", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range steps {
+		if s.Apply != nil {
+			if err := s.Apply(ctx); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	status := filepath.Join(prov.Engine.AvailableDir(), prov.Engine.FileName(StatusVHostName))
+	if owner, _ := fs.ManagedProject(status); owner != "parc" {
+		t.Fatalf("l'en-tête du vhost de supervision doit nommer « parc », obtenu %q", owner)
+	}
+	obs, err := prov.Observe(ctx, parc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(obs.Stale) != 0 {
+		t.Errorf("le vhost de supervision n'est pas un vhost du projet parc : %v", obs.Stale)
 	}
 }
 
@@ -1056,6 +1485,63 @@ func TestVHostDeSupervisionRetireQuandDesactive(t *testing.T) {
 	}
 }
 
+// Désactivé, le vhost de supervision suit le régime de son écriture : retouché,
+// il n'est retiré, lien compris, que sous --force et sauvegardé.
+func TestVHostDeSupervisionRetoucheNEstRetireQueSousForce(t *testing.T) {
+	prov, paths := fixture(t, "nginx")
+	shop := project(t, "shop.fr", model.KindSymfony, "6.4", "8.5")
+	ctx := context.Background()
+	steps, err := prov.PlanStatus(ctx, []*model.Project{shop}, "127.0.0.1:8099", "/ogs-status", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range steps {
+		if s.Apply != nil {
+			if err := s.Apply(ctx); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	path := filepath.Join(prov.Engine.AvailableDir(), prov.Engine.FileName(StatusVHostName))
+	lien := filepath.Join(prov.Engine.EnabledDir(), prov.Engine.FileName(StatusVHostName))
+	data, _ := os.ReadFile(path)
+	retouche := append(data, []byte("# accès ouvert au poste d'astreinte\n")...)
+	if err := os.WriteFile(path, retouche, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	off, err := prov.PlanStatus(ctx, []*model.Project{shop}, "127.0.0.1:8099", "/ogs-status", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(off) != 1 || !strings.Contains(off[0].Summary, "modifié hors ogs") {
+		t.Fatalf("le retrait doit être refusé : %+v", off)
+	}
+	if err := off[0].Apply(ctx); err == nil {
+		t.Error("le retrait d'un vhost retouché doit être refusé sans --force")
+	}
+	if got, _ := os.ReadFile(path); string(got) != string(retouche) {
+		t.Fatal("le vhost retouché a été retiré sans --force")
+	}
+
+	prov.Force = true
+	off, err = prov.PlanStatus(ctx, []*model.Project{shop}, "127.0.0.1:8099", "/ogs-status", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := off[0].Apply(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range []string{path, lien} {
+		if _, err := os.Lstat(f); !os.IsNotExist(err) {
+			t.Errorf("%s devait être retiré sous --force : %v", f, err)
+		}
+	}
+	if baks, _ := filepath.Glob(filepath.Join(paths.BackupsDir(), filepath.Base(path)+".ogs-bak-*")); len(baks) != 1 {
+		t.Errorf("une sauvegarde attendue, %d trouvée(s)", len(baks))
+	}
+}
+
 func TestVHostDeSupervisionSansPoolResteValide(t *testing.T) {
 	prov, _ := fixture(t, "apache")
 	steps, err := prov.PlanStatus(context.Background(), nil, "127.0.0.1:8099", "/ogs-status", true)
@@ -1589,7 +2075,7 @@ func TestCompensationDUneSuppressionDeVHostRetablitLeLienDActivation(t *testing.
 			prov, _ := fixture(t, engineName)
 			nom := prov.Engine.FileName("shopfr_redir")
 			chemin := filepath.Join(prov.Engine.AvailableDir(), nom)
-			origine := []byte("# ancien vhost de redirection\n")
+			origine := vhostEcritPour("shopfr", "# ancien vhost de redirection\n")
 			if err := fs.WriteAtomic(chemin, origine, 0o644, fs.KeepOwner); err != nil {
 				t.Fatal(err)
 			}
@@ -1602,8 +2088,15 @@ func TestCompensationDUneSuppressionDeVHostRetablitLeLienDActivation(t *testing.
 				t.Fatal(err)
 			}
 
+			retrait, err := prov.removeStep(chemin, "shopfr")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if retrait == nil || !retrait.Critical {
+				t.Fatalf("un retrait ordinaire est attendu : %+v", retrait)
+			}
 			plan := &engine.Plan{Project: "shopfr"}
-			plan.Add(prov.removeStep(chemin))
+			plan.Add(retrait)
 			plan.Add(etapeEnEchec())
 
 			report, err := engine.Execute(context.Background(), plan, engine.Options{})

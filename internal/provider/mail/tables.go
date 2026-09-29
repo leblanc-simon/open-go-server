@@ -11,6 +11,7 @@ import (
 	"leblanc.io/open-go-server/internal/exec"
 	"leblanc.io/open-go-server/internal/fs"
 	"leblanc.io/open-go-server/internal/model"
+	"leblanc.io/open-go-server/internal/provider/removal"
 )
 
 // Entry est une ligne des tables : une clé active et le domaine qu'elle signe.
@@ -90,7 +91,11 @@ func (p *Provider) PlanTables(projects []*model.Project, obs Observed) ([]*engin
 			{"mail/dkim-keytable", p.Paths.OpenDKIMKeyTable()},
 			{"mail/dkim-signingtable", p.Paths.OpenDKIMSigningTable()},
 		} {
-			if s := removeStep(t.resource, t.path); s != nil {
+			s, err := p.removeStep(t.resource, t.path)
+			if err != nil {
+				return nil, err
+			}
+			if s != nil {
 				steps = append(steps, s)
 			}
 		}
@@ -156,7 +161,11 @@ func (p *Provider) orphanSteps(proj *model.Project, obs Observed) ([]*engine.Ste
 		if signed[k.Domain] {
 			continue
 		}
-		if s := p.removeFileStep(proj.ID(), k, obs); s != nil {
+		s, err := p.removeFileStep(proj.ID(), k)
+		if err != nil {
+			return nil, err
+		}
+		if s != nil {
 			steps = append(steps, s)
 		}
 	}
@@ -256,23 +265,20 @@ func (p *Provider) tableStep(resource, summary, path string, content []byte, obs
 // TableMode est le mode des tables d'OpenDKIM (voir tableStep).
 const TableMode = 0o640
 
-// removeStep retire une table devenue sans objet.
-func removeStep(resource, path string) *engine.Step {
-	previous, err := os.ReadFile(path)
-	if err != nil {
-		return nil
-	}
-	s := engine.NewStep(resource, engine.Delete, "retrait de "+path+" (signature DKIM désactivée)")
-	s.Critical = false
-	s.Diff = func() (string, error) { return "suppression de " + path, nil }
-	s.Apply = func(context.Context) error {
-		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-			return err
-		}
-		return nil
-	}
-	s.Compensate = func(context.Context) error { return fs.WriteAtomic(path, previous, TableMode, fs.KeepOwner) }
-	return s
+// removeStep retire une table devenue sans objet, sous le régime de son
+// écriture : retouchée, elle ne part que sous --force et sauvegardée ; sans la
+// marque d'ogs, c'est celle de l'administrateur, qu'OpenDKIM n'accepte qu'en un
+// exemplaire — ogs ne la retire pas.
+func (p *Provider) removeStep(resource, path string) (*engine.Step, error) {
+	return removal.File{
+		Resource:    resource,
+		Summary:     "retrait de " + path + " (signature DKIM désactivée)",
+		Path:        path,
+		Force:       p.Force,
+		Backups:     p.Paths.BackupsDir(),
+		Now:         p.now,
+		NonCritical: true,
+	}.Step()
 }
 
 // Reload valide la configuration d'OpenDKIM, le recharge, puis constate.

@@ -347,37 +347,232 @@ func TestPlanDetectsHandEditedPool(t *testing.T) {
 	}
 }
 
-func TestPlanRemovesStalePool(t *testing.T) {
-	prov, paths, _ := fixture(t, "8.5", "8.3")
-	p := project(t, "shop.fr", model.KindSymfony, "6.4", "8.3")
-	ctx := context.Background()
-
-	// Un pool laissé par une version antérieure.
-	stale := paths.PHPPoolFile("8.5", "shopfr")
-	if err := fs.WriteAtomic(stale, []byte("; ancien pool\n"), 0o644, fs.KeepOwner); err != nil {
+// poserPool écrit le pool qu'ogs aurait produit pour un projet, tel qu'un apply
+// antérieur l'a laissé.
+func poserPool(t *testing.T, prov *Provider, p *model.Project, pool model.Pool) string {
+	t.Helper()
+	bp, err := prov.Build(p, pool)
+	if err != nil {
 		t.Fatal(err)
 	}
+	if err := fs.WriteAtomic(bp.Path, bp.Content, 0o644, fs.KeepOwner); err != nil {
+		t.Fatal(err)
+	}
+	return bp.Path
+}
+
+// planAvecObsoletes calcule le plan des pools, suppressions différées comprises.
+func planAvecObsoletes(t *testing.T, prov *Provider, p *model.Project) (*engine.Plan, Observed) {
+	t.Helper()
+	ctx := context.Background()
 	obs, err := prov.Observe(ctx, p)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(obs.Stale) != 1 || obs.Stale[0] != stale {
-		t.Fatalf("pool obsolète non repéré : %+v", obs.Stale)
+	steps, err := prov.Plan(ctx, p, obs)
+	if err != nil {
+		t.Fatal(err)
 	}
-	steps, _ := prov.Plan(ctx, p, obs)
 	plan := &engine.Plan{Project: p.ID()}
 	for _, s := range steps {
 		plan.Add(s)
 	}
 	// Les suppressions sont différées : elles s'appliquent après les vhosts.
-	for _, s := range prov.PlanStale(ctx, p, obs) {
+	stale, err := prov.PlanStale(ctx, p, obs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range stale {
 		plan.Add(s)
+	}
+	return plan, obs
+}
+
+func TestPlanRemovesStalePool(t *testing.T) {
+	prov, _, _ := fixture(t, "8.5", "8.3")
+	p := project(t, "shop.fr", model.KindSymfony, "6.4", "8.5")
+	ctx := context.Background()
+
+	// Le pool qu'ogs a écrit avant une bascule de version.
+	stale := poserPool(t, prov, p, p.Spec.PHP.Pools[0])
+	p.Spec.PHP.Pools[0].Version = "8.3"
+
+	plan, obs := planAvecObsoletes(t, prov, p)
+	if len(obs.Stale) != 1 || obs.Stale[0] != stale {
+		t.Fatalf("pool obsolète non repéré : %+v", obs.Stale)
 	}
 	if _, err := engine.Execute(ctx, plan, engine.Options{}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(stale); !os.IsNotExist(err) {
 		t.Errorf("le pool obsolète devrait avoir été supprimé : %v", err)
+	}
+}
+
+// Le nom d'un pool ne dit pas à qui il appartient : « shop_api.conf » semble
+// prolonger « shop » d'un rôle, et c'est le pool principal du projet shop_api.
+// L'attribution par préfixe le faisait retirer par le premier apply de shop.
+func TestObserveNAttribuePasLePoolDUnVoisinParSonNom(t *testing.T) {
+	prov, _, _ := fixture(t, "8.5")
+	shop := project(t, "shop.fr", model.KindSymfony, "6.4", "8.5")
+	shop.Metadata.Name = "shop"
+	voisin := project(t, "api.shop.fr", model.KindSymfony, "6.4", "8.5")
+	voisin.Metadata.Name = "shop_api"
+	chemin := poserPool(t, prov, voisin, voisin.Spec.PHP.Pools[0])
+	if filepath.Base(chemin) != "shop_api.conf" {
+		t.Fatalf("le pool du voisin est attendu en shop_api.conf, obtenu %s", chemin)
+	}
+
+	plan, obs := planAvecObsoletes(t, prov, shop)
+	if len(obs.Stale) != 0 {
+		t.Errorf("le pool du voisin ne doit pas être obsolète pour shop : %v", obs.Stale)
+	}
+	if _, err := engine.Execute(context.Background(), plan, engine.Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(chemin); err != nil {
+		t.Errorf("le pool du voisin a été retiré par l'apply de shop : %v", err)
+	}
+}
+
+// Le sens inverse : le pool « api » de shop s'écrit dans shop_api.conf, le pool
+// principal du projet shop_api. Inspect, qui ignore le projet de l'en-tête, le
+// tenait pour « à mettre à jour » : shop le réécrivait sous son utilisateur. Le
+// fichier d'un autre projet est un conflit, --force compris.
+func TestPlanRefuseDEcrireLePoolDUnAutreProjet(t *testing.T) {
+	prov, _, _ := fixture(t, "8.5")
+	prov.Force = true
+	voisin := project(t, "api.shop.fr", model.KindSymfony, "6.4", "8.5")
+	voisin.Metadata.Name = "shop_api"
+	chemin := poserPool(t, prov, voisin, voisin.Spec.PHP.Pools[0])
+	avant, _ := os.ReadFile(chemin)
+
+	shop := project(t, "shop.fr", model.KindSymfony, "6.4", "8.5")
+	shop.Metadata.Name = "shop"
+	shop.Spec.PHP.Pools = append(shop.Spec.PHP.Pools, model.Pool{Name: "api", Version: "8.5"})
+	_, err := prov.Plan(context.Background(), shop, Observed{})
+	var owned *fs.OwnerError
+	if !errors.As(err, &owned) || owned.Owner != "shop_api" || owned.Path != chemin {
+		t.Fatalf("le pool du voisin doit être un conflit nommant son propriétaire : %v", err)
+	}
+	if got, _ := os.ReadFile(chemin); string(got) != string(avant) {
+		t.Error("le pool du voisin a été touché")
+	}
+}
+
+// Un pool posé à la main selon la convention — le back-office d'un projet — ne
+// porte pas la marque d'ogs : il n'est jamais retiré, --force compris.
+func TestPoolPoseALaMainSelonLaConventionResteEnPlace(t *testing.T) {
+	prov, paths, _ := fixture(t, "8.3")
+	p := project(t, "shop.fr", model.KindSymfony, "6.4", "8.3")
+	manuel := paths.PHPPoolFile("8.3", "shopfr_admin")
+	corps := []byte("[shopfr_admin]\nuser = shopfr\ngroup = shopfr\nlisten = /run/php/shopfr_admin.sock\n")
+	if err := os.WriteFile(manuel, corps, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, force := range []bool{false, true} {
+		prov.Force = force
+		plan, obs := planAvecObsoletes(t, prov, p)
+		if len(obs.Stale) != 0 {
+			t.Errorf("--force=%v : un pool non géré ne doit pas être obsolète : %v", force, obs.Stale)
+		}
+		if _, err := engine.Execute(context.Background(), plan, engine.Options{}); err != nil {
+			t.Fatal(err)
+		}
+		if data, err := os.ReadFile(manuel); err != nil || string(data) != string(corps) {
+			t.Fatalf("--force=%v : le pool posé à la main a été touché : %v", force, err)
+		}
+	}
+}
+
+// Un pool d'ogs retouché à la main n'est retiré, comme il n'est écrasé, que sous
+// --force et après sauvegarde (§6.4).
+func TestRetraitDUnPoolRetoucheExigeForceEtSauvegarde(t *testing.T) {
+	prov, paths, _ := fixture(t, "8.5", "8.3")
+	p := project(t, "shop.fr", model.KindSymfony, "6.4", "8.5")
+	ctx := context.Background()
+	stale := poserPool(t, prov, p, p.Spec.PHP.Pools[0])
+	data, _ := os.ReadFile(stale)
+	retouche := append(data, []byte("pm.max_children = 4\n")...)
+	if err := os.WriteFile(stale, retouche, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	p.Spec.PHP.Pools[0].Version = "8.3"
+
+	plan, _ := planAvecObsoletes(t, prov, p)
+	var retrait *engine.Step
+	for _, s := range plan.Mutating() {
+		if s.Action == engine.Delete {
+			retrait = s
+		}
+	}
+	if retrait == nil || !strings.Contains(retrait.Summary, "modifié hors ogs") {
+		t.Fatalf("le plan doit annoncer le refus du retrait :\n%s", plan.String())
+	}
+	report, err := engine.Execute(ctx, plan, engine.Options{})
+	if err != nil {
+		t.Fatalf("un retrait refusé ne doit pas défaire le reste de l'apply : %v", err)
+	}
+	if len(report.Warnings) == 0 || !strings.Contains(strings.Join(report.Warnings, "\n"), "--force") {
+		t.Errorf("le refus doit nommer --force : %v", report.Warnings)
+	}
+	if got, _ := os.ReadFile(stale); string(got) != string(retouche) {
+		t.Fatal("le pool retouché a été retiré sans --force")
+	}
+
+	prov.Force = true
+	plan, _ = planAvecObsoletes(t, prov, p)
+	if !strings.Contains(plan.String(), "retrait forcé") {
+		t.Fatalf("le plan doit annoncer le retrait forcé :\n%s", plan.String())
+	}
+	if _, err := engine.Execute(ctx, plan, engine.Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Errorf("le pool devait être retiré sous --force : %v", err)
+	}
+	baks, _ := filepath.Glob(filepath.Join(paths.BackupsDir(), filepath.Base(stale)+".ogs-bak-*"))
+	if len(baks) != 1 {
+		t.Fatalf("une sauvegarde attendue dans %s, %d trouvée(s)", paths.BackupsDir(), len(baks))
+	}
+	if saved, _ := os.ReadFile(baks[0]); string(saved) != string(retouche) {
+		t.Errorf("la sauvegarde doit porter le pool retouché :\n%s", saved)
+	}
+}
+
+// Le pool d'origine d'un projet adopté ne porte pas la marque d'ogs tant que
+// --force ne l'a pas repris. Après un « php switch », il restait actif dans
+// l'ancienne version, sous le compte du projet, sans étape ni avertissement : il
+// n'est toujours pas retiré — ogs ne l'a pas écrit —, mais il est signalé.
+func TestUnPoolAdopteLaisseDansLAncienneVersionEstSignale(t *testing.T) {
+	prov, paths, _ := fixture(t, "8.5", "8.3")
+	p := project(t, "shop.fr", model.KindSymfony, "6.4", "8.3")
+	p.Metadata.Labels = map[string]string{"adopted": "true"}
+	origine := paths.PHPPoolFile("8.5", p.ID())
+	corps := []byte("[shopfr]\nuser = shopfr\ngroup = shopfr\nlisten = /run/php/php8.5-fpm-shopfr.sock\n")
+	if err := os.WriteFile(origine, corps, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Un pool d'un autre nom, posé à la main, reste hors de propos.
+	if err := os.WriteFile(paths.PHPPoolFile("8.5", "shopfr_admin"), corps, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, force := range []bool{false, true} {
+		prov.Force = force
+		plan, obs := planAvecObsoletes(t, prov, p)
+		if len(obs.Stale) != 0 || len(obs.Leftovers) != 1 || obs.Leftovers[0] != origine {
+			t.Fatalf("--force=%v : le pool d'origine doit être un reste, et lui seul : %+v", force, obs)
+		}
+		report, err := engine.Execute(context.Background(), plan, engine.Options{})
+		if err != nil {
+			t.Fatalf("--force=%v : un reste signalé ne doit pas défaire l'apply : %v", force, err)
+		}
+		if !strings.Contains(strings.Join(report.Warnings, "\n"), origine) {
+			t.Errorf("--force=%v : le reste doit être signalé : %v", force, report.Warnings)
+		}
+		if data, err := os.ReadFile(origine); err != nil || string(data) != string(corps) {
+			t.Fatalf("--force=%v : le pool d'origine a été touché : %v", force, err)
+		}
 	}
 }
 

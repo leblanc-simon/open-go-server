@@ -218,7 +218,14 @@ func (w Web) TLSDisabled() bool { return w.TLS != nil && !w.TLS.Enabled }
 
 // VHost est un hôte virtuel.
 type VHost struct {
-	Name     string         `yaml:"name"`
+	Name string `yaml:"name"`
+	// File est le nom réel du fichier d'un vhost adopté, dans sites-available et
+	// sites-enabled. Le nom suivi de l'extension du moteur ne le désigne pas
+	// toujours : l'usage Debian pour nginx est un fichier sans extension
+	// (« shop.fr »). Vide, le fichier se déduit du nom. L'adoption ne renomme
+	// jamais (§9) : sans ce champ, le premier apply écrivait un second fichier à
+	// côté de l'original.
+	File     string         `yaml:"file,omitempty"`
 	Template string         `yaml:"template,omitempty"`
 	Domains  []string       `yaml:"domains"`
 	Docroot  string         `yaml:"docroot,omitempty"`
@@ -354,6 +361,91 @@ func (p *Project) IsPrep() bool { return p.Env() == naming.EnvPrep }
 // AppType résout le type d'application du projet.
 func (p *Project) AppType() (AppType, error) {
 	return Resolve(p.Spec.App.Kind, p.Spec.App.Version)
+}
+
+// VHostExt est l'extension des fichiers de vhost, la même pour les deux
+// moteurs : Apache n'inclut que sites-enabled/*.conf.
+const VHostExt = ".conf"
+
+// VHosts renvoie les vhosts déclarés, ou ceux que le projet déduit. Un projet
+// n'a pas à déclarer son vhost : le type d'application et les domaines
+// suffisent, un domaine « redirect » faisant naître en plus un vhost de
+// redirection.
+//
+// La règle vit ici, avec celle des noms de fichiers, parce que deux lecteurs en
+// dépendent : le provider web, qui écrit les fichiers, et le contrôle d'unicité
+// du parc, qui refuse que deux projets visent le même. Recopiée de l'un à
+// l'autre, elle aurait divergé sans que rien ne le signale, et le contrôle
+// aurait approuvé des collisions que l'apply aurait trouvées.
+func (p *Project) VHosts() []VHost {
+	if len(p.Spec.Web.VHosts) > 0 {
+		return p.Spec.Web.VHosts
+	}
+	at, err := p.AppType()
+	if err != nil {
+		return nil
+	}
+	var domains []string
+	var redirects []string
+	for _, d := range p.Spec.Domains {
+		switch d.Role {
+		case "", "primary", "alias":
+			domains = append(domains, d.Name)
+		case "redirect":
+			redirects = append(redirects, d.Name)
+		}
+	}
+	if len(domains) == 0 {
+		return nil
+	}
+	main := VHost{
+		Name:     MainPoolName,
+		Template: at.VHostTemplate,
+		Domains:  domains,
+		Docroot:  p.Spec.Layout.Docroot,
+	}
+	if at.NeedsPHP && len(p.Spec.PHP.Pools) > 0 {
+		main.Pool = p.Spec.PHP.Pools[0].Name
+	}
+	out := []VHost{main}
+	if len(redirects) > 0 {
+		out = append(out, VHost{
+			Name:     "redirect",
+			Template: "redirect",
+			Domains:  redirects,
+			Options:  map[string]any{"target": domains[0]},
+		})
+	}
+	return out
+}
+
+// VHostName traduit le nom logique d'un vhost en nom de base de son fichier :
+// le vhost principal porte le nom nu du projet, les autres un suffixe de rôle.
+// Un projet adopté conserve en revanche le nom réel de ses fichiers : les
+// renommer reviendrait à recréer le vhost, et son domaine apparaîtrait en
+// conflit avec lui-même.
+func (p *Project) VHostName(vh VHost) string {
+	if vh.Name == "" || vh.Name == MainPoolName {
+		return p.ID()
+	}
+	if p.Metadata.Labels["adopted"] == "true" {
+		return vh.Name
+	}
+	return p.ID() + "_" + vh.Name
+}
+
+// VHostFile est le nom du fichier d'un vhost dans sites-available et
+// sites-enabled. Celui d'un vhost adopté est son nom réel, que l'import porte
+// dans « file » : l'usage Debian pour nginx est un fichier sans extension
+// (« shop.fr »), que le nom du vhost suivi de « .conf » ne désigne pas. Faute
+// de quoi le premier apply écrivait un second fichier à côté de l'original,
+// servant les mêmes domaines — et l'original, rattaché au projet par un nom
+// tronqué, partait comme obsolète.
+func (p *Project) VHostFile(vh VHost) string {
+	if vh.File != "" {
+		return vh.File
+	}
+	return p.VHostName(vh) + VHostExt
 }
 
 // Normalize remplit les valeurs déductibles : identifiant, host effectif, home,

@@ -15,6 +15,7 @@ import (
 	"leblanc.io/open-go-server/internal/fs"
 	"leblanc.io/open-go-server/internal/model"
 	"leblanc.io/open-go-server/internal/naming"
+	"leblanc.io/open-go-server/internal/provider/removal"
 	"leblanc.io/open-go-server/internal/store"
 	"leblanc.io/open-go-server/internal/template"
 )
@@ -95,18 +96,34 @@ type Observed struct {
 	// Stale énumère les fichiers de pool appartenant au projet mais devenus
 	// inutiles : version abandonnée après un switch, pool supprimé du YAML.
 	Stale []string
+	// Leftovers énumère les fichiers qui portent le nom exact d'un pool du
+	// projet dans une autre version que la sienne, sans qu'ogs les ait écrits
+	// pour lui : le pool d'origine d'un projet adopté que --force n'a jamais
+	// repris, resté dans l'ancienne version après un « php switch ». Ils ne
+	// sont pas au projet, donc jamais retirés ; ils sont signalés.
+	Leftovers []string
 }
 
 // Observe inspecte les pools existants du projet, toutes versions confondues.
+//
+// Un pool n'est obsolète que si son en-tête le dit écrit par ogs pour ce projet,
+// et comme l'un de ses pools (fs.ManagedResource), jamais d'après son nom :
+// « shop_api.conf » semble prolonger « shop » d'un rôle, et il est le pool
+// principal du projet shop_api. L'attribution par préfixe faisait retirer au
+// premier apply de shop le pool de son voisin, et tout pool posé à la main
+// selon la convention.
 func (p *Provider) Observe(_ context.Context, proj *model.Project) (Observed, error) {
 	obs := Observed{Files: map[string]fs.State{}}
 	wanted := map[string]bool{}
+	names := map[string]bool{}
 	for _, pool := range proj.Spec.PHP.Pools {
 		name, err := p.poolName(proj, pool)
 		if err != nil {
 			return obs, err
 		}
-		wanted[p.Paths.PHPPoolFile(pool.Version, name)] = true
+		path := p.Paths.PHPPoolFile(pool.Version, name)
+		wanted[path] = true
+		names[filepath.Base(path)] = true
 	}
 	for _, v := range p.versions() {
 		entries, err := os.ReadDir(v.PoolDir)
@@ -118,23 +135,24 @@ func (p *Provider) Observe(_ context.Context, proj *model.Project) (Observed, er
 				continue
 			}
 			path := filepath.Join(v.PoolDir, e.Name())
-			if !p.belongsTo(proj, e.Name()) {
+			if wanted[path] {
 				continue
 			}
-			if !wanted[path] {
+			// Un fichier illisible ne peut pas être attribué : il n'est pas retiré.
+			owner, resource, err := fs.ManagedResource(path)
+			switch {
+			case err != nil:
+			case owner == proj.ID() && strings.HasPrefix(resource, "php/pool/"):
 				obs.Stale = append(obs.Stale, path)
+			case names[e.Name()]:
+				// Le nom exact d'un pool du projet, ailleurs que dans sa version :
+				// il tourne encore sous le compte du projet. Le taire laissait deux
+				// pools actifs après un « php switch » sans que rien ne le dise.
+				obs.Leftovers = append(obs.Leftovers, path)
 			}
 		}
 	}
 	return obs, nil
-}
-
-// belongsTo indique si un fichier de pool appartient au projet. Le nom d'un pool
-// dérive de l'identifiant, ce qui suffit à l'attribution sans lire le fichier.
-func (p *Provider) belongsTo(proj *model.Project, filename string) bool {
-	base := filename[:len(filename)-len(".conf")]
-	id := proj.ID()
-	return base == id || (len(base) > len(id)+1 && base[:len(id)+1] == id+"_")
 }
 
 // poolName traduit le nom logique d'un pool en nom effectif : le pool principal
@@ -265,6 +283,13 @@ func (p *Provider) Plan(_ context.Context, proj *model.Project, obs Observed) ([
 		if err != nil {
 			return nil, err
 		}
+		// Le pool d'un autre projet n'est jamais réécrit, --force compris : le pool
+		// « api » de shop s'écrirait dans shop_api.conf, le pool principal du projet
+		// shop_api, qui tournerait alors sous l'utilisateur de shop.
+		if err := fs.CheckOwner(bp.Path, proj.ID(),
+			fmt.Sprintf("pool « %s » de %s", pool.Name, proj.ID())); err != nil {
+			return nil, err
+		}
 		// L'installation n'est vérifiée qu'en exécution réelle : un plan doit
 		// rester calculable sur une machine qui n'a pas la version visée.
 		if !p.Exec.Simulated() {
@@ -287,12 +312,22 @@ func (p *Provider) Plan(_ context.Context, proj *model.Project, obs Observed) ([
 // séparées du reste et appliquées **après** la réécriture des vhosts : supprimer
 // l'ancien pool avant que le vhost ne pointe sur le nouveau socket exposerait une
 // erreur 502 le temps de la bascule (§7.5).
-func (p *Provider) PlanStale(_ context.Context, proj *model.Project, obs Observed) []*engine.Step {
-	steps := make([]*engine.Step, 0, len(obs.Stale))
-	for _, stale := range obs.Stale {
-		steps = append(steps, p.removeStep(proj, stale))
+//
+// Les restes (Leftovers) y passent aussi, par la même porte : le régime des
+// cinq états les refuse — ogs ne les a pas écrits pour le projet —, et ce refus
+// non critique est ce qui les signale.
+func (p *Provider) PlanStale(_ context.Context, proj *model.Project, obs Observed) ([]*engine.Step, error) {
+	steps := make([]*engine.Step, 0, len(obs.Stale)+len(obs.Leftovers))
+	for _, stale := range append(append([]string(nil), obs.Stale...), obs.Leftovers...) {
+		s, err := p.removeStep(proj, stale)
+		if err != nil {
+			return nil, err
+		}
+		if s != nil {
+			steps = append(steps, s)
+		}
 	}
-	return steps
+	return steps, nil
 }
 
 func (p *Provider) poolStep(proj *model.Project, bp *PoolPlan) *engine.Step {
@@ -352,25 +387,20 @@ func (p *Provider) poolStep(proj *model.Project, bp *PoolPlan) *engine.Step {
 	return s
 }
 
-func (p *Provider) removeStep(proj *model.Project, path string) *engine.Step {
-	s := engine.NewStep("php/pool/"+filepath.Base(path), engine.Delete,
-		fmt.Sprintf("pool php obsolète %s", path))
-	var backup []byte
-	s.Apply = func(context.Context) error {
-		data, err := os.ReadFile(path)
-		if err == nil {
-			backup = data
-		}
-		return os.Remove(path)
-	}
-	s.Compensate = func(context.Context) error {
-		if backup == nil {
-			return nil
-		}
-		return fs.WriteAtomic(path, backup, 0o644, fs.KeepOwner)
-	}
-	s.Reload = []string{"php:" + versionFromPoolPath(path)}
-	return s
+// removeStep retire un pool devenu inutile, sous le régime des cinq états : un
+// pool retouché exige --force et part sauvegardé, un pool qu'ogs n'a pas écrit
+// pour ce projet reste en place.
+func (p *Provider) removeStep(proj *model.Project, path string) (*engine.Step, error) {
+	return removal.File{
+		Resource: "php/pool/" + filepath.Base(path),
+		Summary:  fmt.Sprintf("pool php obsolète %s", path),
+		Path:     path,
+		Project:  proj.ID(),
+		Force:    p.Force,
+		Backups:  p.Paths.BackupsDir(),
+		Now:      p.now,
+		Reload:   []string{"php:" + versionFromPoolPath(path)},
+	}.Step()
 }
 
 // writePool écrit le fichier de pool puis valide la configuration FPM. La

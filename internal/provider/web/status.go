@@ -12,6 +12,7 @@ import (
 	"leblanc.io/open-go-server/internal/engine"
 	"leblanc.io/open-go-server/internal/fs"
 	"leblanc.io/open-go-server/internal/model"
+	"leblanc.io/open-go-server/internal/provider/removal"
 )
 
 // StatusVHostName est le nom du vhost de supervision. Il ne porte pas
@@ -77,19 +78,22 @@ func (p *Provider) PlanStatus(ctx context.Context, projects []*model.Project,
 	enabledPath := path.Join(p.Engine.EnabledDir(), p.Engine.FileName(name))
 
 	if !enabled {
-		if _, err := os.Stat(filePath); err != nil {
-			return nil, nil
+		// Même régime que les vhosts d'un projet : retouché, il n'est retiré que
+		// sous --force et sauvegardé ; sans la marque d'ogs, il n'est pas à lui.
+		s, err := removal.File{
+			Resource: "web/status",
+			Summary:  "retrait du vhost de supervision " + name,
+			Path:     filePath,
+			Project:  "parc",
+			Force:    p.Force,
+			Backups:  p.Paths.BackupsDir(),
+			Now:      p.now,
+			Links:    func() []string { return p.linksTo(filePath) },
+			Reload:   []string{"web:" + p.Engine.Name()},
+		}.Step()
+		if err != nil || s == nil {
+			return nil, err
 		}
-		s := engine.NewStep("web/status", engine.Delete,
-			"retrait du vhost de supervision "+name)
-		s.Apply = func(context.Context) error {
-			_ = os.Remove(enabledPath)
-			if err := os.Remove(filePath); err != nil && !os.IsNotExist(err) {
-				return err
-			}
-			return nil
-		}
-		s.Reload = []string{"web:" + p.Engine.Name()}
 		return []*engine.Step{s}, nil
 	}
 

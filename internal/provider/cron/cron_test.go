@@ -192,6 +192,90 @@ func TestRemovingAllJobsDeletesFile(t *testing.T) {
 	}
 }
 
+// La ligne qu'un exploitant ajoute au fichier cron le fait refuser à l'écriture ;
+// elle ne doit pas partir, sans --force ni copie, au retrait de la dernière
+// tâche déclarée.
+func TestRetraitDUnFichierCronRetoucheExigeForceEtSauvegarde(t *testing.T) {
+	prov, proj := fixture(t)
+	proj.Spec.Crons = []model.CronJob{{Name: "purge", Schedule: "0 3 * * *", Command: "bin/console app:purge"}}
+	ctx := context.Background()
+	applique(t, prov, proj)
+	path := prov.Path(proj.ID())
+	data, _ := os.ReadFile(path)
+	retouche := append(data, []byte("0 4 * * * shopfr /home/shop.fr/www/bin/backup.sh\n")...)
+	if err := os.WriteFile(path, retouche, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	proj.Spec.Crons = nil
+	steps, err := prov.Plan(ctx, proj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(steps) != 1 || !strings.Contains(steps[0].Summary, "modifié hors ogs") {
+		t.Fatalf("le retrait doit être refusé : %+v", steps)
+	}
+	if err := steps[0].Apply(ctx); err == nil || !strings.Contains(err.Error(), "--force") {
+		t.Errorf("le refus doit nommer --force : %v", err)
+	}
+	if got, _ := os.ReadFile(path); string(got) != string(retouche) {
+		t.Fatal("le fichier retouché a été retiré sans --force")
+	}
+	if got := sauvegardes(t, prov, path); len(got) != 0 {
+		t.Fatalf("aucune sauvegarde ne doit être créée par un refus : %v", got)
+	}
+
+	prov.Force = true
+	steps, err = prov.Plan(ctx, proj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(steps) != 1 || !strings.Contains(steps[0].Summary, "retrait forcé") {
+		t.Fatalf("le plan doit annoncer le retrait forcé : %+v", steps)
+	}
+	if err := steps[0].Apply(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("le fichier devait être retiré sous --force : %v", err)
+	}
+	baks := sauvegardes(t, prov, path)
+	if len(baks) != 1 {
+		t.Fatalf("une sauvegarde attendue, %d trouvée(s)", len(baks))
+	}
+	if saved, _ := os.ReadFile(baks[0]); string(saved) != string(retouche) {
+		t.Errorf("la sauvegarde doit porter la ligne de l'exploitant :\n%s", saved)
+	}
+}
+
+// Un fichier posé sous le nom réservé sans la marque d'ogs n'est pas à lui : il
+// reste en place, --force compris, et l'étape le dit.
+func TestFichierCronEtrangerJamaisRetire(t *testing.T) {
+	prov, proj := fixture(t)
+	path := prov.Path(proj.ID())
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const corps = "* * * * * root /usr/local/bin/sauvegarde\n"
+	if err := os.WriteFile(path, []byte(corps), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	prov.Force = true
+	steps, err := prov.Plan(context.Background(), proj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(steps) != 1 || steps[0].Critical || !strings.Contains(steps[0].Summary, "laissé en place") {
+		t.Fatalf("un avertissement non critique est attendu : %+v", steps)
+	}
+	if err := steps[0].Apply(context.Background()); err == nil {
+		t.Error("l'étape doit dire que le fichier est laissé en place")
+	}
+	if got, _ := os.ReadFile(path); string(got) != corps {
+		t.Error("un fichier cron étranger a été retiré")
+	}
+}
+
 func TestPlanDetectsHandEditedFile(t *testing.T) {
 	prov, proj := fixture(t)
 	proj.Spec.Crons = []model.CronJob{{Name: "x", Schedule: "* * * * *", Command: "bin/console x"}}

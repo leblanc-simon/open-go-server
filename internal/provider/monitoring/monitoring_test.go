@@ -539,6 +539,83 @@ func TestOutilDesactiveRetireSonFichier(t *testing.T) {
 	}
 }
 
+// Un outil désactivé ne retire que ce qu'ogs a écrit, et comme il l'a écrit :
+// des prisons retouchées ne partent que sous --force, copie faite, et un
+// fragment sans la marque d'ogs n'est jamais retiré.
+func TestOutilDesactiveNeRetirePasUnFichierRetoucheOuEtranger(t *testing.T) {
+	p, _ := fixture(t)
+	shop := project(t, "shop.fr", model.KindSymfony, "8.3")
+	withLogs(t, shop, "nginx")
+	projects := []*model.Project{shop}
+	on := Observed{Fail2banPresent: true, TelegrafGroup: -1}
+	steps, err := p.Plan(context.Background(), projects, on)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range steps {
+		if s.Apply != nil {
+			if err := s.Apply(context.Background()); err != nil {
+				t.Fatalf("%s : %v", s.Resource, err)
+			}
+		}
+	}
+	jail := p.Paths.Fail2banJailFile()
+	data, err := os.ReadFile(jail)
+	if err != nil {
+		t.Fatal(err)
+	}
+	retouche := append(data, []byte("\n[sshd-maison]\nenabled = true\n")...)
+	if err := os.WriteFile(jail, retouche, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	etranger := p.Paths.TelegrafFile()
+	if err := os.MkdirAll(filepath.Dir(etranger), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(etranger, []byte("[[inputs.cpu]]\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, force := range []bool{false, true} {
+		p.Force = force
+		steps, err := p.Plan(context.Background(), projects, Observed{TelegrafGroup: -1})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, s := range steps {
+			if s.Critical {
+				t.Errorf("%s : le retrait ne doit pas faire échouer un déploiement", s.Resource)
+			}
+			err := s.Apply(context.Background())
+			switch {
+			case s.Resource == "monitoring/telegraf" && err == nil:
+				t.Errorf("--force=%v : un fragment sans la marque d'ogs doit être laissé, en le disant", force)
+			case s.Resource == "monitoring/fail2ban" && !force && err == nil:
+				t.Error("des prisons retouchées ne doivent pas partir sans --force")
+			case s.Resource == "monitoring/fail2ban" && force && err != nil:
+				t.Errorf("sous --force, le retrait doit aboutir : %v", err)
+			}
+		}
+		if data, err := os.ReadFile(etranger); err != nil || string(data) != "[[inputs.cpu]]\n" {
+			t.Errorf("--force=%v : le fragment étranger a été touché : %v", force, err)
+		}
+		_, err = os.Stat(jail)
+		if !force && err != nil {
+			t.Fatalf("les prisons retouchées ont été retirées sans --force : %v", err)
+		}
+		if force && !os.IsNotExist(err) {
+			t.Errorf("les prisons devaient être retirées sous --force : %v", err)
+		}
+	}
+	baks, _ := filepath.Glob(filepath.Join(p.Paths.BackupsDir(), filepath.Base(jail)+".ogs-bak-*"))
+	if len(baks) != 1 {
+		t.Fatalf("une sauvegarde des prisons attendue, %d trouvée(s)", len(baks))
+	}
+	if saved, _ := os.ReadFile(baks[0]); string(saved) != string(retouche) {
+		t.Errorf("la sauvegarde doit porter les prisons retouchées :\n%s", saved)
+	}
+}
+
 func TestFichiersIdempotents(t *testing.T) {
 	p, _ := fixture(t)
 	shop := project(t, "shop.fr", model.KindSymfony, "8.3")

@@ -60,7 +60,7 @@ func NewRootCommand() *cobra.Command {
 	f.BoolVar(&app.Yes, "yes", false, "ne pas demander de confirmation")
 	f.BoolVar(&app.DryRun, "dry-run", false, "calculer le plan sans rien appliquer")
 	f.BoolVar(&app.Force, "force", false,
-		"écraser les fichiers modifiés à la main, après sauvegarde dans /var/lib/ogs/backups")
+		"écraser ou retirer les fichiers modifiés à la main, après sauvegarde dans /var/lib/ogs/backups")
 	f.BoolVar(&app.NonInteractive, "non-interactive", false, "échouer plutôt que de poser une question")
 	f.BoolVarP(&app.Quiet, "quiet", "q", false, "limiter la sortie à l'essentiel")
 	f.CountVarP(&app.Verbose, "verbose", "v", "augmenter le niveau de détail (répétable)")

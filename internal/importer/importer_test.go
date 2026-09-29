@@ -322,6 +322,69 @@ func TestAdoptKeepsRealNames(t *testing.T) {
 	}
 }
 
+// Le vhost adopté désigne exactement son fichier. Sur nginx, l'usage Debian est
+// un fichier sans extension : « shop.fr » et « shop.de » devenaient tous deux
+// « shop », si bien que le projet adopté écrivait shop.conf et que son premier
+// apply retirait l'original et le site voisin.
+func TestScanEtAdoptionGardentLeNomExactDuFichier(t *testing.T) {
+	prefix := t.TempDir()
+	eng, err := web.NewEngine("nginx", prefix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, dir := range []string{eng.AvailableDir(), eng.EnabledDir()} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, name := range []string{"shop.fr", "shop.de", "blog.fr.conf"} {
+		host := strings.TrimSuffix(name, ".conf")
+		body := "server {\n  server_name " + host + ";\n  root /var/www/" + host + ";\n}\n"
+		if err := os.WriteFile(filepath.Join(eng.AvailableDir(), name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	scanner := &Scanner{Paths: config.NewPaths(prefix), Engine: eng}
+	resources, err := scanner.Scan(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	attendus := map[string]string{"shop.fr": "shop.fr", "shop.de": "shop.de", "blog.fr": "blog.fr.conf"}
+	for _, r := range resources {
+		if r.Kind != KindVHost {
+			continue
+		}
+		file, ok := attendus[r.Name]
+		if !ok {
+			t.Errorf("vhost inattendu %q (%s)", r.Name, r.Path)
+			continue
+		}
+		if r.Attr("file") != file || filepath.Base(r.Path) != file {
+			t.Errorf("vhost %s : fichier %q, attendu %q", r.Name, r.Attr("file"), file)
+		}
+		delete(attendus, r.Name)
+	}
+	if len(attendus) != 0 {
+		t.Errorf("vhosts non trouvés : %v", attendus)
+	}
+
+	candidates, _ := Correlate(resources, "/home", "preprod-pp.net")
+	for _, c := range candidates {
+		if c.Host != "shop.fr" {
+			continue
+		}
+		p, _, err := Adopt(c, "/home", "preprod-pp.net")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(p.Spec.Web.VHosts) != 1 || p.Spec.Web.VHosts[0].File != "shop.fr" {
+			t.Fatalf("le vhost adopté doit désigner shop.fr : %+v", p.Spec.Web.VHosts)
+		}
+		return
+	}
+	t.Fatal("candidat shop.fr introuvable")
+}
+
 func TestDivergesAnnouncesNormalisation(t *testing.T) {
 	// Adopter puis appliquer normaliserait la configuration : l'écart doit être
 	// annoncé avant, pas découvert après.

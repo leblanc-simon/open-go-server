@@ -274,6 +274,41 @@ fi
 rm -rf /etc/nginx/projects/statictest
 
 echo
+echo "--- un vhost posé à la main selon la convention n'est jamais retiré ---"
+# L'attribution par préfixe rangeait « statictest_maintenance » parmi les vhosts
+# obsolètes du projet : son apply le retirait, lien compris, sans --force ni
+# copie. Seul l'en-tête d'ogs rattache désormais un fichier à un projet.
+cat > /etc/nginx/sites-available/statictest_maintenance <<'CONF'
+server {
+    listen 80;
+    server_name maintenance.static.test;
+    return 503;
+}
+CONF
+ln -sf ../sites-available/statictest_maintenance /etc/nginx/sites-enabled/statictest_maintenance
+# Le code est vérifié : un apply en échec pour une autre raison laisserait aussi
+# le fichier en place, et l'assertion passerait pour rien.
+sortie=$(ogs apply statictest --yes 2>&1)
+code=$?
+if [ "$code" != "0" ] && [ "$code" != "6" ]; then
+    echo "ÉCHEC : apply statictest a rendu le code $code"
+    echo "$sortie" | tail -5
+    exit 1
+fi
+if echo "$sortie" | grep -q "statictest_maintenance"; then
+    echo "ÉCHEC : le plan de statictest s'occupe d'un vhost qu'ogs n'a pas écrit :"
+    echo "$sortie" | grep "statictest_maintenance"
+    exit 1
+fi
+if [ ! -f /etc/nginx/sites-available/statictest_maintenance ] ||
+    [ ! -L /etc/nginx/sites-enabled/statictest_maintenance ]; then
+    echo "ÉCHEC : un vhost non géré, nommé selon la convention, a été retiré par l'apply du projet"
+    exit 1
+fi
+echo "vhost posé à la main et son lien : en place"
+rm -f /etc/nginx/sites-enabled/statictest_maintenance /etc/nginx/sites-available/statictest_maintenance
+
+echo
 echo "--- un rechargement suffit-il pour l'appartenance de groupe ? ---"
 # La même question que pour Apache, jamais éprouvée sur nginx : les workers
 # rappellent-ils initgroups() au fork ?

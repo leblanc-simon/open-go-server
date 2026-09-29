@@ -14,6 +14,7 @@ import (
 	"leblanc.io/open-go-server/internal/exec"
 	"leblanc.io/open-go-server/internal/fs"
 	"leblanc.io/open-go-server/internal/model"
+	"leblanc.io/open-go-server/internal/provider/removal"
 	"leblanc.io/open-go-server/internal/provider/unit"
 )
 
@@ -240,12 +241,19 @@ func (p *Provider) Plan(_ context.Context, proj *model.Project, instances map[st
 	}
 	path := p.Path(proj.ID())
 	if content == nil {
-		if _, err := os.Stat(path); err == nil {
-			s := engine.NewStep("sudoers/"+proj.ID(), engine.Delete, "délégation retirée")
-			s.Apply = func(context.Context) error { return os.Remove(path) }
-			return s, nil
-		}
-		return nil, nil
+		// Même régime qu'à l'écriture : une règle ajoutée à la main porte une
+		// délégation que quelqu'un a voulue, et ne part que sous --force, copie
+		// faite ; un fichier sans la marque d'ogs n'est pas à lui — doctor le
+		// signale déjà sous ce préfixe.
+		return removal.File{
+			Resource: "sudoers/" + proj.ID(),
+			Summary:  "délégation retirée",
+			Path:     path,
+			Project:  proj.ID(),
+			Force:    p.Force,
+			Backups:  p.Paths.BackupsDir(),
+			Now:      p.now,
+		}.Step()
 	}
 	state, err := fs.Inspect(path, content)
 	if err != nil {

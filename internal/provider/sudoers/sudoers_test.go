@@ -410,6 +410,66 @@ func TestDelegationModifieeALaMainNEstPasEcraseeEnSilence(t *testing.T) {
 	}
 }
 
+// Le retrait de la délégation suit le régime de son écriture : une règle
+// ajoutée à la main ne part pas sans --force, et part sauvegardée.
+func TestRetraitDUneDelegationRetoucheeExigeForceEtSauvegarde(t *testing.T) {
+	prov, proj := fixture(t)
+	ctx := context.Background()
+	step, err := prov.Plan(ctx, proj, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := step.Apply(ctx); err != nil {
+		t.Fatal(err)
+	}
+	path := prov.Path(proj.ID())
+	data, _ := os.ReadFile(path)
+	if err := os.Chmod(path, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	retouche := append(data, []byte("shopfr ALL=(root) NOPASSWD: /usr/local/bin/sauvegarde-shopfr\n")...)
+	if err := os.WriteFile(path, retouche, 0o640); err != nil {
+		t.Fatal(err)
+	}
+
+	proj.Spec.Sudo = &model.Sudo{Style: StyleNone}
+	step, err = prov.Plan(ctx, proj, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if step == nil || !strings.Contains(step.Summary, "modifié hors ogs") {
+		t.Fatalf("le retrait doit être refusé : %+v", step)
+	}
+	if err := step.Apply(ctx); err == nil || !strings.Contains(err.Error(), "--force") {
+		t.Errorf("le refus doit nommer --force : %v", err)
+	}
+	if got, _ := os.ReadFile(path); string(got) != string(retouche) {
+		t.Fatal("la délégation retouchée a été retirée sans --force")
+	}
+
+	prov.Force = true
+	step, err = prov.Plan(ctx, proj, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(step.Summary, "retrait forcé") {
+		t.Fatalf("le plan doit annoncer le retrait forcé : %s", step.Summary)
+	}
+	if err := step.Apply(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("la délégation devait être retirée sous --force : %v", err)
+	}
+	baks, _ := filepath.Glob(filepath.Join(prov.Paths.BackupsDir(), filepath.Base(path)+".ogs-bak-*"))
+	if len(baks) != 1 {
+		t.Fatalf("une sauvegarde attendue dans %s, %d trouvée(s)", prov.Paths.BackupsDir(), len(baks))
+	}
+	if saved, _ := os.ReadFile(baks[0]); string(saved) != string(retouche) {
+		t.Errorf("la sauvegarde doit porter la règle ajoutée à la main :\n%s", saved)
+	}
+}
+
 func TestLAuditIgnoreLaSauvegardeDUnEcrasementForce(t *testing.T) {
 	// La sauvegarde d'une délégation forcée ne doit pas retomber sous les yeux
 	// d'Audit : elle porte le préfixe « ogs- », donc le filtre du répertoire la

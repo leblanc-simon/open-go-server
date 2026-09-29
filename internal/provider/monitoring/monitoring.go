@@ -26,7 +26,7 @@ import (
 	"leblanc.io/open-go-server/internal/provider/amqp"
 	"leblanc.io/open-go-server/internal/provider/db"
 	"leblanc.io/open-go-server/internal/provider/php"
-	"leblanc.io/open-go-server/internal/provider/system"
+	"leblanc.io/open-go-server/internal/provider/removal"
 	"leblanc.io/open-go-server/internal/secret"
 	"leblanc.io/open-go-server/internal/store"
 	"leblanc.io/open-go-server/internal/template"
@@ -150,10 +150,16 @@ func (p *Provider) Plan(ctx context.Context, projects []*model.Project, obs Obse
 			return nil, err
 		}
 		steps = append(steps, step)
-	} else if step := p.removeStep("monitoring/telegraf",
-		"retrait des entrées Telegraf (supervision désactivée)",
-		p.Paths.TelegrafFile(), "monitoring:telegraf"); step != nil {
-		steps = append(steps, step)
+	} else {
+		step, err := p.removeStep("monitoring/telegraf",
+			"retrait des entrées Telegraf (supervision désactivée)",
+			p.Paths.TelegrafFile(), "monitoring:telegraf")
+		if err != nil {
+			return nil, err
+		}
+		if step != nil {
+			steps = append(steps, step)
+		}
 	}
 	if obs.Fail2banPresent {
 		step, err := p.planFail2ban(projects)
@@ -161,58 +167,41 @@ func (p *Provider) Plan(ctx context.Context, projects []*model.Project, obs Obse
 			return nil, err
 		}
 		steps = append(steps, step)
-	} else if step := p.removeStep("monitoring/fail2ban",
-		"retrait des prisons fail2ban (supervision désactivée)",
-		p.Paths.Fail2banJailFile(), "monitoring:fail2ban"); step != nil {
-		steps = append(steps, step)
+	} else {
+		step, err := p.removeStep("monitoring/fail2ban",
+			"retrait des prisons fail2ban (supervision désactivée)",
+			p.Paths.Fail2banJailFile(), "monitoring:fail2ban")
+		if err != nil {
+			return nil, err
+		}
+		if step != nil {
+			steps = append(steps, step)
+		}
 	}
 	return steps, nil
 }
 
 // removeStep retire un fichier de supervision devenu sans objet. Seul le fichier
 // d'ogs est retiré, jamais le répertoire : il appartient à la distribution, et
-// les fichiers voisins à l'administrateur.
-func (p *Provider) removeStep(resource, summary, path, reload string) *engine.Step {
-	info, err := os.Stat(path)
-	if err != nil {
-		return nil
-	}
-	s := engine.NewStep(resource, engine.Delete, summary)
-	// Non critique, comme le reste de la supervision : un fichier qu'on n'arrive
-	// pas à retirer ne doit pas faire échouer un déploiement.
-	s.Critical = false
-	s.Diff = func() (string, error) { return "suppression de " + path, nil }
-	mode, owner := info.Mode().Perm(), fileOwner(info)
-	var previous []byte
-	s.Apply = func(context.Context) error {
-		if data, err := os.ReadFile(path); err == nil {
-			previous = data
-		}
-		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-			return err
-		}
-		return nil
-	}
-	s.Compensate = func(context.Context) error {
-		if previous == nil {
-			return nil
-		}
-		// Mode et propriétaire sont relevés avant le retrait, non redevinés : le
-		// fragment Telegraf est en 0640 groupe de l'agent, et le restaurer en
-		// root:root le rendrait illisible à celui qui doit le lire.
-		return fs.WriteAtomic(path, previous, mode, owner)
-	}
-	s.Reload = []string{reload}
-	return s
-}
-
-// fileOwner relève le propriétaire d'un fichier existant, ou laisse le
-// propriétaire inchangé lorsque le système ne le rend pas.
-func fileOwner(info os.FileInfo) fs.Owner {
-	if uid, gid, ok := system.OwnerOf(info); ok {
-		return fs.Owner{UID: uid, GID: gid}
-	}
-	return fs.KeepOwner
+// les fichiers voisins à l'administrateur. Il suit le régime de son écriture :
+// retouché — une prison ajoutée, un seuil changé —, il ne part que sous --force
+// et sauvegardé ; sans la marque d'ogs, il n'est pas à lui. Mode et propriétaire
+// sont relevés au retrait et rendus tels quels par la compensation : le fragment
+// Telegraf est en 0640 groupe de l'agent, et le restaurer en root:root le
+// rendrait illisible à celui qui doit le lire.
+func (p *Provider) removeStep(resource, summary, path, reload string) (*engine.Step, error) {
+	return removal.File{
+		Resource: resource,
+		Summary:  summary,
+		Path:     path,
+		Force:    p.Force,
+		Backups:  p.backupDir(),
+		Now:      p.now,
+		Reload:   []string{reload},
+		// Non critique, comme le reste de la supervision : un fichier qu'on
+		// n'arrive pas à retirer ne doit pas faire échouer un déploiement.
+		NonCritical: true,
+	}.Step()
 }
 
 // managedFile décrit un fichier de supervision géré par ogs.

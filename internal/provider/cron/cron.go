@@ -13,6 +13,7 @@ import (
 	"leblanc.io/open-go-server/internal/engine"
 	"leblanc.io/open-go-server/internal/fs"
 	"leblanc.io/open-go-server/internal/model"
+	"leblanc.io/open-go-server/internal/provider/removal"
 	"leblanc.io/open-go-server/internal/template"
 )
 
@@ -211,13 +212,23 @@ func (p *Provider) Plan(_ context.Context, proj *model.Project) ([]*engine.Step,
 	}
 	path := p.Path(proj.ID())
 	if len(jobs) == 0 {
-		// Aucune tâche : le fichier ne doit pas subsister.
-		if _, err := os.Stat(path); err == nil {
-			s := engine.NewStep("cron/"+proj.ID(), engine.Delete, "fichier cron devenu inutile")
-			s.Apply = func(context.Context) error { return os.Remove(path) }
-			return []*engine.Step{s}, nil
+		// Aucune tâche : le fichier ne doit pas subsister — sauf s'il porte le
+		// travail de quelqu'un. Une ligne ajoutée à la main par l'exploitant y
+		// était refusée à l'écriture et partait pourtant au retrait de la
+		// dernière tâche, sans --force ni copie.
+		s, err := removal.File{
+			Resource: "cron/" + proj.ID(),
+			Summary:  "fichier cron devenu inutile",
+			Path:     path,
+			Project:  proj.ID(),
+			Force:    p.Force,
+			Backups:  p.Paths.BackupsDir(),
+			Now:      p.now,
+		}.Step()
+		if err != nil || s == nil {
+			return nil, err
 		}
-		return nil, nil
+		return []*engine.Step{s}, nil
 	}
 
 	var steps []*engine.Step

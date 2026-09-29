@@ -227,6 +227,7 @@ func Project(p *model.Project, homeRoot string) error {
 
 	validateDatabases(p, add)
 	validateApp(p, add)
+	validateVHosts(p, adopted, add)
 	validatePHP(p, add)
 	validateAMQP(p, add)
 	validateCrons(p, add)
@@ -731,6 +732,12 @@ func Uniqueness(projects []*model.Project, prepDomain string) error {
 			}
 			return out
 		}},
+		// Un fichier de vhost prolonge l'identifiant d'un rôle, comme un pool : le
+		// vhost « b2b » du projet shop s'écrit dans shop_b2b.conf, qui est le
+		// fichier principal d'un projet shop_b2b. Les deux se réécriraient ce
+		// fichier à chaque apply, chacun servant ses domaines à la place de
+		// l'autre.
+		{"fichier de vhost", map[string]int{}, vhostFiles},
 	}
 	for index, p := range projects {
 		for _, k := range kinds {
@@ -766,6 +773,48 @@ func poolRole(name string) string {
 		return ""
 	}
 	return name
+}
+
+// vhostFiles énumère les fichiers de vhost qu'un projet écrit dans
+// sites-available, par la règle même du provider web (model.Project.VHostFile) :
+// le nom réel d'un vhost adopté, sinon le nom nu du projet pour le vhost
+// principal et un suffixe de rôle pour les autres — y compris le vhost de
+// redirection qu'un domaine « redirect » fait naître sans être déclaré.
+func vhostFiles(p *model.Project) []string {
+	vhosts := p.VHosts()
+	out := make([]string, 0, len(vhosts))
+	for _, vh := range vhosts {
+		out = append(out, p.VHostFile(vh))
+	}
+	return out
+}
+
+// validateVHosts contrôle les vhosts déclarés. Le nom réel d'un fichier
+// (« file ») est réservé aux vhosts adoptés, dont il désigne l'original : un
+// projet d'ogs suit la convention de nommage. Il reste un nom simple — ni
+// chemin, ni fichier caché, que le masque d'inclusion de nginx ne charge pas.
+func validateVHosts(p *model.Project, adopted bool, add func(string, string, ...any)) {
+	seen := map[string]bool{}
+	files := vhostFiles(p)
+	for i, vh := range p.Spec.Web.VHosts {
+		f := fmt.Sprintf("spec.web.vhosts[%d]", i)
+		if vh.File != "" {
+			if !adopted {
+				add(f+".file", "réservé à un vhost adopté (« ogs import ») : "+
+					"un projet d'ogs nomme ses fichiers d'après son identifiant")
+			}
+			if vh.File != filepath.Base(vh.File) || strings.HasPrefix(vh.File, ".") ||
+				strings.ContainsAny(vh.File, " \t\r\n\x00") {
+				add(f+".file", "nom de fichier simple attendu, obtenu %q", vh.File)
+			}
+		}
+		if i < len(files) {
+			if seen[files[i]] {
+				add(f+".name", "le fichier %s est déjà celui d'un autre vhost du projet", files[i])
+			}
+			seen[files[i]] = true
+		}
+	}
 }
 
 // forbiddenRoot refuse les emplacements qu'aucune racine de projet ne devrait

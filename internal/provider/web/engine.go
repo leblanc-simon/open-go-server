@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 
 	"leblanc.io/open-go-server/internal/exec"
+	"leblanc.io/open-go-server/internal/model"
 )
 
 // Engine abstrait un serveur web. Les deux implémentations partagent le même
@@ -20,7 +21,9 @@ type Engine interface {
 	AvailableDir() string
 	// EnabledDir est le répertoire des configurations actives.
 	EnabledDir() string
-	// FileName traduit un nom de vhost en nom de fichier.
+	// FileName traduit un nom de vhost en nom de fichier, par l'extension
+	// model.VHostExt : le contrôle d'unicité du parc nomme les fichiers comme
+	// les moteurs.
 	FileName(name string) string
 	// TemplateName traduit un template logique en template du moteur.
 	TemplateName(template string) string
@@ -54,7 +57,7 @@ func (a apacheEngine) AvailableDir() string {
 func (a apacheEngine) EnabledDir() string {
 	return filepath.Join(a.prefix, "/etc/apache2/sites-enabled")
 }
-func (a apacheEngine) FileName(name string) string  { return name + ".conf" }
+func (a apacheEngine) FileName(name string) string  { return name + model.VHostExt }
 func (a apacheEngine) TemplateName(t string) string { return "apache/" + t + ".conf" }
 func (a apacheEngine) Unit() string                 { return "apache2" }
 func (a apacheEngine) CommentPrefix() string        { return "#" }
@@ -102,7 +105,7 @@ func (n nginxEngine) AvailableDir() string {
 	return filepath.Join(n.prefix, "/etc/nginx/sites-available")
 }
 func (n nginxEngine) EnabledDir() string           { return filepath.Join(n.prefix, "/etc/nginx/sites-enabled") }
-func (n nginxEngine) FileName(name string) string  { return name + ".conf" }
+func (n nginxEngine) FileName(name string) string  { return name + model.VHostExt }
 func (n nginxEngine) TemplateName(t string) string { return "nginx/" + t + ".conf" }
 func (n nginxEngine) Unit() string                 { return "nginx" }
 func (n nginxEngine) CommentPrefix() string        { return "#" }

@@ -21,7 +21,9 @@ import (
 	appprov "leblanc.io/open-go-server/internal/provider/app"
 	"leblanc.io/open-go-server/internal/provider/firewall"
 	"leblanc.io/open-go-server/internal/provider/mail"
+	"leblanc.io/open-go-server/internal/provider/removal"
 	"leblanc.io/open-go-server/internal/provider/unit"
+	"leblanc.io/open-go-server/internal/provider/web"
 	"leblanc.io/open-go-server/internal/spec"
 	"leblanc.io/open-go-server/internal/store"
 	"leblanc.io/open-go-server/internal/template"
@@ -97,13 +99,22 @@ func (a *App) buildPlan(ctx context.Context, provs *providers, p *model.Project)
 		}
 		phpSteps, err := provs.PHP.Plan(ctx, p, phpObs)
 		if err != nil {
+			// Le pool d'un autre projet est un conflit, comme un domaine déjà servi
+			// — non une dépendance absente.
+			var owned *fs.OwnerError
+			if errors.As(err, &owned) {
+				return nil, wrap(CodeConflict, a.ownerGone(err))
+			}
 			return nil, wrap(CodeDependency, err)
 		}
 		for _, s := range phpSteps {
 			plan.Add(s)
 		}
 		// Les suppressions de pools sont différées après la réécriture des vhosts.
-		stale = provs.PHP.PlanStale(ctx, p, phpObs)
+		stale, err = provs.PHP.PlanStale(ctx, p, phpObs)
+		if err != nil {
+			return nil, wrap(CodeError, err)
+		}
 	}
 
 	// Application non-PHP : runtime, unité et attente de disponibilité. Elle
@@ -198,7 +209,7 @@ func (a *App) buildPlan(ctx context.Context, provs *providers, p *model.Project)
 		}
 		webSteps, err := provs.Web.Plan(ctx, p, webObs)
 		if err != nil {
-			return nil, wrap(CodeConflict, err)
+			return nil, a.webPlanErr(err)
 		}
 		for _, s := range webSteps {
 			plan.Add(s)
@@ -260,6 +271,37 @@ func (a *App) buildPlan(ctx context.Context, provs *providers, p *model.Project)
 		plan.Add(logsFinish)
 	}
 	return plan, nil
+}
+
+// webPlanErr donne son code à une erreur du plan web. Un domaine déjà servi et
+// le fichier d'un autre projet sont des conflits (4) ; un nom de fichier que le
+// moteur ne chargerait pas est une faute de déclaration (3), et un fichier dont
+// l'état ne se lit pas avant son retrait, une erreur ordinaire (1).
+func (a *App) webPlanErr(err error) error {
+	var file *web.FileError
+	var inspect *removal.InspectError
+	switch {
+	case errors.As(err, &file):
+		return wrap(CodeValidation, err)
+	case errors.As(err, &inspect):
+		return wrap(CodeError, err)
+	}
+	return wrap(CodeConflict, a.ownerGone(err))
+}
+
+// ownerGone marque le propriétaire d'un fichier refusé (fs.OwnerError) comme
+// disparu quand sa déclaration n'existe plus : le message renverrait sinon à
+// « ogs apply » d'un projet qui n'est plus là — le cas d'un fichier laissé par
+// une suppression. Seule la présence du fichier de déclaration compte : charger
+// le parc entier ferait échouer le message sur le premier voisin invalide.
+func (a *App) ownerGone(err error) error {
+	var owned *fs.OwnerError
+	if errors.As(err, &owned) {
+		if _, statErr := os.Stat(a.Paths.ProjectFile(owned.Owner)); os.IsNotExist(statErr) {
+			owned.Gone = true
+		}
+	}
+	return err
 }
 
 // buildGlobalPlan calcule les étapes qui portent sur l'ensemble du parc.

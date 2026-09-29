@@ -134,6 +134,9 @@ func Inspect(path string, expected []byte) (State, error) {
 // reProject lit l'identifiant que Render inscrit dans la seconde ligne d'en-tête.
 var reProject = regexp.MustCompile(`^[#;]\s*projet: (\S+)  ressource: `)
 
+// reResource lit la ressource inscrite à sa suite, sur la même ligne.
+var reResource = regexp.MustCompile(`  ressource: (\S+)  `)
+
 // ManagedProject rend l'identifiant du projet pour lequel ogs a écrit path, lu
 // dans son en-tête, ou "" si le fichier est absent, n'est pas un fichier régulier
 // ou ne porte pas la marque d'ogs.
@@ -175,6 +178,206 @@ func ManagedProject(path string) (string, error) {
 		return m[1], nil
 	}
 	return "", nil
+}
+
+// readMark lit la marque d'ogs là où Inspect la cherche, dans les trois
+// premières lignes, puis le projet et la ressource sur la ligne qui la suit. at
+// vaut -1 sans marque — une marque qu'aucune ligne ne suit n'est pas un en-tête
+// de Render —, et project est vide si cette ligne n'est pas la sienne.
+func readMark(data []byte) (at int, project, resource string) {
+	// Trois lignes, et le reste : la ligne qui suit la marque peut être la
+	// quatrième.
+	lines := strings.SplitN(string(data), "\n", 4)
+	at = -1
+	for i := 0; i < len(lines) && i < 3; i++ {
+		if strings.Contains(lines[i], Marker) {
+			at = i
+			break
+		}
+	}
+	if at < 0 || at+1 >= len(lines) {
+		return -1, "", ""
+	}
+	next, _, _ := strings.Cut(lines[at+1], "\n")
+	if m := reProject.FindStringSubmatch(next); m != nil {
+		project = m[1]
+		if r := reResource.FindStringSubmatch(next); r != nil {
+			resource = r[1]
+		}
+	}
+	return at, project, resource
+}
+
+// ManagedResource rend le projet et la ressource que l'en-tête d'ogs inscrit
+// dans path (« web/vhost/shopfr », « php/pool/shopfr »), ou deux chaînes vides si
+// le fichier est absent, n'est pas un fichier régulier ou ne porte pas la marque.
+// Un lien n'est jamais suivi.
+//
+// Le projet seul ne range pas un fichier parmi ceux d'un provider : les fichiers
+// de portée parc portent un libellé à sa place, et « parc » — celui du vhost de
+// supervision, posé dans sites-available parmi les vhosts des projets — est aussi
+// un identifiant valide. Un projet ainsi nommé retirait ogs-status.conf comme
+// l'un de ses vhosts obsolètes, que le plan global recréait aussitôt : son plan
+// n'était jamais vide, « diff » rendait toujours 6, et la supervision tombait le
+// temps de chaque apply.
+//
+// C'est la lecture des providers, qui cherche la marque là où Inspect et
+// InspectRemoval la cherchent : ce que l'un attribue, les autres le jugent.
+// Exiger la marque en tête, comme ManagedProject, laissait sans maître le
+// fichier d'un voisin dont l'exploitant avait retouché le haut : Inspect le
+// tenait pour modifié à la main, et --force le réécrivait au compte du mauvais
+// projet. ManagedProject garde cette exigence : il décide seul de ce que la
+// suppression d'un projet retire, sans passer par les cinq états, et un fichier
+// retouché au-dessus de son en-tête y reste en place.
+func ManagedResource(path string) (project, resource string, err error) {
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ELOOP) {
+			return "", "", nil
+		}
+		return "", "", err
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return "", "", err
+	}
+	if !st.Mode().IsRegular() {
+		return "", "", nil
+	}
+	// L'en-tête tient dans les premières lignes : lire le fichier entier pour
+	// l'attribuer coûterait autant qu'un journal.
+	buf := make([]byte, 4096)
+	n, err := io.ReadFull(f, buf)
+	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+		return "", "", err
+	}
+	_, project, resource = readMark(buf[:n])
+	return project, resource, nil
+}
+
+// OwnerError signale un fichier qu'ogs a écrit pour un autre projet que celui
+// qui s'apprête à l'écrire.
+type OwnerError struct {
+	Path string
+	// Owner est le projet que nomme l'en-tête, Project celui qui voulait écrire.
+	Owner, Project string
+	// What nomme ce qui voulait l'écrire (« pool « api » de shop »). Il est
+	// porté par l'erreur plutôt que par un fmt.Errorf qui l'envelopperait : le
+	// message d'un enveloppant est figé à sa création, et Gone ne se sait
+	// qu'après.
+	What string
+	// Gone dit que le propriétaire n'est plus déclaré dans le parc. Seul
+	// l'appelant le sait : CheckOwner ne voit qu'un fichier.
+	Gone bool
+}
+
+// Error nomme les issues : le propriétaire ne le déclare plus, et son apply le
+// retire ; ou les deux le déclarent, et l'un doit changer de nom. Un propriétaire
+// disparu n'a plus d'apply : y renvoyer l'exploitant le ferait tourner en rond.
+func (e *OwnerError) Error() string {
+	var msg string
+	if e.Gone {
+		msg = fmt.Sprintf("%s est le fichier du projet %s, d'après son en-tête, et ce projet n'est plus "+
+			"déclaré : %s ne le reprend pas, --force compris — c'est un reste, à retirer à la main s'il est "+
+			"sans objet", e.Path, e.Owner, e.Project)
+	} else {
+		msg = fmt.Sprintf("%s est le fichier du projet %s, d'après son en-tête : %s ne l'écrit pas, --force compris "+
+			"(si %s ne le déclare plus, « ogs apply %s » le retire ; sinon, l'un des deux doit changer de nom)",
+			e.Path, e.Owner, e.Project, e.Owner, e.Owner)
+	}
+	if e.What != "" {
+		return e.What + " : " + msg
+	}
+	return msg
+}
+
+// CheckOwner refuse d'écrire pour project un fichier qu'ogs a écrit pour un
+// autre projet (*OwnerError, dont what nomme l'écrivain).
+//
+// Le pool « api » et le vhost « b2b » du projet shop s'écrivent dans
+// shop_api.conf et shop_b2b.conf, les fichiers principaux des projets shop_api
+// et shop_b2b. Le contrôle d'unicité ne voit la collision que sur le parc
+// entier, or « apply <id> » ne valide que ses cibles — le chemin ordinaire après
+// avoir édité une déclaration : Inspect, qui ignore le projet de l'en-tête,
+// tenait le fichier du voisin pour « à mettre à jour », et shop le réécrivait à
+// son compte, avec le code 0. --force n'y change rien : il reprend un fichier
+// retouché ou jamais écrit par ogs, il ne donne pas à un projet celui d'un autre.
+// Le propriétaire est lu comme Inspect lit la marque (ManagedResource).
+func CheckOwner(path, project, what string) error {
+	owner, _, err := ManagedResource(path)
+	if err != nil {
+		if what != "" {
+			return fmt.Errorf("%s : %w", what, err)
+		}
+		return err
+	}
+	if owner != "" && owner != project {
+		return &OwnerError{Path: path, Owner: owner, Project: project, What: what}
+	}
+	return nil
+}
+
+// InspectRemoval rend l'état d'un fichier qu'ogs s'apprête à retirer. Aucun
+// rendu n'est attendu, et les cinq états s'y lisent donc à l'aune de ce qu'ogs a
+// lui-même écrit :
+//
+//   - StateAbsent : rien à retirer ;
+//   - StateCurrent : écrit par ogs pour project, et intact — il se retire ;
+//   - StateHandEdited : écrit par ogs pour project, mais retouché depuis — son
+//     retrait exige --force et une sauvegarde, comme son écrasement (§6.4) ;
+//   - StateForeign : sans la marque d'ogs, marqué pour un autre projet, ou qui
+//     n'est pas un fichier régulier — ogs ne le retire jamais.
+//
+// Un project vide accepte toute marque d'ogs : l'en-tête des fichiers de parc
+// porte un libellé (« parc ») ou un décompte de projets, non un identifiant.
+//
+// La marque est cherchée dans les trois premières lignes, comme Inspect : une
+// ligne ajoutée au-dessus de l'en-tête fait un fichier retouché, que --force
+// retire après sauvegarde. Exiger la marque en tête l'aurait rendu « non géré »
+// au retrait alors qu'Inspect le tient pour modifié à la main à l'écriture —
+// réécrit sous --force, mais jamais retirable.
+//
+// Le retrait passait autrefois par le seul nom : un pool ou un vhost non géré,
+// nommé selon la convention, et le fichier retouché d'un exploitant partaient
+// sans --force ni copie, alors que les mêmes fichiers étaient refusés à
+// l'écriture. Un lien n'est jamais suivi : ce n'est pas lui qu'ogs a écrit.
+func InspectRemoval(path, project string) (State, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		switch {
+		case errors.Is(err, fs.ErrNotExist):
+			return StateAbsent, nil
+		case errors.Is(err, syscall.ELOOP):
+			return StateForeign, nil
+		}
+		return StateAbsent, err
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return StateAbsent, err
+	}
+	if !st.Mode().IsRegular() {
+		return StateForeign, nil
+	}
+	data, err := io.ReadAll(f)
+	if err != nil {
+		return StateAbsent, err
+	}
+	at, owner, _ := readMark(data)
+	if at < 0 || (project != "" && owner != project) {
+		return StateForeign, nil
+	}
+	if at > 0 {
+		// L'empreinte ne couvre que ce qui suit l'en-tête : une ligne posée
+		// au-dessus y échappe, et le fichier passerait pour intact.
+		return StateHandEdited, nil
+	}
+	if announced, body := splitHeader(data); announced == "" || announced != Fingerprint(body) {
+		return StateHandEdited, nil
+	}
+	return StateCurrent, nil
 }
 
 // splitHeader isole l'empreinte annoncée et le corps d'un fichier géré. Il ne
@@ -293,14 +496,14 @@ func WriteAtomic(path string, data []byte, mode os.FileMode, owner Owner) error 
 // peut changer sous nos pieds, l'emplacement ne dépend de personne.
 //
 // Le répertoire est créé en 0700, et c'est aussi ce qui rend l'écriture sûre :
-// os.WriteFile suit les liens, or l'horodatage se devine à la seconde près. Une
-// copie déposée dans un répertoire qu'un non-root possède — le .ssh d'un projet,
-// pour la rotation de la clé de déploiement — se ferait détourner par un lien
-// posé d'avance à ce nom, et root écrirait le contenu de l'ancienne clé où le
-// projet l'aurait décidé. Aucun appelant ne choisit donc son répertoire : tous
-// passent par config.Paths.BackupsDir(). Le mode est un filet —
-// « ogs init » le pose déjà (config.Paths.Dirs), avec un mode explicite que le
-// umask ambiant ne rabote pas, ce que MkdirAll ne garantit pas. Ses parents sont
+// l'horodatage se devine à la seconde près. Une copie déposée dans un répertoire
+// qu'un non-root possède — le .ssh d'un projet, pour la rotation de la clé de
+// déploiement — se ferait détourner par un lien posé d'avance à ce nom dès que
+// l'écriture le suit, comme os.WriteFile, et root écrirait le contenu de
+// l'ancienne clé où le projet l'aurait décidé. Aucun appelant ne choisit donc
+// son répertoire : tous passent par config.Paths.BackupsDir(). Le mode est un
+// filet — « ogs init » le pose déjà (config.Paths.Dirs), avec un mode explicite
+// que le umask ambiant ne rabote pas, ce que MkdirAll ne garantit pas. Ses parents sont
 // supposés déjà posés — /var/lib/ogs l'est en 0751 par « ogs init », et le
 // serveur web doit pouvoir le traverser : MkdirAll leur appliquerait sinon le
 // 0700 du dernier composant.
@@ -316,11 +519,8 @@ func BackupTo(path, dir string, now time.Time) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return "", err
-	}
-	dst := filepath.Join(dir, backupName(filepath.Base(path), now))
-	if err := os.WriteFile(dst, data, info.Mode().Perm()); err != nil {
+	dst, err := writeBackup(dir, filepath.Base(path), data, info.Mode().Perm(), now)
+	if err != nil {
 		return "", err
 	}
 	return dst, nil
@@ -333,6 +533,53 @@ func BackupTo(path, dir string, now time.Time) (string, error) {
 // qu'ici : horodatage en UTC, et trié alphabétiquement donc chronologiquement.
 func backupName(base string, now time.Time) string {
 	return fmt.Sprintf("%s.ogs-bak-%s", base, now.UTC().Format("20060102-150405"))
+}
+
+// maxBackupSuffix borne la recherche d'un nom libre : au-delà, c'est le
+// répertoire qui est en cause, non la coïncidence de deux sauvegardes.
+const maxBackupSuffix = 1000
+
+// writeBackup dépose data dans dir, créé au besoin, sous un nom qu'aucune autre
+// sauvegarde n'occupe : le nom horodaté de base, puis, s'il est pris, ce nom
+// suffixé de « .1 », « .2 »…
+//
+// Le nom de base ne désigne pas un fichier : le pool et le vhost d'un projet
+// s'appellent tous deux shopfr.conf, son fichier cron et sa délégation sudo
+// ogs-shopfr, les fragments Telegraf et fail2ban ogs.conf. Un même apply les
+// sauvegarde dans la même seconde — « php switch » sous --force réécrit le vhost
+// puis retire l'ancien pool —, et os.WriteFile écrasait sans un mot la première
+// copie par la seconde : la retouche du vhost était perdue, alors que le plan
+// l'annonçait sauvegardée. O_EXCL ne réutilise jamais un nom, et ne suit pas un
+// lien posé à sa place.
+func writeBackup(dir, base string, data []byte, perm os.FileMode, now time.Time) (string, error) {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", err
+	}
+	name := filepath.Join(dir, backupName(base, now))
+	for i := 0; i <= maxBackupSuffix; i++ {
+		dst := name
+		if i > 0 {
+			dst = fmt.Sprintf("%s.%d", name, i)
+		}
+		f, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, perm.Perm())
+		if errors.Is(err, fs.ErrExist) {
+			continue
+		}
+		if err != nil {
+			return "", err
+		}
+		_, err = f.Write(data)
+		if cerr := f.Close(); err == nil {
+			err = cerr
+		}
+		if err != nil {
+			// Une copie tronquée passerait pour la sauvegarde : elle ne reste pas.
+			_ = os.Remove(dst)
+			return "", err
+		}
+		return dst, nil
+	}
+	return "", fmt.Errorf("aucun nom libre pour sauvegarder %s dans %s", base, dir)
 }
 
 // EnsureDir crée un répertoire avec le mode et le propriétaire attendus, et les

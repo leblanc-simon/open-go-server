@@ -180,6 +180,62 @@ func TestUniquenessDetectsDomainCollision(t *testing.T) {
 	}
 }
 
+// Le vhost « b2b » du projet shop s'écrit dans shop_b2b.conf, le fichier
+// principal d'un projet shop_b2b : les deux se le réécriraient à chaque apply.
+// Les pools étaient déjà comparés ; les fichiers de vhost ne l'étaient pas.
+func TestUniquenessDetecteUnFichierDeVhostPartage(t *testing.T) {
+	shop := newProject(t, "shop.fr", naming.EnvProd, model.KindStatic)
+	shop.Metadata.Name = "shop"
+	shop.Spec.Web.VHosts = []model.VHost{
+		{Name: model.MainPoolName, Domains: []string{"shop.fr"}},
+		{Name: "b2b", Domains: []string{"pro.shop.fr"}},
+	}
+	voisin := newProject(t, "b2b.shop.fr", naming.EnvProd, model.KindStatic)
+	voisin.Metadata.Name = "shop_b2b"
+	err := Uniqueness([]*model.Project{shop, voisin}, "preprod-pp.net")
+	if err == nil || !strings.Contains(err.Error(), "shop_b2b.conf") {
+		t.Fatalf("le fichier de vhost partagé doit être refusé : %v", err)
+	}
+
+	// Le vhost de redirection implicite prolonge lui aussi l'identifiant.
+	redirige := newProject(t, "shop.fr", naming.EnvProd, model.KindStatic)
+	redirige.Metadata.Name = "shop"
+	redirige.Spec.Domains = append(redirige.Spec.Domains,
+		model.Domain{Name: "shop.com", Role: "redirect", Target: "shop.fr"})
+	autre := newProject(t, "promo.shop.fr", naming.EnvProd, model.KindStatic)
+	autre.Metadata.Name = "shop_redirect"
+	if err := Uniqueness([]*model.Project{redirige, autre}, "preprod-pp.net"); err == nil {
+		t.Error("le vhost de redirection implicite doit entrer dans le contrôle")
+	}
+
+	// Un identifiant voisin sans fichier commun reste admis.
+	api := newProject(t, "api.shop.fr", naming.EnvProd, model.KindStatic)
+	api.Metadata.Name = "shop_api"
+	if err := Uniqueness([]*model.Project{shop, api}, "preprod-pp.net"); err != nil {
+		t.Errorf("des identifiants proches sans fichier commun doivent cohabiter : %v", err)
+	}
+}
+
+// Le nom réel d'un fichier de vhost n'a de sens que pour un vhost adopté, dont
+// il désigne l'original ; il reste un nom simple.
+func TestProjectContraintLeFichierDUnVhost(t *testing.T) {
+	p := newProject(t, "shop.fr", naming.EnvProd, model.KindStatic)
+	p.Spec.Web.VHosts = []model.VHost{{Name: "shop.fr", File: "shop.fr", Domains: []string{"shop.fr"}}}
+	if err := Project(p, "/home"); err == nil || !strings.Contains(err.Error(), "adopté") {
+		t.Errorf("un fichier de vhost hors adoption doit être refusé : %v", err)
+	}
+	p.Metadata.Labels = map[string]string{"adopted": "true"}
+	if err := Project(p, "/home"); err != nil {
+		t.Errorf("le fichier d'un vhost adopté doit être admis : %v", err)
+	}
+	for _, file := range []string{"../apache2.conf", ".shop.fr", "shop fr"} {
+		p.Spec.Web.VHosts[0].File = file
+		if err := Project(p, "/home"); err == nil {
+			t.Errorf("fichier %q admis", file)
+		}
+	}
+}
+
 func TestProjectAcceptsPrimaryAndWWWAlias(t *testing.T) {
 	// Le cas le plus courant : servir shop.fr et www.shop.fr. Les deux ont la
 	// même forme canonique, mais ce sont bien deux domaines à déclarer.
