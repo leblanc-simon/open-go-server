@@ -1,0 +1,10 @@
+#!/bin/bash
+# Enveloppe du vrai rsync ($FAUX_RSYNC) : note sous quelle identité il copie quoi.
+# Le récepteur lancé par « -e runuser … -- » porte l'identité que le faux runuser
+# a posée ; « rsync-serveur » est le côté que rsync lance lui-même.
+if [[ "${1:-}" == --server ]]; then
+    printf '[rsync-serveur %s] %s\n' "${FAUX_IDENTITE:-root}" "$*" >>"$FAUX_JOURNAL"
+else
+    printf '[rsync %s] %s\n' "${FAUX_IDENTITE:-root}" "$*" >>"$FAUX_JOURNAL"
+fi
+exec "$FAUX_RSYNC" "$@"

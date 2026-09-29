@@ -1,0 +1,16 @@
+#!/bin/bash
+# Faux runuser : note l'identité demandée, puis exécute la commande sans en
+# changer — le banc ne tourne pas en root. FAUX_IDENTITE la transmet aux
+# enveloppes qui suivent (rsync, install).
+u=root g=''
+while (($#)); do
+    case "$1" in
+        -u) u="$2"; shift 2 ;;
+        -g) g="$2"; shift 2 ;;
+        --) shift; break ;;
+        *) break ;;
+    esac
+done
+printf '[runuser %s:%s] %s\n' "$u" "$g" "$*" >>"$FAUX_JOURNAL"
+export FAUX_IDENTITE="$u"
+exec "$@"

@@ -1,0 +1,6 @@
+#!/bin/bash
+# Faux getent de la cible : les comptes qu'il dit exister sont listés dans
+# $FAUX_COMPTES_CIBLE — le banc ne doit dépendre d'aucun compte de la machine.
+[[ "${1:-}" == passwd ]] || exit 2
+grep -qxF -- "${2:-}" "${FAUX_COMPTES_CIBLE:-/dev/null}" 2>/dev/null || exit 2
+echo "$2:x:1500:1500::/home/$2:/bin/bash"

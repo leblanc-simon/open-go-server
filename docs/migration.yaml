@@ -6,7 +6,8 @@
 #
 #   1. le projet Claude qui connaît l'ancien serveur, qui le REMPLIT ;
 #   2. le script de migration, qui le LIT et enchaîne les phases décrites en bas
-#      de ce fichier (§ Déroulé) — chaque phase est rejouable sans dommage.
+#      de ce fichier (§ Déroulé) — chaque phase est rejouable sans dommage, et
+#      celles qui écraseraient la cible sont refusées une fois la bascule engagée.
 #
 # Ce fichier est un MODÈLE, suivi par git : le copier hors du dépôt avant de le
 # remplir (par exemple /root/migration.yaml sur la cible) — rempli, il porte les
@@ -49,7 +50,15 @@ source:
   nom: ~                          # ex. srv-web-1
   ssh: ~                          # ex. root@203.0.113.10 — joignable DEPUIS la cible
   port_ssh: 22
-  ip_publique: ~                  # pour les listes blanches tierces (voir dependances_externes)
+  # REQUIS : l'adresse que les enregistrements A des domaines désignent AUJOURD'HUI
+  # — pas l'adresse sortante des listes blanches, si les deux diffèrent. Le retour
+  # arrière attend que chaque résolveur la rende de nouveau, exactement (un seul
+  # A, aucun AAAA non déclaré), avant de rouvrir la source ; `prealables` vérifie
+  # que c'est déjà le cas. Un domaine derrière un CDN ou un répartiteur ne la
+  # rendra jamais : bascule et retour se font alors avec --sans-attente-dns, la
+  # propagation constatée à la main.
+  ip_publique: ~
+  ip6_publique: ~                 # si les domaines ont un AAAA vers la source
   systeme: ~                      # ex. Debian 10
   moteur_web: ~                   # apache | nginx
   mysql: ~                        # ex. MySQL 5.7.42, MariaDB 10.3 — `mysql --version`
@@ -71,8 +80,11 @@ cible:
 # Réglages communs de la migration
 # -----------------------------------------------------------------------------
 migration:
-  # Répertoire de travail sur la cible (dumps, journaux de la migration).
-  # Sous /var/lib : un dump contient les données des clients.
+  # Répertoire de travail sur la cible (dumps, journaux et état de la migration).
+  # Sous /var/lib : un dump contient les données des clients. Il porte aussi un
+  # miroir des fichiers de chaque site (<travail>/<id>/miroir), par lequel passe
+  # toute copie vers le home — prévoir l'espace de leur volume, et le supprimer
+  # avec les dumps une fois la source éteinte.
   travail: /var/lib/ogs-migration
 
   # TTL à poser sur les enregistrements DNS AU MOINS 48 h avant la première
@@ -152,11 +164,14 @@ projets:
         - de: shared/.env.local
           vers: www/.env.local
       # Exclus de la copie : caches, journaux, sessions — reconstruits sur place.
+      # Un exclu est aussi protégé du --delete : ce que la cible y a écrit reste.
       exclure:
         - var/cache/
         - var/log/
         - var/sessions/
         - node_modules/           # seulement s'il est reconstruit par la CI
+        - public/maintenance.flag # posé DANS le code : sans cela, la dernière copie
+                                  # l'emporterait, et la cible s'ouvrirait en maintenance
       volume_estime: ~            # `du -sh` — règle la durée de la pré-synchronisation
       # Fichiers de configuration applicative qui portent des identifiants de
       # base, d'AMQP ou des chemins absolus. Ils sont réécrits après copie.
@@ -180,10 +195,20 @@ projets:
       # Mise en maintenance du site SUR LA SOURCE, pendant la bascule : commandes
       # shell exécutées en root sur la source. `maintenance: aucune` si le site
       # n'écrit rien (vitrine statique) — sinon les écritures faites entre la
-      # dernière copie et le changement de DNS sont perdues.
+      # dernière copie et le changement de DNS sont perdues. Rejouables : une
+      # bascule reprise les relance.
       maintenance:
         activer: "touch /var/www/shop/current/public/maintenance.flag"
         desactiver: "rm -f /var/www/shop/current/public/maintenance.flag"
+
+    # Mise en maintenance du site SUR LA CIBLE, le temps qu'un retour arrière
+    # ramène le DNS vers la source : sans elle, la cible sert le site jusqu'au
+    # bout de la propagation, et ce qu'elle reçoit alors est perdu. Commandes
+    # exécutées sous le compte du projet, depuis /home/<host>/www. Facultatif ;
+    # `aucune` pour un site qui n'écrit rien.
+    maintenance_cible:
+      activer: "touch public/maintenance.flag"
+      desactiver: "rm -f public/maintenance.flag"
 
     # Commandes exécutées SUR LA CIBLE après chaque synchronisation, sous le compte
     # du projet, depuis /home/<host>/www, avec son PHP (~/.local/bin) en tête du
@@ -196,7 +221,11 @@ projets:
     bases:
       - moteur: mysql             # mysql | mariadb | postgres
         source: shop_prod         # nom sur l'ancien serveur
-        cible: shopfr             # nom déclaré dans `ogs.spec.databases` (défaut : l'identifiant)
+        # Nom déclaré dans `ogs.spec.databases`, même moteur (défaut : l'identifiant).
+        # Chaque synchronisation la SUPPRIME puis la recharge : aucun autre projet,
+        # du manifeste ou de la cible, ne doit la déclarer, et elle ne doit pas
+        # exister sur la cible avant la première déclaration — sinon, refus.
+        cible: shopfr
         taille: ~                 # Mo — au-delà de ~2 Go, prévoir la fenêtre en conséquence
         charset: utf8mb4
         collation: ~              # ATTENTION : utf8mb4_0900_* (MySQL 8) n'existe pas sous MariaDB
@@ -219,6 +248,10 @@ projets:
       crontab_utilisateur: true   # `crontab -l -u shop` non vide
       fichiers_cron: []           # ex. [/etc/cron.d/shop]
       # Arrêt et relance (retour arrière) de chaque worker, en root sur la source.
+      # Une bascule reprise rejoue l'arrêt, un retour repris la relance : l'échec
+      # d'une commande déjà réussie au premier passage (supervisorctl sur un
+      # programme déjà arrêté) y est toléré ; tout autre échec d'arrêt interrompt
+      # la bascule, le worker tournant sinon sur les deux serveurs.
       workers: []
       #  - arreter: "supervisorctl stop 'shop-messenger:*'"
       #    relancer: "supervisorctl start 'shop-messenger:*'"
@@ -248,7 +281,12 @@ projets:
 
     # --- Vérification après bascule ------------------------------------------------
     # Rejouées AVANT la bascule en forçant la résolution vers la cible
-    # (curl --resolve), puis APRÈS, par le DNS.
+    # (curl --resolve), puis APRÈS, par le DNS. Tant que la cible n'a pas de
+    # certificat pour le domaine, une URL https est vérifiée en http : tout
+    # statut autre que l'attendu y est un échec, hormis une redirection vers le
+    # même domaine en https (page alors invérifiable, signalée). Sans `statut`,
+    # l'URL doit au moins répondre, sans erreur 5xx. `contient` est ce qui prouve
+    # que la page vient bien de CE site : le renseigner.
     verifications:
       - url: https://shop.fr/
         statut: 200
@@ -320,12 +358,31 @@ projets:
 #     `ogs firewall confirm` depuis une SECONDE session ssh ;
 #   - `ogs cert dns-provider set ovh …` si des certificats partent en dns-01 ;
 #   - `ssh <source.ssh> true` depuis la cible (clé de la cible autorisée sur la source) ;
-#   - TTL des zones abaissés à `migration.ttl_bascule`, 48 h avant la vague 1.
+#   - TTL des zones abaissés à `migration.ttl_bascule`, 48 h avant la vague 1 ;
+#   - chaque domaine résout exactement vers `source.ip_publique` (et
+#     `ip6_publique`) : bascule et retour attendront la même exactitude. Contrôlé
+#     pour les seuls projets dont la bascule n'est ni engagée ni faite ; un
+#     domaine sans aucune adresse — nouveau, créé vers la cible à la bascule —
+#     n'est qu'un avertissement, son retour exigeant --sans-attente-dns.
 #
 # PHASE 1 — Déclarer (par projet, sans interruption de service)
-#   - refus si le projet contient « À VÉRIFIER » ;
+#   - refus si le projet porte encore une valeur marquée à vérifier (le marqueur
+#     n'est pas recopié ici : le contrôle le compterait dans le dernier projet),
+#     ou si deux projets du manifeste visent la même base, le même compte, le même
+#     home ou le même domaine ;
 #   - extraire `ogs:` vers un fichier, y forcer `enabled: false` sur chaque cron
 #     et chaque service, `ogs plan -f` pour valider ;
+#   - refus si la cible porte déjà un projet de cet identifiant que la migration
+#     n'a pas déposé, si un autre projet de la cible déclare l'une de ses bases,
+#     son compte ou son home, ou sert l'un de ses domaines, ou si son compte, son
+#     home, une base ou un utilisateur de base y existe déjà : la synchronisation
+#     remplacerait ce qui ne lui appartient pas. Les domaines sont ceux qu'ogs
+#     compare — le host effectif et les alias, « www. » ôté —, pas le seul
+#     metadata.host : une production et sa préproduction (`env: prep`, même
+#     host) ne partagent rien. Une préproduction dont `spec.domains` n'est pas
+#     écrit sert le host qu'ogs lui construit, <label>.<environments.prep.domain>,
+#     le label étant le host privé de son dernier label : shop.fr et shop.com y
+#     donnent le même, shop.preprod-pp.net — et son home s'en déduit ;
 #   - le déposer dans /etc/ogs/projects/<id>.yaml ;
 #   - `ogs amqp messenger <id> --transport …` si `amqp.present` ;
 #   - `ogs apply <id> --yes` : compte, home, pool, bases vides, vhost.
@@ -333,20 +390,33 @@ projets:
 #   - `ogs mail dkim records <id>` → enregistrement à publier (hors script).
 #
 # PHASE 2 — Pré-synchroniser (par projet, répétable, sans interruption)
-#   - fichiers : rsync -rlptH --delete --chown=<id>:<id> depuis la source,
-#     `code` → /home/<host>/www, puis chaque `donnees_hors_code`, avec `exclure` ;
+#   - refusée, avant toute copie, pour un projet dont la bascule est engagée ou
+#     faite : la cible fait foi, et la copie supprimerait sa base et ce qu'elle a
+#     reçu depuis. `retour` d'abord pour resynchroniser depuis la source ;
+#   - fichiers : rsync -rlptH --delete depuis la source vers le miroir
+#     <travail>/<id>/miroir, en root, puis du miroir vers le home par un rsync
+#     dont le côté qui écrit tourne sous le compte du projet — le home est à lui,
+#     et root n'y écrit jamais par le nom — et reçoit ses chemins par le
+#     protocole (-s) ; `code` → /home/<host>/www, puis chaque
+#     `donnees_hors_code`, avec `exclure`. Dans le miroir, le code et chaque
+#     donnée hors code ont chacun leur sous-arbre, jamais l'un sous l'autre : le
+#     miroir reçoit les liens de la source tels quels, et une donnée tirée sous
+#     la copie du code suivrait celui qu'y aurait posé la source (www/public,
+#     pour www/public/uploads), root écrivant alors où la source l'a décidé ;
 #   - bases : `ssh source mysqldump --single-transaction --routines --triggers
 #     --events <source>` (postgres : `pg_dump --no-owner --no-privileges`),
 #     DEFINER réécrits vers l'utilisateur ogs, chargé dans la base `cible` ;
 #     au-delà de quelques Go, charger par un tube plutôt que par `ogs db restore`,
 #     qui lit le fichier entier en mémoire ;
-#   - configuration : chaque `configuration[].cles` réécrite, les `@ogs:VAR`
-#     résolues par `ogs secrets env <id>` ; `chemins_en_dur` corrigés ;
+#   - configuration : chaque `configuration[].cles` réécrite sous le compte du
+#     projet, les `@ogs:VAR` résolues par `ogs secrets env <id>` ; `chemins_en_dur`
+#     corrigés ;
 #   - vidage des caches applicatifs (Symfony : bin/console cache:clear ;
 #     PrestaShop : var/cache/*), sous le compte du projet ;
 #   - `ogs apply <id> --yes` : repose les modes des répertoires que rsync a pu changer ;
-#   - `verifications` rejouées avec curl --resolve <domaine>:443:<ip cible>
-#     (-k tant que le certificat n'est pas émis).
+#   - `verifications` rejouées avec curl --resolve <domaine>:443:<ip cible>, sans
+#     -k : faute de certificat, le premier vhost TLS de la cible — un voisin —
+#     répondrait pour le domaine ; la vérification passe alors en http.
 #   Rejouer cette phase la veille de la bascule réduit le delta final à presque rien.
 #
 # PHASE 3 — Basculer (par vague, dans la fenêtre)
@@ -358,7 +428,12 @@ projets:
 #   5. `verifications` par curl --resolve : en cas d'échec, on s'arrête ici,
 #      la source sort de maintenance, rien n'a été basculé ;
 #   6. DNS : A/AAAA de chaque domaine vers la cible (hors script si la zone est
-#      chez le client) ; attente de la propagation (dig @résolveur public) ;
+#      chez le client) ; attente de la propagation (dig @résolveur public), ou,
+#      sous --sans-attente-dns, propagation constatée à la main (CDN,
+#      répartiteur) et confirmée, même sous --oui. Une bascule interrompue à
+#      partir d'ici reprend ici — `etat` la signale : la copie finale n'est pas
+#      refaite, la cible ayant pu recevoir des écritures des résolveurs déjà
+#      basculés ;
 #   7. crons et services réactivés (`enabled` retiré du fichier du projet),
 #      `ogs apply <id> --yes` : certificat http-01 émis, vhost basculé en TLS,
 #      workers démarrés ;
@@ -371,7 +446,12 @@ projets:
 #   - source éteinte après `migration.conservation_source_jours`.
 #
 # Retour arrière (avant l'étape 7 : trivial ; après : les données écrites sur la
-# cible depuis la bascule sont perdues sans reprise inverse)
-#   - DNS vers la source, source sortie de maintenance, crons et workers
-#     rétablis sur la source ; sur la cible, `ogs service stop <id>` et crons
-#     repassés à `enabled: false`.
+# cible depuis la bascule sont perdues sans reprise inverse). Refusé sans bascule
+# engagée ou faite. Dans cet ordre :
+#   1. cible en maintenance (`maintenance_cible`), crons et services repassés à
+#      `enabled: false` ; un `ogs apply` en échec n'arrête pas le retour — il est
+#      signalé, `ogs service stop <id>` tenté, le code de sortie vaut 1 ;
+#   2. crontab, fichiers de /etc/cron.d et workers rétablis sur la source ;
+#   3. DNS vers la source, attente de la propagation vers `source.ip_publique`
+#      (ou --sans-attente-dns, comme à la bascule) ;
+#   4. source sortie de maintenance, puis la cible — qui ne reçoit plus personne.

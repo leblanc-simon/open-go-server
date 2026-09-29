@@ -1,0 +1,18 @@
+#!/bin/bash
+# Enveloppe du vrai ogs ($FAUX_OGS, en mode préfixé) : note chaque appel, rend
+# $FAUX_OGS_SECRETS à « secrets env » — le mode préfixé n'a pas de moteur de base
+# pour les produire —, échoue d'un code $FAUX_OGS_APPLY_RC à « apply » s'il est
+# posé, et rend 0 à « doctor » — qui, en mode préfixé, ne trouve aucun des
+# moteurs de la machine.
+args=("$@")
+if [[ "${args[0]:-}" == --prefix ]]; then args=("${args[@]:2}"); fi
+printf '[ogs] %s\n' "${args[*]}" >>"$FAUX_JOURNAL"
+case "${args[0]:-} ${args[1]:-}" in
+    "secrets env")
+        if [[ -n "${FAUX_OGS_SECRETS:-}" ]]; then cat "$FAUX_OGS_SECRETS"; exit 0; fi ;;
+    apply\ *)
+        if [[ -n "${FAUX_OGS_APPLY_RC:-}" ]]; then echo "ogs : échec simulé" >&2; exit "$FAUX_OGS_APPLY_RC"; fi ;;
+    doctor\ *)
+        exit 0 ;;
+esac
+exec "$FAUX_OGS" "$@"

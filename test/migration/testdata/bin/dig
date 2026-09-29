@@ -1,0 +1,8 @@
+#!/bin/bash
+# Faux dig : un enregistrement A vaut $FAUX_DIG_A (aucun s'il est vide) ; ni AAAA,
+# ni NS, ni réponse détaillée (TTL).
+for a; do
+    case "$a" in AAAA|NS|+noall) exit 0 ;; esac
+done
+if [[ -n "${FAUX_DIG_A:-}" ]]; then echo "$FAUX_DIG_A"; fi
+exit 0

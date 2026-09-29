@@ -1,0 +1,4 @@
+#!/bin/bash
+# Faux mysqldump de la source : un dump de deux lignes, au nom de la base.
+case "$*" in *--help*) exit 0 ;; esac
+printf -- '-- dump de %s\nINSERT INTO t VALUES (1);\n' "${!#}"

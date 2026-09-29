@@ -1,0 +1,4 @@
+#!/bin/bash
+# Enveloppe du vrai install ($FAUX_INSTALL) : note sous quelle identité il crée quoi.
+printf '[install %s] %s\n' "${FAUX_IDENTITE:-root}" "$*" >>"$FAUX_JOURNAL"
+exec "$FAUX_INSTALL" "$@"

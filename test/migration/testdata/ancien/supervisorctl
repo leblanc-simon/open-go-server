@@ -1,0 +1,11 @@
+#!/bin/bash
+# Faux supervisorctl de la source (le faux ssh a déjà noté la commande). Comme le
+# vrai depuis la version 4, il échoue sur l'arrêt d'un programme déjà arrêté et
+# sur le démarrage d'un programme qui tourne : les états sont sous
+# $FAUX_SOURCE/supervisor.
+etat="$FAUX_SOURCE/supervisor/${2:?programme}.arrete"
+mkdir -p "$(dirname "$etat")"
+case "${1:-}" in
+    stop)  if [[ -e "$etat" ]]; then echo "$2: ERROR (not running)"; exit 1; fi; : >"$etat"; echo "$2: stopped" ;;
+    start) if [[ ! -e "$etat" ]]; then echo "$2: ERROR (already started)"; exit 1; fi; rm -f "$etat"; echo "$2: started" ;;
+esac

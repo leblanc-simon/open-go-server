@@ -1,0 +1,28 @@
+#!/bin/bash
+# Faux ssh vers la source. La « source » est un répertoire local ($FAUX_SOURCE) :
+# la commande distante y est exécutée sur place, /root/ ramené sous
+# $FAUX_SOURCE/root/, les faux outils de la source en tête du PATH.
+#
+# Comme le vrai, il lit l'entrée standard jusqu'au bout pour la transmettre au
+# distant — sauf avec -n. C'est ce qui rend visible un ssh lancé sans -n dans une
+# boucle « while read » : il en avale les éléments suivants.
+set -u
+sans_entree=0
+while (($#)); do
+    case "$1" in
+        -n) sans_entree=1; shift ;;
+        -p|-o|-l|-i|-F|-S|-O|-E) shift 2 ;;
+        -*) shift ;;
+        *) break ;;
+    esac
+done
+shift # l'hôte
+distant="$*"
+case "$distant" in
+    # rsync parle son protocole par l'entrée et la sortie standard.
+    "rsync --server"*) exec bash -c "$distant" ;;
+esac
+((sans_entree)) || cat >/dev/null
+printf '[source] %s\n' "$distant" >>"$FAUX_JOURNAL"
+distant="${distant//\/root\//$FAUX_SOURCE/root/}"
+PATH="$FAUX_SOURCE_BIN:$PATH" exec bash -c "$distant"

@@ -1,0 +1,24 @@
+#!/bin/bash
+# Faux client MySQL de la cible, qui se dit MariaDB. Les bases qu'il dit exister
+# sont listées dans $FAUX_BASES_CIBLE, ses utilisateurs dans
+# $FAUX_UTILISATEURS_BASE_CIBLE ; le reste est noté au journal, et un chargement
+# y laisse la première ligne du dump reçu.
+case "${1:-}" in
+    --version) echo "mysql  Ver 15.1 Distrib 10.11.6-MariaDB, for debian-linux-gnu"; exit 0 ;;
+esac
+tout="$*"
+existe() { # existe <liste> <motif sed du nom>
+    local nom
+    nom="$(sed -E "s/.*$2 = '([^']*)'.*/\1/" <<<"$tout")"
+    if grep -qxF -- "$nom" "${1:-/dev/null}" 2>/dev/null; then echo 1; else echo 0; fi
+}
+case "$tout" in
+    *information_schema.SCHEMATA*) existe "${FAUX_BASES_CIBLE:-}" SCHEMA_NAME; exit 0 ;;
+    *mysql.user*)                  existe "${FAUX_UTILISATEURS_BASE_CIBLE:-}" User; exit 0 ;;
+esac
+printf '[mysql] %s\n' "$tout" >>"$FAUX_JOURNAL"
+case " $tout " in
+    *" -e "*) ;;
+    *) printf '[mysql<] %s : %s\n' "${!#}" "$(head -n 1)" >>"$FAUX_JOURNAL"; cat >/dev/null ;;
+esac
+exit 0

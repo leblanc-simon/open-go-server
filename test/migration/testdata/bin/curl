@@ -1,0 +1,26 @@
+#!/bin/bash
+# Faux curl de la cible : https rend $FAUX_CURL_HTTPS (000 par défaut, faute de
+# certificat), http rend $FAUX_CURL_HTTP ; $FAUX_CURL_CORPS est la page,
+# $FAUX_CURL_REDIRECTION la cible d'une redirection.
+printf '[curl] %s\n' "$*" >>"$FAUX_JOURNAL"
+sortie='' format='' url=''
+while (($#)); do
+    case "$1" in
+        -o) sortie="$2"; shift 2 ;;
+        -w) format="$2"; shift 2 ;;
+        --max-time|--resolve) shift 2 ;;
+        -*) shift ;;
+        *) url="$1"; shift ;;
+    esac
+done
+case "$url" in
+    https://*) code="${FAUX_CURL_HTTPS:-000}" ;;
+    *)         code="${FAUX_CURL_HTTP:-000}" ;;
+esac
+redirection=''
+if [[ "$code" == 3* ]]; then redirection="${FAUX_CURL_REDIRECTION:-}"; fi
+if [[ -n "$sortie" && "$code" != 000 ]]; then printf '%s' "${FAUX_CURL_CORPS:-}" >"$sortie"; fi
+format="${format//'%{http_code}'/$code}"
+format="${format//'%{redirect_url}'/$redirection}"
+printf '%s' "$format"
+[[ "$code" != 000 ]] || exit 7
