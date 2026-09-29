@@ -8,15 +8,19 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/klauspost/compress/zstd"
+	"golang.org/x/sys/unix"
+
+	"leblanc.io/open-go-server/internal/fs"
 )
 
 // Extension est le suffixe des archives produites.
@@ -63,6 +67,28 @@ type Manifest struct {
 	Secrets int `json:"secrets"`
 	// Bytes est la taille totale des données archivées, avant compression.
 	Bytes int64 `json:"bytes"`
+	// Owners donne, par préfixe, le propriétaire de la racine de chaque
+	// arborescence archivée. Les en-têtes de ses entrées portent chacun le leur,
+	// et c'est à celui de la racine qu'ils se comparent à la restauration : le
+	// compte recréé n'a pas forcément les identifiants d'origine. Absent des
+	// archives antérieures, dont les en-têtes ne portaient aucun propriétaire.
+	Owners map[string]Owner `json:"owners,omitempty"`
+}
+
+// Owner est un propriétaire numérique, tel que l'archivage l'a relevé.
+type Owner struct {
+	UID int `json:"uid"`
+	GID int `json:"gid"`
+}
+
+// RootOwner rend le propriétaire de la racine archivée sous prefix, ou nil si
+// l'archive ne le porte pas.
+func (m Manifest) RootOwner(prefix string) *fs.Owner {
+	o, ok := m.Owners[prefix]
+	if !ok {
+		return nil
+	}
+	return &fs.Owner{UID: o.UID, GID: o.GID}
 }
 
 // Entry décrit un élément archivé.
@@ -146,61 +172,164 @@ func (w *Writer) AddFile(kind, name, origin string) error {
 // AddTree ajoute une arborescence. Les liens symboliques sont conservés tels
 // quels : les suivre pourrait faire sortir de l'arborescence du projet, et
 // dupliquerait des données déjà archivées.
+//
+// L'arborescence est le plus souvent un home, qui appartient à l'utilisateur du
+// projet (D51) et où son code tourne encore pendant l'archivage — shell ouvert
+// (D62), tâches, pool PHP. filepath.Walk atteignait chaque entrée par son chemin
+// complet et ouvrait les fichiers par os.Open : un répertoire remplacé par un lien
+// une fois sa liste lue, ou un fichier entre son Lstat et son ouverture, faisait
+// archiver en root le contenu d'un fichier du système — /etc/ogs/master.key, le
+// home d'un voisin —, que la restauration rendait ensuite à l'utilisateur. Le
+// parcours se fait donc par descripteurs (fs.Dir) : chaque entrée est ouverte
+// relativement au répertoire ouvert, sans suivre de lien, et décrite par le
+// descripteur ouvert plutôt que par le constat qui l'a précédé.
+//
+// Chaque en-tête porte le propriétaire numérique de son entrée, et le manifeste
+// celui de la racine (Manifest.Owners) : sans eux, la restauration ne savait pas
+// ce qui était au projet, et rendait à l'utilisateur jusqu'au lien dur qu'il
+// aurait posé vers un fichier du système.
 func (w *Writer) AddTree(kind, prefix, root string) error {
-	root = filepath.Clean(root)
-	return filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			// Un fichier disparu pendant l'archivage n'est pas une raison
-			// d'interrompre : on le signale dans le manifeste et on continue.
-			if os.IsNotExist(err) {
-				return nil
-			}
-			return err
-		}
-		rel, relErr := filepath.Rel(root, path)
-		if relErr != nil {
-			return relErr
-		}
-		if rel == "." {
+	dir, err := fs.OpenDir(filepath.Clean(root))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
 			return nil
 		}
-		name := filepath.ToSlash(filepath.Join(prefix, rel))
-		switch {
-		case info.IsDir():
-			return w.tar.WriteHeader(&tar.Header{
-				Name: name + "/", Mode: int64(info.Mode().Perm()),
-				ModTime: info.ModTime(), Typeflag: tar.TypeDir,
-			})
-		case info.Mode()&os.ModeSymlink != 0:
-			target, err := os.Readlink(path)
-			if err != nil {
-				return err
-			}
-			return w.tar.WriteHeader(&tar.Header{
-				Name: name, Linkname: target, ModTime: info.ModTime(), Typeflag: tar.TypeSymlink,
-			})
-		case !info.Mode().IsRegular():
-			// Sockets et fifos n'ont pas de sens dans une archive.
-			return nil
+		return err
+	}
+	defer dir.Close()
+	st, err := dir.Stat()
+	if err != nil {
+		return err
+	}
+	if w.manifest.Owners == nil {
+		w.manifest.Owners = map[string]Owner{}
+	}
+	uid, gid := ownerOf(st)
+	w.manifest.Owners[prefix] = Owner{UID: uid, GID: gid}
+	return w.addDir(dir, prefix)
+}
+
+// ownerOf rend le propriétaire numérique relevé par un stat, qu'il vienne d'un
+// fs.Dir ou d'un *os.File.
+func ownerOf(info os.FileInfo) (uid, gid int) {
+	switch st := info.Sys().(type) {
+	case *unix.Stat_t:
+		return int(st.Uid), int(st.Gid)
+	case *syscall.Stat_t:
+		return int(st.Uid), int(st.Gid)
+	}
+	return 0, 0
+}
+
+// entryChecked est appelée entre le constat d'un fichier et son ouverture. Elle
+// ne fait rien : les tests y substituent un lien au fichier constaté, au moment
+// exact que viserait une course.
+var entryChecked = func(name string) {}
+
+// addDir archive le contenu d'un répertoire ouvert, sous le nom name.
+func (w *Writer) addDir(dir *fs.Dir, name string) error {
+	names, err := dir.Names()
+	if err != nil {
+		return err
+	}
+	for _, n := range names {
+		if err := w.addEntry(dir, n, path.Join(name, n)); err != nil {
+			return err
 		}
-		f, err := os.Open(path)
+	}
+	return nil
+}
+
+// addEntry archive l'entrée n du répertoire ouvert dir. Une entrée qui disparaît
+// ou change de nature entre son constat et son ouverture est passée : son contenu
+// n'est plus celui qu'on a constaté, et une entrée que l'utilisateur fait changer
+// sous nos pieds n'est pas une raison d'interrompre la suppression.
+func (w *Writer) addEntry(dir *fs.Dir, n, name string) error {
+	info, err := dir.Lstat(n)
+	if err != nil {
+		return skipChanged(err)
+	}
+	switch {
+	case info.IsDir():
+		sub, err := dir.OpenDir(n)
+		if err != nil {
+			return skipChanged(err)
+		}
+		defer sub.Close()
+		st, err := sub.Stat()
 		if err != nil {
 			return err
 		}
-		defer f.Close()
+		uid, gid := ownerOf(st)
 		if err := w.tar.WriteHeader(&tar.Header{
-			Name: name, Mode: int64(info.Mode().Perm()), Size: info.Size(),
-			ModTime: info.ModTime(), Typeflag: tar.TypeReg,
+			Name: name + "/", Mode: int64(st.Mode().Perm()), Uid: uid, Gid: gid,
+			ModTime: st.ModTime(), Typeflag: tar.TypeDir,
 		}); err != nil {
 			return err
 		}
-		written, err := io.Copy(w.tar, f)
+		return w.addDir(sub, name)
+	case info.Mode()&os.ModeSymlink != 0:
+		target, err := dir.Readlink(n)
 		if err != nil {
-			return err
+			return skipChanged(err)
 		}
-		w.manifest.Bytes += written
+		uid, gid := ownerOf(info)
+		return w.tar.WriteHeader(&tar.Header{
+			Name: name, Linkname: target, Uid: uid, Gid: gid,
+			ModTime: info.ModTime(), Typeflag: tar.TypeSymlink,
+		})
+	case !info.Mode().IsRegular():
+		// Sockets et fifos n'ont pas de sens dans une archive.
 		return nil
-	})
+	}
+	entryChecked(name)
+	f, err := dir.OpenFile(n)
+	if err != nil {
+		return skipChanged(err)
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	uid, gid := ownerOf(st)
+	if err := w.tar.WriteHeader(&tar.Header{
+		Name: name, Mode: int64(st.Mode().Perm()), Size: st.Size(), Uid: uid, Gid: gid,
+		ModTime: st.ModTime(), Typeflag: tar.TypeReg,
+	}); err != nil {
+		return err
+	}
+	// La taille annoncée est celle du descripteur : un fichier qui grandit pendant
+	// la lecture n'en donne pas davantage — tar refuserait l'excédent et ferait
+	// échouer toute l'archive —, et un fichier raccourci est complété de zéros,
+	// comme le fait GNU tar, l'en-tête étant déjà écrit.
+	written, err := io.CopyN(w.tar, f, st.Size())
+	if errors.Is(err, io.EOF) {
+		_, err = io.CopyN(w.tar, zeros{}, st.Size()-written)
+	}
+	if err != nil {
+		return err
+	}
+	w.manifest.Bytes += written
+	return nil
+}
+
+// skipChanged écarte les erreurs d'une entrée disparue ou changée de nature
+// pendant l'archivage — le constat ne vaut plus —, et rend les autres.
+func skipChanged(err error) error {
+	if errors.Is(err, os.ErrNotExist) || errors.Is(err, fs.ErrNotDirectory) ||
+		errors.Is(err, fs.ErrNotRegular) || errors.Is(err, syscall.EINVAL) {
+		return nil
+	}
+	return err
+}
+
+// zeros est une source inépuisable d'octets nuls.
+type zeros struct{}
+
+func (zeros) Read(p []byte) (int, error) {
+	clear(p)
+	return len(p), nil
 }
 
 // AddSecret ajoute un secret, qui reste chiffré : l'archive ne doit pas être une
@@ -314,10 +443,31 @@ func ReadManifest(path string) (Manifest, error) {
 }
 
 // Extract lit une archive et remet le contenu d'un préfixe donné dans un
-// répertoire. Les chemins sont vérifiés : une entrée pointant hors du répertoire
-// cible est refusée, faille classique des extractions d'archives.
-func Extract(path, prefix, dest string) (int, error) {
-	f, err := os.Open(path)
+// répertoire, et rend le nombre de fichiers et de liens posés. owner donne le
+// propriétaire de chaque entrée créée d'après son chemin relatif à dest et celui
+// que son en-tête porte — nul dans une archive antérieure à Manifest.Owners ; nil
+// laisse celui du processus.
+//
+// dest est le plus souvent le home d'un projet, qui appartient à son utilisateur
+// (D51), et root y écrit après que l'apply y a posé ses liens — vers le trousseau
+// commun (D61), l'interpréteur PHP (D70), le répertoire root des journaux (D71).
+// L'extraction écrivait par le nom, donc à travers eux : l'authorized_keys
+// régulier d'un projet réécrivait le trousseau de tout le parc. Rien n'est donc
+// résolu par son nom : chaque composant est ouvert relativement à son parent sans
+// suivre de lien (fs.Dir), et une entrée n'est jamais écrite à travers ce qui
+// occupe son nom — un fichier ou un lien est retiré, le lien lui-même et jamais
+// sa cible, puis l'entrée créée en exclusivité et son propriétaire posé sur son
+// descripteur. Aucun chown ne repasse après coup sur une arborescence que
+// l'utilisateur modifie peut-être déjà. Un répertoire existant est gardé avec son
+// mode et son propriétaire : model.defaultDirs en est le juge.
+//
+// Une entrée qui ne peut pas être posée ainsi — un répertoire occupe son nom, un
+// composant de son chemin est un lien, fût-il posé par l'archive elle-même — est
+// écartée sans interrompre les autres, et l'erreur rendue les énumère. Une entrée
+// qui sortirait de dest, faille classique des extractions d'archives, interrompt
+// tout : l'archive a été fabriquée.
+func Extract(file, prefix, dest string, owner func(rel string, orig fs.Owner) fs.Owner) (int, error) {
+	f, err := os.Open(file)
 	if err != nil {
 		return 0, err
 	}
@@ -330,11 +480,17 @@ func Extract(path, prefix, dest string) (int, error) {
 	if err := os.MkdirAll(dest, 0o750); err != nil {
 		return 0, err
 	}
-	root, err := filepath.Abs(dest)
+	root, err := fs.OpenDir(dest)
 	if err != nil {
 		return 0, err
 	}
+	chain := &dirChain{root: root}
+	defer chain.close()
+	if owner == nil {
+		owner = func(string, fs.Owner) fs.Owner { return fs.KeepOwner }
+	}
 	count := 0
+	var refused []string
 	tr := tar.NewReader(dec)
 	for {
 		header, err := tr.Next()
@@ -344,54 +500,171 @@ func Extract(path, prefix, dest string) (int, error) {
 		if err != nil {
 			return count, err
 		}
-		if prefix != "" && !strings.HasPrefix(header.Name, prefix) {
+		if prefix != "" && header.Name != prefix && !strings.HasPrefix(header.Name, prefix+"/") {
 			continue
 		}
-		rel := strings.TrimPrefix(header.Name, prefix)
-		rel = strings.TrimPrefix(rel, "/")
-		if rel == "" {
+		rel := path.Clean(strings.TrimLeft(strings.TrimPrefix(header.Name, prefix), "/"))
+		if rel == "." {
 			continue
 		}
-		target := filepath.Join(root, filepath.FromSlash(rel))
-		// Une entrée qui sortirait du répertoire cible est refusée : c'est la
-		// faille classique des extractions d'archives.
-		if !within(root, target) {
+		if rel == ".." || strings.HasPrefix(rel, "../") {
 			return count, fmt.Errorf("entrée %q sortirait du répertoire de destination", header.Name)
 		}
-		switch header.Typeflag {
-		case tar.TypeDir:
-			if err := os.MkdirAll(target, os.FileMode(header.Mode).Perm()); err != nil {
-				return count, err
+		comps := strings.Split(rel, "/")
+		name := comps[len(comps)-1]
+		mode := os.FileMode(header.Mode).Perm()
+		o := owner(rel, fs.Owner{UID: header.Uid, GID: header.Gid})
+		var placed bool
+		parent, err := chain.open(comps[:len(comps)-1])
+		if err == nil {
+			switch header.Typeflag {
+			case tar.TypeDir:
+				err = placeDir(parent, name, mode, o)
+			case tar.TypeSymlink:
+				err = placeSymlink(parent, name, header.Linkname, o)
+				placed = err == nil
+			case tar.TypeReg:
+				placed, err = placeFile(parent, name, mode, o, tr)
+				if err != nil && placed {
+					// Le contenu n'a pas pu être recopié : l'archive est illisible
+					// ou le disque plein, et les entrées suivantes n'iraient pas
+					// mieux.
+					return count, err
+				}
 			}
-		case tar.TypeSymlink:
-			if err := os.MkdirAll(filepath.Dir(target), 0o750); err != nil {
-				return count, err
-			}
-			_ = os.Remove(target)
-			if err := os.Symlink(header.Linkname, target); err != nil {
-				return count, err
-			}
-			count++
-		case tar.TypeReg:
-			if err := os.MkdirAll(filepath.Dir(target), 0o750); err != nil {
-				return count, err
-			}
-			out, err := os.OpenFile(target, os.O_CREATE|os.O_TRUNC|os.O_WRONLY,
-				os.FileMode(header.Mode).Perm())
-			if err != nil {
-				return count, err
-			}
-			if _, err := io.Copy(out, tr); err != nil {
-				out.Close()
-				return count, err
-			}
-			if err := out.Close(); err != nil {
-				return count, err
-			}
+		}
+		if err != nil {
+			refused = append(refused, rel+" : "+err.Error())
+			continue
+		}
+		if placed {
 			count++
 		}
 	}
+	if len(refused) > 0 {
+		shown := refused
+		if len(shown) > 5 {
+			shown = append(shown[:5:5], fmt.Sprintf("et %d autre(s)", len(refused)-5))
+		}
+		return count, fmt.Errorf("%d entrée(s) non restaurée(s) — %s", len(refused), strings.Join(shown, " ; "))
+	}
 	return count, nil
+}
+
+// dirChain garde ouverts les répertoires du chemin de la dernière entrée extraite.
+// L'archive énumère l'arborescence en profondeur d'abord : les entrées successives
+// partagent l'essentiel de leur chemin, et rouvrir chaque composant depuis la
+// racine coûterait un openat par niveau et par entrée. Seule la branche courante
+// est ouverte, ce qui borne les descripteurs à la profondeur de l'arborescence.
+type dirChain struct {
+	root  *fs.Dir
+	names []string
+	dirs  []*fs.Dir
+}
+
+// open rend le répertoire désigné par comps, chaque composant ouvert relativement
+// au précédent sans suivre de lien. Un composant absent n'est pas créé : l'archive
+// nomme chaque répertoire avant son contenu, et son absence dit qu'il a été
+// écarté — son contenu l'est avec lui.
+func (c *dirChain) open(comps []string) (*fs.Dir, error) {
+	keep := 0
+	for keep < len(c.names) && keep < len(comps) && c.names[keep] == comps[keep] {
+		keep++
+	}
+	c.truncate(keep)
+	for _, comp := range comps[keep:] {
+		sub, err := c.current().OpenDir(comp)
+		if err != nil {
+			return nil, err
+		}
+		c.names = append(c.names, comp)
+		c.dirs = append(c.dirs, sub)
+	}
+	return c.current(), nil
+}
+
+func (c *dirChain) current() *fs.Dir {
+	if len(c.dirs) == 0 {
+		return c.root
+	}
+	return c.dirs[len(c.dirs)-1]
+}
+
+func (c *dirChain) truncate(n int) {
+	for len(c.dirs) > n {
+		_ = c.dirs[len(c.dirs)-1].Close()
+		c.dirs = c.dirs[:len(c.dirs)-1]
+		c.names = c.names[:len(c.names)-1]
+	}
+}
+
+func (c *dirChain) close() {
+	c.truncate(0)
+	_ = c.root.Close()
+}
+
+// placeDir pose un répertoire de l'archive. Un répertoire existant est gardé tel
+// quel ; un fichier ou un lien à sa place est retiré — le lien, pas sa cible.
+func placeDir(parent *fs.Dir, name string, mode os.FileMode, owner fs.Owner) error {
+	info, err := parent.Lstat(name)
+	switch {
+	case err == nil && info.IsDir():
+		return nil
+	case err == nil:
+		if err := parent.Remove(name); err != nil {
+			return err
+		}
+	case !errors.Is(err, os.ErrNotExist):
+		return err
+	}
+	sub, err := parent.Mkdir(name, mode, owner)
+	if err != nil {
+		return err
+	}
+	return sub.Close()
+}
+
+// placeSymlink pose un lien de l'archive, en remplaçant atomiquement le fichier ou
+// le lien qui occupe son nom. Un répertoire n'est jamais remplacé par un lien : la
+// suite de l'extraction, ou l'apply, écrirait dedans.
+func placeSymlink(parent *fs.Dir, name, target string, owner fs.Owner) error {
+	if info, err := parent.Lstat(name); err == nil && info.IsDir() {
+		return errors.New("un répertoire occupe ce nom")
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return parent.Symlink(target, name, owner)
+}
+
+// placeFile pose un fichier de l'archive et y recopie son contenu. created dit si
+// le fichier a été créé : une erreur rendue ensuite vient de la recopie, et le
+// fichier incomplet est retiré.
+func placeFile(parent *fs.Dir, name string, mode os.FileMode, owner fs.Owner, content io.Reader) (created bool, err error) {
+	info, err := parent.Lstat(name)
+	switch {
+	case err == nil && info.IsDir():
+		return false, errors.New("un répertoire occupe ce nom")
+	case err == nil:
+		if err := parent.Remove(name); err != nil {
+			return false, err
+		}
+	case !errors.Is(err, os.ErrNotExist):
+		return false, err
+	}
+	out, err := parent.Create(name, mode, owner)
+	if err != nil {
+		return false, err
+	}
+	if _, err := io.Copy(out, content); err != nil {
+		out.Close()
+		_ = parent.Remove(name)
+		return true, err
+	}
+	if err := out.Close(); err != nil {
+		_ = parent.Remove(name)
+		return true, err
+	}
+	return true, nil
 }
 
 // ReadFile extrait un seul fichier de l'archive, en mémoire.
@@ -489,14 +762,6 @@ func sanitize(name string) string { return strings.ReplaceAll(name, "/", "__") }
 // sert qu'aux archives antérieures au nom porté dans la charge.
 func unsanitize(name string) string { return strings.ReplaceAll(name, "__", "/") }
 
-func within(root, target string) bool {
-	rel, err := filepath.Rel(root, target)
-	if err != nil {
-		return false
-	}
-	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
-}
-
 // Available renvoie l'espace disponible, en octets, sur le système de fichiers
 // contenant le chemin donné.
 func Available(path string) (uint64, error) { return available(path) }
@@ -513,7 +778,7 @@ func Expired(dir string, retention time.Duration, now time.Time) ([]string, erro
 	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
+		if errors.Is(err, os.ErrNotExist) {
 			return nil, nil
 		}
 		return nil, err

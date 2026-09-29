@@ -761,6 +761,11 @@ func newRestoreCommand(app *App) *cobra.Command {
 			if err != nil {
 				return exitf(CodeValidation, "%v", err)
 			}
+			// Les répertoires tels que l'archive les déclare : la normalisation
+			// retire les anciennes entrées logs/ et .bin/, qui disent pourtant, dans
+			// une archive antérieure aux propriétaires portés, que ces répertoires
+			// étaient à root (RestoredOwner).
+			archived := append([]model.Dir(nil), p.Spec.Layout.Dirs...)
 			if err := app.prepare(p); err != nil {
 				return err
 			}
@@ -807,11 +812,24 @@ func newRestoreCommand(app *App) *cobra.Command {
 				}
 				partial = err
 			}
-			if count, err := archive.Extract(path, "tree", p.Spec.Layout.Root); err != nil {
+			// L'arborescence vient après l'apply, et c'est voulu : le compte existe
+			// alors, et chaque entrée reçoit son propriétaire sur le descripteur de
+			// ce qui vient d'être créé. Extraire avant, dans un home vierge, l'aurait
+			// laissé à root jusqu'à une passe de chown faite après la création du
+			// compte — ses services déjà démarrés, son code libre de glisser sous
+			// un nom un lien dur vers un fichier du système, que chown lui aurait
+			// donné. Ce que l'apply vient de poser dans le home — le lien du
+			// trousseau commun, celui de l'interpréteur, ~/logs — n'est jamais
+			// traversé : l'extraction le remplace, en tant que lien, par ce que
+			// l'archive porte, soit le home tel que l'utilisateur l'avait laissé ;
+			// l'apply suivant le traite selon ses règles (D61, D70, D71) — c'est
+			// lui qui migre l'ancien ~/logs d'une archive antérieure à D71, rendu à
+			// root comme il l'était.
+			if err := app.restoreTree(path, p, archived, manifest); err != nil {
 				app.printf("⚠ restauration de l'arborescence : %v\n", err)
-			} else {
-				app.printf("✓ %d fichier(s) restauré(s) dans %s\n", count, p.Spec.Layout.Root)
-				app.chownTree(cmd, p)
+				if partial == nil {
+					partial = exitf(CodePartial, "l'arborescence n'a pas été entièrement restaurée")
+				}
 			}
 			if withData {
 				app.restoreDumps(cmd, path, p, manifest)
@@ -850,18 +868,38 @@ func (a *App) restoreEnvFile(p *model.Project, secrets map[string][2][]byte) {
 	a.printf("✓ fichier d'environnement restauré : %s\n", path)
 }
 
-// chownTree rend l'arborescence restaurée à l'utilisateur du projet.
-func (a *App) chownTree(cmd *cobra.Command, p *model.Project) {
-	if a.Exec.Simulated() {
-		return
+// restoreTree remet l'arborescence archivée dans le home, chaque entrée au nom
+// que system.Provider.RestoredOwner lui donne — à l'utilisateur ce qui était à
+// lui, à root le reste, d'après les propriétaires que l'archive porte, ou à
+// défaut d'après sa déclaration archivée. Un « chown -R » après coup ne rendait
+// que www/, et n'importe quel chown récursif passerait sur un home que
+// l'utilisateur modifie déjà : le propriétaire est posé par l'extraction, sur
+// chaque descripteur.
+func (a *App) restoreTree(path string, p *model.Project, archived []model.Dir, manifest archive.Manifest) error {
+	owner, err := a.systemProvider().RestoredOwner(p, archived, manifest.RootOwner("tree"))
+	if err != nil {
+		return fmt.Errorf("%w — rien n'a été extrait", err)
 	}
-	if _, err := a.Exec.Run(cmd.Context(), exec.Command{
-		Name: "/bin/chown",
-		Args: []string{"-R", p.Spec.User.Name + ":" + p.Spec.User.Group,
-			filepath.Join(p.Spec.Layout.Root, "www")},
-	}); err != nil {
-		a.printf("⚠ propriétaire de l'arborescence : %v\n", err)
+	count, err := archive.Extract(path, "tree", p.Spec.Layout.Root, owner)
+	if count > 0 || err == nil {
+		a.printf("✓ %d fichier(s) restauré(s) dans %s\n", count, p.Spec.Layout.Root)
 	}
+	// L'apply de la restauration a précédé l'extraction : l'ancien répertoire des
+	// journaux qu'elle vient de rendre attend l'apply suivant pour être migré. La
+	// déclaration archivée dit s'il en est un ; un répertoire que l'utilisateur
+	// aurait posé à la place du lien n'en est pas un, et la migration le refusera.
+	legacy := model.LegacyLogDir(p.Spec.Layout.Root)
+	for _, d := range archived {
+		if filepath.Clean(d.Path) != model.LogLink || d.Owner != "root" {
+			continue
+		}
+		if info, lerr := os.Lstat(legacy); lerr == nil && info.IsDir() {
+			a.printf("→ l'archive rend l'ancien %s d'un projet antérieur à D71 : « ogs apply %s » en reprendra "+
+				"les journaux sous %s\n", legacy, p.ID(), p.Spec.Layout.LogDir)
+		}
+		break
+	}
+	return err
 }
 
 // restoreDumps recharge les sauvegardes présentes dans l'archive.

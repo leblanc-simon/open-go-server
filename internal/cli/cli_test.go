@@ -1794,6 +1794,194 @@ func TestDeleteThenRestoreRoundTrip(t *testing.T) {
 	}
 }
 
+func TestRestaurationNEcritJamaisATraversLesLiensPosesParLApply(t *testing.T) {
+	// La restauration applique le projet avant d'en remettre l'arborescence, et
+	// l'apply pose dans le home neuf trois liens vers des fichiers qui ne sont pas
+	// au projet : le trousseau commun (D61), l'interpréteur PHP (D70) et le
+	// répertoire root des journaux (D71). L'archive, elle, porte le home tel que
+	// l'utilisateur l'avait laissé — un authorized_keys régulier, que D61 admet, un
+	// script à la place du lien php, un vrai répertoire à la place de ~/logs.
+	// L'extraction écrivait par le nom, donc à travers ces liens, en root : le
+	// trousseau de tout le parc, le binaire du système et le répertoire des
+	// journaux recevaient le contenu choisi par le projet.
+	h := newHarness(t)
+	h.mustRun("init")
+	trousseau := h.path("opt", "default_authorized_keys")
+	phpBin := h.path("usr", "bin", "php8.5")
+	for f, body := range map[string]string{
+		trousseau: "ssh-ed25519 AAAA cle-des-administrateurs\n",
+		phpBin:    "#!/bin/sh\n# vrai interpreteur\n",
+	} {
+		if err := os.MkdirAll(filepath.Dir(f), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(f, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	h.mustRunPartial("site", "create", "shop.fr", "--kind", "php-symfony", "--app-version", "6.4",
+		"--php", "8.5", "--yes")
+	home := h.path("home", "shop.fr")
+	logDir := h.path("var", "log", "ogs-projects", "shopfr")
+	for rel, want := range map[string]string{
+		".ssh/authorized_keys": trousseau, ".local/bin/php": phpBin, "logs": logDir,
+	} {
+		if got, _ := os.Readlink(filepath.Join(home, rel)); got != want {
+			t.Fatalf("~/%s doit être un lien vers %s après la création, obtenu %q", rel, want, got)
+		}
+	}
+
+	// L'utilisateur du projet, maître de son home (D51), remplace les trois liens.
+	for rel, body := range map[string]string{
+		".ssh/authorized_keys": "ssh-ed25519 BBBB cle-du-projet\n",
+		".local/bin/php":       "#!/bin/sh\n# script du projet\n",
+	} {
+		p := filepath.Join(home, rel)
+		if err := os.Remove(p); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(body), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	logs := filepath.Join(home, "logs")
+	if err := os.Remove(logs); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(logs, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("/etc/shadow", filepath.Join(logs, "apache-error.log.1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(logs, "depose.txt"), []byte("déposé\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	h.mustRunPartial("project", "delete", "shopfr", "--yes")
+	entries, err := os.ReadDir(h.path("var", "lib", "ogs", "archives"))
+	if err != nil || len(entries) == 0 {
+		t.Fatalf("aucune archive : %v", err)
+	}
+	out := h.mustRunPartial("project", "restore",
+		h.path("var", "lib", "ogs", "archives", entries[0].Name()), "--yes")
+	if strings.Contains(out, "antérieur à D71") {
+		t.Errorf("un ~/logs posé par l'utilisateur n'est pas l'ancien répertoire des journaux :\n%s", out)
+	}
+
+	if data, _ := os.ReadFile(trousseau); string(data) != "ssh-ed25519 AAAA cle-des-administrateurs\n" {
+		t.Errorf("le trousseau commun a été réécrit par la restauration : %q\n%s", data, out)
+	}
+	if data, _ := os.ReadFile(phpBin); string(data) != "#!/bin/sh\n# vrai interpreteur\n" {
+		t.Errorf("l'interpréteur du système a reçu le script du projet : %q", data)
+	}
+	for _, name := range []string{"apache-error.log.1", "depose.txt"} {
+		if _, err := os.Lstat(filepath.Join(logDir, name)); err == nil {
+			t.Errorf("%s posé dans le répertoire root des journaux par la restauration", name)
+		}
+	}
+	// Le home, lui, revient tel que l'utilisateur l'avait laissé : les liens de
+	// l'apply sont remplacés en tant que liens — jamais traversés —, et l'apply
+	// suivant les traitera selon ses règles, un authorized_keys régulier n'étant
+	// jamais remplacé (D61).
+	if info, err := os.Lstat(logs); err != nil || !info.IsDir() {
+		t.Errorf("~/logs doit revenir en répertoire du projet : %v %v", info, err)
+	}
+	for rel, want := range map[string]string{
+		".ssh/authorized_keys": "ssh-ed25519 BBBB cle-du-projet\n",
+		".local/bin/php":       "#!/bin/sh\n# script du projet\n",
+		"logs/depose.txt":      "déposé\n",
+	} {
+		info, err := os.Lstat(filepath.Join(home, rel))
+		if err != nil || !info.Mode().IsRegular() {
+			t.Errorf("~/%s doit revenir en fichier régulier : %v %v", rel, info, err)
+			continue
+		}
+		if data, _ := os.ReadFile(filepath.Join(home, rel)); string(data) != want {
+			t.Errorf("~/%s restauré : %q, attendu %q", rel, data, want)
+		}
+	}
+	if target, err := os.Readlink(filepath.Join(logs, "apache-error.log.1")); err != nil || target != "/etc/shadow" {
+		t.Errorf("le lien du projet doit revenir tel quel dans son home : %q %v", target, err)
+	}
+}
+
+func TestRestaurationDUneArchiveAnterieureAD71ReprendSesJournaux(t *testing.T) {
+	// Une archive d'un projet antérieur à D71 porte son ~/logs, répertoire root des
+	// journaux, et une déclaration qui le dit. L'apply de la restauration pose le
+	// lien ~/logs, que l'extraction remplace — sans le traverser — par le répertoire
+	// archivé, rendu à root comme il l'était (RestoredOwner, qui ne se voit qu'en
+	// root) : c'est l'apply suivant qui migre ses journaux sous logs.root et
+	// rétablit le lien. Ne rien extraire sous ~/logs aurait perdu ces journaux.
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("project", "create", "shop.fr", "--kind", "php-plain")
+	h.mustRun("apply", "shopfr", "--yes")
+	home := h.path("home", "shop.fr")
+	decl := h.path("etc", "ogs", "projects", "shopfr.yaml")
+	data, _ := os.ReadFile(decl)
+	nouveau := h.path("var", "log", "ogs-projects", "shopfr")
+	ancien := strings.Replace(string(data), "logDir: "+nouveau, "logDir: "+filepath.Join(home, "logs"), 1)
+	ancien = strings.Replace(ancien, "path: .ssh", "path: logs\n        mode: \"0710\"\n        owner: root\n      - path: .ssh", 1)
+	if !strings.Contains(ancien, "logDir: "+filepath.Join(home, "logs")) || !strings.Contains(ancien, "path: logs") {
+		t.Fatalf("déclaration inattendue, impossible d'y réintroduire l'ancien ~/logs :\n%s", data)
+	}
+	if err := os.WriteFile(decl, []byte(ancien), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	legacy := filepath.Join(home, "logs")
+	if err := os.Remove(legacy); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(nouveau); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(legacy, 0o710); err != nil {
+		t.Fatal(err)
+	}
+	for name, content := range map[string]string{
+		"apache-access.log":   "accès d'avant la suppression\n",
+		"apache-access.log.1": "accès plus ancien\n",
+	} {
+		if err := os.WriteFile(filepath.Join(legacy, name), []byte(content), 0o640); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	h.mustRunPartial("project", "delete", "shopfr", "--yes")
+	entries, err := os.ReadDir(h.path("var", "lib", "ogs", "archives"))
+	if err != nil || len(entries) == 0 {
+		t.Fatalf("aucune archive : %v", err)
+	}
+	out := h.mustRunPartial("project", "restore", h.path("var", "lib", "ogs", "archives", entries[0].Name()), "--yes")
+	if info, err := os.Lstat(legacy); err != nil || !info.IsDir() {
+		t.Fatalf("l'ancien ~/logs doit revenir en répertoire : %v %v", info, err)
+	}
+	if !strings.Contains(out, "ogs apply shopfr") {
+		t.Errorf("la restauration doit dire que l'apply suivant migrera l'ancien ~/logs :\n%s", out)
+	}
+	journaux, _ := os.ReadDir(nouveau)
+	for _, e := range journaux {
+		if data, _ := os.ReadFile(filepath.Join(nouveau, e.Name())); strings.Contains(string(data), "accès") {
+			t.Errorf("%s écrit sous logs.root à travers le lien ~/logs par l'extraction", e.Name())
+		}
+	}
+
+	out = h.mustRunPartial("apply", "shopfr", "--yes")
+	if !strings.Contains(out, "reprise des journaux") {
+		t.Errorf("l'apply suivant doit reprendre l'ancien ~/logs :\n%s", out)
+	}
+	if got, _ := os.ReadFile(filepath.Join(nouveau, "apache-access.log")); string(got) != "accès d'avant la suppression\n" {
+		t.Errorf("journal courant mal repris : %q", got)
+	}
+	if got, _ := os.ReadFile(filepath.Join(nouveau, "apache-access.log.1")); string(got) != "accès plus ancien\n" {
+		t.Errorf("journal roté mal repris : %q", got)
+	}
+	if target, err := os.Readlink(legacy); err != nil || target != nouveau {
+		t.Errorf("~/logs doit redevenir un lien vers %s : %q (%v)", nouveau, target, err)
+	}
+}
+
 func TestPurgeRequiresExactIdentifier(t *testing.T) {
 	// Une suppression sans recours ne doit pas pouvoir être confirmée par un
 	// simple --yes.

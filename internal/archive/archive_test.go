@@ -1,12 +1,21 @@
 package archive
 
 import (
+	"archive/tar"
 	"encoding/json"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
+
+	"github.com/klauspost/compress/zstd"
+	"golang.org/x/sys/unix"
+
+	"leblanc.io/open-go-server/internal/fs"
 )
 
 func TestRoundTrip(t *testing.T) {
@@ -90,7 +99,7 @@ func TestRoundTrip(t *testing.T) {
 
 	// L'arborescence se restaure à l'identique, liens compris.
 	dest := filepath.Join(dir, "restore")
-	count, err := Extract(path, "tree", dest)
+	count, err := Extract(path, "tree", dest, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -177,11 +186,347 @@ func TestExtractRefusesPathTraversal(t *testing.T) {
 		t.Fatal(err)
 	}
 	dest := filepath.Join(dir, "dest")
-	if _, err := Extract(path, "tree", dest); err == nil {
+	if _, err := Extract(path, "tree", dest, nil); err == nil {
 		t.Fatal("l'extraction devait être refusée")
 	}
 	if _, err := os.Stat(filepath.Join(dir, "evasion.txt")); !os.IsNotExist(err) {
 		t.Error("aucun fichier ne doit avoir été écrit hors de la destination")
+	}
+}
+
+// archiver écrit les fichiers donnés dans une arborescence neuve, en crée les
+// liens, et l'archive sous « tree ».
+func archiver(t *testing.T, dir string, files map[string]string, links map[string]string) string {
+	t.Helper()
+	src := filepath.Join(dir, "source")
+	for rel, body := range files {
+		p := filepath.Join(src, rel)
+		if err := os.MkdirAll(filepath.Dir(p), 0o750); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for rel, target := range links {
+		p := filepath.Join(src, rel)
+		if err := os.MkdirAll(filepath.Dir(p), 0o750); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(target, p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	path := filepath.Join(dir, "archive"+Extension)
+	w, err := Create(path, Manifest{Project: "shopfr"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.AddTree("tree", "tree", src); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestExtractNeTraverseJamaisUnLienDeLaDestination(t *testing.T) {
+	// La restauration extrait dans un home où l'apply vient de poser ses liens :
+	// .ssh/authorized_keys vers le trousseau commun (D61), .local/bin/php vers
+	// l'interpréteur (D70), ~/logs vers le répertoire root des journaux (D71).
+	// L'archive porte le home tel que l'utilisateur l'avait laissé. Root ne doit
+	// écrire à travers aucun de ces liens : chacun est remplacé en tant que lien.
+	dir := t.TempDir()
+	systeme := filepath.Join(dir, "systeme")
+	journaux := filepath.Join(systeme, "journaux")
+	if err := os.MkdirAll(journaux, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	trousseau := filepath.Join(systeme, "default_authorized_keys")
+	php := filepath.Join(systeme, "php8.5")
+	for f, body := range map[string]string{trousseau: "cle-admin\n", php: "vrai php\n"} {
+		if err := os.WriteFile(f, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	path := archiver(t, dir, map[string]string{
+		".ssh/authorized_keys":  "cle-du-projet\n",
+		".local/bin/php":        "script du projet\n",
+		"logs/depose.txt":       "déposé\n",
+		"www/current/index.php": "<?php // release",
+	}, map[string]string{
+		"logs/apache-error.log.1": "/etc/shadow",
+		"www/public":              "current",
+	})
+
+	home := filepath.Join(dir, "home")
+	for _, d := range []string{".ssh", ".local/bin", "www/public"} {
+		if err := os.MkdirAll(filepath.Join(home, d), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(home, "www", "public", "garde.txt"), []byte("posé par l'apply"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for link, target := range map[string]string{
+		".ssh/authorized_keys": trousseau, ".local/bin/php": php, "logs": journaux,
+	} {
+		if err := os.Symlink(target, filepath.Join(home, link)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	count, err := Extract(path, "tree", home, nil)
+	for f, want := range map[string]string{trousseau: "cle-admin\n", php: "vrai php\n"} {
+		if data, _ := os.ReadFile(f); string(data) != want {
+			t.Errorf("%s réécrit à travers un lien de la destination : %q", f, data)
+		}
+	}
+	if entries, _ := os.ReadDir(journaux); len(entries) != 0 {
+		t.Errorf("entrées posées dans le répertoire désigné par ~/logs : %v", entries)
+	}
+	for rel, want := range map[string]string{
+		".ssh/authorized_keys": "cle-du-projet\n", ".local/bin/php": "script du projet\n",
+		"logs/depose.txt": "déposé\n", "www/current/index.php": "<?php // release",
+	} {
+		info, lerr := os.Lstat(filepath.Join(home, rel))
+		if lerr != nil || !info.Mode().IsRegular() {
+			t.Errorf("%s doit être un fichier régulier : %v %v", rel, info, lerr)
+			continue
+		}
+		if data, _ := os.ReadFile(filepath.Join(home, rel)); string(data) != want {
+			t.Errorf("%s : %q, attendu %q", rel, data, want)
+		}
+	}
+	if info, lerr := os.Lstat(filepath.Join(home, "logs")); lerr != nil || !info.IsDir() {
+		t.Errorf("~/logs doit être redevenu le répertoire archivé : %v %v", info, lerr)
+	}
+	if target, _ := os.Readlink(filepath.Join(home, "logs", "apache-error.log.1")); target != "/etc/shadow" {
+		t.Errorf("le lien archivé doit revenir tel quel, cible %q", target)
+	}
+	// Un répertoire que l'apply a peuplé n'est jamais remplacé par un lien : la
+	// suite écrirait dedans. L'entrée est écartée, les autres sont restaurées, et
+	// l'erreur la nomme.
+	if err == nil || !strings.Contains(err.Error(), "www/public") {
+		t.Errorf("l'entrée www/public doit être signalée comme écartée : %v", err)
+	}
+	if data, _ := os.ReadFile(filepath.Join(home, "www", "public", "garde.txt")); string(data) != "posé par l'apply" {
+		t.Errorf("le répertoire existant doit rester intact : %q", data)
+	}
+	if count != 5 {
+		t.Errorf("%d entrée(s) posée(s), 5 attendues (quatre fichiers et un lien)", count)
+	}
+}
+
+func TestExtractRefuseUneEntreeSousUnLienDeLArchive(t *testing.T) {
+	// L'archive elle-même peut poser un lien, puis une entrée sous ce lien : c'est
+	// la forme classique de l'évasion d'une extraction, que le contrôle lexical des
+	// chemins ne voit pas. Aucun composant n'est suivi : l'entrée est écartée.
+	dir := t.TempDir()
+	dehors := filepath.Join(dir, "dehors")
+	if err := os.MkdirAll(dehors, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "piege"+Extension)
+	w, err := Create(path, Manifest{Project: "x"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.tar.WriteHeader(&tar.Header{Name: "tree/evasion", Linkname: dehors, Typeflag: tar.TypeSymlink}); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.AddBytes("tree", "tree/evasion/piege.txt", "", []byte("dehors"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.AddBytes("tree", "tree/sain.txt", "", []byte("sain"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	dest := filepath.Join(dir, "dest")
+	_, err = Extract(path, "tree", dest, nil)
+	if err == nil || !strings.Contains(err.Error(), "evasion/piege.txt") {
+		t.Errorf("l'entrée sous le lien doit être écartée et nommée : %v", err)
+	}
+	if entries, _ := os.ReadDir(dehors); len(entries) != 0 {
+		t.Errorf("root a écrit à travers le lien de l'archive : %v", entries)
+	}
+	if data, _ := os.ReadFile(filepath.Join(dest, "sain.txt")); string(data) != "sain" {
+		t.Errorf("les entrées saines doivent être restaurées malgré tout : %q", data)
+	}
+}
+
+// proprietaireDEssai rend un propriétaire que le test peut poser et qui se
+// distingue de celui du processus : n'importe lequel en root, un groupe dont le
+// processus est membre sans que ce soit le sien sinon. C'est celui qui prouve que
+// chaque entrée l'a reçu.
+func proprietaireDEssai(t *testing.T) fs.Owner {
+	t.Helper()
+	if os.Geteuid() == 0 {
+		return fs.Owner{UID: 4242, GID: 4242}
+	}
+	groups, err := os.Getgroups()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, g := range groups {
+		if g != os.Getgid() {
+			return fs.Owner{UID: -1, GID: g}
+		}
+	}
+	t.Skip("ni root ni groupe secondaire : le propriétaire posé ne se distinguerait pas")
+	return fs.KeepOwner
+}
+
+// aRecu dit si info porte le propriétaire o, dont un UID négatif n'est pas posé.
+func aRecu(info os.FileInfo, o fs.Owner) bool {
+	st := info.Sys().(*syscall.Stat_t)
+	return int(st.Gid) == o.GID && (o.UID < 0 || int(st.Uid) == o.UID)
+}
+
+func TestExtractDonneChaqueEntreeCreeeASonProprietaire(t *testing.T) {
+	// L'extraction crée en root : ce qui n'était pas rendu restait à root — un
+	// authorized_keys que sshd lit sous l'identité de l'utilisateur, les sessions
+	// PHP, les caches, tout le site d'un projet adopté servi hors de www/. Chaque
+	// entrée créée reçoit le propriétaire que lui donne l'appelant d'après son
+	// chemin et celui que l'archive porte, sur son descripteur — les liens compris,
+	// par lchown —, et un répertoire existant garde le sien.
+	essai := proprietaireDEssai(t)
+	dir := t.TempDir()
+	path := archiver(t, dir, map[string]string{
+		"www/public/index.php":         "<?php",
+		".ssh/authorized_keys":         "cle",
+		"var/sessions/sess_abc":        "a|s:1:\"b\";",
+		".config/composer/auth.json":   "{}",
+		"public_html/index.php":        "<?php // adopté",
+		"var/cache/prod/container.php": "cache",
+	}, map[string]string{".local/bin/php": "/usr/bin/php8.5"})
+	home := filepath.Join(dir, "home")
+	if err := os.MkdirAll(filepath.Join(home, "www"), 0o710); err != nil {
+		t.Fatal(err)
+	}
+	source := fs.Owner{UID: os.Getuid(), GID: os.Getgid()}
+	demandes := map[string]fs.Owner{}
+	owner := func(rel string, orig fs.Owner) fs.Owner {
+		demandes[rel] = orig
+		return essai
+	}
+	if _, err := Extract(path, "tree", home, owner); err != nil {
+		t.Fatal(err)
+	}
+	for _, rel := range []string{".ssh/authorized_keys", "public_html/index.php", ".local/bin/php", "var/cache"} {
+		if got, ok := demandes[rel]; !ok || got != source {
+			t.Errorf("%s : propriétaire demandé avec %+v (%v), attendu celui de la source %+v", rel, got, ok, source)
+		}
+	}
+	err := filepath.Walk(home, func(p string, info os.FileInfo, err error) error {
+		if err != nil || p == home {
+			return err
+		}
+		rel, _ := filepath.Rel(home, p)
+		switch {
+		case rel == "www":
+			if aRecu(info, essai) {
+				t.Errorf("www existait : son propriétaire ne doit pas changer")
+			}
+		case !aRecu(info, essai):
+			st := info.Sys().(*syscall.Stat_t)
+			t.Errorf("%s restauré sans le propriétaire demandé (%d:%d, attendu %+v)", rel, st.Uid, st.Gid, essai)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+// enTetes relit les en-têtes d'une archive, par nom.
+func enTetes(t *testing.T, path string) map[string]*tar.Header {
+	t.Helper()
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	dec, err := zstd.NewReader(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dec.Close()
+	out := map[string]*tar.Header{}
+	tr := tar.NewReader(dec)
+	for {
+		h, err := tr.Next()
+		if err == io.EOF {
+			return out
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		out[h.Name] = h
+	}
+}
+
+func TestAddTreePorteLeProprietaireDeChaqueEntree(t *testing.T) {
+	// Les en-têtes ne portaient aucun propriétaire : la restauration ne savait pas
+	// ce qui était au projet, et rendait à l'utilisateur jusqu'au lien dur qu'il
+	// aurait posé dans son home vers un fichier du système. Chaque en-tête porte
+	// celui de son entrée, relevé sur le descripteur, et le manifeste celui de la
+	// racine, auquel la restauration les compare.
+	essai := proprietaireDEssai(t)
+	dir := t.TempDir()
+	src := filepath.Join(dir, "source")
+	autre := filepath.Join(src, "www", "autre.txt")
+	for f, body := range map[string]string{filepath.Join(src, "www", "index.php"): "<?php", autre: "autre"} {
+		if err := os.MkdirAll(filepath.Dir(f), 0o750); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(f, []byte(body), 0o640); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink("index.php", filepath.Join(src, "www", "lien")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chown(autre, essai.UID, essai.GID); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "a"+Extension)
+	w, err := Create(path, Manifest{Project: "shopfr"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.AddTree("tree", "tree", src); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	moi := fs.Owner{UID: os.Getuid(), GID: os.Getgid()}
+	manifest, err := ReadManifest(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := manifest.RootOwner("tree"); got == nil || *got != moi {
+		t.Errorf("propriétaire de la racine au manifeste : %+v, attendu %+v", got, moi)
+	}
+	if got := (Manifest{}).RootOwner("tree"); got != nil {
+		t.Errorf("une archive antérieure ne porte aucun propriétaire : %+v", got)
+	}
+	headers := enTetes(t, path)
+	for name, want := range map[string]fs.Owner{
+		"tree/www/": moi, "tree/www/index.php": moi, "tree/www/lien": moi, "tree/www/autre.txt": essai,
+	} {
+		h, ok := headers[name]
+		switch {
+		case !ok:
+			t.Errorf("%s absent de l'archive", name)
+		case h.Gid != want.GID || (want.UID >= 0 && h.Uid != want.UID):
+			t.Errorf("%s : en-tête %d:%d, attendu %+v", name, h.Uid, h.Gid, want)
+		}
 	}
 }
 
@@ -419,5 +764,153 @@ func TestArchiveDunFormatPlusRecentEstRefusee(t *testing.T) {
 	}
 	if _, err := Secrets(path); err == nil || !strings.Contains(err.Error(), "mettre ogs à jour") {
 		t.Errorf("Secrets accepte un format inconnu : %v", err)
+	}
+}
+
+// horsDuHome pose, hors de l'arborescence archivée, un fichier que l'utilisateur
+// du projet ne peut pas lire : c'est lui qu'une substitution chercherait à faire
+// entrer dans l'archive, pour le retrouver dans son home à la restauration.
+func horsDuHome(t *testing.T, dir string) (string, string) {
+	t.Helper()
+	dehors := filepath.Join(dir, "dehors")
+	if err := os.MkdirAll(dehors, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	secret := "root:$y$j9T$SECRET-HORS-DU-HOME:19000:0:99999:7:::\n"
+	if err := os.WriteFile(filepath.Join(dehors, "shadow"), []byte(secret), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return dehors, secret
+}
+
+func TestAddTreeNeSuitPasUnAncetreSubstitue(t *testing.T) {
+	// L'archivage lit en root un home qui appartient à l'utilisateur, dont le code
+	// tourne encore — shell ouvert (D62), tâches cron, pool PHP. filepath.Walk
+	// atteignait chaque entrée par son chemin complet : une fois la liste de www/
+	// lue, remplacer www par un lien vers un répertoire du système faisait lire les
+	// entrées suivantes à travers ce lien, un Lstat ne protégeant que le dernier
+	// composant. La substitution est déclenchée ici au moment exact où le parcours
+	// ouvre www/aaa, ce que l'utilisateur obtient lui-même par inotify.
+	dir := t.TempDir()
+	dehors, secret := horsDuHome(t, dir)
+	root := filepath.Join(dir, "home", "shop.fr")
+	www := filepath.Join(root, "www")
+	lent := filepath.Join(www, "aaa")
+	if err := os.MkdirAll(lent, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3000; i++ {
+		if err := os.WriteFile(filepath.Join(lent, fmt.Sprintf("f%05d", i)), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(www, "shadow"), []byte("leurre"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fd, err := unix.InotifyInit1(unix.IN_CLOEXEC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(fd)
+	if _, err := unix.InotifyAddWatch(fd, lent, unix.IN_OPEN); err != nil {
+		t.Fatal(err)
+	}
+	substitue := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 4096)
+		if _, err := unix.Read(fd, buf); err != nil {
+			substitue <- err
+			return
+		}
+		if err := os.Rename(www, www+".orig"); err != nil {
+			substitue <- err
+			return
+		}
+		substitue <- os.Symlink(dehors, www)
+	}()
+	path := filepath.Join(dir, "archives", "a"+Extension)
+	w, err := Create(path, Manifest{Project: "shopfr"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.AddTree("tree", "tree", root); err != nil {
+		t.Fatalf("AddTree : %v", err)
+	}
+	if _, err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-substitue; err != nil {
+		t.Fatalf("substitution : %v", err)
+	}
+	got, err := ReadFile(path, "tree/www/shadow")
+	if err == nil && string(got) == secret {
+		t.Fatal("un fichier extérieur au home est entré dans l'archive par un répertoire substitué")
+	}
+	// Le répertoire parcouru reste celui que l'on avait ouvert, sous son nouveau
+	// nom : le leurre qu'il contient est archivé, rien d'autre.
+	if err != nil || string(got) != "leurre" {
+		t.Errorf("tree/www/shadow : %q (%v), attendu le leurre du répertoire ouvert", got, err)
+	}
+}
+
+func TestAddTreeNOuvreJamaisUnLienSubstitueAUnFichier(t *testing.T) {
+	// Le type d'une entrée était constaté par Lstat, puis le fichier ouvert par
+	// os.Open, qui suit les liens : entre les deux, l'utilisateur substitue un lien
+	// vers un fichier de même taille — l'en-tête reprenait la taille du Lstat — et
+	// root en archivait le contenu. La substitution est faite ici au moment exact
+	// qui sépare le constat de l'ouverture, celui qu'une course viserait : l'entrée
+	// doit être ouverte sans suivre de lien, et écartée sans faire échouer
+	// l'archive.
+	dir := t.TempDir()
+	dehors, secret := horsDuHome(t, dir)
+	root := filepath.Join(dir, "home", "shop.fr")
+	www := filepath.Join(root, "www")
+	if err := os.MkdirAll(www, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	cible := filepath.Join(www, "cible")
+	if err := os.WriteFile(cible, []byte(strings.Repeat("-", len(secret))), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(www, "voisin"), []byte("voisin"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	substitue := false
+	defer func(prev func(string)) { entryChecked = prev }(entryChecked)
+	entryChecked = func(name string) {
+		if name != "tree/www/cible" {
+			return
+		}
+		if err := os.Remove(cible); err != nil {
+			t.Error(err)
+		}
+		if err := os.Symlink(filepath.Join(dehors, "shadow"), cible); err != nil {
+			t.Error(err)
+		}
+		substitue = true
+	}
+	path := filepath.Join(dir, "a"+Extension)
+	w, err := Create(path, Manifest{Project: "shopfr"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.AddTree("tree", "tree", root); err != nil {
+		t.Fatalf("une entrée changée sous nos pieds ne doit pas faire échouer l'archive : %v", err)
+	}
+	if _, err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !substitue {
+		t.Fatal("la substitution n'a pas eu lieu : le test n'éprouve rien")
+	}
+	got, err := ReadFile(path, "tree/www/cible")
+	if err == nil && string(got) == secret {
+		t.Fatal("entrée constatée régulière, puis ouverte à travers le lien substitué : le secret est archivé")
+	}
+	if err == nil {
+		t.Errorf("l'entrée substituée devait être écartée, archivée : %q", got)
+	}
+	if got, err := ReadFile(path, "tree/www/voisin"); err != nil || string(got) != "voisin" {
+		t.Errorf("les autres entrées doivent être archivées : %q %v", got, err)
 	}
 }
