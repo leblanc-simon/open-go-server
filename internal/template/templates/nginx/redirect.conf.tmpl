@@ -10,7 +10,7 @@ server {
 
     access_log {{ .LogDir }}/nginx-access.log;
     location / {
-        return 301 {{ if .TLS }}https{{ else }}http{{ end }}://{{ .RedirectTarget }}$request_uri;
+        return 301 {{ .RedirectScheme }}://{{ .RedirectTarget }}$request_uri;
     }
 }
 {{ if .TLS }}
@@ -23,11 +23,12 @@ server {
     ssl_certificate     {{ .CertDir }}/fullchain.pem;
     ssl_certificate_key {{ .CertDir }}/privkey.pem;
 
-    # Un domaine redirigé doit l'être aussi en HTTPS : le certificat le couvre,
-    # et un visiteur qui arrive en https ne doit pas voir une erreur de nom.
+    # Un domaine redirigé doit l'être aussi en HTTPS (D43) : ce bloc n'est rendu
+    # que si le certificat présent couvre ce domaine, et un visiteur qui arrive
+    # en https ne doit pas voir une erreur de nom.
     access_log {{ .LogDir }}/nginx-access.log;
     location / {
-        return 301 https://{{ .RedirectTarget }}$request_uri;
+        return 301 {{ .RedirectScheme }}://{{ .RedirectTarget }}$request_uri;
     }
 }
 {{- end }}

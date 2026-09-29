@@ -202,6 +202,58 @@ func TestExecuteReloadsOnce(t *testing.T) {
 	}
 }
 
+func TestUneEtapePartielleRetientSonRechargementSansEtreCompensee(t *testing.T) {
+	// Un certificat émis pour une partie de ses noms remplace le matériel que le
+	// serveur garde en mémoire : l'avertissement ne doit pas coûter le
+	// rechargement, faute de quoi l'ancien certificat resterait présenté jusqu'à
+	// son expiration. Il ne doit pas non plus être défait par une étape critique
+	// en échec plus loin : d'autres étapes ont pu le désigner entre-temps.
+	tr := &tracker{}
+	plan := &Plan{Project: "shopfr"}
+	cert := tr.step("certificat", Create, false, false)
+	cert.Apply = func(context.Context) error {
+		return Partial(errors.New("émis sans ancien-shop.fr"))
+	}
+	cert.Reload = []string{"web:apache"}
+	plan.Add(cert)
+	plan.Add(tr.step("vhost", Update, false, true))
+	plan.Add(tr.step("cron", Create, true, true))
+
+	var reloads []string
+	report, err := Execute(context.Background(), plan, Options{
+		Reload: func(_ context.Context, target string) error {
+			reloads = append(reloads, target)
+			return nil
+		},
+	})
+	if err == nil {
+		t.Fatal("l'échec critique doit remonter")
+	}
+	if len(report.Warnings) != 2 || !strings.Contains(report.Warnings[0], "sans ancien-shop.fr") {
+		t.Errorf("l'aboutissement partiel est un avertissement : %v", report.Warnings)
+	}
+	if fmt.Sprint(tr.events) != "[]" {
+		t.Errorf("l'étape partielle ne doit pas être compensée : %v", tr.events)
+	}
+
+	// Sans échec critique, le rechargement suit, une fois.
+	plan = &Plan{Project: "shopfr"}
+	plan.Add(cert)
+	plan.Add(tr.step("vhost", Update, false, true))
+	reloads = nil
+	if _, err := Execute(context.Background(), plan, Options{
+		Reload: func(_ context.Context, target string) error {
+			reloads = append(reloads, target)
+			return nil
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if fmt.Sprint(reloads) != "[web:apache]" {
+		t.Errorf("l'étape partielle doit porter son rechargement : %v", reloads)
+	}
+}
+
 func TestLockIsExclusive(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "ogs.lock")
 	first, err := Acquire(path)

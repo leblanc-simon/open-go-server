@@ -17,6 +17,7 @@ import (
 	"leblanc.io/open-go-server/internal/model"
 	"leblanc.io/open-go-server/internal/naming"
 	"leblanc.io/open-go-server/internal/provider/php"
+	tlsprov "leblanc.io/open-go-server/internal/provider/tls"
 	"leblanc.io/open-go-server/internal/store"
 	"leblanc.io/open-go-server/internal/template"
 )
@@ -74,6 +75,14 @@ func project(t *testing.T, host string, kind model.AppKind, version, php string)
 	}
 	p.Spec.Domains = append(p.Spec.Domains, model.Domain{Name: "www." + host, Role: "alias"})
 	return p
+}
+
+// certificatCouvrant simule le certificat shopfr présent sur le disque, qui
+// couvre les noms donnés — les mêmes que la demande.
+func certificatCouvrant(noms ...string) func(*model.Project) tlsprov.Coverage {
+	return func(*model.Project) tlsprov.Coverage {
+		return tlsprov.Coverage{Ref: "shopfr", Present: noms, Requested: noms}
+	}
 }
 
 func buildMain(t *testing.T, prov *Provider, p *model.Project) *VHostPlan {
@@ -814,7 +823,7 @@ func TestEveryTemplateServesHTTPSWhenTLSIsEnabled(t *testing.T) {
 			nom := moteur + "/" + string(c.kind) + c.role
 			t.Run(nom, func(t *testing.T) {
 				prov, _ := fixture(t, moteur)
-				prov.CertRef = func(*model.Project) (string, bool) { return "shopfr", true }
+				prov.Certificate = certificatCouvrant("shop.fr", "www.shop.fr", "ancien.fr")
 				p := project(t, "shop.fr", c.kind, c.version, "8.5")
 
 				// Une application derrière un proxy déclare sa cible : c'est le
@@ -858,6 +867,367 @@ func TestEveryTemplateServesHTTPSWhenTLSIsEnabled(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// certificatEnAttente simule le certificat shopfr présent pour les noms déjà
+// servis, alors que la demande en porte d'autres : une réémission est en attente.
+func certificatEnAttente(presents []string, demandes ...string) func(*model.Project) tlsprov.Coverage {
+	return func(*model.Project) tlsprov.Coverage {
+		return tlsprov.Coverage{Ref: "shopfr", Present: presents, Requested: demandes}
+	}
+}
+
+// blocs sépare le rendu d'un vhost en sa partie du port 80 et sa partie du port
+// 443, vide sans TLS.
+func blocs(t *testing.T, moteur, c string) (port80, port443 string) {
+	t.Helper()
+	marque := "<VirtualHost *:443>"
+	if moteur == "nginx" {
+		marque = "listen 443 ssl;"
+	}
+	i := strings.Index(c, marque)
+	if i < 0 {
+		return c, ""
+	}
+	return c[:i], c[i:]
+}
+
+// servi dit si un nom figure parmi les noms d'un bloc, pour l'un ou l'autre
+// moteur.
+func servi(moteur, bloc, nom string) bool {
+	if moteur == "apache" {
+		return strings.Contains(bloc, "ServerName "+nom+"\n") || strings.Contains(bloc, "ServerAlias "+nom+"\n")
+	}
+	for _, l := range strings.Split(bloc, "\n") {
+		l = strings.TrimSpace(l)
+		if strings.HasPrefix(l, "server_name ") {
+			for _, n := range strings.Fields(strings.TrimSuffix(strings.TrimPrefix(l, "server_name "), ";")) {
+				if n == nom {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// redirigeVers renvoie la cible de la redirection du port 80 d'un bloc.
+func redirigeVers(moteur, bloc string) string {
+	re := regexp.MustCompile(`RewriteRule \^\(\.\*\)\$ (\S+)\$1`)
+	if moteur == "nginx" {
+		re = regexp.MustCompile(`return 301 (\S+)\$request_uri;`)
+	}
+	if m := re.FindStringSubmatch(bloc); m != nil {
+		return m[1]
+	}
+	return ""
+}
+
+func TestAjoutDAliasGardeLeHTTPSPendantLaReemission(t *testing.T) {
+	// Un alias ajouté ne couvre pas encore le certificat en place, qui reste
+	// valable pour le reste. Le vhost redescendait en HTTP seul — rechargé ainsi
+	// avant même le challenge —, et pour de bon si l'émission échouait : HSTS
+	// rendait le site injoignable. Il doit garder son bloc 443 sur le certificat
+	// en place, et servir le challenge du nouvel alias sur le port 80.
+	for _, moteur := range []string{"apache", "nginx"} {
+		t.Run(moteur, func(t *testing.T) {
+			prov, _ := fixture(t, moteur)
+			p := project(t, "shop.fr", model.KindSymfony, "6.4", "8.5")
+			p.Spec.Domains = append(p.Spec.Domains, model.Domain{Name: "boutique.fr", Role: "alias"})
+			prov.Certificate = certificatEnAttente([]string{"shop.fr", "www.shop.fr"},
+				"shop.fr", "www.shop.fr", "boutique.fr")
+			c := string(buildMain(t, prov, p).Content)
+			port80, port443 := blocs(t, moteur, c)
+			if port443 == "" {
+				t.Fatalf("le bloc 443 doit rester servi avec le certificat en place :\n%s", c)
+			}
+			for _, want := range []string{"certificates/shopfr/fullchain.pem", "Strict-Transport-Security"} {
+				if !strings.Contains(port443, want) {
+					t.Errorf("%q absent du bloc 443 :\n%s", want, port443)
+				}
+			}
+			if cible := redirigeVers(moteur, port80); cible != "https://shop.fr" {
+				t.Errorf("le port 80 doit rediriger vers un nom couvert, obtenu %q :\n%s", cible, port80)
+			}
+			// Le challenge du nouvel alias : servi sur le port 80, avant la
+			// redirection, sans quoi l'émission qui doit le couvrir échoue.
+			if !servi(moteur, port80, "boutique.fr") {
+				t.Errorf("le port 80 doit servir boutique.fr pour son challenge :\n%s", port80)
+			}
+			challenge := "location ^~ /.well-known/acme-challenge/"
+			if moteur == "apache" {
+				challenge = `RewriteCond %{REQUEST_URI} !^/\.well-known/acme-challenge/`
+				if !strings.Contains(port80, "Alias /.well-known/acme-challenge") {
+					t.Errorf("le répertoire du challenge n'est pas aliasé :\n%s", port80)
+				}
+			}
+			iChallenge := strings.Index(port80, challenge)
+			iRedirect := strings.Index(port80, "https://shop.fr")
+			if iChallenge < 0 || iChallenge > iRedirect {
+				t.Errorf("le challenge doit échapper à la redirection :\n%s", port80)
+			}
+			// Le bloc 443 le déclare aussi : il le présentera au rechargement qui
+			// suit l'émission, sans que le vhost change.
+			if !servi(moteur, port443, "boutique.fr") {
+				t.Errorf("le bloc 443 doit déclarer boutique.fr :\n%s", port443)
+			}
+			if steps := prov.PlanTLS(context.Background(), p); len(steps) != 0 {
+				t.Errorf("le rendu ne dépend pas de l'émission, aucune bascule attendue : %v", steps)
+			}
+		})
+	}
+}
+
+func TestChangementDeDomainePrincipalGardeLeHTTPSDeLAncien(t *testing.T) {
+	// Le domaine principal change, l'ancien reste servi en alias : le certificat
+	// en place ne couvre que lui. Le vhost reste en HTTPS sous l'ancien nom le
+	// temps de l'émission, puis bascule sur le nouveau une fois le certificat
+	// réémis.
+	for _, moteur := range []string{"apache", "nginx"} {
+		t.Run(moteur, func(t *testing.T) {
+			prov, _ := fixture(t, moteur)
+			p := project(t, "shop.fr", model.KindSymfony, "6.4", "8.5")
+			p.Spec.Domains = []model.Domain{
+				{Name: "boutique.fr", Role: "primary"},
+				{Name: "shop.fr", Role: "alias"},
+				{Name: "www.shop.fr", Role: "alias"},
+			}
+			demande := []string{"boutique.fr", "shop.fr", "www.shop.fr"}
+			prov.Certificate = certificatEnAttente([]string{"shop.fr", "www.shop.fr"}, demande...)
+			ctx := context.Background()
+
+			bp := buildMain(t, prov, p)
+			port80, port443 := blocs(t, moteur, string(bp.Content))
+			if port443 == "" {
+				t.Fatalf("le bloc 443 doit rester servi avec le certificat en place :\n%s", bp.Content)
+			}
+			if cible := redirigeVers(moteur, port80); cible != "https://shop.fr" {
+				t.Errorf("le port 80 doit rediriger vers le nom que le certificat couvre, obtenu %q", cible)
+			}
+			if !servi(moteur, port80, "boutique.fr") {
+				t.Errorf("le nouveau principal doit être servi sur le port 80 pour son challenge :\n%s", port80)
+			}
+			if err := prov.writeVHost(ctx, bp); err != nil {
+				t.Fatal(err)
+			}
+
+			steps := prov.PlanTLS(ctx, p)
+			if len(steps) != 1 || !strings.Contains(steps[0].Summary, "bascule du vhost shopfr") {
+				t.Fatalf("une bascule attendue après l'émission : %v", steps)
+			}
+			// Émission échouée : le vhost en place reste, et l'étape le dit.
+			err := steps[0].Apply(ctx)
+			if err == nil || !strings.Contains(err.Error(), "sans boutique.fr : le vhost reste servi en HTTPS sous shop.fr") {
+				t.Errorf("l'échec de l'émission doit être signalé : %v", err)
+			}
+			if steps[0].Critical {
+				t.Error("la bascule doit rester non critique")
+			}
+			// Émission réussie : le nom déclaré reprend sa place.
+			prov.Certificate = certificatCouvrant(demande...)
+			if err := steps[0].Apply(ctx); err != nil {
+				t.Fatal(err)
+			}
+			data, err := os.ReadFile(bp.Path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			port80, port443 = blocs(t, moteur, string(data))
+			if cible := redirigeVers(moteur, port80); cible != "https://boutique.fr" {
+				t.Errorf("après l'émission, le port 80 doit rediriger vers le principal, obtenu %q", cible)
+			}
+			if port443 == "" || !servi(moteur, port443, "shop.fr") {
+				t.Errorf("l'ancien principal doit rester servi en HTTPS :\n%s", data)
+			}
+		})
+	}
+}
+
+func TestRedirectionServieEnHTTPSSeulementSiLeCertificatLaCouvre(t *testing.T) {
+	// Le vhost de redirection recevait le TLS avec le certificat du projet, qui
+	// ne le couvrait pas : https://ancien-shop.fr rendait une erreur de nom. Son
+	// bloc 443 ne doit exister que si le certificat présent couvre ce nom.
+	for _, moteur := range []string{"apache", "nginx"} {
+		t.Run(moteur, func(t *testing.T) {
+			prov, paths := fixture(t, moteur)
+			// Le certificat est celui du projet, pas un certificat au nom du vhost.
+			prov.CertDir = func(ref string) string { return filepath.Join(paths.ACMEDir(), "certificates", ref) }
+			p := project(t, "shop.fr", model.KindStatic, "", "")
+			p.Spec.Domains = append(p.Spec.Domains,
+				model.Domain{Name: "ancien-shop.fr", Role: "redirect", Target: "shop.fr"})
+			demande := []string{"shop.fr", "www.shop.fr", "ancien-shop.fr"}
+			prov.Certificate = certificatEnAttente([]string{"shop.fr", "www.shop.fr"}, demande...)
+			vhosts := prov.vhosts(p)
+			if len(vhosts) != 2 {
+				t.Fatalf("un vhost de redirection attendu : %+v", vhosts)
+			}
+			bp, err := prov.Build(p, vhosts[1])
+			if err != nil {
+				t.Fatal(err)
+			}
+			port80, port443 := blocs(t, moteur, string(bp.Content))
+			if port443 != "" {
+				t.Errorf("aucun bloc 443 sans certificat qui couvre ancien-shop.fr :\n%s", bp.Content)
+			}
+			// La cible, elle, est couverte : autant y envoyer en https d'emblée.
+			if cible := redirigeVers(moteur, port80); cible != "https://shop.fr" {
+				t.Errorf("redirection du port 80 : %q", cible)
+			}
+			steps := prov.PlanTLS(context.Background(), p)
+			if len(steps) != 1 || !strings.Contains(steps[0].Summary, "activation TLS du vhost shopfr_redirect") {
+				t.Errorf("l'activation du TLS de la redirection suit l'émission : %v", steps)
+			}
+
+			prov.Certificate = certificatCouvrant(demande...)
+			bp, err = prov.Build(p, vhosts[1])
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, port443 = blocs(t, moteur, string(bp.Content))
+			if port443 == "" || !servi(moteur, port443, "ancien-shop.fr") ||
+				!strings.Contains(port443, "certificates/shopfr/fullchain.pem") {
+				t.Errorf("couvert, le domaine redirigé doit être servi en HTTPS :\n%s", bp.Content)
+			}
+			if cible := redirigeVers(moteur, port443); cible != "https://shop.fr" {
+				t.Errorf("redirection du port 443 : %q", cible)
+			}
+		})
+	}
+}
+
+func TestPrincipalDevenuRedirectionAboutitPendantLEmission(t *testing.T) {
+	// shop.fr, servi en HTTPS, devient une redirection vers boutique.fr. Tant que
+	// le certificat ne couvre pas boutique.fr, rien ne le sert en HTTPS : la
+	// redirection doit y envoyer en http, et non vers une erreur de nom.
+	for _, moteur := range []string{"apache", "nginx"} {
+		t.Run(moteur, func(t *testing.T) {
+			prov, _ := fixture(t, moteur)
+			p := project(t, "shop.fr", model.KindStatic, "", "")
+			p.Spec.Domains = []model.Domain{
+				{Name: "boutique.fr", Role: "primary"},
+				{Name: "shop.fr", Role: "redirect", Target: "boutique.fr"},
+			}
+			demande := []string{"boutique.fr", "shop.fr"}
+			prov.Certificate = certificatEnAttente([]string{"shop.fr"}, demande...)
+			vhosts := prov.vhosts(p)
+			bp, err := prov.Build(p, vhosts[1])
+			if err != nil {
+				t.Fatal(err)
+			}
+			port80, port443 := blocs(t, moteur, string(bp.Content))
+			if port443 == "" {
+				t.Fatalf("shop.fr reste couvert : son bloc 443 doit rester servi :\n%s", bp.Content)
+			}
+			for nom, bloc := range map[string]string{"80": port80, "443": port443} {
+				if cible := redirigeVers(moteur, bloc); cible != "http://boutique.fr" {
+					t.Errorf("port %s : la cible n'est pas encore servie en HTTPS, obtenu %q", nom, cible)
+				}
+			}
+			// Les deux vhosts basculent après l'émission.
+			if steps := prov.PlanTLS(context.Background(), p); len(steps) != 2 {
+				t.Errorf("deux bascules attendues : %v", steps)
+			}
+		})
+	}
+}
+
+func TestUneBasculeIncompleteReecritCeQueLeRepliACouvert(t *testing.T) {
+	// Un site neuf dont la redirection est refusée : son vhost est écrit quand
+	// rien n'est couvert, vers http://shop.fr. Le repli couvre shop.fr, pas la
+	// redirection ; la bascule, qui visait le bloc 443 de celle-ci, abandonnait
+	// sans réécrire le schéma, et le visiteur faisait un saut de plus jusqu'au
+	// prochain apply.
+	for _, moteur := range []string{"apache", "nginx"} {
+		t.Run(moteur, func(t *testing.T) {
+			prov, _ := fixture(t, moteur)
+			ctx := context.Background()
+			p := project(t, "shop.fr", model.KindStatic, "", "")
+			p.Spec.Domains = append(p.Spec.Domains,
+				model.Domain{Name: "ancien-shop.fr", Role: "redirect", Target: "shop.fr"})
+			demande := []string{"shop.fr", "www.shop.fr", "ancien-shop.fr"}
+			prov.Certificate = certificatEnAttente(nil, demande...)
+			redirection := prov.vhosts(p)[1]
+			bp, err := prov.Build(p, redirection)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cible := redirigeVers(moteur, string(bp.Content)); cible != "http://shop.fr" {
+				t.Fatalf("rien n'est couvert, la cible est visée en http : %q", cible)
+			}
+			if err := prov.writeVHost(ctx, bp); err != nil {
+				t.Fatal(err)
+			}
+			var bascule *engine.Step
+			for _, s := range prov.PlanTLS(ctx, p) {
+				if s.Resource == "web/vhost/shopfr_redirect/tls" {
+					bascule = s
+				}
+			}
+			if bascule == nil {
+				t.Fatal("la redirection doit basculer après l'émission")
+			}
+
+			// L'émission s'est repliée sur les noms du vhost principal.
+			prov.Certificate = certificatEnAttente([]string{"shop.fr", "www.shop.fr"}, demande...)
+			err = bascule.Apply(ctx)
+			if partial := (*engine.PartialError)(nil); !errors.As(err, &partial) ||
+				!strings.Contains(err.Error(), "sans ancien-shop.fr") {
+				t.Errorf("la bascule incomplète doit le dire, et garder son rechargement : %v", err)
+			}
+			data, err := os.ReadFile(bp.Path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			port80, port443 := blocs(t, moteur, string(data))
+			if cible := redirigeVers(moteur, port80); cible != "https://shop.fr" {
+				t.Errorf("la cible couverte doit être visée en https, obtenu %q :\n%s", cible, data)
+			}
+			if port443 != "" {
+				t.Errorf("la redirection non couverte n'a pas de bloc 443 :\n%s", data)
+			}
+			// Rien à réécrire : un échec simple, sans rechargement.
+			err = bascule.Apply(ctx)
+			if partial := (*engine.PartialError)(nil); err == nil || errors.As(err, &partial) {
+				t.Errorf("un vhost inchangé ne demande aucun rechargement : %v", err)
+			}
+		})
+	}
+}
+
+func TestUneCibleEtrangereEstViseeEnHTTPSQuoiQueCouvreLeCertificat(t *testing.T) {
+	// Une redirection déclarée vers un site tiers : ce que couvre notre
+	// certificat ne dit rien du schéma de la cible. En préproduction, un wildcard
+	// qui ne couvre pas le nom redirigé l'envoyait en http.
+	for _, moteur := range []string{"apache", "nginx"} {
+		t.Run(moteur, func(t *testing.T) {
+			prov, _ := fixture(t, moteur)
+			p := project(t, "shop.fr", model.KindStatic, "", "")
+			redirection := model.VHost{Name: "ancien", Template: "redirect", Domains: []string{"ancien.fr"},
+				Options: map[string]any{"target": "autre-site.com"}}
+			p.Spec.Web.VHosts = append(prov.vhosts(p), redirection)
+			prov.Certificate = certificatCouvrant("shop.fr", "www.shop.fr")
+			bp, err := prov.Build(p, redirection)
+			if err != nil {
+				t.Fatal(err)
+			}
+			port80, port443 := blocs(t, moteur, string(bp.Content))
+			if port443 != "" {
+				t.Errorf("ancien.fr n'est pas couvert : aucun bloc 443 attendu :\n%s", bp.Content)
+			}
+			if cible := redirigeVers(moteur, port80); cible != "https://autre-site.com" {
+				t.Errorf("la cible étrangère doit être visée en https, obtenu %q", cible)
+			}
+			// Sans TLS voulu, le schéma reste http : c'est le monde que déclare le vhost.
+			redirection.TLS = &model.TLS{Enabled: false}
+			bp, err = prov.Build(p, redirection)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cible := redirigeVers(moteur, string(bp.Content)); cible != "http://autre-site.com" {
+				t.Errorf("TLS écarté : cible %q", cible)
+			}
+		})
 	}
 }
 
@@ -911,7 +1281,7 @@ func TestProxyVHostReferencesOnlyDefinedVariables(t *testing.T) {
 	// fragment d'ogs : une variable inconnue est une erreur de configuration, pas
 	// un avertissement.
 	prov, _ := fixture(t, "nginx")
-	prov.CertRef = func(*model.Project) (string, bool) { return "shopfr", true }
+	prov.Certificate = certificatCouvrant("shop.fr", "www.shop.fr")
 	p := project(t, "shop.fr", model.KindGo, "", "")
 	p.Spec.Web.VHosts = prov.vhosts(p)
 	p.Spec.Web.VHosts[0].Options = map[string]any{"proxyTarget": "127.0.0.1:20101"}

@@ -11,7 +11,7 @@
 
     RewriteEngine On
     RewriteCond %{REQUEST_URI} !^/\.well-known/acme-challenge/
-    RewriteRule ^(.*)$ {{ if .TLS }}https{{ else }}http{{ end }}://{{ .RedirectTarget }}$1 [R=301,L]
+    RewriteRule ^(.*)$ {{ .RedirectScheme }}://{{ .RedirectTarget }}$1 [R=301,L]
 
     ErrorLog {{ .LogDir }}/apache-error.log
     CustomLog {{ .LogDir }}/apache-access.log combined
@@ -27,10 +27,11 @@
     SSLCertificateFile {{ .CertDir }}/fullchain.pem
     SSLCertificateKeyFile {{ .CertDir }}/privkey.pem
 
-    # Un domaine redirigé doit l'être aussi en HTTPS : le certificat le couvre,
-    # et un visiteur qui arrive en https ne doit pas voir une erreur de nom.
+    # Un domaine redirigé doit l'être aussi en HTTPS (D43) : ce bloc n'est rendu
+    # que si le certificat présent couvre ce domaine, et un visiteur qui arrive
+    # en https ne doit pas voir une erreur de nom.
     RewriteEngine On
-    RewriteRule ^(.*)$ https://{{ .RedirectTarget }}$1 [R=301,L]
+    RewriteRule ^(.*)$ {{ .RedirectScheme }}://{{ .RedirectTarget }}$1 [R=301,L]
 
     ErrorLog {{ .LogDir }}/apache-error.log
     CustomLog {{ .LogDir }}/apache-access.log combined

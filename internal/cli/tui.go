@@ -97,9 +97,10 @@ func (b *tuiBackend) Snapshot(ctx context.Context, p *model.Project) (tui.Snapsh
 	if ref, ready := provs.TLS.CertificateFor(p); ref != "" {
 		snapshot.Certificate = ref
 		if !ready {
-			snapshot.Problems = append(snapshot.Problems, "certificat "+ref+" indisponible")
+			état, problème := étatDuCertificat(provs, p, ref)
+			snapshot.Problems = append(snapshot.Problems, problème)
 			if snapshot.Health == "sain" {
-				snapshot.Health = "TLS absent"
+				snapshot.Health = "TLS " + état
 			}
 		} else if info, ok, _ := provs.TLS.Store.Read(ref); ok {
 			snapshot.CertDays = info.DaysLeft(nowFunc())
@@ -138,11 +139,7 @@ func (b *tuiBackend) Apply(ctx context.Context, p *model.Project) (string, error
 	}
 	report, err := engine.Execute(ctx, plan, engine.Options{
 		OnStep: func(s *engine.Step, stepErr error) {
-			if stepErr == nil {
-				fmt.Fprintf(&buf, "✓ %s\n", s.Summary)
-			} else {
-				fmt.Fprintf(&buf, "✗ %s : %v\n", s.Summary, stepErr)
-			}
+			fmt.Fprintln(&buf, issueDÉtape(s, stepErr))
 		},
 		OnWarning: func(s *engine.Step, stepErr error) {
 			fmt.Fprintf(&buf, "⚠ %s : %v\n", s.Summary, stepErr)
@@ -222,7 +219,15 @@ func (b *tuiBackend) RenewCertificate(ctx context.Context, p *model.Project) err
 	if len(requests) == 0 {
 		return fmt.Errorf("le projet %s ne demande aucun certificat", p.ID())
 	}
-	_, errs := provs.TLS.Renew(ctx, requests, true)
+	done, errs := provs.TLS.Renew(ctx, requests, true)
+	// Comme « ogs cert renew » : le serveur garde en mémoire le matériel qu'il a
+	// chargé, et continuerait de présenter l'ancien certificat — y compris quand
+	// le renouvellement s'est replié sur les noms du vhost principal.
+	if len(done) > 0 {
+		if err := provs.Web.Reload(ctx); err != nil {
+			return fmt.Errorf("certificat renouvelé, mais le serveur web n'a pas été rechargé : %w", err)
+		}
+	}
 	if len(errs) > 0 {
 		return errs[0]
 	}

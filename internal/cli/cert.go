@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -146,16 +147,44 @@ func newCertIssueCommand(app *App) *cobra.Command {
 			}
 			app.printf("émission du certificat %s pour %s (%s%s)…\n",
 				req.Name, strings.Join(req.Domains, ", "), req.Challenge, stagingSuffix(req.Staging))
-			if err := provs.TLS.Issue(cmd.Context(), req); err != nil {
-				_ = app.Audit.Record("", "tls/certificate/"+req.Name, "cert.issue", "échec", err.Error())
-				return wrap(CodeError, err)
+			// Un repli — la demande complète refusée, le certificat émis pour les
+			// seuls noms du vhost principal — a écrit un matériel neuf : il se
+			// recharge comme une émission, et se signale comme un succès partiel.
+			issueErr := provs.TLS.Issue(cmd.Context(), req)
+			partial := (*tlsprov.PartialError)(nil)
+			if issueErr != nil && !errors.As(issueErr, &partial) {
+				_ = app.Audit.Record("", "tls/certificate/"+req.Name, "cert.issue", "échec", issueErr.Error())
+				return wrap(CodeError, issueErr)
 			}
-			_ = app.Audit.Record("", "tls/certificate/"+req.Name, "cert.issue", "ok",
-				strings.Join(req.Domains, ","))
 			info, _, _ := provs.TLS.Store.Read(req.Name)
-			app.printf("✓ certificat %s émis, valable jusqu'au %s\n",
-				req.Name, info.NotAfter.Format("02/01/2006"))
+			if partial != nil {
+				_ = app.Audit.Record("", "tls/certificate/"+req.Name, "cert.issue", "avertissement",
+					issueErr.Error())
+				app.printf("⚠ %v\n", issueErr)
+				app.printf("✓ certificat %s émis pour %s, valable jusqu'au %s\n",
+					req.Name, strings.Join(partial.Covered, ", "), info.NotAfter.Format("02/01/2006"))
+			} else {
+				_ = app.Audit.Record("", "tls/certificate/"+req.Name, "cert.issue", "ok",
+					strings.Join(req.Domains, ","))
+				app.printf("✓ certificat %s émis, valable jusqu'au %s\n",
+					req.Name, info.NotAfter.Format("02/01/2006"))
+			}
+			// Un vhost déjà servi en HTTPS désigne ce certificat par son chemin : son
+			// rendu ne change pas quand l'émission ajoute un nom, donc « ogs apply »
+			// ne rechargerait rien, et le serveur présenterait indéfiniment le
+			// matériel qu'il garde en mémoire — celui qui ne couvre pas l'alias.
+			app.printf("  ↻ rechargement de %s\n", provs.Engine.Unit())
+			if err := provs.Web.Reload(cmd.Context()); err != nil {
+				// Code 6 : le certificat est émis, mais le serveur présente toujours
+				// l'ancien — un succès partiel, non un succès.
+				app.printf("⚠ rechargement du serveur web : %v\n", err)
+				return exitf(CodePartial, "certificat %s émis, mais le serveur web ne l'a pas relu", req.Name)
+			}
 			app.printf("  activer le TLS sur le vhost :\n    ogs apply\n")
+			if partial != nil {
+				return exitf(CodePartial, "certificat %s émis sans %s",
+					req.Name, strings.Join(partial.Missing, ", "))
+			}
 			return nil
 		},
 	}
@@ -178,8 +207,14 @@ func newCertRenewCommand(app *App) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "renew [id|@partagé...]",
 		Short: "Renouveler les certificats proches de l'échéance",
-		Long: "Renouvelle les certificats expirant sous 30 jours. Avec --force, renouvelle\n" +
-			"quoi qu'il en soit. C'est la commande appelée par le timer ogs-renew.",
+		Long: "Renouvelle les certificats expirant sous 30 jours, et ceux qui ne couvrent plus\n" +
+			"les domaines demandés — l'émission d'un alias qui a échoué à l'apply est ainsi\n" +
+			"reprise, une fois la déclaration appliquée. Un nom refusé par l'autorité ne\n" +
+			"coûte ni le certificat du site ni les noms qui peuvent aboutir : l'émission se\n" +
+			"replie sur eux, les redirections écartées les premières (code 6). Loin de\n" +
+			"l'échéance, le repli n'a lieu que s'il ajoute un nom sans retirer aucun de ceux\n" +
+			"que le certificat en place sert. Avec --force, renouvelle quoi qu'il en soit.\n" +
+			"C'est la commande appelée par le timer ogs-renew.",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			provs, err := app.certProviders()
 			if err != nil {
@@ -188,6 +223,8 @@ func newCertRenewCommand(app *App) *cobra.Command {
 			defer provs.close()
 
 			var requests []tlsprov.Request
+			var refusés []error
+			deferred := 0
 			if all || len(args) == 0 {
 				requests = append(requests, provs.TLS.SharedRequests()...)
 				projects, err := app.loadProjects()
@@ -197,9 +234,15 @@ func newCertRenewCommand(app *App) *cobra.Command {
 				for _, p := range projects {
 					reqs, err := provs.TLS.Requests(p)
 					if err != nil {
+						// Un projet dont la demande est refusée n'est plus renouvelé : le
+						// passer en silence laissait le timer rendre 0 pendant que son
+						// certificat allait à l'expiration. Les autres projets n'en
+						// dépendent pas, d'où un échec compté plutôt qu'un arrêt.
+						refusés = append(refusés, fmt.Errorf("%s : certificat non examiné, déclaration refusée : %w",
+							p.ID(), err))
 						continue
 					}
-					requests = append(requests, reqs...)
+					requests = append(requests, app.sansDevancerLApply(provs, p, reqs, &deferred)...)
 				}
 			} else {
 				for _, arg := range args {
@@ -217,14 +260,15 @@ func newCertRenewCommand(app *App) *cobra.Command {
 					if err != nil {
 						return exitf(CodeValidation, "%s", err)
 					}
-					requests = append(requests, reqs...)
+					requests = append(requests, app.sansDevancerLApply(provs, p, reqs, &deferred)...)
 				}
 			}
-			if len(requests) == 0 {
+			if len(requests) == 0 && deferred == 0 && len(refusés) == 0 {
 				app.printf("aucun certificat à examiner\n")
 				return nil
 			}
 			done, errs := provs.TLS.Renew(cmd.Context(), requests, app.Force)
+			errs = append(refusés, errs...)
 			for _, name := range done {
 				app.printf("✓ %s renouvelé\n", name)
 				_ = app.Audit.Record("", "tls/certificate/"+name, "cert.renew", "ok", "")
@@ -240,17 +284,28 @@ func newCertRenewCommand(app *App) *cobra.Command {
 					hook.Context{Resources: done, Extra: map[string]string{"cert": strings.Join(done, ",")}})
 			}
 			if len(done) == 0 && len(errs) == 0 {
-				app.printf("= aucun certificat n'arrive à échéance (%d examiné(s))\n", len(requests))
+				app.printf("= aucun certificat n'arrive à échéance (%d examiné(s))\n", len(requests)+deferred)
 				return nil
+			}
+			// Le serveur web doit relire les nouveaux fichiers, dès qu'il y en a : un
+			// échec ailleurs dans le parc — une redirection dont le DNS pointe
+			// ailleurs, et qui échoue à chaque passage — ne doit pas priver les
+			// certificats renouvelés de leur rechargement, sans quoi le serveur
+			// présenterait l'ancien matériel jusqu'à son expiration.
+			var reloadErr error
+			if len(done) > 0 {
+				app.printf("↻ rechargement de %s\n", provs.Engine.Unit())
+				if reloadErr = provs.Web.Reload(cmd.Context()); reloadErr != nil {
+					app.printf("⚠ rechargement du serveur web : %v\n", reloadErr)
+				}
 			}
 			if len(errs) > 0 {
 				// Code 6 : le timer systemd le tolère, un renouvellement en échec ne
 				// doit pas masquer ceux qui ont abouti.
 				return exitf(CodePartial, "%d renouvellement(s) en échec", len(errs))
 			}
-			// Le serveur web doit relire les nouveaux fichiers.
-			if err := provs.Web.Reload(cmd.Context()); err != nil {
-				app.printf("⚠ rechargement du serveur web : %v\n", err)
+			if reloadErr != nil {
+				return exitf(CodePartial, "certificats renouvelés, mais le serveur web ne les a pas relus")
 			}
 			return nil
 		},
@@ -399,6 +454,63 @@ func newCertDNSSetCommand(app *App) *cobra.Command {
 	f.StringVar(&clientID, "client-id", "", "identifiant client OAuth2")
 	f.StringVar(&clientSecret, "client-secret", "", "secret client OAuth2")
 	return cmd
+}
+
+// étatDuCertificat qualifie, pour « status » et l'interface, un certificat qui
+// n'est pas complet : « absent », « expiré » ou « incomplet », et le problème à
+// signaler. Un certificat incomplet — une réémission en attente, ou repliée —
+// reste servi pour les noms qu'il couvre : l'annoncer absent dirait le
+// contraire de ce que voit le visiteur. Le message nomme ces noms, et eux
+// seuls : quand le domaine principal change et que l'ancien devient une
+// redirection, c'est elle qui est servie en HTTPS, non le site.
+func étatDuCertificat(provs *providers, p *model.Project, ref string) (état, problème string) {
+	info, ok, _ := provs.TLS.Store.Read(ref)
+	switch {
+	case !ok:
+		return "absent", "certificat " + ref + " indisponible"
+	case info.Expired(nowFunc()):
+		return "expiré", fmt.Sprintf("certificat %s expiré depuis le %s", ref, info.NotAfter.Format("02/01/2006"))
+	}
+	cov := provs.TLS.Coverage(p)
+	var servis, manquants []string
+	for _, d := range cov.Requested {
+		if cov.Serves(d) {
+			servis = append(servis, d)
+		} else {
+			manquants = append(manquants, d)
+		}
+	}
+	if len(servis) == 0 {
+		return "absent", fmt.Sprintf("certificat %s : aucun des domaines demandés n'est couvert (%s)",
+			ref, strings.Join(manquants, ", "))
+	}
+	return "incomplet", fmt.Sprintf("certificat %s : %s pas encore couvert(s), HTTPS servi pour %s "+
+		"sur le certificat en place", ref, strings.Join(manquants, ", "), strings.Join(servis, ", "))
+}
+
+// sansDevancerLApply écarte d'un renouvellement non forcé les réémissions que seule
+// la couverture motive — un certificat frais qui ne couvre pas toute sa demande —
+// tant que la déclaration du projet n'a pas été appliquée telle quelle. Un alias
+// ajouté au fichier mais pas encore appliqué n'est servi par aucun vhost : son
+// challenge échouerait à coup sûr, et chaque passage du timer compterait un échec
+// auprès de l'autorité, jusqu'à suspendre les tentatives — celles de l'apply qui
+// suit comprises. L'apply s'en chargera. Une échéance, elle, n'attend pas.
+func (a *App) sansDevancerLApply(provs *providers, p *model.Project, reqs []tlsprov.Request,
+	deferred *int) []tlsprov.Request {
+	if a.Force || a.applied(p) {
+		return reqs
+	}
+	var out []tlsprov.Request
+	for _, req := range reqs {
+		if provs.TLS.AwaitsCoverage(req) {
+			*deferred++
+			a.printf("= %s : déclaration modifiée depuis le dernier apply, réémission laissée à « ogs apply %s »\n",
+				req.Name, p.ID())
+			continue
+		}
+		out = append(out, req)
+	}
+	return out
 }
 
 // certProviders ouvre la base d'état puis construit les providers : les

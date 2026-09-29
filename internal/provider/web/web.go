@@ -17,6 +17,7 @@ import (
 	"leblanc.io/open-go-server/internal/model"
 	"leblanc.io/open-go-server/internal/provider/php"
 	"leblanc.io/open-go-server/internal/provider/system"
+	tlsprov "leblanc.io/open-go-server/internal/provider/tls"
 	"leblanc.io/open-go-server/internal/template"
 )
 
@@ -31,10 +32,11 @@ type Provider struct {
 	Templates *template.Set
 	Engine    Engine
 	PHP       *php.Provider
-	// CertRef résout le certificat d'un projet et indique si son matériel est
-	// présent. Le vhost n'est écrit en TLS que si le certificat existe : le
-	// contraire empêcherait le serveur web de démarrer.
-	CertRef func(*model.Project) (string, bool)
+	// Certificate résout le certificat d'un projet : sa référence, ce que couvre
+	// le matériel présent, ce que couvrira la demande. Le vhost n'est écrit en TLS
+	// que si le certificat existe — le contraire empêcherait le serveur web de
+	// démarrer — et couvre l'un de ses noms (vueTLSDe).
+	Certificate func(*model.Project) tlsprov.Coverage
 	// CertDir localise le matériel d'un certificat.
 	CertDir func(ref string) string
 	// ProxyTarget résout la cible d'un vhost de proxy : socket ou adresse locale.
@@ -295,25 +297,22 @@ func (p *Provider) Build(proj *model.Project, vh model.VHost) (*VHostPlan, error
 		frontController = "index.php"
 	}
 
-	// Le TLS n'est activé dans le rendu que si le certificat est réellement
-	// disponible. Sinon le vhost est produit en HTTP seul : c'est aussi ce qui
-	// permet au challenge HTTP-01 d'aboutir avant la première émission.
-	wantTLS := !proj.Spec.Web.TLSDisabled() && (vh.TLS == nil || vh.TLS.Enabled)
-	certRef, certReady := "", false
-	if wantTLS && p.CertRef != nil {
-		certRef, certReady = p.CertRef(proj)
-	}
+	// Le TLS n'est activé dans le rendu que si le certificat présent couvre l'un
+	// des noms du vhost. Sinon le vhost est produit en HTTP seul : c'est aussi ce
+	// qui permet au challenge HTTP-01 d'aboutir avant la première émission.
+	cov := p.coverage(proj, vh)
+	vue := vueTLSDe(proj, vh, wantsTLS(proj, vh), cov.Serves)
 	certDir := filepath.Join(p.Paths.ACMEDir(), "certificates", name)
-	if certRef != "" && p.CertDir != nil {
-		certDir = p.CertDir(certRef)
+	if cov.Ref != "" && p.CertDir != nil {
+		certDir = p.CertDir(cov.Ref)
 	}
 
 	ctx := map[string]any{
 		"Project":         proj.ID(),
 		"Name":            name,
 		"AppKind":         string(proj.Spec.App.Kind),
-		"ServerName":      vh.Domains[0],
-		"Aliases":         vh.Domains[1:],
+		"ServerName":      vue.serverName,
+		"Aliases":         vue.aliases,
 		"Docroot":         docroot,
 		"LogDir":          proj.Spec.Layout.LogDir,
 		"FrontController": frontController,
@@ -323,7 +322,7 @@ func (p *Provider) Build(proj *model.Project, vh model.VHost) (*VHostPlan, error
 		"ACMEChallenge":     p.Paths.ACMEChallenge(),
 		"ACMEChallengeDir":  p.Paths.ACMEChallengeTokens(),
 		"RobotsNoindexFile": p.Paths.RobotsNoindexFile(),
-		"TLS":               wantTLS && certReady,
+		"TLS":               vue.on,
 		"HSTS":              optionBool(vh.Options, "hsts", true),
 		"CertDir":           certDir,
 		"Noindex":           proj.IsPrep(),
@@ -335,6 +334,7 @@ func (p *Provider) Build(proj *model.Project, vh model.VHost) (*VHostPlan, error
 		"IncludeVHost":   p.IncludeDir(name, IncludeVHost),
 		"IncludeDocroot": p.IncludeDir(name, IncludeDocroot),
 		"RedirectTarget": optionString(vh.Options, "target", vh.Domains[0]),
+		"RedirectScheme": vue.redirectScheme,
 		"ProxyTarget":    optionString(vh.Options, "proxyTarget", ""),
 		"FPMHandler":     "",
 		"FPMPass":        "",
@@ -384,9 +384,99 @@ func (p *Provider) Build(proj *model.Project, vh model.VHost) (*VHostPlan, error
 	_, enabledErr := os.Lstat(enabledPath)
 	return &VHostPlan{
 		Name: name, Path: path, EnabledPath: enabledPath, Content: content,
-		State: state, Enabled: enabledErr == nil, ServerName: vh.Domains[0], Domains: vh.Domains,
+		State: state, Enabled: enabledErr == nil, ServerName: vue.serverName, Domains: vh.Domains,
 		IncludeDirs: p.includeDirs(content),
 	}, nil
+}
+
+// wantsTLS dit si un vhost demande le TLS : oui par défaut, sauf renoncement du
+// projet ou du vhost.
+func wantsTLS(proj *model.Project, vh model.VHost) bool {
+	return !proj.Spec.Web.TLSDisabled() && (vh.TLS == nil || vh.TLS.Enabled)
+}
+
+// coverage résout le certificat d'un vhost, vide s'il n'en demande pas.
+func (p *Provider) coverage(proj *model.Project, vh model.VHost) tlsprov.Coverage {
+	if !wantsTLS(proj, vh) || p.Certificate == nil {
+		return tlsprov.Coverage{}
+	}
+	return p.Certificate(proj)
+}
+
+// vueTLS est ce que le certificat décide dans le rendu d'un vhost.
+type vueTLS struct {
+	// on rend le bloc 443.
+	on bool
+	// serverName est le nom canonique : celui du ServerName, vers lequel le port
+	// 80 redirige ; aliases, les autres noms, dans l'ordre déclaré.
+	serverName string
+	aliases    []string
+	// redirectScheme est le schéma de la cible d'un vhost de redirection.
+	redirectScheme string
+}
+
+// vueTLSDe calcule le rendu TLS d'un vhost selon ce que couvre un certificat —
+// le présent pour le rendu, le demandé pour savoir si une émission le changera.
+//
+// Le bloc 443 est rendu dès que le certificat couvre **l'un** des noms du vhost,
+// et non tous : un nom ajouté attend sa réémission sans retirer le HTTPS des
+// autres. Le critère n'est pas le seul domaine principal : quand celui-ci change
+// en gardant l'ancien parmi les alias, c'est l'ancien que le certificat couvre,
+// et il faut continuer de le servir. D'où le nom canonique, qui est le premier
+// nom couvert — la redirection du port 80 vise ainsi toujours un nom que le
+// certificat présente, jamais une erreur de nom. Les noms en attente restent
+// déclarés dans les deux blocs : le port 80 les sert pour le challenge HTTP-01,
+// avant toute redirection, et le 443 les présentera au rechargement qui suit
+// l'émission.
+//
+// Une redirection ne vise https que si sa cible, quand c'est un nom du projet,
+// est couverte : un domaine principal remplacé qui devient redirection doit
+// continuer d'aboutir pendant l'émission du nouveau, fût-ce en HTTP. Une cible
+// étrangère est visée en https dès que le TLS est voulu : ce que couvre notre
+// certificat ne dit rien d'elle — une préproduction dont le wildcard ne couvre
+// pas le nom redirigé l'enverrait sinon en http.
+func vueTLSDe(proj *model.Project, vh model.VHost, want bool, covers func(string) bool) vueTLS {
+	v := vueTLS{serverName: vh.Domains[0], aliases: vh.Domains[1:], redirectScheme: "http"}
+	if want {
+		for i, d := range vh.Domains {
+			if !covers(d) {
+				continue
+			}
+			v.on = true
+			if i > 0 {
+				v.serverName = d
+				v.aliases = append(append([]string{}, vh.Domains[:i]...), vh.Domains[i+1:]...)
+			}
+			break
+		}
+	}
+	target := optionString(vh.Options, "target", vh.Domains[0])
+	switch {
+	case !want:
+	case ownDomain(proj, target):
+		if covers(target) {
+			v.redirectScheme = "https"
+		}
+	default:
+		v.redirectScheme = "https"
+	}
+	return v
+}
+
+// equal compare deux rendus TLS.
+func (v vueTLS) equal(o vueTLS) bool {
+	return v.on == o.on && v.serverName == o.serverName &&
+		v.redirectScheme == o.redirectScheme && strings.Join(v.aliases, " ") == strings.Join(o.aliases, " ")
+}
+
+// ownDomain dit si un nom est l'un des domaines du projet.
+func ownDomain(proj *model.Project, name string) bool {
+	for _, d := range proj.Spec.Domains {
+		if strings.EqualFold(d.Name, name) {
+			return true
+		}
+	}
+	return false
 }
 
 // IncludeDir est le répertoire de surcharge d'un vhost pour un contexte donné.
@@ -625,42 +715,105 @@ func (p *Provider) includeStep(bp *VHostPlan) *engine.Step {
 	return s
 }
 
-// PlanTLS produit la bascule en TLS des vhosts dont le certificat n'était pas
-// encore disponible au moment du calcul. Ces étapes sont appliquées après
-// l'émission : le rendu est donc recalculé au moment de l'exécution, pas au plan.
+// PlanTLS produit la bascule des vhosts dont le rendu dépend d'une émission à
+// venir : l'activation du TLS d'un vhost que le certificat présent ne couvre
+// pas, ou le retour au nom canonique déclaré d'un vhost servi sur le certificat
+// en place. Ces étapes sont appliquées après l'émission : le rendu est donc
+// recalculé au moment de l'exécution, pas au plan.
+//
+// Un vhost dont le rendu ne change pas — un alias ajouté, le reste couvert —
+// n'a pas d'étape : son bloc 443 désigne déjà le certificat par son chemin, et
+// c'est le rechargement porté par l'étape d'émission qui lui fait présenter le
+// nouveau.
 func (p *Provider) PlanTLS(_ context.Context, proj *model.Project) []*engine.Step {
-	if p.CertRef == nil {
-		return nil
-	}
-	if _, ready := p.CertRef(proj); ready {
-		// Le certificat était déjà là : le vhost a été écrit en TLS d'emblée.
-		return nil
-	}
 	var steps []*engine.Step
 	for _, vh := range p.vhosts(proj) {
-		if proj.Spec.Web.TLSDisabled() || (vh.TLS != nil && !vh.TLS.Enabled) {
+		cov := p.coverage(proj, vh)
+		if cov.Ref == "" || cov.Complete() || len(vh.Domains) == 0 {
+			continue
+		}
+		want := wantsTLS(proj, vh)
+		avant, après := vueTLSDe(proj, vh, want, cov.Serves), vueTLSDe(proj, vh, want, cov.WillServe)
+		if avant.equal(après) {
 			continue
 		}
 		vhCopy := vh
 		name := p.vhostName(proj, vh)
-		s := engine.NewStep("web/vhost/"+name+"/tls", engine.Update,
-			fmt.Sprintf("activation TLS du vhost %s", name))
-		// Non critique : si l'émission a échoué, le site reste servi en HTTP.
+		summary := fmt.Sprintf("activation TLS du vhost %s", name)
+		switch {
+		case avant.on:
+			summary = fmt.Sprintf("bascule du vhost %s sur le certificat réémis", name)
+		case !après.on:
+			// Seule la cible change de schéma : une redirection que le certificat
+			// demandé ne couvre pas, vers un principal qu'il couvrira.
+			summary = fmt.Sprintf("redirection du vhost %s vers https", name)
+		}
+		s := engine.NewStep("web/vhost/"+name+"/tls", engine.Update, summary)
+		// Non critique : si l'émission a échoué, le site reste servi tel quel.
 		s.Critical = false
 		s.Apply = func(ctx context.Context) error {
-			ref, ready := p.CertRef(proj)
-			if !ready {
-				return fmt.Errorf("certificat %s indisponible : le vhost reste en HTTP "+
-					"(reprendre avec « ogs cert issue %s » puis « ogs apply %s »)", ref, proj.ID(), proj.ID())
-			}
+			// Le vhost est rendu d'après le matériel présent, et comparé au fichier
+			// en place, que l'émission ait abouti ou non : un repli a pu couvrir une
+			// partie de ce qu'elle visait — la cible d'une redirection écrite en http
+			// quand rien n'était couvert, que le visiteur rejoindrait sinon par un
+			// saut de plus jusqu'au prochain apply.
 			bp, err := p.Build(proj, vhCopy)
 			if err != nil {
 				return err
 			}
-			if bp.State == fs.StateCurrent {
+			écrit := false
+			switch bp.State {
+			case fs.StateCurrent:
+			case fs.StateHandEdited, fs.StateForeign:
+				// Le plan a refusé ou sauvegardé tout fichier retouché : celui-ci l'a
+				// été pendant l'exécution, et c'est le travail de quelqu'un, qu'une
+				// bascule n'écrase pas.
+				return fmt.Errorf("%s modifié hors ogs pendant l'exécution : bascule abandonnée", bp.Path)
+			default:
+				if err := p.writeVHost(ctx, bp); err != nil {
+					return err
+				}
+				écrit = true
+			}
+			cov := p.coverage(proj, vhCopy)
+			vue := vueTLSDe(proj, vhCopy, want, cov.Serves)
+			if vue.equal(vueTLSDe(proj, vhCopy, want, cov.WillServe)) {
 				return nil
 			}
-			return p.writeVHost(ctx, bp)
+			// L'émission a échoué, ou ne couvre pas tout : le rendu écrit ne
+			// présente que ce que couvre le matériel sur le disque.
+			reprise := fmt.Sprintf("reprendre avec « ogs cert issue %s » puis « ogs apply %s »",
+				proj.ID(), proj.ID())
+			var manquants []string
+			for _, d := range append(append([]string{}, vhCopy.Domains...),
+				optionString(vhCopy.Options, "target", "")) {
+				if d != "" && cov.WillServe(d) && !cov.Serves(d) {
+					manquants = append(manquants, d)
+				}
+			}
+			var manque error
+			switch {
+			case !vue.on && len(cov.Present) == 0:
+				manque = fmt.Errorf("certificat %s indisponible : le vhost reste en HTTP (%s)",
+					cov.Ref, reprise)
+			case !vue.on:
+				// Le certificat existe, et sert le site, mais ne couvre pas ce vhost :
+				// une redirection que la demande complète n'a pas obtenue. Le dire
+				// « indisponible » ferait croire le site en HTTP.
+				manque = fmt.Errorf("certificat %s sans %s : le vhost reste en HTTP (%s)",
+					cov.Ref, strings.Join(manquants, ", "), reprise)
+			default:
+				// Émission échouée ou repliée sans le nouveau nom : le certificat en
+				// place, réémis ou non, ne sert que l'ancien.
+				manque = fmt.Errorf("certificat %s sans %s : le vhost reste servi en HTTPS "+
+					"sous %s avec le certificat en place (%s)", cov.Ref, strings.Join(manquants, ", "),
+					vue.serverName, reprise)
+			}
+			if écrit {
+				// Un vhost réécrit doit être rechargé, bascule incomplète ou non.
+				return engine.Partial(manque)
+			}
+			return manque
 		}
 		s.Reload = []string{"web:" + p.Engine.Name()}
 		steps = append(steps, s)

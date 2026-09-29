@@ -46,6 +46,12 @@ type Request struct {
 	KeyType     string
 	Staging     bool
 	Email       string
+	// Essential porte les noms dont l'émission ne doit dépendre d'aucun autre :
+	// ceux du vhost principal. Quand la demande complète échoue, l'émission se
+	// replie par paliers qui écartent d'abord les redirections, puis les noms que
+	// le certificat en place ne couvre pas (fallbacks). Vide, la demande est d'un
+	// seul tenant — un certificat partagé, par exemple.
+	Essential []string
 }
 
 // Wildcard indique si la demande porte un joker, ce qui impose DNS-01 : aucun

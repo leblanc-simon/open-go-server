@@ -2,9 +2,11 @@ package tls
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -32,6 +34,13 @@ type Provider struct {
 	// sauvegarde horodatée (§6.4). Sans lui, le refus n'aurait aucune porte de
 	// sortie et le plan global resterait bloqué.
 	Force bool
+	// WebReload est l'intention de rechargement du serveur web retenu
+	// (« web:apache », « web:nginx »), portée par toute étape qui émet. Un
+	// certificat réémis remplace un matériel que le serveur garde en mémoire :
+	// sans rechargement, il continue de présenter l'ancien — celui qui ne couvre
+	// pas l'alias ajouté, ou qui expire —, et le vhost, dont le rendu n'a pas
+	// changé, ne déclenche rien de lui-même.
+	WebReload string
 }
 
 // refusStep produit l'étape qui refuse d'écraser un fichier qu'ogs n'a pas
@@ -85,8 +94,12 @@ func (p *Provider) Requests(proj *model.Project) ([]Request, error) {
 			req.Name = proj.ID()
 		}
 		if len(req.Domains) == 0 {
-			req.Domains = servedDomains(proj)
+			req.Domains = CertifiedDomains(proj)
 		}
+		// Un joker déclaré est essentiel dès qu'il couvre un nom servi : le
+		// comparer nom à nom l'écartait du repli, et www.shop.fr, qu'il couvrait,
+		// perdait sa couverture au premier repli réussi.
+		req.Essential = covering(req.Domains, servedDomains(proj))
 		if err := req.Validate(); err != nil {
 			return nil, err
 		}
@@ -101,11 +114,12 @@ func (p *Provider) Requests(proj *model.Project) ([]Request, error) {
 	if !wantsTLS(proj) {
 		return nil, nil
 	}
-	domains := servedDomains(proj)
+	domains := CertifiedDomains(proj)
 	if len(domains) == 0 {
 		return nil, nil
 	}
-	req := Request{Name: proj.ID(), Domains: domains, Challenge: ChallengeHTTP01}
+	req := Request{Name: proj.ID(), Domains: domains, Challenge: ChallengeHTTP01,
+		Essential: servedDomains(proj)}
 	if err := req.Validate(); err != nil {
 		return nil, err
 	}
@@ -127,6 +141,10 @@ func (p *Provider) SharedRef(proj *model.Project) string {
 	if !ok {
 		return ""
 	}
+	// Le critère porte sur les domaines servis, non sur les redirections : une
+	// redirection que le wildcard ne couvre pas ne vaut pas une émission propre à
+	// la préproduction, que D26 écarte. Son vhost reste alors en HTTP seul, le
+	// rendu ne présentant jamais un certificat qui ne couvre pas ses noms.
 	info := Info{Domains: shared.Domains}
 	if !info.Covers(servedDomains(proj)) {
 		return ""
@@ -177,8 +195,11 @@ func (p *Provider) SharedRequests() []Request {
 // et si son matériel est déjà présent sur le disque.
 func (p *Provider) CertificateFor(proj *model.Project) (ref string, available bool) {
 	if shared := p.SharedRef(proj); shared != "" {
-		_, ok, _ := p.Store.Read(shared)
-		return shared, ok
+		// La même règle que pour le certificat d'un projet : un wildcard expiré
+		// n'est plus présenté (Coverage), et l'annoncer disponible ferait dire à
+		// « status » qu'une préproduction repassée en HTTP seul est saine.
+		info, ok, _ := p.Store.Read(shared)
+		return shared, ok && !info.Expired(p.now())
 	}
 	reqs, err := p.Requests(proj)
 	if err != nil || len(reqs) == 0 {
@@ -189,9 +210,66 @@ func (p *Provider) CertificateFor(proj *model.Project) (ref string, available bo
 	if err != nil || !ok {
 		return ref, false
 	}
-	// Un certificat présent mais ne couvrant pas tous les domaines servis n'est
-	// pas utilisable : l'activer produirait un avertissement de sécurité.
+	// « Disponible » veut dire ici complet : présent, non expiré, couvrant toute
+	// la demande. C'est la question des rapports d'état. Le rendu des vhosts, lui,
+	// ne s'y fie pas — il suit ce que couvre le matériel présent (Coverage).
 	return ref, info.Covers(reqs[0].Domains) && !info.Expired(p.now())
+}
+
+// Coverage décrit, pour le rendu des vhosts d'un projet, le certificat qu'ils
+// emploient : sa référence, les noms que couvre le matériel présent sur le
+// disque, et ceux que couvrira le certificat demandé une fois émis.
+//
+// Les deux ne se confondent pas, et c'est tout l'enjeu. Un alias ajouté, un
+// domaine principal qui change font diverger la demande du matériel présent,
+// qui reste pourtant valable pour les noms qu'il couvrait. Juger le vhost sur la
+// demande le faisait redescendre en HTTP seul le temps de la réémission — donc
+// rechargé ainsi avant le challenge —, et pour de bon si elle échouait : HSTS
+// rendait alors le site injoignable à qui l'avait déjà visité, et les autres
+// recevaient sur le port 443 le vhost par défaut, celui d'un autre client.
+type Coverage struct {
+	// Ref est la référence du certificat, vide si le projet n'en demande aucun.
+	Ref string
+	// Present porte les noms du certificat présent, vide s'il est absent ou
+	// expiré : un certificat expiré n'est plus présenté.
+	Present []string
+	// Requested porte les domaines demandés : ceux que couvrira le certificat
+	// une fois émis.
+	Requested []string
+}
+
+// Serves dit si le certificat présent couvre un nom.
+func (c Coverage) Serves(name string) bool { return coveredBy(c.Present, name) }
+
+// WillServe dit si le certificat demandé couvrira un nom, une fois émis.
+func (c Coverage) WillServe(name string) bool { return coveredBy(c.Requested, name) }
+
+// Complete dit si le certificat présent couvre toute la demande : aucune
+// émission n'a alors de quoi changer le rendu d'un vhost.
+func (c Coverage) Complete() bool {
+	return len(c.Present) > 0 && Info{Domains: c.Present}.Covers(c.Requested)
+}
+
+// Coverage renvoie ce que le rendu des vhosts d'un projet doit savoir de son
+// certificat.
+func (p *Provider) Coverage(proj *model.Project) Coverage {
+	var cov Coverage
+	if shared := p.SharedRef(proj); shared != "" {
+		cov.Ref = shared
+		if req, ok := p.SharedRequest(shared); ok {
+			cov.Requested = req.Domains
+		}
+	} else {
+		reqs, err := p.Requests(proj)
+		if err != nil || len(reqs) == 0 {
+			return Coverage{}
+		}
+		cov.Ref, cov.Requested = reqs[0].Name, reqs[0].Domains
+	}
+	if info, ok, err := p.Store.Read(cov.Ref); err == nil && ok && !info.Expired(p.now()) {
+		cov.Present = info.Domains
+	}
+	return cov
 }
 
 // wantsTLS indique qu'au moins un vhost demande du TLS. En l'absence de
@@ -212,13 +290,48 @@ func wantsTLS(proj *model.Project) bool {
 	return false
 }
 
-// servedDomains renvoie les domaines à couvrir : les domaines principaux et les
-// alias, à l'exclusion des redirections, qui n'ont pas à être chiffrées.
+// servedDomains renvoie les domaines servis : les domaines principaux et les
+// alias, ceux du vhost principal.
 func servedDomains(proj *model.Project) []string {
 	var out []string
 	for _, d := range proj.Spec.Domains {
 		switch d.Role {
 		case "", "primary", "alias":
+			out = append(out, d.Name)
+		}
+	}
+	return out
+}
+
+// CertifiedDomains renvoie les domaines que le certificat d'un projet doit
+// couvrir : les domaines servis, puis les redirections. Un domaine redirigé a
+// autant besoin d'être chiffré (D43) — c'est une adresse connue, référencée, et
+// souvent un sous-domaine du principal, que le HSTS « includeSubDomains » de
+// celui-ci oblige le navigateur à joindre en HTTPS. L'en exclure servait son
+// vhost 443 avec un certificat qui ne le couvrait pas.
+//
+// La crainte qui les avait écartées est fondée : une commande ACME échoue tout
+// entière sur un seul nom refusé, et une redirection dont le DNS pointe ailleurs,
+// dont l'enregistrement a expiré ou dont l'AAAA mène à une autre machine ferait
+// échouer le renouvellement du principal — le site tomberait à l'échéance, des
+// semaines après une mise à jour qui n'avait rien cassé —, et un alias ajouté à
+// côté d'elle ne serait jamais couvert. Deux choses l'écartent : le rendu suit le
+// matériel présent (Coverage), non la demande, et l'émission se replie par
+// paliers quand la demande complète échoue, les redirections écartées les
+// premières (fallbacks). La redirection n'est alors couverte que lorsqu'elle peut
+// l'être ; le vhost principal, dès qu'il peut l'être.
+//
+// Une redirection qu'aucune demande ACME ne peut porter en est écartée : une
+// adresse IP, que la validation des domaines admet — rediriger
+// http://203.0.113.10 vers le site a du sens. La garder faisait refuser la
+// demande entière à la validation, donc le projet entier : plus d'apply, et le
+// renouvellement du parc, qui passe outre un projet en erreur, cessait sans un
+// mot de renouveler le site. Son vhost reste en HTTP seul, aucun certificat ne
+// couvrant son nom.
+func CertifiedDomains(proj *model.Project) []string {
+	out := servedDomains(proj)
+	for _, d := range proj.Spec.Domains {
+		if d.Role == "redirect" && validateDomain(d.Name) == nil {
 			out = append(out, d.Name)
 		}
 	}
@@ -257,6 +370,14 @@ func (p *Provider) certificateStep(req Request) (*engine.Step, error) {
 		return nil, err
 	}
 	now := p.now()
+	// Le rechargement n'est acquis qu'à l'émission réussie ou repliée : le moteur
+	// ne retient les intentions que des étapes appliquées, ou abouties en partie
+	// (stepError), et un échec laisse le serveur sur le certificat qu'il présente
+	// déjà.
+	var reload []string
+	if p.WebReload != "" {
+		reload = []string{p.WebReload}
+	}
 	switch {
 	case present && info.Covers(req.Domains) && !info.NeedsRenewal(now):
 		return engine.NewStep(resource, engine.NoOp,
@@ -266,22 +387,31 @@ func (p *Provider) certificateStep(req Request) (*engine.Step, error) {
 			fmt.Sprintf("certificat %s : domaines à couvrir modifiés (%s)",
 				req.Name, strings.Join(req.Domains, ", ")))
 		s.Critical = false
-		s.Apply = func(ctx context.Context) error { return p.issue(ctx, req) }
+		// Loin de l'échéance, le certificat en place reste servi : le repli n'a lieu
+		// que s'il couvre un nom de plus sans en retirer aucun. Près d'elle, il garde
+		// le site quoi qu'il en coûte aux autres noms.
+		urgent := info.NeedsRenewal(now)
+		s.Apply = func(ctx context.Context) error { return stepError(p.issueOrFallback(ctx, req, urgent)) }
+		// Le vidage recharge un vhost qui garde son bloc 443 sur le certificat en
+		// place : il n'expose que les nouveaux noms au challenge du port 80.
 		s.FlushReloads = req.Challenge == "http-01"
+		s.Reload = reload
 		return s, nil
 	case present:
 		s := engine.NewStep(resource, engine.Update,
 			fmt.Sprintf("renouvellement du certificat %s (expire dans %d jours)",
 				req.Name, info.DaysLeft(now)))
 		s.Critical = false
-		s.Apply = func(ctx context.Context) error { return p.issue(ctx, req) }
+		s.Apply = func(ctx context.Context) error { return stepError(p.issueOrFallback(ctx, req, true)) }
 		s.FlushReloads = req.Challenge == "http-01"
+		s.Reload = reload
 		return s, nil
 	}
 	s := engine.NewStep(resource, engine.Create,
 		fmt.Sprintf("certificat %s pour %s (%s)", req.Name, strings.Join(req.Domains, ", "), req.Challenge))
 	s.Critical = false
-	s.Apply = func(ctx context.Context) error { return p.issue(ctx, req) }
+	s.Apply = func(ctx context.Context) error { return stepError(p.issueOrFallback(ctx, req, true)) }
+	s.Reload = reload
 	// Le challenge HTTP-01 se fait servir par le vhost : il doit être chargé, non
 	// seulement écrit. Sans ce vidage, la première émission d'un site neuf échoue
 	// en 404, le serveur n'ayant pas encore relu sa configuration.
@@ -289,6 +419,193 @@ func (p *Provider) certificateStep(req Request) (*engine.Step, error) {
 	// La compensation ne retire que ce que cette exécution a créé.
 	s.Compensate = func(context.Context) error { return p.Store.Remove(req.Name) }
 	return s, nil
+}
+
+// stepError traduit l'issue d'une émission pour le moteur : un repli réussi est
+// un aboutissement partiel, qui garde le rechargement de l'étape — le certificat
+// a changé sur le disque, et le serveur présenterait sinon l'ancien.
+func stepError(err error) error {
+	if partial := (*PartialError)(nil); errors.As(err, &partial) {
+		return engine.Partial(err)
+	}
+	return err
+}
+
+// PartialError signale une émission repliée : la demande complète a échoué, et le
+// certificat n'a été émis que pour les noms essentiels (Request.Essential).
+type PartialError struct {
+	Name string
+	// Covered porte les noms que couvre le certificat émis, Missing ceux de la
+	// demande qu'il ne couvre pas.
+	Covered []string
+	Missing []string
+	// Dropped porte ceux des noms écartés que le certificat remplacé couvrait :
+	// une redirection validée autrefois, refusée aujourd'hui. Son vhost, écrit en
+	// HTTPS, présente désormais un certificat qui ne la couvre pas — jusqu'au
+	// prochain apply, qui le repasse en HTTP seul.
+	Dropped []string
+	// Cause est l'échec de la demande complète.
+	Cause error
+}
+
+func (e *PartialError) Error() string {
+	msg := fmt.Sprintf("certificat %s émis pour %s seulement — %s non couvert(s) : %v",
+		e.Name, strings.Join(e.Covered, ", "), strings.Join(e.Missing, ", "), e.Cause)
+	if len(e.Dropped) > 0 {
+		msg += fmt.Sprintf(" (%s n'est plus couvert : « ogs apply » retire son bloc 443)",
+			strings.Join(e.Dropped, ", "))
+	}
+	return msg
+}
+
+func (e *PartialError) Unwrap() error { return e.Cause }
+
+// fallbacks rend les demandes de repli d'une émission échouée, par paliers, de la
+// plus large à la plus étroite. Une commande ACME échoue tout entière sur un seul
+// nom refusé, et son erreur ne nomme ce nom que dans un texte propre à lego,
+// qu'ogs ne lit pas : chaque palier écarte une classe de noms dont l'échec est à
+// craindre, en commençant par la moins précieuse.
+//
+//  1. sans les redirections en attente — une redirection que le certificat en
+//     place ne couvre pas, dont le DNS ne pointe peut-être pas ici ;
+//  2. sans aucune redirection — une redirection validée autrefois peut être
+//     refusée aujourd'hui, son domaine ayant expiré ;
+//  3. ce que couvre le certificat en place — un alias ou un nouveau principal
+//     ajouté avant la bascule de son DNS fait échouer les deux paliers qui
+//     précèdent, et ce palier garde les redirections déjà servies, dont un
+//     www.shop.fr que le HSTS « includeSubDomains » du site oblige à joindre en
+//     HTTPS ;
+//  4. les noms du vhost principal que couvre le certificat en place — le site, à
+//     défaut de tout le reste.
+//
+// Sans certificat en place, les paliers se réduisent aux noms du vhost
+// principal : un site neuf dont la redirection ne pointe pas encore ici reçoit
+// quand même le sien. Un palier vide, ou identique à la demande ou à un palier
+// précédent, est omis. Une demande sans noms essentiels — un certificat partagé —
+// est d'un seul tenant : aucun palier.
+func fallbacks(req Request, inPlace *Info) []Request {
+	if len(req.Essential) == 0 {
+		return nil
+	}
+	var kept []string
+	if inPlace != nil {
+		kept = among(req.Domains, inPlace.Domains)
+	}
+	essential := req.Essential
+	paliers := [][]string{
+		keep(req.Domains, func(n string) bool { return slices.Contains(essential, n) || slices.Contains(kept, n) }),
+		essential,
+		kept,
+		keep(essential, func(n string) bool { return slices.Contains(kept, n) }),
+	}
+	vus := map[string]bool{strings.Join(req.Domains, ","): true}
+	var out []Request
+	for _, names := range paliers {
+		key := strings.Join(names, ",")
+		if len(names) == 0 || vus[key] {
+			continue
+		}
+		vus[key] = true
+		fb := req
+		// Un repli est d'un seul tenant : il ne se replie pas à son tour.
+		fb.Domains, fb.Essential = names, nil
+		out = append(out, fb)
+	}
+	return out
+}
+
+// among rend les noms de names que couvre covering, dans leur ordre.
+func among(names, covering []string) []string {
+	return keep(names, func(n string) bool { return coveredBy(covering, n) })
+}
+
+// covering rend les noms de names qui couvrent l'un de ceux de served, dans leur
+// ordre : un joker compte dès qu'il couvre un nom servi.
+func covering(names, served []string) []string {
+	return keep(names, func(n string) bool {
+		return slices.ContainsFunc(served, func(s string) bool { return coveredBy([]string{n}, s) })
+	})
+}
+
+// keep rend les noms qui satisfont le critère, dans leur ordre.
+func keep(names []string, ok func(string) bool) []string {
+	var out []string
+	for _, n := range names {
+		if ok(n) {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// issueOrFallback émet la demande complète et, si elle échoue, se replie par
+// paliers (fallbacks) : une commande ACME échoue tout entière sur un seul nom
+// refusé, et sans repli, une redirection dont le DNS pointe ailleurs ferait
+// expirer le certificat du site principal — ou empêcherait à jamais de couvrir
+// l'alias qu'on vient d'ajouter. Le premier palier qui aboutit rend une
+// *PartialError : le certificat est écrit, il ne couvre pas tout.
+//
+// Quand le certificat peut attendre — présent, loin de son échéance, sans
+// renouvellement forcé —, un palier n'est tenté que s'il couvre un nom que le
+// certificat en place ne couvre pas, sans retirer aucun de ceux qu'il sert.
+// Réémettre à l'identique consommerait les quotas de l'autorité pour rien, et
+// retirer un nom servi — l'ancien principal devenu redirection, qu'un HSTS garde
+// en HTTPS chez tous ses visiteurs — le casserait des semaines avant l'heure.
+// Près de l'échéance, le site passe avant tout le reste.
+func (p *Provider) issueOrFallback(ctx context.Context, req Request, urgent bool) error {
+	err := p.issue(ctx, req)
+	if err == nil {
+		return nil
+	}
+	var inPlace *Info
+	if info, ok, rerr := p.Store.Read(req.Name); rerr == nil && ok {
+		inPlace = &info
+	}
+	var served []string
+	if inPlace != nil && !inPlace.Expired(p.now()) {
+		served = among(req.Domains, inPlace.Domains)
+	}
+	échecs := err
+	var réservé *Request
+	for _, fb := range fallbacks(req, inPlace) {
+		if !urgent && inPlace != nil {
+			if inPlace.Covers(fb.Domains) {
+				continue
+			}
+			if !(Info{Domains: fb.Domains}).Covers(served) {
+				if réservé == nil {
+					réservé = &fb
+				}
+				continue
+			}
+		}
+		if ferr := p.issue(ctx, fb); ferr != nil {
+			échecs = fmt.Errorf("%w ; repli sur %s en échec : %v", échecs, strings.Join(fb.Domains, ", "), ferr)
+			continue
+		}
+		partial := &PartialError{Name: req.Name, Covered: fb.Domains, Cause: err}
+		for _, d := range req.Domains {
+			if coveredBy(fb.Domains, d) {
+				continue
+			}
+			partial.Missing = append(partial.Missing, d)
+			if coveredBy(served, d) {
+				partial.Dropped = append(partial.Dropped, d)
+			}
+		}
+		return partial
+	}
+	if réservé != nil {
+		// L'exploitant qui vient d'ajouter un nom doit apprendre pourquoi il n'est
+		// pas couvert, et quand il le sera : sans cela, seul le refus de la demande
+		// complète s'affichait, et l'attente semblait sans fin.
+		retirés := keep(served, func(n string) bool { return !coveredBy(réservé.Domains, n) })
+		échecs = fmt.Errorf("%w — repli sur %s réservé à l'échéance, à partir du %s : il retirerait %s, "+
+			"que le certificat en place sert encore (un renouvellement forcé l'impose dès maintenant)",
+			échecs, strings.Join(réservé.Domains, ", "),
+			inPlace.NotAfter.Add(-RenewBefore).Format("02/01/2006"), strings.Join(retirés, ", "))
+	}
+	return échecs
 }
 
 // issue émet le certificat en tenant compte de la suspension éventuelle.
@@ -328,10 +645,28 @@ func (p *Provider) issue(ctx context.Context, req Request) error {
 	return nil
 }
 
-// Issue émet ou renouvelle un certificat à la demande.
-func (p *Provider) Issue(ctx context.Context, req Request) error { return p.issue(ctx, req) }
+// Issue émet ou renouvelle un certificat à la demande. Le repli suit la règle du
+// plan : loin de l'échéance, seul un palier qui ajoute un nom sans en retirer
+// aucun est tenté.
+func (p *Provider) Issue(ctx context.Context, req Request) error {
+	info, present, err := p.Store.Read(req.Name)
+	if err != nil {
+		return err
+	}
+	return p.issueOrFallback(ctx, req, !present || info.NeedsRenewal(p.now()))
+}
 
-// Renew renouvelle les certificats arrivant à échéance et renvoie ceux traités.
+// AwaitsCoverage dit si seule la couverture motive la réémission d'un certificat :
+// présent, loin de son échéance, mais ne couvrant pas toute sa demande.
+func (p *Provider) AwaitsCoverage(req Request) bool {
+	info, ok, err := p.Store.Read(req.Name)
+	return err == nil && ok && !info.NeedsRenewal(p.now()) && !info.Covers(req.Domains)
+}
+
+// Renew renouvelle les certificats arrivant à échéance, ou ne couvrant plus les
+// domaines demandés, et renvoie ceux traités. Un renouvellement replié compte
+// parmi les traités — le matériel a changé, le serveur doit le relire — et parmi
+// les erreurs, les noms écartés restant à couvrir.
 func (p *Provider) Renew(ctx context.Context, requests []Request, force bool) ([]string, []error) {
 	var done []string
 	var errs []error
@@ -348,10 +683,19 @@ func (p *Provider) Renew(ctx context.Context, requests []Request, force bool) ([
 		if !present && !force {
 			continue
 		}
-		if present && !force && !info.NeedsRenewal(now) {
+		// Un certificat qui ne couvre plus la demande est réémis comme s'il
+		// arrivait à échéance : c'est ce qui reprend seul une émission échouée à
+		// l'apply — un alias dont le DNS ne pointait pas encore ici —, le vhost
+		// servant déjà ce nom sur le certificat en place.
+		due := !present || info.NeedsRenewal(now)
+		if present && !force && !due && info.Covers(req.Domains) {
 			continue
 		}
-		if err := p.issue(ctx, req); err != nil {
+		err = p.issueOrFallback(ctx, req, due || force)
+		if partial := (*PartialError)(nil); errors.As(err, &partial) {
+			done = append(done, req.Name)
+		}
+		if err != nil {
 			errs = append(errs, fmt.Errorf("%s : %w", req.Name, err))
 			continue
 		}

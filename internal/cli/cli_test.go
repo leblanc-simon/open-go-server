@@ -10,8 +10,10 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/klauspost/compress/zstd"
 
@@ -20,7 +22,9 @@ import (
 	"leblanc.io/open-go-server/internal/model"
 	appprov "leblanc.io/open-go-server/internal/provider/app"
 	runtimeprov "leblanc.io/open-go-server/internal/provider/runtime"
+	tlsprov "leblanc.io/open-go-server/internal/provider/tls"
 	"leblanc.io/open-go-server/internal/secret"
+	"leblanc.io/open-go-server/internal/spec"
 	"leblanc.io/open-go-server/internal/store"
 )
 
@@ -1280,6 +1284,467 @@ func TestDoctorWarnsOnExpiringCertificate(t *testing.T) {
 	}
 	if !strings.Contains(out, "certificats") {
 		t.Errorf("doctor doit rendre compte des certificats :\n%s", out)
+	}
+}
+
+// modifierDomaines réécrit les domaines déclarés d'un projet, comme le ferait
+// l'exploitant dans son fichier.
+func (h *harness) modifierDomaines(t *testing.T, id string, modifier func([]model.Domain) []model.Domain) {
+	t.Helper()
+	path := h.path("etc", "ogs", "projects", id+".yaml")
+	p, err := spec.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.Spec.Domains = modifier(p.Spec.Domains)
+	if err := spec.Save(path, p); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// nomsDuCertificat rend les noms que couvre un certificat présent sous le préfixe.
+func (h *harness) nomsDuCertificat(t *testing.T, name string) []string {
+	t.Helper()
+	info, ok, err := tlsprov.Store{Paths: config.NewPaths(h.prefix)}.Read(name)
+	if err != nil || !ok {
+		t.Fatalf("certificat %s illisible : %v", name, err)
+	}
+	return info.Domains
+}
+
+// vhostEtBloc443 rend le chemin du vhost principal de shopfr et la marque de son
+// bloc 443, selon le moteur.
+func vhostEtBloc443(moteur string) (string, string) {
+	if moteur == "nginx" {
+		return filepath.Join("etc", "nginx", "sites-available", "shopfr.conf"), "listen 443 ssl;"
+	}
+	return filepath.Join("etc", "apache2", "sites-available", "shopfr.conf"), "<VirtualHost *:443>"
+}
+
+func TestAjoutDAliasNeRetirePasLeHTTPSDuSite(t *testing.T) {
+	// shop.fr est en ligne en HTTPS, HSTS compris ; l'exploitant ajoute un alias,
+	// souvent avant d'en avoir basculé le DNS. Le vhost était réécrit en HTTP
+	// seul, rechargé ainsi avant le challenge, et le restait quand l'émission
+	// échouait : HSTS rendait le site injoignable à qui l'avait déjà visité, et
+	// les autres recevaient sur le port 443 le site d'un autre client.
+	for _, moteur := range []string{"apache", "nginx"} {
+		t.Run(moteur, func(t *testing.T) {
+			h := newHarness(t)
+			h.mustRun("init")
+			if moteur == "nginx" {
+				h.choisirNginx(t)
+				// Le paquet nginx crée ses répertoires ; le préfixe ne porte que ceux
+				// d'Apache.
+				for _, d := range []string{"sites-available", "sites-enabled"} {
+					if err := os.MkdirAll(h.path("etc", "nginx", d), 0o755); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			vhostRel, bloc443 := vhostEtBloc443(moteur)
+			h.mustRun("project", "create", "shop.fr", "--kind", "php-symfony", "--php", "8.5")
+			h.mustRunPartial("apply", "shopfr", "--yes")
+			if avant := h.read(t, vhostRel); !strings.Contains(avant, bloc443) {
+				t.Fatalf("le site doit être servi en HTTPS au départ :\n%s", avant)
+			}
+
+			h.modifierDomaines(t, "shopfr", func(d []model.Domain) []model.Domain {
+				return append(d, model.Domain{Name: "boutique.fr", Role: "alias"})
+			})
+			// Une autorité qui refuse boutique.fr.
+			h.suspendreACME(t, "shop.fr", "boutique.fr")
+
+			// Le plan n'annonce plus le retrait du bloc 443 ni du HSTS. L'en-tête,
+			// dont l'empreinte peut contenir « 443 », n'est pas du rendu.
+			diff, _ := h.run("diff", "shopfr")
+			for _, l := range strings.Split(diff, "\n") {
+				l = strings.TrimSpace(l)
+				if strings.HasPrefix(l, "-") && !strings.Contains(l, "empreinte: sha256:") &&
+					(strings.Contains(l, bloc443) || strings.Contains(l, "SSLEngine") ||
+						strings.Contains(l, "ssl_certificate") || strings.Contains(l, "Strict-Transport-Security")) {
+					t.Errorf("le diff retire le HTTPS du site : %q\n%s", l, diff)
+				}
+			}
+
+			out, code := h.run("apply", "shopfr", "--yes")
+			if code != CodePartial || !strings.Contains(out, "suspendues") {
+				t.Fatalf("l'émission devait échouer en avertissement (code %d) :\n%s", code, out)
+			}
+			apres := h.read(t, vhostRel)
+			if !strings.Contains(apres, bloc443) || !strings.Contains(apres, "Strict-Transport-Security") {
+				t.Errorf("le site doit rester servi en HTTPS, HSTS compris, sur le certificat en place :\n%s", apres)
+			}
+			if !strings.Contains(apres, "certificates/shopfr/fullchain.pem") {
+				t.Errorf("le vhost doit désigner le certificat en place :\n%s", apres)
+			}
+			if !strings.Contains(apres, "boutique.fr") {
+				t.Errorf("le nouvel alias doit être servi, ne serait-ce que pour son challenge :\n%s", apres)
+			}
+			// L'état dit ce que voit le visiteur : un HTTPS servi, un alias en attente.
+			status, _ := h.run("status", "shopfr")
+			if !strings.Contains(status, "incomplet") || strings.Contains(status, "absent") ||
+				!strings.Contains(status, "boutique.fr pas encore couvert") {
+				t.Errorf("le certificat doit être annoncé incomplet, non absent :\n%s", status)
+			}
+
+			// La cause levée, le timer de renouvellement reprend l'émission seul.
+			db, err := store.Open(h.path("var", "lib", "ogs", "state.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = db.ClearACMEFailures("shop.fr,boutique.fr")
+			db.Close()
+			renew := h.mustRun("cert", "renew", "--all")
+			if !strings.Contains(renew, "shopfr renouvelé") {
+				t.Errorf("le timer doit réémettre un certificat qui ne couvre plus la demande :\n%s", renew)
+			}
+			if noms := h.nomsDuCertificat(t, "shopfr"); !slices.Contains(noms, "boutique.fr") {
+				t.Errorf("le certificat réémis doit couvrir l'alias : %v", noms)
+			}
+			// Et le vhost, déjà prêt, n'a plus rien à changer.
+			plan := h.mustRun("plan", "shopfr")
+			for _, interdit := range []string{"~ vhost", "~ certificat", "activation TLS", "bascule du vhost"} {
+				if strings.Contains(plan, interdit) {
+					t.Errorf("%q inattendu après la réémission :\n%s", interdit, plan)
+				}
+			}
+		})
+	}
+}
+
+func TestAjoutDAliasRechargeLeServeurApresLEmission(t *testing.T) {
+	// Le vhost d'un alias ajouté ne change plus après l'émission : c'est l'étape
+	// du certificat qui doit recharger le serveur, sans quoi il présente
+	// indéfiniment l'ancien matériel, qui ne couvre pas l'alias.
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("project", "create", "shop.fr", "--kind", "php-symfony", "--php", "8.5")
+	h.mustRunPartial("apply", "shopfr", "--yes")
+	h.modifierDomaines(t, "shopfr", func(d []model.Domain) []model.Domain {
+		return append(d, model.Domain{Name: "boutique.fr", Role: "alias"})
+	})
+	out := h.mustRunPartial("apply", "shopfr", "--yes")
+	if strings.Contains(out, "activation TLS") {
+		t.Errorf("le vhost ne doit jamais repasser par le HTTP seul :\n%s", out)
+	}
+	iCert := strings.Index(out, "✓ certificat shopfr : domaines à couvrir modifiés")
+	iReload := strings.LastIndex(out, "↻ rechargement de apache2")
+	if iCert < 0 || iReload < iCert {
+		t.Errorf("un rechargement doit suivre l'émission (certificat=%d rechargement=%d) :\n%s",
+			iCert, iReload, out)
+	}
+	if noms := h.nomsDuCertificat(t, "shopfr"); !slices.Contains(noms, "boutique.fr") {
+		t.Errorf("le certificat doit couvrir l'alias : %v", noms)
+	}
+}
+
+func TestCertIssueRechargeLeServeurWeb(t *testing.T) {
+	// Un vhost déjà servi en HTTPS désigne son certificat par son chemin : une
+	// réémission manuelle ne change pas son rendu, et « ogs apply » ne
+	// rechargerait rien. C'est donc à « cert issue » de le faire.
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("project", "create", "shop.fr", "--kind", "static")
+	h.mustRun("apply", "--yes")
+	out := h.mustRun("cert", "issue", "shopfr")
+	iEmis := strings.Index(out, "émis")
+	iReload := strings.Index(out, "↻ rechargement de apache2")
+	if iEmis < 0 || iReload < iEmis {
+		t.Errorf("l'émission doit être suivie d'un rechargement :\n%s", out)
+	}
+}
+
+func TestRedirectionCouverteParLeCertificatDuProjet(t *testing.T) {
+	// Un domaine redirigé a autant besoin d'être chiffré (D43). Il était exclu du
+	// certificat, et son vhost 443 servait pourtant le certificat du projet :
+	// https://ancien-shop.fr rendait une erreur de nom au lieu de la 301.
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("site", "create", "shop.fr", "--kind", "static", "--redirect", "ancien-shop.fr", "--yes")
+	if noms := h.nomsDuCertificat(t, "shopfr"); !slices.Contains(noms, "ancien-shop.fr") {
+		t.Errorf("le certificat du projet doit couvrir la redirection : %v", noms)
+	}
+	redirect := h.read(t, filepath.Join("etc", "apache2", "sites-available", "shopfr_redirect.conf"))
+	if !strings.Contains(redirect, "<VirtualHost *:443>") ||
+		!strings.Contains(redirect, "certificates/shopfr/fullchain.pem") {
+		t.Errorf("la redirection doit être servie en HTTPS avec le certificat du projet :\n%s", redirect)
+	}
+	// Le certificat auto-signé que déclare « site create » suit la même règle.
+	h.mustRun("site", "create", "atelier.fr", "--kind", "static", "--redirect", "ancien-atelier.fr",
+		"--self-signed", "--yes")
+	if noms := h.nomsDuCertificat(t, "atelierfr"); !slices.Contains(noms, "ancien-atelier.fr") {
+		t.Errorf("le certificat déclaré doit couvrir la redirection : %v\n%s", noms,
+			h.read(t, filepath.Join("etc", "ogs", "projects", "atelierfr.yaml")))
+	}
+}
+
+func TestAliasDevenuRedirectionResteCouvertAuRenouvellement(t *testing.T) {
+	// Un alias basculé en redirection restait couvert par le certificat… jusqu'au
+	// renouvellement suivant, qui le réémettait sans lui : la redirection HTTPS
+	// cassait en silence, une soixantaine de jours plus tard.
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("site", "create", "shop.fr", "--kind", "static", "--alias", "ancien-shop.fr", "--yes")
+	h.modifierDomaines(t, "shopfr", func(d []model.Domain) []model.Domain {
+		for i := range d {
+			if d[i].Name == "ancien-shop.fr" {
+				d[i].Role, d[i].Target = "redirect", "shop.fr"
+			}
+		}
+		return d
+	})
+	h.mustRunPartial("apply", "shopfr", "--yes")
+	h.mustRun("cert", "renew", "shopfr", "--force")
+	if noms := h.nomsDuCertificat(t, "shopfr"); !slices.Contains(noms, "ancien-shop.fr") {
+		t.Errorf("le certificat renouvelé doit couvrir la redirection : %v", noms)
+	}
+	redirect := h.read(t, filepath.Join("etc", "apache2", "sites-available", "shopfr_redirect.conf"))
+	if !strings.Contains(redirect, "<VirtualHost *:443>") {
+		t.Errorf("la redirection doit rester servie en HTTPS :\n%s", redirect)
+	}
+}
+
+// suspendreACME simule une autorité qui refuse une liste de domaines : le compteur
+// porté au seuil suspend les tentatives, et l'émission de cette liste échoue comme
+// après cinq refus. Toute autre liste — celle d'un repli — reste permise.
+func (h *harness) suspendreACME(t *testing.T, domaines ...string) {
+	t.Helper()
+	db, err := store.Open(h.path("var", "lib", "ogs", "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	for i := 0; i < store.ACMEFailureThreshold; i++ {
+		if _, _, err := db.RecordACMEFailure(strings.Join(domaines, ","), "challenge http-01 refusé"); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestUneRedirectionRefuseeNeCoutePasLeRenouvellementDuSite(t *testing.T) {
+	// Un site en HTTPS reçoit une redirection dont le DNS pointe ailleurs. Mise dans
+	// la demande du certificat (D43), elle faisait échouer toute la commande ACME :
+	// le certificat du site ne se renouvelait plus, et le site tombait à
+	// l'échéance, HSTS compris — des semaines après une mise à jour qui n'avait
+	// rien cassé.
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("site", "create", "shop.fr", "--kind", "static", "--yes")
+	h.modifierDomaines(t, "shopfr", func(d []model.Domain) []model.Domain {
+		return append(d, model.Domain{Name: "ancien-shop.fr", Role: "redirect", Target: "shop.fr"})
+	})
+	h.suspendreACME(t, "shop.fr", "ancien-shop.fr")
+
+	out, code := h.run("apply", "shopfr", "--yes")
+	if code != CodePartial || !strings.Contains(out, "certificat shopfr sans ancien-shop.fr : le vhost reste en HTTP") {
+		t.Errorf("la redirection non couverte doit être signalée (code %d) :\n%s", code, out)
+	}
+	sites := filepath.Join("etc", "apache2", "sites-available")
+	if main := h.read(t, filepath.Join(sites, "shopfr.conf")); !strings.Contains(main, "<VirtualHost *:443>") {
+		t.Errorf("le site reste servi en HTTPS :\n%s", main)
+	}
+	if redirect := h.read(t, filepath.Join(sites, "shopfr_redirect.conf")); strings.Contains(redirect, "<VirtualHost *:443>") {
+		t.Errorf("aucun certificat ne couvre la redirection, aucun bloc 443 :\n%s", redirect)
+	}
+
+	chaîne := filepath.Join("var", "lib", "ogs", "acme", "certificates", "shopfr", "fullchain.pem")
+	avant := h.read(t, chaîne)
+	out, code = h.run("cert", "renew", "shopfr", "--force")
+	if code != CodePartial {
+		t.Errorf("la redirection écartée est un succès partiel (code %d) :\n%s", code, out)
+	}
+	for _, attendu := range []string{"✓ shopfr renouvelé", "ancien-shop.fr non couvert", "↻ rechargement de apache2"} {
+		if !strings.Contains(out, attendu) {
+			t.Errorf("%q absent :\n%s", attendu, out)
+		}
+	}
+	if h.read(t, chaîne) == avant {
+		t.Error("le certificat du site doit être renouvelé malgré la redirection refusée")
+	}
+	if noms := h.nomsDuCertificat(t, "shopfr"); strings.Join(noms, ",") != "shop.fr" {
+		t.Errorf("renouvelé pour le site seul : %v", noms)
+	}
+}
+
+func TestUnSiteNeufRecoitSonCertificatMalgreUneRedirectionRefusee(t *testing.T) {
+	// La première émission d'un site dont la redirection ne pointe pas encore ici :
+	// le site ne doit pas rester en HTTP pour autant.
+	h := newHarness(t)
+	h.mustRun("init")
+	h.suspendreACME(t, "shop.fr", "ancien-shop.fr")
+	out, code := h.run("site", "create", "shop.fr", "--kind", "static", "--redirect", "ancien-shop.fr", "--yes")
+	if code != CodePartial || !strings.Contains(out, "émis pour shop.fr seulement") {
+		t.Errorf("l'émission doit aboutir pour le site (code %d) :\n%s", code, out)
+	}
+	if noms := h.nomsDuCertificat(t, "shopfr"); strings.Join(noms, ",") != "shop.fr" {
+		t.Errorf("certificat du site : %v", noms)
+	}
+	sites := filepath.Join("etc", "apache2", "sites-available")
+	if main := h.read(t, filepath.Join(sites, "shopfr.conf")); !strings.Contains(main, "<VirtualHost *:443>") {
+		t.Errorf("le site doit être basculé en HTTPS :\n%s", main)
+	}
+	redirect := h.read(t, filepath.Join(sites, "shopfr_redirect.conf"))
+	if strings.Contains(redirect, "<VirtualHost *:443>") {
+		t.Errorf("la redirection non couverte reste en HTTP :\n%s", redirect)
+	}
+	// Écrite quand rien n'était couvert, elle visait http://shop.fr ; le repli a
+	// couvert le site, la bascule doit la réécrire vers https.
+	if !strings.Contains(redirect, "https://shop.fr$1") {
+		t.Errorf("la redirection doit viser le site en https une fois celui-ci couvert :\n%s", redirect)
+	}
+}
+
+func TestUnAliasEstCouvertMalgreUneRedirectionRefusee(t *testing.T) {
+	// Un site en HTTPS reçoit une redirection que l'autorité refuse et un alias
+	// joignable. Le repli ne retenait que les noms déjà couverts, et seulement
+	// près de l'échéance : l'alias n'était couvert ni à l'apply ni au timer, tant
+	// que la redirection restait refusée — alors qu'avant elle, il l'aurait été.
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("site", "create", "shop.fr", "--kind", "static", "--yes")
+	h.modifierDomaines(t, "shopfr", func(d []model.Domain) []model.Domain {
+		return append(d, model.Domain{Name: "boutique.fr", Role: "alias"},
+			model.Domain{Name: "ancien-shop.fr", Role: "redirect", Target: "shop.fr"})
+	})
+	h.suspendreACME(t, "shop.fr", "boutique.fr", "ancien-shop.fr")
+	out, code := h.run("apply", "shopfr", "--yes")
+	if code != CodePartial {
+		t.Errorf("la redirection écartée est un succès partiel (code %d) :\n%s", code, out)
+	}
+	if noms := h.nomsDuCertificat(t, "shopfr"); strings.Join(noms, ",") != "shop.fr,boutique.fr" {
+		t.Errorf("l'alias doit être couvert sans attendre la redirection : %v", noms)
+	}
+	// Le certificat est écrit et le serveur rechargé : l'étape n'a pas échoué.
+	if strings.Contains(out, "✗ certificat") ||
+		!strings.Contains(out, "✓ certificat shopfr : domaines à couvrir modifiés (shop.fr, boutique.fr, ancien-shop.fr) (en partie)") {
+		t.Errorf("une émission repliée s'annonce aboutie en partie, non en échec :\n%s", out)
+	}
+	if !strings.Contains(out, "ancien-shop.fr non couvert") {
+		t.Errorf("la redirection écartée doit être nommée :\n%s", out)
+	}
+}
+
+func TestUneRedirectionDepuisUneAdresseIPNeBloquePasLeProjet(t *testing.T) {
+	// La validation admet une adresse IP comme domaine. Mise dans la demande de
+	// certificat, une redirection depuis une IP la faisait refuser entière : plus
+	// de plan ni d'apply (code 3), « status » en erreur, et « cert renew --all »,
+	// qui passe outre un projet en erreur, cessait sans un mot de renouveler le
+	// site — le timer rendait 0 et le certificat expirait.
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("site", "create", "shop.fr", "--kind", "static", "--redirect", "203.0.113.10", "--yes")
+	if noms := h.nomsDuCertificat(t, "shopfr"); strings.Join(noms, ",") != "shop.fr" {
+		t.Errorf("certificat du site : %v", noms)
+	}
+	if out, code := h.run("plan", "shopfr"); code == CodeValidation {
+		t.Errorf("le projet doit rester planifiable :\n%s", out)
+	}
+	if status, _ := h.run("status", "shopfr"); strings.Contains(status, "erreur") {
+		t.Errorf("le projet n'est pas en erreur :\n%s", status)
+	}
+	renew := h.mustRun("cert", "renew", "--all", "--force")
+	if !strings.Contains(renew, "shopfr renouvelé") {
+		t.Errorf("le renouvellement du parc doit traiter le site :\n%s", renew)
+	}
+	redirect := h.read(t, filepath.Join("etc", "apache2", "sites-available", "shopfr_redirect.conf"))
+	if strings.Contains(redirect, "<VirtualHost *:443>") || !strings.Contains(redirect, "https://shop.fr$1") {
+		t.Errorf("la redirection d'une IP reste en HTTP, vers le site en https :\n%s", redirect)
+	}
+	// Le certificat auto-signé que déclare « site create » suit la même règle.
+	h.mustRun("site", "create", "atelier.fr", "--kind", "static", "--redirect", "203.0.113.20",
+		"--self-signed", "--yes")
+}
+
+func TestLeRenouvellementDuParcSignaleUnProjetQuIlNePeutExaminer(t *testing.T) {
+	// Un projet dont la demande de certificat est refusée — ici un alias en
+	// adresse IP, qu'aucun certificat ACME ne peut porter — était passé en
+	// silence par « cert renew --all » : le timer rendait 0, et le certificat du
+	// projet allait à l'expiration sans que rien ne l'annonce.
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("site", "create", "shop.fr", "--kind", "static", "--yes")
+	h.mustRun("site", "create", "atelier.fr", "--kind", "static", "--yes")
+	h.modifierDomaines(t, "atelierfr", func(d []model.Domain) []model.Domain {
+		return append(d, model.Domain{Name: "203.0.113.11", Role: "alias"})
+	})
+	out, code := h.run("cert", "renew", "--all", "--force")
+	if code != CodePartial {
+		t.Errorf("un projet non examiné est un échec partiel (code %d) :\n%s", code, out)
+	}
+	if !strings.Contains(out, "⚠ atelierfr : certificat non examiné, déclaration refusée") {
+		t.Errorf("le projet écarté doit être nommé :\n%s", out)
+	}
+	// Les autres projets n'en dépendent pas.
+	if !strings.Contains(out, "✓ shopfr renouvelé") || !strings.Contains(out, "↻ rechargement de apache2") {
+		t.Errorf("le reste du parc doit être renouvelé et rechargé :\n%s", out)
+	}
+}
+
+func TestLeTimerNeDevancePasLApply(t *testing.T) {
+	// Un alias ajouté au fichier mais pas encore appliqué n'est servi par aucun
+	// vhost : le timer qui réémettait pour lui échouait au challenge, et chaque
+	// passage comptait un échec auprès de l'autorité, jusqu'à suspendre les
+	// tentatives de l'apply qui suit.
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("site", "create", "shop.fr", "--kind", "static", "--yes")
+	h.modifierDomaines(t, "shopfr", func(d []model.Domain) []model.Domain {
+		return append(d, model.Domain{Name: "boutique.fr", Role: "alias"})
+	})
+	out := h.mustRun("cert", "renew", "--all")
+	if !strings.Contains(out, "réémission laissée à « ogs apply shopfr »") {
+		t.Errorf("la réémission doit attendre l'apply :\n%s", out)
+	}
+	if noms := h.nomsDuCertificat(t, "shopfr"); slices.Contains(noms, "boutique.fr") {
+		t.Errorf("aucune émission avant l'apply : %v", noms)
+	}
+	// Une échéance, elle, n'attend pas : --force est la main de l'exploitant.
+	h.mustRun("cert", "renew", "shopfr", "--force")
+	if noms := h.nomsDuCertificat(t, "shopfr"); !slices.Contains(noms, "boutique.fr") {
+		t.Errorf("--force réémet pour la déclaration : %v", noms)
+	}
+}
+
+func TestStatutNommeCeQueLeCertificatEnPlaceSertEncore(t *testing.T) {
+	// Le domaine principal change et l'ancien devient une redirection : tant que
+	// le nouveau n'est pas couvert, c'est la redirection qui reste en HTTPS, le
+	// site passant en HTTP seul. « HTTPS servi sur le certificat en place » disait
+	// le site servi.
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("site", "create", "shop.fr", "--kind", "static", "--yes")
+	h.modifierDomaines(t, "shopfr", func([]model.Domain) []model.Domain {
+		return []model.Domain{{Name: "boutique.fr", Role: "primary"},
+			{Name: "shop.fr", Role: "redirect", Target: "boutique.fr"}}
+	})
+	h.suspendreACME(t, "boutique.fr", "shop.fr")
+	h.mustRunPartial("apply", "shopfr", "--yes")
+	status, _ := h.run("status", "shopfr")
+	if !strings.Contains(status, "boutique.fr pas encore couvert(s), HTTPS servi pour shop.fr sur") {
+		t.Errorf("l'état doit nommer ce qui reste servi en HTTPS :\n%s", status)
+	}
+}
+
+func TestStatutAnnonceUnCertificatExpire(t *testing.T) {
+	// Un certificat expiré n'est ni absent ni incomplet : c'est le mot qui guide
+	// vers la cause, un renouvellement qui échoue depuis un mois.
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("site", "create", "shop.fr", "--kind", "static", "--yes")
+	passé := func() time.Time { return time.Now().Add(-48 * time.Hour) }
+	matériel, err := tlsprov.SelfSigned{Validity: time.Hour, Now: passé}.Issue(context.Background(),
+		tlsprov.Request{Name: "shopfr", Domains: []string{"shop.fr"}, Challenge: tlsprov.ChallengeSelfSigned})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := (tlsprov.Store{Paths: config.NewPaths(h.prefix)}).Write("shopfr", matériel); err != nil {
+		t.Fatal(err)
+	}
+	status, code := h.run("status", "shopfr")
+	colonne := regexp.MustCompile(`(?m)^shopfr\s+prod\s+shop\.fr\s+\S+\s+\d+\s+\S+\s+expiré\s`)
+	if code != CodePartial || !strings.Contains(status, "certificat shopfr expiré depuis le") ||
+		!colonne.MatchString(status) {
+		t.Errorf("l'expiration doit être nommée (code %d) :\n%s", code, status)
 	}
 }
 

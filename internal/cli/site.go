@@ -18,6 +18,7 @@ import (
 	"leblanc.io/open-go-server/internal/naming"
 	"leblanc.io/open-go-server/internal/provider/amqp"
 	"leblanc.io/open-go-server/internal/provider/db"
+	tlsprov "leblanc.io/open-go-server/internal/provider/tls"
 	"leblanc.io/open-go-server/internal/provider/unit"
 	"leblanc.io/open-go-server/internal/spec"
 	"leblanc.io/open-go-server/internal/validate"
@@ -212,7 +213,7 @@ func (a *App) buildSite(host string, opts siteOptions) (*model.Project, error) {
 	}
 	if opts.selfSigned {
 		p.Spec.Certificates = []model.Certificate{{
-			Name: p.ID(), Domains: servedDomains(p), Challenge: "selfsigned",
+			Name: p.ID(), Domains: tlsprov.CertifiedDomains(p), Challenge: "selfsigned",
 		}}
 	}
 	for _, raw := range opts.services {
@@ -234,18 +235,6 @@ func (a *App) buildSite(host string, opts siteOptions) (*model.Project, error) {
 		return nil, err
 	}
 	return p, nil
-}
-
-// servedDomains renvoie les domaines à couvrir par un certificat.
-func servedDomains(p *model.Project) []string {
-	var out []string
-	for _, d := range p.Spec.Domains {
-		switch d.Role {
-		case "", "primary", "alias":
-			out = append(out, d.Name)
-		}
-	}
-	return out
 }
 
 // parseServiceOption lit « template:transport:instances ».
@@ -524,11 +513,7 @@ func (a *App) applyProjects(cmd *cobra.Command, projects []*model.Project) error
 		}
 		report, err := engine.Execute(cmd.Context(), plan, engine.Options{
 			OnStep: func(s *engine.Step, stepErr error) {
-				if stepErr == nil {
-					a.printf("  ✓ %s\n", s.Summary)
-				} else {
-					a.printf("  ✗ %s : %v\n", s.Summary, stepErr)
-				}
+				a.printf("  %s\n", issueDÉtape(s, stepErr))
 			},
 			OnWarning: func(s *engine.Step, stepErr error) {
 				a.printf("  ⚠ %s : %v\n", s.Summary, stepErr)
@@ -688,10 +673,11 @@ func newStatusCommand(app *App) *cobra.Command {
 				}
 				if ref, ready := provs.TLS.CertificateFor(p); ref != "" {
 					if !ready {
-						row.Certifate = "absent"
-						row.Problems = append(row.Problems, "certificat "+ref+" indisponible")
+						état, problème := étatDuCertificat(provs, p, ref)
+						row.Certifate = état
+						row.Problems = append(row.Problems, problème)
 						if row.Health == "sain" {
-							row.Health = "TLS absent"
+							row.Health = "TLS " + état
 						}
 						problems++
 					} else if info, ok, _ := provs.TLS.Store.Read(ref); ok {

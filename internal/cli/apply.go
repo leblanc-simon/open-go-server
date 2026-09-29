@@ -806,11 +806,7 @@ func newApplyCommand(app *App) *cobra.Command {
 				}
 				report, err := engine.Execute(cmd.Context(), plan, engine.Options{
 					OnStep: func(s *engine.Step, stepErr error) {
-						if stepErr == nil {
-							app.printf("  ✓ %s\n", s.Summary)
-						} else {
-							app.printf("  ✗ %s : %v\n", s.Summary, stepErr)
-						}
+						app.printf("  %s\n", issueDÉtape(s, stepErr))
 					},
 					OnWarning: func(s *engine.Step, stepErr error) {
 						app.printf("  ⚠ %s : %v\n", s.Summary, stepErr)
@@ -910,7 +906,7 @@ func (a *App) systemctlBin(ctx context.Context, bin string, args ...string) erro
 
 // recordState met à jour l'état observé après une application réussie.
 func (a *App) recordState(p *model.Project) error {
-	data, err := spec.Encode(p)
+	hash, err := specHash(p)
 	if err != nil {
 		return wrap(CodeError, err)
 	}
@@ -918,9 +914,34 @@ func (a *App) recordState(p *model.Project) error {
 		ID: p.ID(), Host: p.Metadata.Host, Env: p.Metadata.Env,
 		EffectiveHost: effectiveHostOf(p), Home: p.Spec.Layout.Root,
 		AppKind: string(p.Spec.App.Kind), AppVersion: p.Spec.App.Version,
-		SpecHash: fs.Fingerprint(data),
+		SpecHash: hash,
 	}
 	return wrap(CodeError, a.Store.UpsertProject(row))
+}
+
+// specHash est l'empreinte de la déclaration d'un projet, telle qu'enregistrée
+// à chaque apply.
+func specHash(p *model.Project) (string, error) {
+	data, err := spec.Encode(p)
+	if err != nil {
+		return "", err
+	}
+	return fs.Fingerprint(data), nil
+}
+
+// applied dit si la déclaration d'un projet est celle de son dernier apply : ce
+// que servent ses vhosts est alors ce qu'elle déclare. Faux au moindre doute —
+// base fermée, projet jamais appliqué.
+func (a *App) applied(p *model.Project) bool {
+	if a.Store == nil {
+		return false
+	}
+	row, err := a.Store.Project(p.ID())
+	if err != nil {
+		return false
+	}
+	hash, err := specHash(p)
+	return err == nil && row.SpecHash == hash
 }
 
 // withProject fond le projet courant dans la liste du parc : lors d'une
@@ -982,4 +1003,20 @@ var _ = tabwriter.NewWriter
 // étape : sans lui, seul le compte des avertissements en gardait la trace.
 func (a *App) reloadWarning(target string, err error) {
 	a.printf("  ⚠ rechargement %s : %v\n", target, err)
+}
+
+// issueDÉtape rend la ligne qui annonce l'issue d'une étape. Une étape aboutie en
+// partie (engine.PartialError) — un certificat émis pour les seuls noms que
+// l'autorité a acceptés — a produit son effet : le certificat est écrit, le
+// serveur le rechargera. La marquer « ✗ » ferait croire à un échec, et
+// l'avertissement qui la suit dit déjà ce qui manque.
+func issueDÉtape(s *engine.Step, stepErr error) string {
+	partial := (*engine.PartialError)(nil)
+	switch {
+	case stepErr == nil:
+		return "✓ " + s.Summary
+	case errors.As(stepErr, &partial):
+		return "✓ " + s.Summary + " (en partie)"
+	}
+	return fmt.Sprintf("✗ %s : %v", s.Summary, stepErr)
 }

@@ -136,6 +136,29 @@ type Options struct {
 // ErrDryRun est renvoyé lorsque l'exécution a été simulée.
 var ErrDryRun = errors.New("exécution simulée")
 
+// PartialError marque l'aboutissement partiel d'une étape non critique : elle a
+// produit un effet, mais pas tout ce qu'elle visait. L'exécution la remonte en
+// avertissement, comme un échec, et retient pourtant ses intentions de
+// rechargement — un certificat émis pour une partie de ses noms remplace le
+// matériel que le serveur garde en mémoire, et sans rechargement il continuerait
+// de présenter l'ancien, jusqu'à son expiration.
+//
+// Elle n'est pas pour autant comptée parmi les étapes à compenser : défaire ce
+// qu'elle a produit, sur l'échec d'une étape critique plus loin, retirerait un
+// matériel que d'autres étapes ont pu déjà désigner.
+type PartialError struct{ Err error }
+
+func (e *PartialError) Error() string { return e.Err.Error() }
+func (e *PartialError) Unwrap() error { return e.Err }
+
+// Partial enveloppe l'erreur d'une étape qui n'a abouti qu'en partie.
+func Partial(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &PartialError{Err: err}
+}
+
 // Execute applique le plan en saga : les étapes sont jouées dans l'ordre et,
 // si une étape critique échoue, les étapes déjà appliquées sont compensées en
 // ordre inverse. Une étape non critique en échec produit un avertissement et
@@ -217,6 +240,9 @@ func Execute(ctx context.Context, plan *Plan, opts Options) (*Report, error) {
 				opts.Audit(s, "ok", "")
 			}
 		case !s.Critical:
+			if partial := (*PartialError)(nil); errors.As(err, &partial) {
+				attendre(s.Reload)
+			}
 			report.Warnings = append(report.Warnings, fmt.Sprintf("%s : %v", s.Resource, err))
 			if opts.OnWarning != nil {
 				opts.OnWarning(s, err)

@@ -330,6 +330,7 @@ func (a *App) buildProviders() (*providers, error) {
 	if a.Exec.Simulated() {
 		certs.Issuer = tlsprov.SelfSigned{}
 	}
+	certs.WebReload = sys.WebReload
 	fw, err := a.firewallProvider(eng.Unit())
 	if err != nil {
 		return nil, err
@@ -349,7 +350,7 @@ func (a *App) buildProviders() (*providers, error) {
 		PHP:     php,
 		Web: &web.Provider{
 			Paths: a.Paths, Exec: a.Exec, Templates: tmpl, Engine: eng, PHP: php,
-			CertRef:     certs.CertificateFor,
+			Certificate: certs.Coverage,
 			CertDir:     certStore.Dir,
 			ProxyTarget: appProv.ProxyTarget,
 			Force:       a.Force,
