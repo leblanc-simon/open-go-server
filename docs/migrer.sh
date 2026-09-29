@@ -46,6 +46,8 @@
 #
 # Variable d'environnement : OGS, la commande ogs (défaut « ogs »). Pour un essai
 # sans privilèges : OGS="./ogs --prefix ./dev" migrer.sh -m m.yaml declarer shopfr
+# TMPDIR (défaut /tmp) accueille le répertoire privé de l'exécution : refusé si
+# un autre compte peut y renommer ce que le script dépose.
 #
 # Dépendances sur la cible : python3 et python3-yaml, rsync, curl, dig, gzip.
 # Sur la source : rsync, mysqldump ou pg_dump.
@@ -116,13 +118,34 @@ MANIFESTE="$(realpath "$MANIFESTE")"
 # Un répertoire par exécution, supprimé en entier à la sortie : temporaire() est
 # appelée dans $(…), un sous-shell où l'ajout à une liste se perdrait — et avec
 # lui la suppression de fichiers qui portent des secrets (ogs secrets env).
-TMPD="$(mktemp -d "${TMPDIR:-/tmp}/migrer.XXXXXX")"
+TMPD="$(realpath -- "$(mktemp -d "${TMPDIR:-/tmp}/migrer.XXXXXX")")"
 PY="$TMPD/migrer.py"
 TEMPORAIRES=("$TMPD")
+# Le socket de contrôle de ssh (ControlMaster) vit dans ce répertoire, jamais sous
+# un nom stable d'un répertoire commun : ssh se raccorde au socket qu'il trouve
+# sans demander qui l'a posé, et un compte local qui y aurait posé le sien
+# recevrait les commandes de root destinées à la source — et fournirait ce que la
+# cible en reçoit : dumps rechargés en root, fichiers copiés, lectures qui
+# pilotent le script.
+SSH_CTL="$TMPD/ssh"
 BASCULE_EN_COURS=''
 RETOUR_EN_COURS=''
 nettoyer() {
     local rc=$?
+    # Un second Ctrl+C pendant la fermeture du maître ne doit pas sauter la
+    # suppression des secrets : le piège « exit 130 » s'exécuterait dans celui-ci.
+    # Un gestionnaire non vide, et non « '' », est remis à la valeur par défaut
+    # chez les enfants : ssh -O exit reste interruptible.
+    trap : HUP INT TERM
+    # D'abord ce qui ne doit pas manquer : le maître ssh survivrait au script,
+    # ControlPersist durant, et une sortie coupée (tee interrompu) tuerait le shell
+    # au premier message, avant la suppression des secrets.
+    if [[ -S "$SSH_CTL" ]]; then
+        ssh -o "ControlPath=${SSH_CTL//%/%%}" -O exit "${SRC_SSH:-source}" </dev/null >/dev/null 2>&1 || true
+    fi
+    # Un second Ctrl+C, impatient, ne laisse pas les secrets en place.
+    trap '' HUP INT TERM
+    rm -rf "${TEMPORAIRES[@]}"
     if ((rc != 0)); then
         local relancer
         relancer="$0 -m $(printf '%q' "$MANIFESTE") --executer"
@@ -136,9 +159,41 @@ nettoyer() {
             erreur "Reprendre : $relancer retour $RETOUR_EN_COURS"
         fi
     fi
-    rm -rf "${TEMPORAIRES[@]}"
 }
 trap nettoyer EXIT
+# Une interruption (Ctrl+C, session coupée, kill) passe par exit : bash lance bien
+# le piège EXIT sur un signal fatal, mais sous le code de la dernière commande —
+# 0, le plus souvent —, et une bascule interrompue n'y serait pas signalée.
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# repertoire_prive <répertoire> : à ce seul compte (0700), et nul autre ne peut le
+# renommer pour poser le sien à sa place — chaque parent est à root ou à ce
+# compte, et n'est inscriptible par d'autres que sous le bit sticky, comme /tmp.
+# Sinon, code 1 et le premier répertoire du chemin en défaut.
+repertoire_prive() {
+    local d="$1" u m
+    while :; do
+        read -r u m < <(stat -c '%u %a' -- "$d") || break
+        if [[ $d == "$1" ]]; then
+            [[ $u == "$EUID" && $m == 700 ]] || break
+        else
+            [[ $u == 0 || $u == "$EUID" ]] || break
+            (( (8#$m & 8#022) == 0 || (8#$m & 8#1000) != 0 )) || break
+        fi
+        [[ $d != / ]] || return 0
+        d="$(dirname -- "$d")"
+    done
+    printf '%s' "$d"
+    return 1
+}
+# Ce répertoire porte le script Python que root exécute, les chaînes de connexion
+# d'ogs et le socket de ssh. mktemp -d le crée en exclusivité, en 0700, sous un
+# nom imprévisible : encore faut-il que TMPDIR ne laisse personne le remplacer.
+if ! EXPOSE="$(repertoire_prive "$TMPD")"; then
+    fatal "TMPDIR=${TMPDIR:-/tmp} : $EXPOSE est à un autre compte, ou inscriptible par d'autres sans bit sticky — le répertoire de l'exécution pourrait y être remplacé ; relancer avec TMPDIR=/tmp"
+fi
 
 cat >"$PY" <<'PYEOF'
 import copy, glob, hashlib, json, os, re, sys, urllib.parse
@@ -616,7 +671,10 @@ def c_export(fichier, path):
     with open(fichier, encoding="utf-8") as f:
         print(fmt(chemin(yaml.safe_load(f), path)))
 
-def c_resoudre(valeur, env_json):
+def c_resoudre(env_json):
+    # La référence arrive par l'environnement, comme la valeur à c_config : une
+    # valeur écrite telle quelle dans le manifeste est celle que reçoit le fichier.
+    valeur = os.environ["MIGRER_REF"]
     if not valeur.startswith("@ogs:"):
         print(valeur, end="")
         return
@@ -644,7 +702,8 @@ def php_chaine(v):
 
 def c_config(fichier, format_, cle):
     # La valeur arrive par l'environnement, pas par la ligne de commande : celle-ci
-    # est lisible de tout compte de la machine (ps), et elle porte des mots de passe.
+    # est lisible de tout compte de la machine (ps, /proc/<pid>/cmdline), et elle
+    # porte des mots de passe ; l'environnement ne l'est que du compte qui l'exécute.
     valeur = os.environ["MIGRER_VALEUR"]
     with open(fichier, encoding="utf-8") as f:
         texte = f.read()
@@ -769,8 +828,11 @@ SRC_SSH="$(m - source.ssh)"
 SRC_PORT="$(m - source.port_ssh)"; SRC_PORT="${SRC_PORT:-22}"
 SRC_IP="$(m - source.ip_publique)"
 SRC_IP6="$(m - source.ip6_publique)"
+# Une connexion maîtresse sert les appels d'une exécution, par le socket de son
+# répertoire privé (SSH_CTL) — les % doublés, ssh y lisant des jetons. nettoyer la
+# ferme ; un script tué sans nettoyer ne la laisse qu'une minute d'inactivité.
 SSH_OPTS=(-p "$SRC_PORT" -o BatchMode=yes -o ConnectTimeout=15
-          -o ControlMaster=auto -o "ControlPath=${TMPDIR:-/tmp}/migrer-ssh-%C" -o ControlPersist=15m)
+          -o ControlMaster=auto -o "ControlPath=${SSH_CTL//%/%%}" -o ControlPersist=60)
 # Sans -n : rsync parle son protocole par l'entrée standard de ssh.
 RSYNC_SSH="ssh $(printf '%q ' "${SSH_OPTS[@]}")"
 CIBLE_IP="$(m - cible.ip_publique)"
@@ -1246,7 +1308,9 @@ reecrire_configuration() {
         [[ -n "$fichier" ]] || continue
         local chemin_f="${P_ROOT[$id]}/$fichier" n=0
         while IFS=$'\x1f' read -r cle ref; do
-            valeur="$(py resoudre "$ref" "$env_json")" || fatal "$id : $fichier, $cle : valeur irrésoluble"
+            # Ni la référence ni la valeur ne passent par une ligne de commande, que
+            # tout compte de la machine lit dans /proc/<pid>/cmdline.
+            valeur="$(MIGRER_REF="$ref" py resoudre "$env_json")" || fatal "$id : $fichier, $cle : valeur irrésoluble"
             cmd_affiche "réécrire $cle dans $chemin_f ($format), sous le compte ${P_USER[$id]}"
             if ((EXECUTER)); then
                 [[ -f "$chemin_f" ]] || fatal "$chemin_f absent après la copie"
@@ -1713,7 +1777,9 @@ if ((EXECUTER)); then
     ((EUID == 0)) || fatal "--executer exige root"
     install -d -m 0700 "$TRAVAIL"
     JOURNAL="$TRAVAIL/journal-$(date +%Y%m%d-%H%M%S)-$PHASE.log"
-    exec > >(tee -a "$JOURNAL") 2>&1
+    # -i : un Ctrl+C, reçu par tout le groupe, ne coupe pas le journal avant les
+    # consignes de reprise qu'affiche nettoyer.
+    exec > >(tee -i -a "$JOURNAL") 2>&1
     exec 9>"$TRAVAIL/.verrou"
     flock -n 9 || fatal "une autre migration est en cours ($TRAVAIL/.verrou)"
     info "journal : $JOURNAL"

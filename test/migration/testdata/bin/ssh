@@ -6,17 +6,51 @@
 # Comme le vrai, il lit l'entrée standard jusqu'au bout pour la transmettre au
 # distant — sauf avec -n. C'est ce qui rend visible un ssh lancé sans -n dans une
 # boucle « while read » : il en avale les éléments suivants.
+#
+# Comme le vrai encore, le premier appel multiplexé (ControlMaster, ControlPath)
+# pose le socket de contrôle, et « -O exit » le retire. Il refuse un socket dont
+# le répertoire n'est pas à ce seul compte, en 0700 : le vrai s'y raccorderait
+# sans demander qui l'a posé.
 set -u
-sans_entree=0
+sans_entree=0 maitre='' controle='' ordre=''
 while (($#)); do
     case "$1" in
         -n) sans_entree=1; shift ;;
-        -p|-o|-l|-i|-F|-S|-O|-E) shift 2 ;;
+        -o) case "$2" in
+                ControlMaster=*) maitre="${2#*=}" ;;
+                ControlPath=*)   controle="${2#*=}" ;;
+            esac
+            shift 2 ;;
+        -O) ordre="$2"; shift 2 ;;
+        -p|-l|-i|-F|-S|-E) shift 2 ;;
         -*) shift ;;
         *) break ;;
     esac
 done
 shift # l'hôte
+
+if [[ -n "$controle" && "$controle" != none ]]; then
+    rep="$(dirname -- "$controle")"
+    droits="$(stat -c '%u %a' -- "$rep" 2>/dev/null || echo absent)"
+    printf '[ssh-controle] %s %s\n' "$droits" "$controle" >>"$FAUX_JOURNAL"
+    if [[ "$droits" != "$(id -u) 700" ]]; then
+        echo "faux ssh : socket de contrôle $controle hors d'un répertoire privé ($droits)" >&2
+        exit 255
+    fi
+fi
+if [[ -n "$ordre" ]]; then
+    printf '[ssh -O %s] %s\n' "$ordre" "$controle" >>"$FAUX_JOURNAL"
+    [[ -S "$controle" ]] || { echo "Control socket connect($controle): No such file or directory" >&2; exit 255; }
+    if [[ "$ordre" == exit ]]; then rm -f -- "$controle"; fi
+    exit 0
+fi
+if [[ -n "$controle" && "$controle" != none && "$maitre" =~ ^(auto|yes|autoask|ask)$ && ! -e "$controle" ]]; then
+    # Relatif : un chemin de socket ne dépasse pas 108 octets, et celui du banc
+    # est long. Le vrai python3, pour ne pas noter cet appel au journal.
+    (cd "$rep" && "$FAUX_PYTHON3" -c 'import socket, sys; socket.socket(socket.AF_UNIX).bind(sys.argv[1])' \
+        "$(basename -- "$controle")")
+fi
+
 distant="$*"
 case "$distant" in
     # rsync parle son protocole par l'entrée et la sortie standard.

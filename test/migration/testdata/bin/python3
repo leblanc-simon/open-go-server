@@ -1,0 +1,6 @@
+#!/bin/bash
+# Enveloppe du vrai python3 ($FAUX_PYTHON3) : note sous quelle identité il est
+# lancé, et avec quels arguments — ce que tout compte de la machine lit dans
+# /proc/<pid>/cmdline, quand il s'y trouve un secret.
+printf '[python3 %s] %s\n' "${FAUX_IDENTITE:-root}" "$*" >>"$FAUX_JOURNAL"
+exec "$FAUX_PYTHON3" "$@"

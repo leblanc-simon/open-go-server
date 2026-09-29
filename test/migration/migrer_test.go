@@ -3,9 +3,10 @@
 //
 // L'ancien serveur est un répertoire local, joint par un faux ssh qui lit
 // l'entrée standard comme le vrai (testdata/bin/ssh) ; moteurs de base, crontab,
-// supervisorctl, dig, curl et runuser sont simulés. rsync, install et ogs sont
-// les vrais — ogs construit depuis le dépôt et lancé en mode préfixé —, derrière
-// des enveloppes qui notent chaque appel dans un journal que les tests relisent.
+// supervisorctl, dig, curl et runuser sont simulés. rsync, install, python3 et
+// ogs sont les vrais — ogs construit depuis le dépôt et lancé en mode préfixé —,
+// derrière des enveloppes qui notent chaque appel, arguments compris, dans un
+// journal que les tests relisent.
 //
 // Le script exige root pour --executer : le banc en lance une copie dont seule
 // cette garde est retirée. Le banc ne tourne pas en root, donc runuser ne change
@@ -14,6 +15,7 @@
 package migration
 
 import (
+	"bufio"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -21,7 +23,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 )
 
 const (
@@ -34,8 +38,8 @@ const (
 )
 
 var (
-	ogsBinaire, rsyncReel, installReel string
-	manque                             string // outil absent : les tests sont sautés
+	ogsBinaire, rsyncReel, installReel, pythonReel string
+	manque                                         string // outil absent : les tests sont sautés
 )
 
 func TestMain(m *testing.M) {
@@ -52,6 +56,7 @@ func TestMain(m *testing.M) {
 		}
 		rsyncReel, _ = exec.LookPath("rsync")
 		installReel, _ = exec.LookPath("install")
+		pythonReel, _ = exec.LookPath("python3")
 		dir, err := os.MkdirTemp("", "banc-migration-")
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
@@ -97,6 +102,12 @@ func nouveauBanc(t *testing.T) *banc {
 	dir := t.TempDir()
 	if reel, err := filepath.EvalSymlinks(dir); err == nil {
 		dir = reel
+	}
+	// t.TempDir crée son répertoire en 0777 moins l'umask : sous l'umask 002, il
+	// serait inscriptible par le groupe, et le script refuserait d'y poser le
+	// répertoire privé de son exécution (TMPDIR est dessous).
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatal(err)
 	}
 	b := &banc{
 		t:       t,
@@ -284,6 +295,7 @@ func (b *banc) env(extra []string) []string {
 		"FAUX_SOURCE_BIN="+ancien,
 		"FAUX_RSYNC="+rsyncReel,
 		"FAUX_INSTALL="+installReel,
+		"FAUX_PYTHON3="+pythonReel,
 		"FAUX_OGS="+ogsBinaire,
 		"FAUX_BASES_CIBLE="+filepath.Join(b.dir, "bases-cible"),
 		"FAUX_UTILISATEURS_BASE_CIBLE="+filepath.Join(b.dir, "utilisateurs-base-cible"),
@@ -1057,4 +1069,180 @@ func TestRetourNeDependPasDUnApplyReussiSurLaCible(t *testing.T) {
 		t.Errorf("crontab de la source non rétablie : %q", got)
 	}
 	contient(t, "état", b.etat(), "retour ")
+}
+
+// Le socket de contrôle de ssh vit dans le répertoire privé de chaque exécution,
+// jamais sous un nom stable d'un répertoire commun. Il était posé dans /tmp, au
+// nom migrer-ssh-%C que tout compte de la machine calcule : une phase lancée
+// après l'expiration du maître se raccordait au socket qu'un autre y avait posé
+// — ssh ne demande pas qui le tient —, et lui confiait les commandes de root
+// vers la source. Le faux ssh refuse un socket hors d'un répertoire en 0700 à ce
+// compte ; chaque exécution a le sien, ferme son maître et le supprime, qu'elle
+// aboutisse ou non.
+func TestLeSocketDeControleDeSshVitDansUnRepertoirePrive(t *testing.T) {
+	b := nouveauBanc(t)
+	b.ecrireManifeste(b.manifeste(b.projetShop()))
+	tmp := filepath.Join(b.dir, "tmp")
+	b.jusquALaBascule()
+	// Interrompu : l'attente du DNS échoue, et la sortie passe par nettoyer.
+	b.echouer([]string{dnsCible}, phase("--delai-dns", "0", "retour", "shopfr")...)
+
+	sockets, fermes := map[string]bool{}, map[string]bool{}
+	for _, ligne := range strings.Split(b.journal(), "\n") {
+		if reste, ok := strings.CutPrefix(ligne, "[ssh-controle] "); ok {
+			champs := strings.Fields(reste)
+			if len(champs) != 3 || champs[1] != "700" {
+				t.Errorf("socket de contrôle hors d'un répertoire privé : %s", ligne)
+				continue
+			}
+			if filepath.Dir(filepath.Dir(champs[2])) != tmp {
+				t.Errorf("socket de contrôle hors du répertoire de l'exécution, sous %s : %s", tmp, ligne)
+			}
+			sockets[champs[2]] = true
+		}
+		if reste, ok := strings.CutPrefix(ligne, "[ssh -O exit] "); ok {
+			fermes[reste] = true
+		}
+	}
+	// Synchronisation, bascule et retour passent par ssh ; la déclaration, non.
+	if len(sockets) < 3 {
+		t.Fatalf("un socket de contrôle par exécution attendu, relevé : %v\n%s", sockets, b.journal())
+	}
+	for s := range sockets {
+		if !fermes[s] {
+			t.Errorf("maître ssh de %s laissé ouvert à la sortie", s)
+		}
+		if existe(filepath.Dir(s)) {
+			t.Errorf("%s laissé en place à la sortie", filepath.Dir(s))
+		}
+	}
+	entrees, err := os.ReadDir(tmp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entrees {
+		t.Errorf("%s laissé dans TMPDIR", e.Name())
+	}
+}
+
+// Un TMPDIR où un autre compte peut renommer le répertoire de l'exécution — et
+// poser le sien à sa place, avec le script Python que root exécute et le socket
+// de ssh — est refusé avant tout usage. Un répertoire commun sous le bit sticky,
+// comme /tmp, ne l'est pas.
+func TestUnTMPDIROuvertAuxAutresComptesEstRefuse(t *testing.T) {
+	b := nouveauBanc(t)
+	b.ecrireManifeste(b.manifeste(b.projetShop()))
+	ouvert := filepath.Join(b.dir, "ouvert")
+	if err := os.Mkdir(ouvert, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(ouvert, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	sortie := b.echouer([]string{"TMPDIR=" + ouvert}, "controle", "shopfr")
+	contient(t, "TMPDIR inscriptible par tous", sortie,
+		"TMPDIR="+ouvert+" : "+ouvert+" est à un autre compte, ou inscriptible par d'autres sans bit sticky")
+	if entrees, _ := os.ReadDir(ouvert); len(entrees) != 0 {
+		t.Errorf("répertoire de l'exécution laissé dans %s : %v", ouvert, entrees)
+	}
+
+	if err := os.Chmod(ouvert, 0o777|os.ModeSticky); err != nil {
+		t.Fatal(err)
+	}
+	b.reussir([]string{"TMPDIR=" + ouvert}, "controle", "shopfr")
+}
+
+// Aucune valeur de configuration ne passe par une ligne de commande, que tout
+// compte de la machine lit dans /proc/<pid>/cmdline : la valeur résolue d'une
+// clé — chaîne de connexion, mot de passe — repartait en argument de python3,
+// lancé en root. Le banc note les arguments de chaque commande simulée, et ceux
+// de python3.
+func TestAucuneValeurDeConfigurationNePasseParLaLigneDeCommande(t *testing.T) {
+	b := nouveauBanc(t)
+	p := b.projetShop()
+	p["source"].(M)["configuration"] = L{M{
+		"fichier": "www/.env.local", "format": "dotenv",
+		"cles": M{
+			"DATABASE_URL":      "@ogs:DATABASE_URL",
+			"DATABASE_PASSWORD": "@ogs:DATABASE_URL#password",
+			// Le manifeste ne porte aucun secret ; une valeur écrite telle quelle
+			// ne passe pas davantage par la ligne de commande.
+			"MAILER_DSN": "smtp://relais:Litt3ral@localhost",
+		},
+	}}
+	b.ecrireManifeste(b.manifeste(p))
+	b.jusquALaBascule()
+
+	contient(t, "configuration réécrite", b.lire(filepath.Join(b.home, "www/.env.local")),
+		"DATABASE_URL='mysql://shopfr:S3cret@localhost/shopfr'",
+		"DATABASE_PASSWORD='S3cret'",
+		"MAILER_DSN='smtp://relais:Litt3ral@localhost'")
+	j := b.journal()
+	// Sans ces lignes, l'exclusion qui suit ne prouverait rien.
+	contient(t, "arguments notés", j, " resoudre ",
+		"[python3 shopfr] - config "+b.home+"/www/.env.local dotenv DATABASE_PASSWORD")
+	exclut(t, "arguments des commandes", j, "S3cret", "Litt3ral")
+}
+
+// Interrompue par Ctrl+C — que reçoit tout le groupe de processus, tee du journal
+// compris —, une bascule passe par nettoyer comme toute sortie : maître ssh
+// fermé, répertoire de l'exécution supprimé, consigne de reprise affichée. Bash
+// lance bien le piège EXIT sur un signal fatal, mais sous le code de la dernière
+// commande, 0 le plus souvent : la bascule interrompue n'était pas signalée.
+func TestUneBasculeInterrompueNettoieEtLeDit(t *testing.T) {
+	b := nouveauBanc(t)
+	b.ecrireManifeste(b.manifeste(b.projetShop()))
+	b.reussir(nil, phase("declarer", "shopfr")...)
+	b.reussir(nil, phase("synchroniser", "shopfr")...)
+
+	// Le DNS désigne encore la source : la bascule attend sa propagation.
+	m := b.marque()
+	cmd := exec.Command("bash", append([]string{b.script, "-m", b.manif},
+		phase("--delai-dns", "120", "basculer", "shopfr")...)...)
+	cmd.Env = b.env([]string{dnsSource})
+	cmd.Dir = b.dir
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	lecture, ecriture, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd.Stdout, cmd.Stderr = ecriture, ecriture
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	ecriture.Close()
+	garde := time.AfterFunc(90*time.Second, func() { _ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) })
+	defer garde.Stop()
+
+	var sortie strings.Builder
+	interrompu := false
+	lignes := bufio.NewScanner(lecture)
+	for lignes.Scan() {
+		sortie.WriteString(lignes.Text() + "\n")
+		if !interrompu && strings.Contains(lignes.Text(), "en attente : shop.fr") {
+			// Le temps que « sleep » soit lancé : lancé après le signal, il
+			// survivrait au script et tiendrait la sortie jusqu'à son terme.
+			time.Sleep(500 * time.Millisecond)
+			if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGINT); err != nil {
+				t.Error(err)
+			}
+			interrompu = true
+		}
+	}
+	err = cmd.Wait()
+	var fin *exec.ExitError
+	if !interrompu || !errors.As(err, &fin) || fin.ExitCode() != 130 {
+		t.Fatalf("bascule interrompue : %v (interruption envoyée : %v), attendu le code 130\n%s", err, interrompu, sortie.String())
+	}
+	contient(t, "bascule interrompue", sortie.String(),
+		"bascule de shopfr interrompue",
+		"Reprendre : "+b.script+" -m "+b.manif+" --executer basculer shopfr")
+	contient(t, "bascule interrompue", b.depuis(m), "[ssh -O exit] ")
+	entrees, err := os.ReadDir(filepath.Join(b.dir, "tmp"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entrees {
+		t.Errorf("%s laissé dans TMPDIR après l'interruption", e.Name())
+	}
 }
