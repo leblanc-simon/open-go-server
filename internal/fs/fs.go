@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -128,6 +129,52 @@ func Inspect(path string, expected []byte) (State, error) {
 		return StateCurrent, nil
 	}
 	return StateOutdated, nil
+}
+
+// reProject lit l'identifiant que Render inscrit dans la seconde ligne d'en-tête.
+var reProject = regexp.MustCompile(`^[#;]\s*projet: (\S+)  ressource: `)
+
+// ManagedProject rend l'identifiant du projet pour lequel ogs a écrit path, lu
+// dans son en-tête, ou "" si le fichier est absent, n'est pas un fichier régulier
+// ou ne porte pas la marque d'ogs.
+//
+// C'est le seul critère d'appartenance qui vaille avant de supprimer un fichier.
+// Le nom ne prouve rien : « shop_api.conf » semble prolonger « shop » par un nom
+// de pool, alors qu'il est le fichier du projet shop_api — l'attribution par
+// préfixe faisait retirer au premier apply de shop le pool et le vhost de son
+// voisin. Un lien n'est jamais suivi : un lien n'a pas d'en-tête, et sa cible
+// n'est pas lui.
+func ManagedProject(path string) (string, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ELOOP) {
+			return "", nil
+		}
+		return "", err
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return "", err
+	}
+	if !st.Mode().IsRegular() {
+		return "", nil
+	}
+	// L'en-tête tient dans les premières lignes : lire le fichier entier pour
+	// l'attribuer coûterait autant qu'un journal.
+	buf := make([]byte, 4096)
+	n, err := io.ReadFull(f, buf)
+	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+		return "", err
+	}
+	lines := strings.SplitN(string(buf[:n]), "\n", 3)
+	if len(lines) < 2 || !strings.Contains(lines[0], Marker) {
+		return "", nil
+	}
+	if m := reProject.FindStringSubmatch(lines[1]); m != nil {
+		return m[1], nil
+	}
+	return "", nil
 }
 
 // splitHeader isole l'empreinte annoncée et le corps d'un fichier géré. Il ne

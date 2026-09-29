@@ -348,3 +348,49 @@ func TestEnsureDirRefuseUnLienSymbolique(t *testing.T) {
 		t.Errorf("le lien a été altéré : %v, %v", fi, err)
 	}
 }
+
+func TestManagedProjectLitLeProjetDansLEnTete(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name string, data []byte) string {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	voisin := header()
+	voisin.Project = "shop_api"
+	cas := []struct {
+		nom, attendu string
+		path         string
+	}{
+		{"fichier du voisin, dont le nom prolonge un autre identifiant", "shop_api",
+			write("shop_api.conf", Render(voisin, []byte("[shop_api]\n"), ";"))},
+		{"en-tête sans ligne de personnalisation", "shopfr",
+			write("shopfr.conf", Render(Header{Project: "shopfr", Resource: "php/pool/shopfr"}, []byte("x\n"), "#"))},
+		{"fichier posé à la main", "", write("shop_old.conf", []byte("[shop_old]\nuser = shop\n"))},
+		{"corps qui imite un en-tête hors des premières lignes", "",
+			write("imite.conf", []byte("server {}\n# Généré par ogs\n# projet: shopfr  ressource: x\n"))},
+		{"fichier vide", "", write("vide.conf", nil)},
+		{"fichier absent", "", filepath.Join(dir, "absent.conf")},
+	}
+	for _, c := range cas {
+		got, err := ManagedProject(c.path)
+		if err != nil {
+			t.Errorf("%s : erreur %v", c.nom, err)
+		}
+		if got != c.attendu {
+			t.Errorf("%s : projet %q, attendu %q", c.nom, got, c.attendu)
+		}
+	}
+
+	// Un lien n'est jamais suivi, même vers un fichier géré : c'est la cible
+	// qui porte l'en-tête, pas le lien.
+	lien := filepath.Join(dir, "lien.conf")
+	if err := os.Symlink(filepath.Join(dir, "shop_api.conf"), lien); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := ManagedProject(lien); got != "" || err != nil {
+		t.Errorf("lien : projet %q, erreur %v ; attendu aucun projet, sans erreur", got, err)
+	}
+}
