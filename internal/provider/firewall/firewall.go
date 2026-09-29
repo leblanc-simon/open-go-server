@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -43,17 +44,39 @@ type Provider struct {
 	// WebUnit est l'unité du moteur web retenu, qui rend le profil « web »
 	// disponible.
 	WebUnit string
-	// Force passe outre un fichier de profils modifié à la main et les gardes
-	// contre la coupure d'accès.
+	// WebUndecided dit qu'un serveur web est installé sans qu'un moteur soit
+	// retenu — Apache et nginx à la fois, sans web.engine. C'est une inconnue,
+	// non une absence : le profil web reste disponible, ses ports ne dépendant
+	// pas du moteur.
+	WebUndecided bool
+	// Force passe outre un fichier de profils modifié à la main (§6.4), et rien
+	// d'autre : c'est le --force de toutes les commandes, qu'on donne pour un
+	// fichier retouché sans penser au pare-feu.
 	Force bool
-	Now   func() time.Time
-	// Admin rend l'adresse de la session d'administration courante. Nil : elle
-	// est cherchée dans l'environnement de la session SSH.
-	Admin func() (netip.Addr, bool)
+	// AllowLockout passe outre les gardes contre la coupure d'accès. C'est une
+	// décision sur le pare-feu, distincte de Force : seules les commandes
+	// « ogs firewall » la prennent, le plan global jamais.
+	AllowLockout bool
+	Now          func() time.Time
+	// Admin rend la session d'administration courante. Nil : elle est cherchée
+	// dans l'environnement de la session SSH.
+	Admin func() (Session, bool)
 
 	// Armed est posé par l'étape d'activation lorsqu'elle a programmé le retour
 	// automatique : l'appelant doit alors dire qu'il faut confirmer.
 	Armed time.Duration
+}
+
+// Session est la session SSH d'administration : l'adresse du client, et
+// l'adresse et le port du serveur où elle est arrivée — ceux que la session
+// suivante empruntera aussi.
+type Session struct {
+	Addr netip.Addr
+	// Local est l'adresse du serveur que le client a jointe ; invalide
+	// lorsqu'elle n'est pas connue.
+	Local netip.Addr
+	// Port est vide lorsqu'il n'est pas connu.
+	Port string
 }
 
 // Name identifie le provider.
@@ -90,11 +113,30 @@ type Observed struct {
 	Incoming, Outgoing, Routed string
 	Logging                    string
 	Rules                      []ObservedRule
-	// RollbackPending dit qu'une activation attend sa confirmation.
+	// RollbackPending dit qu'une activation attend sa confirmation : son retour
+	// automatique est programmé.
 	RollbackPending bool
+	// Unconfirmed dit qu'une activation n'a jamais été confirmée : le témoin posé
+	// à l'armement du retour automatique est toujours là.
+	Unconfirmed bool
 	// PreviousProfiles porte les ports du fichier de profils actuel.
 	PreviousProfiles map[string]string
 }
+
+// RollbackLost dit qu'une activation jamais confirmée tient sans filet : ufw est
+// actif, et plus aucun retour n'est programmé — un redémarrage dans le délai a
+// effacé l'unité transitoire, qui vivait sous /run.
+func (o Observed) RollbackLost() bool { return o.Unconfirmed && o.Enabled && !o.RollbackPending }
+
+// RolledBack dit qu'ufw est inactif après une activation jamais confirmée : le
+// retour automatique a joué.
+func (o Observed) RolledBack() bool { return o.Unconfirmed && !o.Enabled && !o.RollbackPending }
+
+// unconfirmedMark est le témoin d'une activation que personne n'a confirmée. Il
+// vit sous /var/lib/ogs, là où l'unité transitoire du retour vit sous /run : un
+// redémarrage dans le délai efface celle-ci, ufw repart actif sans filet, et
+// sans le témoin ni confirm, ni status, ni doctor n'en disaient rien.
+func (p *Provider) unconfirmedMark() string { return filepath.Join(p.Paths.Lib(), "ufw-unconfirmed") }
 
 // Observe relit l'état d'ufw dans ses fichiers : ceux-là mêmes que la commande
 // ufw écrit, et qu'elle relit à chaque démarrage.
@@ -130,6 +172,9 @@ func (p *Provider) Observe(ctx context.Context) (Observed, error) {
 		res, _ := p.Exec.Run(ctx, exec.Command{Name: "systemctl",
 			Args: []string{"is-active", RollbackUnit + ".timer"}})
 		obs.RollbackPending = strings.TrimSpace(res.Stdout) == "active"
+	}
+	if _, err := os.Lstat(p.unconfirmedMark()); err == nil {
+		obs.Unconfirmed = true
 	}
 	return obs, nil
 }
@@ -293,10 +338,12 @@ func (p *Provider) Plan(ctx context.Context, projects []*model.Project, obs Obse
 	}
 
 	stale(true)
-	if s, err := p.profilesStep(profiles, kept, obs, st); err != nil {
+	profStep, portsChanged, err := p.profilesStep(profiles, kept, obs, st)
+	if err != nil {
 		return nil, err
-	} else if s != nil {
-		steps = append(steps, s)
+	}
+	if profStep != nil {
+		steps = append(steps, profStep)
 	}
 	for _, r := range desired {
 		if s := p.ruleStep(r, byKey[r.Key()], obs, st); s != nil {
@@ -323,7 +370,12 @@ func (p *Provider) Plan(ctx context.Context, projects []*model.Project, obs Obse
 		steps = append(steps, s)
 	}
 
-	if err := p.validate(ctx, projects, profiles, desired, obs, steps); err != nil {
+	// Changer les ports d'un profil qu'une règle emploie ferme l'ancien port :
+	// « ufw app update » y porte la règle entière. C'est un resserrement au même
+	// titre qu'un retrait — un Port de sshd mal relu, ou des ports déclarés à
+	// tort, fermaient ainsi le port où sshd écoute sans qu'aucune garde ne joue.
+	tightening := len(portsChanged) > 0 || tightens(steps)
+	if err := p.validate(ctx, projects, profiles, desired, obs, tightening); err != nil {
 		return nil, err
 	}
 	return steps, nil
@@ -587,7 +639,15 @@ func (p *Provider) stateStep(obs Observed, st *run) *engine.Step {
 		s := engine.NewStep("firewall/state", engine.Delete, "désactivation d'ufw (active: false)")
 		s.Critical = false
 		s.Diff = func() (string, error) { return "ufw disable", nil }
-		s.Apply = func(ctx context.Context) error { return p.ufw(ctx, "disable") }
+		s.Apply = func(ctx context.Context) error {
+			if err := p.ufw(ctx, "disable"); err != nil {
+				return err
+			}
+			// Une activation en attente n'a plus rien à confirmer : son témoin
+			// ferait croire, ufw inactif, que le retour automatique a joué.
+			p.disarm(ctx)
+			return nil
+		}
 		s.Compensate = func(ctx context.Context) error { return p.ufw(ctx, "--force", "enable") }
 		return s
 	}
@@ -602,6 +662,14 @@ func (p *Provider) armRollback(ctx context.Context, delay time.Duration) error {
 		return nil
 	}
 	p.disarm(ctx)
+	// Le témoin d'abord : un retour programmé sans lui se perdrait en silence au
+	// premier redémarrage.
+	now := p.now()
+	note := fmt.Sprintf("# Activation d'ufw du %s, jamais confirmée : retour automatique prévu le %s.\n"+
+		"# « ogs firewall confirm » retire ce fichier.\n", now.Format(time.RFC3339), now.Add(delay).Format(time.RFC3339))
+	if err := fs.WriteAtomic(p.unconfirmedMark(), []byte(note), 0o600, fs.KeepOwner); err != nil {
+		return fmt.Errorf("témoin de l'activation : %w", err)
+	}
 	_, err := p.Exec.Run(ctx, exec.Command{Name: "systemd-run", Args: []string{
 		"--unit=" + RollbackUnit,
 		"--description=ogs : désactivation d'ufw faute de confirmation",
@@ -609,12 +677,15 @@ func (p *Provider) armRollback(ctx context.Context, delay time.Duration) error {
 		"--timer-property=AccuracySec=1s",
 		"ufw", "--force", "disable",
 	}})
+	if err != nil {
+		_ = os.Remove(p.unconfirmedMark())
+	}
 	return err
 }
 
-// disarm annule un retour automatique en attente, et oublie un précédent
-// échec : une unité transitoire en échec empêcherait d'en recréer une du même
-// nom.
+// disarm annule un retour automatique en attente et retire son témoin, et
+// oublie un précédent échec : une unité transitoire en échec empêcherait d'en
+// recréer une du même nom.
 func (p *Provider) disarm(ctx context.Context) {
 	if p.simulated() {
 		return
@@ -622,37 +693,49 @@ func (p *Provider) disarm(ctx context.Context) {
 	_, _ = p.Exec.Run(ctx, exec.Command{Name: "systemctl", Args: []string{"stop", RollbackUnit + ".timer"}})
 	_, _ = p.Exec.Run(ctx, exec.Command{Name: "systemctl", Args: []string{"reset-failed",
 		RollbackUnit + ".timer", RollbackUnit + ".service"}})
+	_ = os.Remove(p.unconfirmedMark())
 }
 
-// Confirm annule le retour automatique d'une activation. Le booléen dit s'il y
-// en avait un.
+// Confirm annule le retour automatique d'une activation et retire son témoin.
+// Le booléen dit s'il y avait une activation à confirmer : en attente, ou dont
+// le retour a été perdu — ufw actif, le minuteur effacé par un redémarrage. La
+// nouvelle session d'où l'on confirme prouve l'accès dans les deux cas. Un
+// retour qui a joué laisse le témoin : il n'y a rien à confirmer, et status et
+// doctor disent pourquoi ufw est inactif.
 func (p *Provider) Confirm(ctx context.Context, obs Observed) (bool, error) {
-	if !obs.RollbackPending {
+	switch {
+	case obs.RollbackPending:
+		if _, err := p.Exec.Run(ctx, exec.Command{Name: "systemctl",
+			Args: []string{"stop", RollbackUnit + ".timer"}}); err != nil {
+			return true, err
+		}
+	case !obs.RollbackLost():
 		return false, nil
 	}
-	if _, err := p.Exec.Run(ctx, exec.Command{Name: "systemctl",
-		Args: []string{"stop", RollbackUnit + ".timer"}}); err != nil {
-		return true, err
+	if err := os.Remove(p.unconfirmedMark()); err != nil && !os.IsNotExist(err) {
+		return true, fmt.Errorf("témoin de l'activation : %w", err)
 	}
 	return true, nil
 }
 
 // profilesStep écrit le fichier de profils, puis fait relire par ufw ceux dont
 // les ports changent : une règle d'application porte les ports que le profil
-// avait lorsqu'elle a été posée, et ne suit pas un profil réécrit.
-func (p *Provider) profilesStep(profiles []Profile, kept map[string]string, obs Observed, st *run) (*engine.Step, error) {
+// avait lorsqu'elle a été posée, et ne suit pas un profil réécrit. Il rend aussi
+// ces profils, dont le changement ferme l'ancien port.
+func (p *Provider) profilesStep(profiles []Profile, kept map[string]string, obs Observed,
+	st *run) (*engine.Step, []string, error) {
 	path := p.Paths.UFWProfilesFile()
 	body := renderProfiles(profiles, kept)
 	content := fs.Render(fs.Header{Project: "parc", Resource: "firewall/profiles", Generated: p.now()}, body, "#")
 	state, err := fs.Inspect(path, content)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	summary := fmt.Sprintf("profils ufw (%d disponible(s) sur %d)", countAvailable(profiles), len(profiles))
 	forced := false
 	switch state {
 	case fs.StateCurrent:
-		return nil, nil
+		return nil, nil, nil
 	case fs.StateHandEdited, fs.StateForeign:
 		if !p.Force {
 			s := engine.NewStep("firewall/profiles", engine.Update, summary+" — fichier modifié hors ogs")
@@ -662,7 +745,7 @@ func (p *Provider) profilesStep(profiles []Profile, kept map[string]string, obs 
 				return fmt.Errorf("%s a été modifié en dehors d'ogs : relancer avec --force pour l'écraser "+
 					"(l'original sera sauvegardé dans %s)", path, p.Paths.BackupsDir())
 			}
-			return s, nil
+			return s, nil, nil
 		}
 		forced = true
 		summary += " — écrasement forcé"
@@ -742,7 +825,7 @@ func (p *Provider) profilesStep(profiles []Profile, kept map[string]string, obs 
 		}
 		return nil
 	}
-	return s, nil
+	return s, changed, nil
 }
 
 func usedBy(rules []ObservedRule, app string) bool {
@@ -765,16 +848,21 @@ func countAvailable(profiles []Profile) int {
 }
 
 // validate refuse ce qui couperait un accès ou ne fonctionnerait pas. Les
-// gardes contre la coupure cèdent à --force : l'exploitant qui a la console
-// sous la main peut vouloir fermer SSH ; les autres contrôles, non.
+// gardes contre la coupure cèdent à AllowLockout : l'exploitant qui a la
+// console sous la main peut vouloir fermer SSH ; les autres contrôles, non.
+// Elles ne jouent que si le plan resserre le pare-feu (tightening) : sans
+// resserrement, rien de ce qui passe aujourd'hui ne cesse de passer. Et elles
+// jugent ce qui restera ouvert : les règles voulues, et celles que le plan
+// laisse en place (keptOpens).
 func (p *Provider) validate(ctx context.Context, projects []*model.Project, profiles []Profile, desired []Rule,
-	obs Observed, steps []*engine.Step) error {
+	obs Observed, tightening bool) error {
 	cfg := p.cfg()
 	var problems, lockout []string
 
-	byName := map[string]Profile{}
+	byName, byUFW := map[string]Profile{}, map[string]Profile{}
 	for _, prof := range profiles {
 		byName[prof.Name] = prof
+		byUFW[prof.UFWName] = prof
 	}
 	rulesFor := func(profile string) []Rule {
 		var out []Rule
@@ -801,84 +889,373 @@ func (p *Provider) validate(ctx context.Context, projects []*model.Project, prof
 	}
 
 	filtering := cfg.IsActive() && cfg.IncomingPolicy() != "allow"
-	// Les ports que sshd écoute réellement : aucune lecture de sshd_config ne
-	// couvre toutes ses syntaxes, et un port que le profil n'ouvre pas est
-	// l'accès que la politique par défaut coupe.
-	if ssh := byName["ssh"]; filtering && ssh.Available && tightens(steps) {
-		opened := map[string]bool{}
-		for _, spec := range ssh.Ports {
-			list, _, _ := strings.Cut(spec, "/")
-			for _, port := range strings.Split(list, ",") {
-				opened[port] = true
+	ssh, sshRules := byName["ssh"], rulesFor("ssh")
+	// Les ports où sshd écoute réellement, lus une fois, et seulement si une
+	// garde en a besoin : aucune lecture de sshd_config ne couvre toutes ses
+	// syntaxes. Vide, c'est que « ss » se tait — mode simulé, ss absent.
+	var listening []string
+	listened := false
+	sshdPorts := func() []string {
+		if !listened {
+			listening, listened = p.sshdListening(ctx), true
+		}
+		return listening
+	}
+	// admits dit si une règle ssh voulue laisse passer cette adresse.
+	admits := func(addr netip.Addr) bool {
+		for _, r := range sshRules {
+			if r.From == config.UFWAny {
+				return true
+			}
+			if pr, err := config.ParseUFWAddress(r.From); err == nil && pr.Contains(addr) {
+				return true
 			}
 		}
-		for _, port := range p.sshdListening(ctx) {
-			if !opened[port] {
+		return false
+	}
+	// wanted dit si une règle voulue ouvre l'un de ces ports depuis addr — depuis
+	// une source quelconque si addr est invalide —, quel que soit son profil : un
+	// profil déclaré sur un port de sshd est un accès comme un autre, et ne
+	// regarder que le profil « ssh » refusait ce qui ne fermait rien.
+	wanted := func(ports []string, addr netip.Addr) bool {
+		for _, r := range desired {
+			if r.Direction != "in" || r.Action != "allow" || r.App == "" || !overlaps(byUFW[r.App].Ports, ports) {
+				continue
+			}
+			if !addr.IsValid() || r.From == config.UFWAny {
+				return true
+			}
+			if pr, err := config.ParseUFWAddress(r.From); err == nil && pr.Contains(addr) {
+				return true
+			}
+		}
+		return false
+	}
+
+	// Un port où sshd écoute, que plus rien n'ouvre une fois le plan appliqué,
+	// est l'accès que la politique par défaut coupe. La garde vaut quelle que
+	// soit la disponibilité du profil : un profil ssh écarté, ou qu'aucune unité
+	// ne signale, voit ses règles retirées aussi sûrement qu'un port mal
+	// déclaré — et sans session SSH à protéger, rien d'autre ne le voyait.
+	if filtering && tightening {
+		for _, port := range sshdPorts() {
+			if (ssh.Available && opens(ssh.Ports, port)) || wanted(tcpSpecs(port), netip.Addr{}) ||
+				keptOpens(obs.Rules, byUFW, tcpSpecs(port), Session{}) {
+				continue
+			}
+			if ssh.Available {
 				lockout = append(lockout, fmt.Sprintf("sshd écoute sur le port %s, que le profil ssh n'ouvre pas "+
-					"(%s) — le déclarer dans profiles.ssh.ports", port, ssh.PortsSpec()))
+					"(%s), ni aucune autre règle — le déclarer dans profiles.ssh.ports", port, ssh.PortsSpec()))
+			} else {
+				lockout = append(lockout, fmt.Sprintf("sshd écoute sur le port %s, que plus rien n'ouvrirait : le "+
+					"profil ssh n'est pas disponible (%s), et aucune autre règle n'ouvre ce port", port, ssh.Reason))
 			}
 		}
 	}
 	if filtering {
-		if ssh := byName["ssh"]; ssh.Available && len(rulesFor("ssh")) == 0 {
-			lockout = append(lockout, "ssh : aucune source autorisée alors que la politique entrante est "+
-				cfg.IncomingPolicy()+" — plus personne ne se connecterait ; ajouter une adresse de confiance "+
-				"(trusted) ou profiles.ssh.allow")
+		// Une règle de l'administrateur est une source comme une autre : ogs ne
+		// la retire jamais. L'ignorer faisait refuser un « ufw limit OpenSSH »
+		// posé à la main à chaque apply, et l'on prenait l'habitude de lever la
+		// garde.
+		if ssh.Available && len(sshRules) == 0 {
+			target := tcpSpecs(sshdPorts()...)
+			if len(target) == 0 {
+				target = ssh.Ports
+			}
+			if !wanted(target, netip.Addr{}) && !keptOpens(obs.Rules, byUFW, target, Session{}) {
+				lockout = append(lockout, "ssh : aucune source autorisée alors que la politique entrante est "+
+					cfg.IncomingPolicy()+" — plus personne ne se connecterait ; ajouter une adresse de confiance "+
+					"(trusted) ou profiles.ssh.allow")
+			}
 		}
-		if web := byName["web"]; web.Available && usesHTTP01(projects) {
+		// La garde porte sur ce que le plan laisse ouvert, non sur la seule
+		// disponibilité détectée : un profil web tenu pour absent voit ses règles
+		// retirées, et ferme le web aux validations aussi sûrement qu'un accès
+		// restreint.
+		if web := byName["web"]; usesHTTP01(projects) && (web.Available || managedRulesFor(obs.Rules, web.UFWName)) {
 			open := false
 			for _, r := range rulesFor("web") {
 				if r.From == config.UFWAny {
 					open = true
 				}
 			}
-			if !open {
+			forced := cfg.Profiles["web"].Available
+			switch {
+			case open:
+			case web.Available:
 				problems = append(problems, "web : un projet émet ses certificats par HTTP-01, dont les "+
 					"validations viennent d'adresses que nul ne connaît d'avance — profiles.web.allow doit "+
 					"comprendre « any »")
+			case forced != nil && !*forced:
+				problems = append(problems, "web : un projet émet ses certificats par HTTP-01, et « profiles.web."+
+					"available: false » retirerait l'accès public au web, dont ses validations ont besoin — lever "+
+					"ce forçage, ou émettre ces certificats par DNS-01")
+			default:
+				problems = append(problems, fmt.Sprintf("web : un projet émet ses certificats par HTTP-01, et le "+
+					"profil web n'est pas disponible (%s) : le plan retirerait l'accès public au web — retenir le "+
+					"moteur (web.engine), ou « profiles.web.available: true »", web.Reason))
 			}
 		}
 	}
 
-	if admin, ok := p.adminAddress(); ok {
+	if admin, ok := p.adminSession(); ok {
 		for _, r := range desired {
 			if r.Kind != KindBan {
 				continue
 			}
-			if pr, err := config.ParseUFWAddress(r.From); err == nil && pr.Contains(admin) {
+			if pr, err := config.ParseUFWAddress(r.From); err == nil && pr.Contains(admin.Addr) {
 				lockout = append(lockout, fmt.Sprintf("la session d'administration vient de %s, que %s bannirait",
-					admin, r.From))
+					admin.Addr, r.From))
 			}
 		}
-		if filtering && tightens(steps) {
-			covered := false
-			for _, r := range rulesFor("ssh") {
-				if r.From == config.UFWAny {
-					covered = true
-					break
-				}
-				if pr, err := config.ParseUFWAddress(r.From); err == nil && pr.Contains(admin) {
-					covered = true
-					break
-				}
+		if filtering && tightening {
+			// La session suivante doit passer, adresse et port ensemble. Ses ports
+			// sont ceux où sshd écoute, si ss les dit ; à défaut, celui où la
+			// session en cours est arrivée ; à défaut, ceux du profil. Le port de
+			// la session ne compte pas quand ss dit que sshd n'y écoute plus : la
+			// suivante n'y arrivera de toute façon pas, et le compter refusait le
+			// plan même qui ouvrait le port où sshd a été déplacé.
+			basis, target := "profil", ssh.Ports
+			switch {
+			case len(sshdPorts()) > 0:
+				basis, target = "ss", tcpSpecs(sshdPorts()...)
+			case admin.Port != "":
+				basis, target = "session", tcpSpecs(admin.Port)
 			}
-			if !covered {
-				lockout = append(lockout, fmt.Sprintf("la session d'administration vient de %s, qu'aucune "+
-					"règle ssh n'autorise : l'appliquer la couperait — ajouter cette adresse à trusted ou à "+
-					"profiles.ssh.allow", admin))
+			if !wanted(target, admin.Addr) && !keptOpens(obs.Rules, byUFW, target, admin) {
+				lockout = append(lockout, sessionLockout(admin, basis, ssh, sshdPorts(),
+					admits(admin.Addr), overlaps(ssh.Ports, target), viaInterface(obs.Rules, byUFW, target, admin)))
 			}
 		}
 	}
 
-	if !p.Force {
+	if !p.AllowLockout {
 		for _, l := range lockout {
-			problems = append(problems, l+" (--force passe outre)")
+			problems = append(problems, l+" (« ogs firewall apply --allow-lockout » passe outre)")
 		}
 	}
 	if len(problems) > 0 {
 		return &ValidationError{Problems: problems}
 	}
 	return nil
+}
+
+// sessionLockout compose le refus de la garde de la session. Il nomme ce qui
+// manque, et seulement cela : admitted dit si une règle ssh voulue admet
+// l'adresse, reachable si le profil ssh ouvre l'un des ports visés. Déduire le
+// remède d'une règle qui admettait l'adresse sur un port sans rapport — le 80 —
+// faisait conseiller de déclarer un port que le profil ouvrait déjà.
+func sessionLockout(admin Session, basis string, ssh Profile, listening []string,
+	admitted, reachable, viaIface bool) string {
+	var msg string
+	switch {
+	case !ssh.Available:
+		msg = fmt.Sprintf("la session d'administration vient de %s, et le profil ssh n'est pas disponible (%s) : "+
+			"ni une règle voulue ni une règle de l'administrateur ne la laisseraient plus passer — l'appliquer "+
+			"couperait la suivante", admin.Addr, ssh.Reason)
+	case admitted && basis == "session":
+		msg = fmt.Sprintf("la session d'administration est arrivée sur le port %s, que le profil ssh n'ouvre pas "+
+			"(%s) : l'appliquer couperait la suivante — le déclarer dans profiles.ssh.ports",
+			admin.Port, ssh.PortsSpec())
+	case admitted && basis == "ss":
+		msg = fmt.Sprintf("la session d'administration vient de %s, qu'aucune règle n'admettrait plus sur les "+
+			"ports où sshd écoute (%s) : l'appliquer couperait la suivante — les déclarer dans profiles.ssh.ports",
+			admin.Addr, strings.Join(listening, ", "))
+	case admitted:
+		msg = fmt.Sprintf("la session d'administration vient de %s, et le profil ssh n'ouvre aucun port TCP "+
+			"(%s) : l'appliquer couperait la suivante — corriger profiles.ssh.ports", admin.Addr, ssh.PortsSpec())
+	default:
+		msg = fmt.Sprintf("la session d'administration vient de %s, qu'aucune règle du profil ssh n'autorise : "+
+			"l'appliquer la couperait — ajouter cette adresse à trusted ou à profiles.ssh.allow", admin.Addr)
+		switch {
+		case reachable:
+		case basis == "session":
+			msg += fmt.Sprintf(", et le port %s, où elle est arrivée, à profiles.ssh.ports (%s)",
+				admin.Port, ssh.PortsSpec())
+		case basis == "ss":
+			msg += fmt.Sprintf(", et les ports où sshd écoute (%s) à profiles.ssh.ports",
+				strings.Join(listening, ", "))
+		}
+	}
+	if viaIface {
+		msg += " ; seule une règle de l'administrateur liée à une interface l'admettrait peut-être, et rien ne " +
+			"dit par laquelle la session est arrivée"
+	}
+	return msg
+}
+
+// managedRulesFor dit si une règle d'ogs relue emploie ce profil : c'est une
+// règle que le plan retire si le profil cesse d'être disponible.
+func managedRulesFor(rules []ObservedRule, app string) bool {
+	for _, r := range rules {
+		if r.Managed && r.Recognized && r.App == app {
+			return true
+		}
+	}
+	return false
+}
+
+// keptOpens dit si une règle que le plan laisse en place ouvre l'un de ces
+// ports TCP — tout port, si ports est vide. Une telle règle est celle de
+// l'administrateur, qu'ogs ne touche jamais, ou une règle d'ogs retouchée qu'il
+// ne sait plus retirer : l'accès qu'elle porte survit au plan, et les gardes
+// contre la coupure qui l'ignoraient refusaient ce qui ne coupe rien.
+//
+// Sans session (s.Addr invalide), la question est « ce port restera-t-il ouvert
+// du dehors ? », et toute autorisation entrante y répond, liée ou non à une
+// interface ou à une adresse du serveur : l'accès par un VPN (« in on wg0 ») est
+// un accès, et le compter pour rien refusait, depuis la console, chaque
+// bannissement de qui administre par là. Pour une session, la règle doit
+// admettre son chemin : son adresse, et l'adresse du serveur où elle est
+// arrivée si la règle en vise une. Une interface, en revanche, rien ne dit
+// laquelle la session a empruntée : la garde refuse plutôt que de parier, et le
+// dit (viaInterface).
+func keptOpens(rules []ObservedRule, profiles map[string]Profile, ports []string, s Session) bool {
+	return keptRule(rules, profiles, ports, s, !s.Addr.IsValid())
+}
+
+// viaInterface dit si seule une règle laissée en place liée à une interface
+// admettrait la session : keptOpens ne la compte pas.
+func viaInterface(rules []ObservedRule, profiles map[string]Profile, ports []string, s Session) bool {
+	return keptRule(rules, profiles, ports, s, true) && !keptRule(rules, profiles, ports, s, false)
+}
+
+// keptRule porte keptOpens ; anyInterface y compte les règles liées à une
+// interface. Seule compte une autorisation (« allow », « limit », journalisée
+// ou non), entrante, depuis tout port d'origine — une règle qui exige un port
+// d'origine n'admet pas un client ordinaire. Sans session, ce qui ne sert que
+// la boucle locale, qu'ufw laisse passer de toute façon, n'ouvre rien du dehors.
+func keptRule(rules []ObservedRule, profiles map[string]Profile, ports []string, s Session, anyInterface bool) bool {
+	for _, o := range rules {
+		// Une règle d'ogs reconnue est voulue — comptée comme telle —, ou retirée.
+		if o.Managed && o.Recognized {
+			continue
+		}
+		f := o.fields
+		if len(f) != 7 && len(f) != 9 {
+			continue
+		}
+		verb, _, _ := strings.Cut(f[0], "_")
+		proto, dport, dst, sport, src, dir := f[1], f[2], f[3], f[4], f[5], f[len(f)-1]
+		if (verb != "allow" && verb != "limit") || sport != "any" {
+			continue
+		}
+		// ufw range l'interface dans le sens : « in_wg0 ».
+		if iface, bound := strings.CutPrefix(dir, "in_"); dir != "in" &&
+			(!bound || !anyInterface || iface == "lo" || strings.Contains(iface, "!")) {
+			continue
+		}
+		if !isAnyAddress(dst) {
+			pr, ok := observedPrefix(dst)
+			switch {
+			case !ok:
+				continue
+			case s.Addr.IsValid():
+				if !s.Local.IsValid() || !pr.Contains(s.Local) {
+					continue
+				}
+			case pr.Addr().IsLoopback():
+				continue
+			}
+		}
+		if dport == "any" {
+			dport = "1:65535"
+		}
+		specs := []string{dport + "/" + proto}
+		if len(f) == 9 {
+			if f[7] != "-" {
+				continue
+			}
+			// « ufw app update » donne à toute règle d'un profil réécrit ses
+			// nouveaux ports, celles de l'administrateur comprises.
+			if prof, ok := profiles[strings.ReplaceAll(f[6], "%20", " ")]; ok {
+				specs = prof.Ports
+			}
+		}
+		if len(ports) > 0 && !overlaps(specs, ports) {
+			continue
+		}
+		// Une règle IPv4 n'admet pas un client IPv6, « any » compris : chaque
+		// famille a son fichier.
+		pr, ok := observedPrefix(src)
+		switch {
+		case !ok:
+		case s.Addr.IsValid():
+			if pr.Contains(s.Addr) {
+				return true
+			}
+		case !pr.Addr().IsLoopback():
+			return true
+		}
+	}
+	return false
+}
+
+// observedPrefix lit une adresse d'un tuple d'ufw, réseau ou adresse seule.
+func observedPrefix(s string) (netip.Prefix, bool) {
+	if pr, err := netip.ParsePrefix(s); err == nil {
+		return pr, true
+	}
+	a, err := netip.ParseAddr(s)
+	if err != nil {
+		return netip.Prefix{}, false
+	}
+	return netip.PrefixFrom(a, a.BitLen()), true
+}
+
+// tcpSpecs écrit des ports nus au format d'un profil.
+func tcpSpecs(ports ...string) []string {
+	out := make([]string, 0, len(ports))
+	for _, p := range ports {
+		out = append(out, p+"/tcp")
+	}
+	return out
+}
+
+// tcpRanges lit des ports au format d'ufw (« 22/tcp », « 22,2222/tcp »,
+// « 2200:2300/tcp ») en plages TCP. Un port sans protocole, ou « any », vaut
+// pour les deux.
+func tcpRanges(specs []string) [][2]int {
+	var out [][2]int
+	for _, spec := range specs {
+		list, proto, _ := strings.Cut(spec, "/")
+		if proto != "" && proto != "tcp" && proto != "any" {
+			continue
+		}
+		for _, part := range strings.Split(list, ",") {
+			lo, hi, isRange := strings.Cut(part, ":")
+			if !isRange {
+				hi = lo
+			}
+			a, errA := strconv.Atoi(lo)
+			b, errB := strconv.Atoi(hi)
+			if errA == nil && errB == nil && a <= b {
+				out = append(out, [2]int{a, b})
+			}
+		}
+	}
+	return out
+}
+
+// overlaps dit si deux jeux de ports ont un port TCP en commun.
+func overlaps(a, b []string) bool {
+	rb := tcpRanges(b)
+	for _, x := range tcpRanges(a) {
+		for _, y := range rb {
+			if x[0] <= y[1] && y[0] <= x[1] {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// opens dit si des ports de profil ouvrent ce port TCP.
+func opens(specs []string, port string) bool {
+	if _, err := strconv.Atoi(port); err != nil {
+		return false
+	}
+	return overlaps(specs, tcpSpecs(port))
 }
 
 // sshdListening rend les ports TCP où sshd écoute, lus par « ss ». En mode
@@ -951,8 +1328,10 @@ func socketStreamPorts(out string) []string {
 	return ports
 }
 
-// tightens dit si le plan peut retirer un accès : activation, politique
-// entrante, retrait d'une règle, nouveau refus.
+// tightens dit si les étapes du plan peuvent retirer un accès : activation,
+// politique entrante, retrait d'une règle, nouveau refus. Le changement des
+// ports d'un profil employé, que l'étape des profils ne laisse pas voir, est
+// compté par Plan.
 func tightens(steps []*engine.Step) bool {
 	for _, s := range steps {
 		switch {
@@ -978,33 +1357,32 @@ func usesHTTP01(projects []*model.Project) bool {
 	return false
 }
 
-// adminAddress rend l'adresse de la session d'administration, en mode réel
-// seulement.
-func (p *Provider) adminAddress() (netip.Addr, bool) {
+// adminSession rend la session d'administration, en mode réel seulement.
+func (p *Provider) adminSession() (Session, bool) {
 	if p.Admin != nil {
 		return p.Admin()
 	}
 	if p.simulated() {
-		return netip.Addr{}, false
+		return Session{}, false
 	}
 	return DetectAdmin()
 }
 
-// DetectAdmin cherche l'adresse du client SSH de la session courante. sudo
-// efface SSH_CONNECTION de l'environnement (env_reset, que « doctor » exige) :
-// on remonte donc la chaîne des processus parents, dont l'environnement la
-// porte encore — root peut le lire.
-func DetectAdmin() (netip.Addr, bool) {
-	if a, ok := parseSSHConnection(os.Getenv("SSH_CONNECTION")); ok {
-		return a, true
+// DetectAdmin cherche la session SSH courante : l'adresse du client, et le port
+// du serveur où elle est arrivée. sudo efface SSH_CONNECTION de l'environnement
+// (env_reset, que « doctor » exige) : on remonte donc la chaîne des processus
+// parents, dont l'environnement la porte encore — root peut le lire.
+func DetectAdmin() (Session, bool) {
+	if s, ok := parseSSHConnection(os.Getenv("SSH_CONNECTION")); ok {
+		return s, true
 	}
 	pid := os.Getppid()
 	for i := 0; i < 32 && pid > 1; i++ {
 		if env, err := os.ReadFile(fmt.Sprintf("/proc/%d/environ", pid)); err == nil {
 			for _, kv := range strings.Split(string(env), "\x00") {
 				if v, ok := strings.CutPrefix(kv, "SSH_CONNECTION="); ok {
-					if a, ok := parseSSHConnection(v); ok {
-						return a, true
+					if s, ok := parseSSHConnection(v); ok {
+						return s, true
 					}
 				}
 			}
@@ -1015,19 +1393,32 @@ func DetectAdmin() (netip.Addr, bool) {
 		}
 		pid = next
 	}
-	return netip.Addr{}, false
+	return Session{}, false
 }
 
-func parseSSHConnection(v string) (netip.Addr, bool) {
+// parseSSHConnection lit « client port-client serveur port-serveur ». L'adresse
+// et le port du serveur sont ceux que sshd a vus, après toute translation : ce
+// sont aussi ceux que filtre ufw, dont la chaîne d'entrée passe après la
+// translation de destination.
+func parseSSHConnection(v string) (Session, bool) {
 	f := strings.Fields(v)
 	if len(f) == 0 {
-		return netip.Addr{}, false
+		return Session{}, false
 	}
 	a, err := netip.ParseAddr(f[0])
 	if err != nil {
-		return netip.Addr{}, false
+		return Session{}, false
 	}
-	return a.Unmap(), true
+	s := Session{Addr: a.Unmap()}
+	if len(f) >= 4 {
+		if l, err := netip.ParseAddr(f[2]); err == nil {
+			s.Local = l.Unmap()
+		}
+		if _, err := strconv.Atoi(f[3]); err == nil {
+			s.Port = f[3]
+		}
+	}
+	return s, true
 }
 
 // parentPID lit le parent d'un processus dans /proc/<pid>/stat. Le nom de la

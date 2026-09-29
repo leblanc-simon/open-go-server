@@ -172,14 +172,21 @@ func unitDetector(ports string, units ...string) func(*Provider) detection {
 }
 
 // detectWeb suit le moteur retenu par ogs : il est déjà détecté, et le parc n'en
-// sert qu'un.
+// sert qu'un. Un moteur que rien ne départage — Apache et nginx installés, sans
+// web.engine — n'est pas une absence : un serveur web est là, et les ports du
+// profil ne dépendent pas du moteur. Le tenir pour absent retirait les règles
+// du web, donc l'accès public de tous les sites et les validations HTTP-01, au
+// premier « ogs firewall ban ».
 func (p *Provider) detectWeb() detection {
 	d := detection{ports: []string{"80,443/tcp"}}
-	if p.WebUnit == "" {
+	switch {
+	case p.WebUnit != "":
+		d.available, d.reason = true, "moteur "+p.WebUnit
+	case p.WebUndecided:
+		d.available, d.reason = true, "serveur web installé, moteur non retenu (web.engine)"
+	default:
 		d.reason = "aucun moteur web retenu"
-		return d
 	}
-	d.available, d.reason = true, "moteur "+p.WebUnit
 	return d
 }
 
@@ -220,7 +227,7 @@ func (p *Provider) sshdPorts() []string {
 			return
 		}
 		for _, line := range configLines(data) {
-			key, value := directive(line)
+			key, value := directive(sshdLine(line))
 			switch strings.ToLower(key) {
 			case "match":
 				// Port est refusé dans un bloc Match : ce qui suit n'en porte pas.
@@ -253,6 +260,23 @@ func (p *Provider) sshdPorts() []string {
 	}
 	visit(p.Paths.Rooted("/etc/ssh/sshd_config"), 0)
 	return out
+}
+
+// sshdLine ôte d'une ligne de sshd_config le commentaire qui la termine : pour
+// sshd, un « # » qui ouvre un mot clôt la ligne — « Port 2222 # déplacé » vaut
+// port 2222 (vérifié par « sshd -T » sur OpenSSH 8.9). Relue telle quelle, la
+// valeur n'était plus un nombre, le profil retombait au port 22, et la
+// politique par défaut fermait 2222, où sshd écoutait toujours. Un « # » au
+// milieu d'un mot en fait partie, comme pour sshd.
+func sshdLine(line string) string {
+	fields := strings.Fields(line)
+	for i, f := range fields {
+		if strings.HasPrefix(f, "#") {
+			fields = fields[:i]
+			break
+		}
+	}
+	return strings.Join(fields, " ")
 }
 
 // detectRedis lit le port de redis.conf : « port 0 » coupe l'écoute TCP, et un

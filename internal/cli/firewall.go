@@ -18,6 +18,7 @@ import (
 	"leblanc.io/open-go-server/internal/engine"
 	"leblanc.io/open-go-server/internal/fs"
 	"leblanc.io/open-go-server/internal/provider/firewall"
+	"leblanc.io/open-go-server/internal/provider/web"
 )
 
 // newFirewallCommand construit « ogs firewall » (D72).
@@ -32,7 +33,11 @@ func newFirewallCommand(app *App) *cobra.Command {
 			"Sans ufw.yaml, ogs ne touche pas à ufw. Une règle est à ogs si son commentaire\n" +
 			"commence par « ogs: » ; les autres appartiennent à l'administrateur et restent\n" +
 			"intactes. La première activation se défait d'elle-même faute de\n" +
-			"« ogs firewall confirm » dans le délai (rollbackAfter, 5 minutes par défaut).",
+			"« ogs firewall confirm » dans le délai (rollbackAfter, 5 minutes par défaut).\n\n" +
+			"Une déclaration qui couperait l'accès SSH est refusée. --allow-lockout, propre à\n" +
+			"« plan », « apply », « ban » et « unban », passe outre. --force garde son sens\n" +
+			"ordinaire — écraser un fichier retouché : le fichier de profils, ou ufw.yaml pour\n" +
+			"« init » — et ne lève jamais cette garde.",
 	}
 	cmd.AddCommand(
 		newFirewallInitCommand(app),
@@ -50,22 +55,44 @@ func newFirewallCommand(app *App) *cobra.Command {
 	return cmd
 }
 
+// firewallWebEngine choisit le moteur web pour le pare-feu. Isolé pour rester
+// substituable en test : le mode préfixé se rabat sur Apache, et ne rend jamais
+// l'échec du mode réel devant deux moteurs sans web.engine.
+var firewallWebEngine = (*App).webEngine
+
 // firewall construit le provider pour les commandes du pare-feu. Le moteur web
 // n'est cherché que pour le profil « web » : son absence ne doit pas empêcher
-// de lire l'état d'ufw.
+// de lire l'état d'ufw. Un moteur introuvable n'est pas pour autant l'absence
+// de serveur web : deux moteurs sans web.engine, c'est un serveur web qu'on ne
+// sait pas nommer, et le profil web reste disponible — le tenir pour absent
+// retirait l'accès public de tous les sites au premier bannissement.
 func (a *App) firewall() (*firewall.Provider, error) {
-	unit := ""
-	if eng, err := a.webEngine(); err == nil {
+	unit, undecided := "", false
+	if eng, err := firewallWebEngine(a); err == nil {
 		unit = eng.Unit()
+	} else {
+		undecided = webServerInstalled(a.Prefix)
 	}
 	fw, err := a.firewallProvider(unit)
 	if err != nil {
 		return nil, err
 	}
+	fw.WebUndecided = undecided
 	if fw.LoadErr != nil {
 		return nil, wrap(CodeValidation, fw.LoadErr)
 	}
 	return fw, nil
+}
+
+// webServerInstalled dit si l'un des moteurs est présent, au critère même de
+// leur détection.
+func webServerInstalled(prefix string) bool {
+	for _, name := range []string{"apache", "nginx"} {
+		if eng, err := web.NewEngine(name, prefix); err == nil && eng.Installed() {
+			return true
+		}
+	}
+	return false
 }
 
 // managedFirewall exige ufw.yaml.
@@ -99,7 +126,9 @@ func newFirewallInitCommand(app *App) *cobra.Command {
 			}
 			admin, known := netip.Addr{}, false
 			if app.Prefix == "" {
-				admin, known = firewall.DetectAdmin()
+				var s firewall.Session
+				s, known = firewall.DetectAdmin()
+				admin = s.Addr
 			}
 			content := starterUFW(fw.Profiles(), admin, known, nowFunc())
 			if err := fs.EnsureDir(app.Paths.Etc(), 0o700, fs.KeepOwner); err != nil {
@@ -227,8 +256,14 @@ func newFirewallStatusCommand(app *App) *cobra.Command {
 				}
 			}
 			lignes = append(lignes, ligne{"règles", fmt.Sprintf("%d d'ogs, %d de l'administrateur", managed, foreign), ""})
-			if obs.RollbackPending {
+			switch {
+			case obs.RollbackPending:
 				lignes = append(lignes, ligne{"confirmation", "en attente", "ogs firewall confirm"})
+			case obs.RollbackLost():
+				lignes = append(lignes, ligne{"confirmation", "jamais confirmée, retour automatique perdu",
+					"ogs firewall confirm"})
+			case obs.RolledBack():
+				lignes = append(lignes, ligne{"confirmation", "défaite par le retour automatique", "ogs firewall apply"})
 			}
 			return app.emit("FirewallStatus", lignes, nil, func(tw *tabwriter.Writer) {
 				fmt.Fprintln(tw, "\tCONSTATÉ\tVOULU")
@@ -451,8 +486,10 @@ func newFirewallWhoisCommand(app *App) *cobra.Command {
 
 // firewallPlan calcule le plan du pare-feu seul. Il se passe de l'attelage
 // complet des providers : un moteur web absent, ou deux moteurs sans
-// « web.engine », ne doivent pas empêcher de bannir une adresse.
-func (a *App) firewallPlan(cmd *cobra.Command) (*engine.Plan, *firewall.Provider, error) {
+// « web.engine », ne doivent pas empêcher de bannir une adresse. allowLockout
+// lève les gardes contre la coupure : c'est la seule voie qui le fasse, le
+// --force des fichiers retouchés n'en ayant pas le pouvoir.
+func (a *App) firewallPlan(cmd *cobra.Command, allowLockout bool) (*engine.Plan, *firewall.Provider, error) {
 	projects, err := a.loadProjects()
 	if err != nil {
 		return nil, nil, err
@@ -461,6 +498,7 @@ func (a *App) firewallPlan(cmd *cobra.Command) (*engine.Plan, *firewall.Provider
 	if err != nil {
 		return nil, nil, err
 	}
+	fw.AllowLockout = allowLockout
 	steps, err := a.firewallSteps(cmd.Context(), fw, projects, true)
 	if err != nil {
 		return nil, nil, err
@@ -472,12 +510,19 @@ func (a *App) firewallPlan(cmd *cobra.Command) (*engine.Plan, *firewall.Provider
 	return plan, fw, nil
 }
 
+// allowLockoutFlag déclare --allow-lockout sur une commande du pare-feu.
+func allowLockoutFlag(cmd *cobra.Command, v *bool) {
+	cmd.Flags().BoolVar(v, "allow-lockout", false,
+		"passer outre les gardes contre la coupure d'accès (session SSH, ports de sshd, SSH fermé à tous)")
+}
+
 func newFirewallPlanCommand(app *App) *cobra.Command {
-	return &cobra.Command{
+	var allowLockout bool
+	cmd := &cobra.Command{
 		Use:   "plan",
 		Short: "Calculer les changements du pare-feu, sans rien appliquer",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			plan, _, err := app.firewallPlan(cmd)
+			plan, _, err := app.firewallPlan(cmd, allowLockout)
 			if err != nil {
 				return err
 			}
@@ -504,10 +549,13 @@ func newFirewallPlanCommand(app *App) *cobra.Command {
 			return nil
 		},
 	}
+	allowLockoutFlag(cmd, &allowLockout)
+	return cmd
 }
 
 func newFirewallApplyCommand(app *App) *cobra.Command {
-	return &cobra.Command{
+	var allowLockout bool
+	cmd := &cobra.Command{
 		Use:   "apply",
 		Short: "Appliquer ufw.yaml au pare-feu, et à lui seul",
 		Long: "Réconcilie le seul pare-feu, sans le reste du parc. Les prisons fail2ban, dont\n" +
@@ -525,15 +573,17 @@ func newFirewallApplyCommand(app *App) *cobra.Command {
 			if err := app.openStore(); err != nil {
 				return err
 			}
-			return app.applyFirewall(cmd)
+			return app.applyFirewall(cmd, allowLockout)
 		},
 	}
+	allowLockoutFlag(cmd, &allowLockout)
+	return cmd
 }
 
 // applyFirewall applique le plan du pare-feu. Le verrou global et la base
 // d'état sont à la charge de l'appelant.
-func (a *App) applyFirewall(cmd *cobra.Command) error {
-	plan, fw, err := a.firewallPlan(cmd)
+func (a *App) applyFirewall(cmd *cobra.Command, allowLockout bool) error {
+	plan, fw, err := a.firewallPlan(cmd, allowLockout)
 	if err != nil {
 		return err
 	}
@@ -579,7 +629,9 @@ func newFirewallConfirmCommand(app *App) *cobra.Command {
 		Short: "Confirmer l'activation d'ufw et annuler son retour automatique",
 		Long: "À lancer depuis une NOUVELLE session SSH : c'est elle qui prouve que le pare-feu\n" +
 			"laisse passer l'administration. Une session ouverte avant l'activation survit à\n" +
-			"des règles qui refuseraient la suivante.",
+			"des règles qui refuseraient la suivante.\n\n" +
+			"Un redémarrage dans le délai efface le retour automatique, et ufw repart actif :\n" +
+			"l'activation reste alors à confirmer, ce que « status » et « doctor » signalent.",
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			// La confirmation ne lit pas ufw.yaml : un fichier retouché, voire cassé,
 			// depuis l'activation ne doit pas empêcher de garder un pare-feu qui
@@ -594,11 +646,42 @@ func newFirewallConfirmCommand(app *App) *cobra.Command {
 				return wrap(CodeError, err)
 			}
 			if !pending {
+				// ufw inactif alors qu'ufw.yaml le veut actif, c'est d'ordinaire un
+				// retour automatique qui vient de jouer : répondre « rien à
+				// confirmer » laissait croire le pare-feu en place, alors qu'il ne
+				// filtre plus rien — et un script ne pouvait pas le distinguer
+				// d'une confirmation. ufw.yaml n'est lu que pour dire si l'inactivité
+				// est voulue : cassé, il ne décide rien.
+				if obs.Installed && !obs.Enabled {
+					cfg, present, lerr := config.LoadUFW(app.Paths.UFWConfig())
+					switch {
+					case lerr == nil && !present:
+					case lerr == nil && !cfg.IsActive():
+						app.printf("aucune activation en attente de confirmation : ufw est inactif, comme " +
+							"ufw.yaml le demande (active: false)\n")
+						return nil
+					case obs.RolledBack():
+						app.printf("⚠ ufw est inactif : le retour automatique a défait l'activation, faute de " +
+							"confirmation dans le délai — « ogs firewall apply » la refait, à confirmer depuis une " +
+							"nouvelle session\n")
+						return exitf(CodePartial, "ufw est inactif : rien à confirmer")
+					default:
+						app.printf("⚠ ufw est inactif : aucune activation à confirmer — le retour automatique " +
+							"l'a défaite si le délai est échu, ou ufw n'a pas encore été activé ; « ogs firewall " +
+							"apply » l'active\n")
+						return exitf(CodePartial, "ufw est inactif : rien à confirmer")
+					}
+				}
 				app.printf("aucune activation en attente de confirmation\n")
 				return nil
 			}
 			if app.Audit != nil {
 				_ = app.Audit.Record("", "firewall/state", "firewall.confirm", "ok", "")
+			}
+			if obs.RollbackLost() {
+				app.printf("✓ activation d'ufw confirmée — son retour automatique avait déjà disparu (un " +
+					"redémarrage l'efface) : ufw tenait sans filet\n")
+				return nil
 			}
 			app.printf("✓ activation d'ufw confirmée : le retour automatique est annulé\n")
 			return nil
@@ -612,8 +695,9 @@ func newFirewallConfirmCommand(app *App) *cobra.Command {
 // l'exploitant, qui disent souvent pourquoi une adresse est là, survivent.
 func newFirewallBanCommand(app *App, ban bool) *cobra.Command {
 	var (
-		comment string
-		noApply bool
+		comment      string
+		noApply      bool
+		allowLockout bool
 	)
 	use, short := "ban <adresse|source>", "Bannir une adresse, un réseau ou une source nommée"
 	if !ban {
@@ -669,13 +753,14 @@ func newFirewallBanCommand(app *App, ban bool) *cobra.Command {
 			if err := app.openStore(); err != nil {
 				return err
 			}
-			return app.applyFirewall(cmd)
+			return app.applyFirewall(cmd, allowLockout)
 		},
 	}
 	if ban {
 		cmd.Flags().StringVar(&comment, "comment", "", "commentaire de la règle (sinon engendré)")
 	}
 	cmd.Flags().BoolVar(&noApply, "no-apply", false, "écrire ufw.yaml sans appliquer")
+	allowLockoutFlag(cmd, &allowLockout)
 	return cmd
 }
 

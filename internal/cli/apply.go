@@ -405,7 +405,10 @@ func (a *App) buildGlobalPlan(ctx context.Context, provs *providers, targeted []
 
 	// Pare-feu (D72) : après tout ce qui fait naître un service, pour que ses
 	// règles existent le jour où il écoute, et avant la rotation des journaux,
-	// dont le refus éventuel ne doit pas le priver de son tour.
+	// dont le refus éventuel ne doit pas le priver de son tour. Ses gardes contre
+	// la coupure n'y cèdent jamais : le --force qu'on donne ici pour un fichier
+	// retouché ne dit rien du pare-feu, et les lever est une décision que seules
+	// les commandes « ogs firewall » prennent (--allow-lockout).
 	fwSteps, err := a.firewallSteps(ctx, provs.Firewall, projects, false)
 	if err != nil {
 		return nil, err

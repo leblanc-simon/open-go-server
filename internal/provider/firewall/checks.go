@@ -18,7 +18,7 @@ type Finding struct {
 // rien n'écoute — le sshd déplacé, que la politique par défaut couperait —, un
 // service qui n'écoute que la boucle locale et dont les règles n'ont pas
 // d'objet, Docker qui publie ses ports en amont d'ufw, une activation qui
-// attend sa confirmation.
+// attend sa confirmation, ou qui ne l'a jamais reçue.
 func (p *Provider) Checks(obs Observed, listeners []string) []Finding {
 	if !p.Managed() {
 		return nil
@@ -40,10 +40,20 @@ func (p *Provider) Checks(obs Observed, listeners []string) []Finding {
 	default:
 		add("pare-feu", "ok", "ufw inactif, comme ufw.yaml le demande", "")
 	}
-	if obs.RollbackPending {
+	switch {
+	case obs.RollbackPending:
 		add("pare-feu : confirmation", "avertissement",
 			"l'activation d'ufw n'a pas été confirmée : il se désactivera de lui-même au terme du délai",
 			"ogs firewall confirm")
+	case obs.RollbackLost():
+		add("pare-feu : confirmation", "avertissement",
+			"l'activation d'ufw n'a jamais été confirmée, et son retour automatique a disparu — un redémarrage "+
+				"dans le délai l'efface : ufw reste actif, sans filet",
+			"ogs firewall confirm, depuis une nouvelle session SSH")
+	case obs.RolledBack() && cfg.IsActive():
+		add("pare-feu : confirmation", "avertissement",
+			"le retour automatique a désactivé ufw, faute de confirmation dans le délai",
+			"ogs firewall apply, puis ogs firewall confirm depuis une nouvelle session SSH")
 	}
 	if unit, ok := p.unitExists("docker"); ok {
 		add("pare-feu : docker", "avertissement", unit+" est installé : Docker publie les ports de ses "+

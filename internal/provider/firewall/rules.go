@@ -152,6 +152,11 @@ type ObservedRule struct {
 	Verb string
 	// Raw est le tuple d'origine, pour l'affichage.
 	Raw string
+	// fields est le tuple découpé, commentaire ôté : action, protocole, port et
+	// adresse de destination, port et adresse d'origine, applications, sens. Les
+	// gardes contre la coupure y lisent ce qu'ouvre une règle de
+	// l'administrateur, qu'aucune des formes d'ogs ne décrit.
+	fields []string
 }
 
 // readRules relit un jeu de règles ufw ; un fichier absent n'en porte aucune.
@@ -191,6 +196,7 @@ func parseRules(data []byte, family int) []ObservedRule {
 			Managed: strings.HasPrefix(comment, Marker)}
 		obs.Comment = comment
 		fields := strings.Fields(tuple)
+		obs.fields = fields
 		if len(fields) > 0 {
 			obs.Verb = fields[0]
 		}

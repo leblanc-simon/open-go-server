@@ -14,8 +14,18 @@
 #   — un profil dont le port change entraîne ses règles (« ufw app update ») ;
 #   — un refus relu après une autorisation est replacé en tête, et bloque ;
 #   — une règle de l'administrateur survit, une règle d'ogs orpheline part ;
-#   — la première activation se défait d'elle-même faute de confirmation ;
-#   — la garde refuse d'appliquer ce qui couperait la session SSH.
+#   — la première activation se défait d'elle-même faute de confirmation, et
+#     « confirm » dit ensuite qu'ufw est inactif, en code 6 ;
+#   — un retour automatique perdu (un redémarrage efface son unité) laisse un
+#     témoin, que status, doctor et confirm lisent ;
+#   — la garde refuse d'appliquer ce qui couperait la session SSH ;
+#   — un Port annoté garde son port, et des ports ssh qui fermeraient celui où
+#     sshd écoute sont refusés, le --force d'« ogs apply » n'y pouvant rien —
+#     un profil ssh écarté aussi, sauf si l'administrateur ouvre ssh lui-même,
+#     fût-ce par une seule interface ;
+#   — sshd déplacé : le plan qui suit son nouveau port passe, le port d'une
+#     session où sshd n'écoute plus ne comptant pas ;
+#   — deux moteurs sans web.engine : bannir ne retire pas l'accès au web.
 set -uo pipefail
 . /scenarios/lib.sh
 
@@ -154,13 +164,38 @@ for _ in $(seq 1 45); do
 done
 ufw status | grep -q "Status: inactive" || echec "sans confirmation, ufw doit s'être désactivé"
 doit_passer dehors 22 "après le retour automatique"
+# Un « confirm » tardif ne doit pas laisser croire le pare-feu en place, ni
+# rendre le code d'une confirmation.
+sortie=$(ogs firewall confirm 2>&1)
+code=$?
+[ "$code" = 6 ] || { echo "$sortie"; echec "confirm après le retour doit rendre 6, obtenu $code"; }
+echo "$sortie" | grep -q "ufw est inactif" || { echo "$sortie"; echec "confirm après le retour doit dire qu'ufw est inactif"; }
+echo "$sortie" | grep -q "le retour automatique a défait" || { echo "$sortie"; echec "confirm doit dire que le retour a joué"; }
+ogs firewall status | grep -q "défaite par le retour automatique" || { ogs firewall status; echec "status : retour joué"; }
 
 # --- Seconde activation, confirmée ----------------------------------------
 ogs apply --yes >/tmp/apply.log 2>&1 || { cat /tmp/apply.log; echec "apply"; }
 ogs firewall confirm | grep -q "confirmée" || echec "confirm"
 systemctl is-active --quiet ogs-ufw-rollback.timer && echec "le minuteur doit être arrêté"
+[ -e /var/lib/ogs/ufw-unconfirmed ] && echec "confirm doit retirer le témoin de l'activation"
 sleep 35
 ufw status | grep -q "Status: active" || echec "confirmé, ufw doit rester actif"
+
+# --- Retour perdu : un redémarrage dans le délai ---------------------------
+# L'unité transitoire du retour vit sous /run : un redémarrage dans le délai
+# l'efface, et ufw repart actif, sans filet. L'arrêter à la main en tient lieu —
+# redémarrer le conteneur emporterait les espaces réseau des clients. Le témoin,
+# sous /var/lib/ogs, survit : c'est lui qui le fait savoir.
+ufw --force disable >/dev/null
+ogs firewall apply --yes >/dev/null || echec "firewall apply (troisième activation)"
+[ -f /var/lib/ogs/ufw-unconfirmed ] || echec "l'activation doit poser son témoin"
+systemctl stop ogs-ufw-rollback.timer
+ufw status | grep -q "Status: active" || echec "ufw doit rester actif, sans filet"
+ogs firewall status | grep -q "retour automatique perdu" || { ogs firewall status; echec "status : retour perdu"; }
+docteur | grep -q "retour automatique a disparu" || echec "doctor doit signaler le retour perdu"
+ogs firewall confirm | grep -q "avait déjà disparu" || echec "confirm doit confirmer l'activation au retour perdu"
+[ -e /var/lib/ogs/ufw-unconfirmed ] && echec "confirm doit retirer le témoin"
+ufw status | grep -q "Status: active" || echec "confirmé, ufw reste actif"
 
 # ufw accepte le fichier de profils d'ogs : ports détectés.
 ufw app info ogs-sftp | grep -q "2222/tcp" || { ufw app info ogs-sftp; echec "profil sftp"; }
@@ -176,6 +211,94 @@ ufw status | grep "10.201.0.0/24" | grep -q "ogs: prestataire (ACME SARL)" ||
 # Idempotence : relire ce qu'ufw a rangé ne doit rien redemander.
 n=$(changements)
 [ "$n" = 0 ] || { ogs firewall plan; echec "plan non vide après apply ($n changement(s))"; }
+
+# --- Ports de sshd : gardés comme un retrait -------------------------------
+# sshd admet un commentaire en fin de ligne ; relu tel quel, il faisait retomber
+# le profil au port 22 et fermait 2200.
+printf 'Port 22 # annoté\nPort 2200 # second port\n' >/etc/ssh/sshd_config.d/essai.conf
+sshd -t || echec "montage : sshd doit admettre le commentaire de fin de ligne"
+[ "$(changements)" = 0 ] || { ogs firewall plan; echec "un Port annoté ne doit rien changer"; }
+# Des ports ssh qui ferment 2200, où sshd écoute : refusé, et le --force des
+# fichiers retouchés n'y peut rien. La session, arrivée sur 2200, passerait
+# encore par 22 : c'est la garde des ports de sshd qui parle.
+cp /etc/ogs/ufw.yaml /tmp/ufw.yaml.avant
+sed -i 's#^profiles:#profiles:\n  ssh:\n    ports: [22/tcp]#' /etc/ogs/ufw.yaml
+sortie=$(SSH_CONNECTION="10.200.0.2 50000 10.200.0.1 2200" ogs firewall apply --yes --force 2>&1)
+code=$?
+[ "$code" = 3 ] || { echo "$sortie"; echec "des ports ssh qui ferment 2200 doivent être refusés (code 3), obtenu $code"; }
+echo "$sortie" | grep -q "sshd écoute sur le port 2200" || { echo "$sortie"; echec "la garde doit nommer le port de sshd"; }
+sortie=$(ogs apply --yes --force 2>&1)
+code=$?
+[ "$code" = 6 ] || { echo "$sortie"; echec "« apply --force » : le pare-feu refusé doit rendre 6, obtenu $code"; }
+ufw app info ogs-ssh | grep -q "2200/tcp" || { ufw app info ogs-ssh; echec "le --force d'apply a levé la garde"; }
+doit_passer confiance 2200 "second port de sshd, gardé"
+cp /tmp/ufw.yaml.avant /etc/ogs/ufw.yaml
+[ "$(changements)" = 0 ] || { ogs firewall plan; echec "plan non vide après la garde"; }
+
+# Un profil ssh écarté voit ses règles retirées : depuis la console, sans
+# session à protéger, la garde des ports de sshd doit refuser quand même.
+sed -i 's#^profiles:#profiles:\n  ssh:\n    available: false#' /etc/ogs/ufw.yaml
+sortie=$(ogs firewall apply --yes 2>&1)
+code=$?
+[ "$code" = 3 ] || { echo "$sortie"; echec "un profil ssh écarté doit être refusé (code 3), obtenu $code"; }
+echo "$sortie" | grep -q "sshd écoute sur le port 22, que plus rien n'ouvrirait" ||
+    { echo "$sortie"; echec "la garde doit nommer le port de sshd"; }
+doit_passer confiance 22 "profil ssh écarté, refusé"
+# Qui ouvre ssh par ses propres règles n'est pas refusé : ogs ne les touche pas.
+ufw limit 22/tcp comment 'ssh géré à la main' >/dev/null
+ufw allow 2200/tcp comment 'ssh géré à la main' >/dev/null
+sortie=$(ogs firewall apply --yes 2>&1) || { echo "$sortie"; echec "les règles de l'administrateur ouvrent les ports de sshd"; }
+doit_passer confiance 22 "ssh ouvert par l'administrateur"
+doit_passer confiance 2200 "ssh ouvert par l'administrateur"
+cp /tmp/ufw.yaml.avant /etc/ogs/ufw.yaml
+ogs firewall apply --yes >/dev/null || echec "firewall apply (profil ssh rétabli)"
+ufw delete limit 22/tcp >/dev/null
+ufw delete allow 2200/tcp >/dev/null
+doit_passer confiance 22 "profil ssh rétabli"
+[ "$(changements)" = 0 ] || { ogs firewall plan; echec "plan non vide, profil ssh rétabli"; }
+
+# Qui n'ouvre ssh que par un lien — un VPN ; ici, celui du bureau — garde un
+# accès : depuis la console, une règle liée à une interface ouvre le port, et la
+# garde ne refuse plus. Pour une session, rien ne dit par quelle interface elle
+# est arrivée : la garde refuse, et le dit ; une règle vers l'adresse du serveur
+# qu'elle a jointe, elle, se vérifie.
+sed -i 's#^profiles:#profiles:\n  ssh:\n    available: false#' /etc/ogs/ufw.yaml
+ufw allow in on v-confiance to any port 22 proto tcp comment 'ssh par le lien du bureau' >/dev/null
+ufw allow in on v-confiance to any port 2200 proto tcp comment 'ssh par le lien du bureau' >/dev/null
+sortie=$(ogs firewall plan 2>&1) || { echo "$sortie"; echec "une règle liée à une interface ouvre les ports de sshd"; }
+sortie=$(SSH_CONNECTION="10.200.0.2 50000 10.200.0.1 22" ogs firewall apply --yes 2>&1)
+code=$?
+[ "$code" = 3 ] || { echo "$sortie"; echec "une session par le lien, sans autre règle, doit être gardée (code 3), obtenu $code"; }
+echo "$sortie" | grep -q "liée à une interface" || { echo "$sortie"; echec "le refus doit nommer la règle liée à une interface"; }
+ufw allow proto tcp to 10.200.0.1 port 22 comment 'ssh vers le lien du bureau' >/dev/null
+sortie=$(SSH_CONNECTION="10.200.0.2 50000 10.200.0.1 22" ogs firewall apply --yes 2>&1) ||
+    { echo "$sortie"; echec "la règle vers l'adresse jointe par la session la couvre"; }
+doit_passer confiance 22 "ssh vers l'adresse du lien"
+doit_passer confiance 2200 "ssh par le lien du bureau"
+doit_bloquer dehors 22 "ssh fermé hors du lien du bureau"
+doit_bloquer dehors 2200 "ssh fermé hors du lien du bureau"
+cp /tmp/ufw.yaml.avant /etc/ogs/ufw.yaml
+ogs firewall apply --yes >/dev/null || echec "firewall apply (profil ssh rétabli, lien)"
+ufw delete allow in on v-confiance to any port 22 proto tcp >/dev/null
+ufw delete allow in on v-confiance to any port 2200 proto tcp >/dev/null
+ufw delete allow proto tcp to 10.200.0.1 port 22 >/dev/null
+doit_passer confiance 22 "profil ssh rétabli, lien"
+[ "$(changements)" = 0 ] || { ogs firewall plan; echec "plan non vide, profil ssh rétabli après le lien"; }
+
+# sshd déplacé sur 2200 seul et redémarré, la session en cours arrivée sur 22 :
+# ss ne montre plus sshd sur 22. Le plan qui porte le profil sur 2200 rend
+# l'accès ; la garde comptait le port de la session, et refusait la réparation.
+printf 'Port 2200\n' >/etc/ssh/sshd_config.d/essai.conf
+systemctl restart ssh || echec "sshd (2200 seul)"
+sortie=$(SSH_CONNECTION="10.200.0.2 50000 10.200.0.1 22" ogs firewall apply --yes 2>&1) ||
+    { echo "$sortie"; echec "le plan qui suit sshd sur 2200 doit passer"; }
+ufw app info ogs-ssh | grep -Eq "^ *22/tcp" && { ufw app info ogs-ssh; echec "le profil ssh doit suivre sshd"; }
+doit_passer confiance 2200 "sshd déplacé, profil suivi"
+printf 'Port 22 # annoté\nPort 2200 # second port\n' >/etc/ssh/sshd_config.d/essai.conf
+systemctl restart ssh || echec "sshd (22 et 2200)"
+ogs firewall apply --yes >/dev/null || echec "firewall apply (sshd rétabli sur 22 et 2200)"
+doit_passer confiance 22 "sshd rétabli sur 22"
+[ "$(changements)" = 0 ] || { ogs firewall plan; echec "plan non vide, sshd rétabli"; }
 
 # --- Commentaire corrigé en place -----------------------------------------
 avant=$(ufw status numbered | grep -c "ogs:")
@@ -215,6 +338,16 @@ doit_bloquer dehors 80 "refus replacé en tête"
 
 ogs firewall unban 10.201.0.2 --yes >/dev/null || echec "unban"
 doit_passer dehors 80 "bannissement levé"
+
+# Deux moteurs sans web.engine : une inconnue, non l'absence de serveur web.
+# Bannir retirait l'accès public au web de tous les sites.
+cp /etc/ogs/config.yaml /tmp/config.yaml.avant
+sed -i '/^  engine: apache$/d' /etc/ogs/config.yaml
+sortie=$(ogs firewall ban 10.201.0.3 --yes 2>&1) || { echo "$sortie"; echec "ban sans moteur retenu"; }
+echo "$sortie" | grep -q "retrait" && { echo "$sortie"; echec "bannir sans moteur retenu ne doit retirer aucun accès"; }
+doit_passer dehors 80 "web ouvert à tous, moteur non retenu"
+ogs firewall unban 10.201.0.3 --yes >/dev/null || echec "unban sans moteur retenu"
+cp /tmp/config.yaml.avant /etc/ogs/config.yaml
 
 # --- Règle de l'administrateur, règle orpheline ---------------------------
 ufw allow from 10.201.0.2 to any port 2200 proto tcp comment 'poste de secours' >/dev/null

@@ -381,27 +381,58 @@ func TestProfilEmployeParUneRegleEtrangereGarde(t *testing.T) {
 	}
 }
 
+// session fixe la session d'administration du banc.
+func session(addr, port string) func() (Session, bool) {
+	return func() (Session, bool) { return Session{Addr: netip.MustParseAddr(addr), Port: port}, true }
+}
+
 func TestGardeSessionAdministration(t *testing.T) {
 	b := nouveauBanc(t, declarationType, "ssh", "mariadb")
-	b.prov.Admin = func() (netip.Addr, bool) { return netip.MustParseAddr("192.0.2.50"), true }
+	b.prov.Admin = session("192.0.2.50", "")
 	_, err := b.planErr()
 	var ve *ValidationError
 	if !errors.As(err, &ve) || !strings.Contains(err.Error(), "192.0.2.50") {
 		t.Fatalf("une activation qui couperait la session doit être refusée : %v", err)
 	}
-	b.prov.Force = true
+	b.prov.AllowLockout = true
 	if _, err := b.planErr(); err != nil {
-		t.Errorf("--force passe outre la garde : %v", err)
+		t.Errorf("--allow-lockout passe outre la garde : %v", err)
 	}
 
-	b.prov.Force = false
-	b.prov.Admin = func() (netip.Addr, bool) { return netip.MustParseAddr("203.0.113.10"), true }
+	b.prov.AllowLockout = false
+	b.prov.Admin = session("203.0.113.10", "")
 	if _, err := b.planErr(); err != nil {
 		t.Errorf("une session couverte par la confiance est acceptée : %v", err)
 	}
-	b.prov.Admin = func() (netip.Addr, bool) { return netip.MustParseAddr("192.0.2.66"), true }
+	b.prov.Admin = session("192.0.2.66", "")
 	if _, err := b.planErr(); err == nil || !strings.Contains(err.Error(), "bannirait") {
 		t.Errorf("bannir l'adresse de la session doit être refusé : %v", err)
+	}
+}
+
+// Le --force des fichiers retouchés (§6.4) se donne pour un vhost ou une
+// rotation, sans penser au pare-feu : il levait pourtant les gardes contre la
+// coupure dans toute commande qui exécute le plan global. Ce sont deux
+// décisions distinctes.
+func TestForceNeLevePasLesGardesContreLaCoupure(t *testing.T) {
+	b := nouveauBanc(t, declarationType, "ssh", "mariadb")
+	b.prov.Force = true
+	b.prov.Admin = session("192.0.2.50", "")
+	if _, err := b.planErr(); err == nil || !strings.Contains(err.Error(), "192.0.2.50") {
+		t.Errorf("--force ne doit pas lever la garde de la session : %v", err)
+	}
+	b.prov.Admin = session("192.0.2.66", "")
+	if _, err := b.planErr(); err == nil || !strings.Contains(err.Error(), "bannirait") {
+		t.Errorf("--force ne doit pas lever la garde du bannissement : %v", err)
+	}
+	b.prov.Admin = nil
+	b.prov.Cfg.Trusted = nil
+	_, err := b.planErr()
+	if err == nil || !strings.Contains(err.Error(), "ssh : aucune source") {
+		t.Fatalf("--force ne doit pas lever la garde de SSH fermé à tous : %v", err)
+	}
+	if !strings.Contains(err.Error(), "--allow-lockout") || strings.Contains(err.Error(), "--force") {
+		t.Errorf("le refus doit nommer la seule option qui le lève :\n%v", err)
 	}
 }
 
@@ -669,5 +700,714 @@ func TestPortsSSHSocketInactiveIgnorée(t *testing.T) {
 	b.prov.Exec = &ssReel{b.rec}
 	if got := b.prov.sshdListening(context.Background()); len(got) != 1 || got[0] != "2222" {
 		t.Errorf("seuls les ports de sshd comptent : %v", got)
+	}
+}
+
+// reconcilier met le banc dans l'état d'un pare-feu réconcilié et actif :
+// fichier de profils écrit, règles posées, ufw actif. Le plan qui suit est vide.
+func (b *banc) reconcilier(projects ...*model.Project) {
+	b.t.Helper()
+	for _, s := range b.plan(projects...) {
+		if s.Resource != "firewall/profiles" {
+			continue
+		}
+		if _, err := engine.Execute(context.Background(), &engine.Plan{Steps: []*engine.Step{s}},
+			engine.Options{}); err != nil {
+			b.t.Fatal(err)
+		}
+	}
+	desired, err := b.prov.Desired()
+	if err != nil {
+		b.t.Fatal(err)
+	}
+	b.write("/etc/ufw/user.rules", rulesFile(desired, 4))
+	b.write("/etc/ufw/user6.rules", rulesFile(desired, 6))
+	b.write("/etc/ufw/ufw.conf", "ENABLED=yes\nLOGLEVEL=low\n")
+	if res := resources(b.plan(projects...)); len(res) != 0 {
+		b.t.Fatalf("état réconcilié non conforme : %v", res)
+	}
+}
+
+func (b *banc) profil(name string) string {
+	b.t.Helper()
+	data, err := os.ReadFile(filepath.Join(b.root, "etc/ufw/applications.d/ogs"))
+	if err != nil {
+		b.t.Fatal(err)
+	}
+	return parseProfiles(data)[name]
+}
+
+// sshdSur2222 prépare un sshd déplacé sur 2222, qu'une session de confiance
+// administre. ss le montre à l'écoute ; aucune ssh.socket.
+func sshdSur2222(t *testing.T) *banc {
+	b := nouveauBanc(t, "sources:\n  bureau:\n    owner: \"Bureau\"\n    addresses: [10.200.0.2]\n"+
+		"trusted: [bureau]\npolicy:\n  incoming: deny\n", "ssh")
+	b.write("/etc/ssh/sshd_config", "Include /etc/ssh/sshd_config.d/*.conf\n")
+	b.write("/etc/ssh/sshd_config.d/essai.conf", "Port 2222\n")
+	b.prov.Admin = session("10.200.0.2", "")
+	b.rec.Responses["ss -Htlnp"] = exec.Result{Stdout: `LISTEN 0 128 0.0.0.0:2222 0.0.0.0:* users:(("sshd",pid=156,fd=6))
+LISTEN 0 128 [::]:2222 [::]:* users:(("sshd",pid=156,fd=7))`}
+	b.rec.Errors["systemctl is-active"] = errors.New("inactive")
+	b.prov.Exec = &ssReel{b.rec}
+	b.reconcilier()
+	if got := b.profil("ogs-ssh"); got != "2222/tcp" {
+		t.Fatalf("état initial : ogs-ssh = %s", got)
+	}
+	return b
+}
+
+// sshd admet un commentaire en fin de ligne : « Port 2222 # déplacé » relu tel
+// quel faisait retomber le profil au port 22, et « ufw app update ogs-ssh »
+// fermait 2222, où sshd écoutait toujours.
+func TestPortSSHAnnotéGardeSonPort(t *testing.T) {
+	b := sshdSur2222(t)
+	b.write("/etc/ssh/sshd_config.d/essai.conf", "Port 2222 # déplacé le 12/09\n"+
+		"ListenAddress 0.0.0.0:2201\t# bastion\nPort 2200#collé\n")
+	for _, p := range b.prov.Profiles() {
+		if p.Name == "ssh" && p.PortsSpec() != "2222/tcp|2201/tcp" {
+			t.Errorf("ssh : %s — le commentaire de fin de ligne ne fait pas partie de la valeur, "+
+				"un « # » collé au mot si", p.PortsSpec())
+		}
+	}
+	b.write("/etc/ssh/sshd_config.d/essai.conf", "Port 2222 # déplacé le 12/09\n")
+	if res := resources(b.plan()); len(res) != 0 {
+		t.Errorf("une annotation ne change rien au pare-feu : %v", res)
+	}
+	if b.rec.Contains("ufw app update ogs-ssh") {
+		t.Error("le profil ssh ne doit pas être relu par ufw")
+	}
+}
+
+// Changer les ports d'un profil employé ferme l'ancien port : c'est un
+// resserrement, que la garde des ports où sshd écoute doit voir comme un
+// retrait. Elle ne jouait que sur un retrait de règle ou une activation.
+func TestChangementDePortsDuProfilSSHGardé(t *testing.T) {
+	b := sshdSur2222(t)
+	b.prov.Cfg.Profiles = map[string]config.UFWProfile{"ssh": {Ports: []string{"22/tcp"}}}
+	_, err := b.planErr()
+	var ve *ValidationError
+	if !errors.As(err, &ve) || !strings.Contains(err.Error(), "sshd écoute sur le port 2222") {
+		t.Fatalf("des ports ssh qui ferment le port où sshd écoute doivent être refusés : %v", err)
+	}
+	b.prov.AllowLockout = true
+	steps, err := b.planErr()
+	if err != nil {
+		t.Fatalf("--allow-lockout passe outre : %v", err)
+	}
+	if res := resources(steps); len(res) != 1 || res[0] != "firewall/profiles" {
+		t.Errorf("seul le fichier de profils change : %v", res)
+	}
+}
+
+// Là où ss se tait — mode simulé, ss absent —, la session porte le port : un
+// profil ssh qui ne l'ouvre plus couperait la suivante. La garde ne comparait
+// que l'adresse.
+func TestGardeSessionContrôleLePortDuServeur(t *testing.T) {
+	b := nouveauBanc(t, declarationType, "ssh", "mariadb")
+	b.write("/etc/ssh/sshd_config", "Port 2222\n")
+	b.prov.Admin = session("203.0.113.10", "2222")
+	b.reconcilier()
+
+	b.prov.Cfg.Profiles["ssh"] = config.UFWProfile{Ports: []string{"22/tcp"}}
+	_, err := b.planErr()
+	if err == nil || !strings.Contains(err.Error(), "arrivée sur le port 2222") {
+		t.Fatalf("un profil ssh qui n'ouvre plus le port de la session doit être refusé : %v", err)
+	}
+	b.prov.Cfg.Profiles["ssh"] = config.UFWProfile{Ports: []string{"22/tcp", "2200:2300/tcp"}}
+	if _, err := b.planErr(); err != nil {
+		t.Errorf("une plage qui couvre le port de la session le laisse passer : %v", err)
+	}
+}
+
+func TestSessionSSHLitLePortDuServeur(t *testing.T) {
+	s, ok := parseSSHConnection("::ffff:203.0.113.10 51234 ::ffff:10.0.0.1 2222")
+	if !ok || s.Addr != netip.MustParseAddr("203.0.113.10") || s.Port != "2222" ||
+		s.Local != netip.MustParseAddr("10.0.0.1") {
+		t.Errorf("session : %+v", s)
+	}
+	if s, ok := parseSSHConnection("203.0.113.10"); !ok || s.Port != "" {
+		t.Errorf("sans port, l'adresse suffit : %+v", s)
+	}
+}
+
+func TestPortsOuvertsParUnProfil(t *testing.T) {
+	for _, c := range []struct {
+		specs []string
+		port  string
+		want  bool
+	}{
+		{[]string{"22/tcp"}, "22", true},
+		{[]string{"2200/tcp", "22/tcp"}, "22", true},
+		{[]string{"22,2222/tcp"}, "2222", true},
+		{[]string{"2200:2300/tcp"}, "2222", true},
+		{[]string{"2200:2300/tcp"}, "22", false},
+		{[]string{"2222/udp"}, "2222", false},
+		{[]string{"2222"}, "2222", true},
+	} {
+		if got := opens(c.specs, c.port); got != c.want {
+			t.Errorf("opens(%v, %s) = %v", c.specs, c.port, got)
+		}
+	}
+}
+
+// Deux moteurs sans web.engine : une inconnue, non l'absence de serveur web.
+// Le profil web tenu pour absent voyait ses règles retirées au premier
+// « ogs firewall ban » — l'accès public de tous les sites, et les validations
+// HTTP-01, avec lui.
+func TestMoteurWebIndéterminéGardeLesRèglesDuWeb(t *testing.T) {
+	b := nouveauBanc(t, declarationType, "ssh", "mariadb")
+	proj := &model.Project{}
+	proj.Spec.Certificates = []model.Certificate{{Name: "shop", Domains: []string{"shop.fr"}}}
+	b.reconcilier(proj)
+
+	b.prov.WebUnit, b.prov.WebUndecided = "", true
+	b.prov.Cfg.Ban = append(b.prov.Cfg.Ban, config.ParseUFWEntry("198.51.100.9"))
+	steps, err := b.planErr(proj)
+	if err != nil {
+		t.Fatalf("bannir une adresse ne dépend pas du moteur web : %v", err)
+	}
+	if d := diffs(t, steps); strings.Contains(d, "ogs-web") {
+		t.Errorf("les règles du web ne doivent pas partir :\n%s", d)
+	}
+	for _, p := range b.prov.Profiles() {
+		if p.Name == "web" && !p.Available {
+			t.Errorf("un serveur web installé reste un serveur web : %+v", p)
+		}
+	}
+}
+
+// La garde HTTP-01 porte sur ce que le plan laisse ouvert, non sur la seule
+// disponibilité détectée : un profil web indisponible retire ses règles.
+func TestGardeHTTP01SansProfilWeb(t *testing.T) {
+	b := nouveauBanc(t, declarationType, "ssh", "mariadb")
+	proj := &model.Project{}
+	proj.Spec.Certificates = []model.Certificate{{Name: "shop", Domains: []string{"shop.fr"}}}
+	b.reconcilier(proj)
+
+	// Écarté dans ufw.yaml, le refus nomme le forçage : « forcer
+	// profiles.web.available » ne disait rien à qui l'avait déjà forcé à faux.
+	faux, web := false, b.prov.Cfg.Profiles["web"]
+	b.prov.Cfg.Profiles["web"] = config.UFWProfile{Available: &faux, Allow: web.Allow}
+	if _, err := b.planErr(proj); err == nil || !strings.Contains(err.Error(), "« profiles.web.available: false »") {
+		t.Errorf("un web écarté sous un projet en HTTP-01 doit être refusé en nommant le forçage : %v", err)
+	}
+	b.prov.Cfg.Profiles["web"] = web
+
+	b.prov.WebUnit = ""
+	if _, err := b.planErr(proj); err == nil || !strings.Contains(err.Error(), "HTTP-01") {
+		t.Errorf("retirer l'accès public au web sous un projet en HTTP-01 doit être refusé : %v", err)
+	}
+	// Sans projet en HTTP-01, un web absent perd ses règles : rien n'y écoute.
+	steps, err := b.planErr()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d := diffs(t, steps); !strings.Contains(d, "ufw delete allow from any to any app ogs-web") {
+		t.Errorf("les règles d'un profil web indisponible partent :\n%s", d)
+	}
+}
+
+// sshdÉcoute fait montrer par ss un sshd à l'écoute sur ces ports, sans
+// ssh.socket ; sans port, ss se tait.
+func (b *banc) sshdÉcoute(ports ...string) {
+	var lines []string
+	for _, p := range ports {
+		lines = append(lines, fmt.Sprintf(`LISTEN 0 128 0.0.0.0:%s 0.0.0.0:* users:(("sshd",pid=156,fd=6))`, p))
+	}
+	b.rec.Responses["ss -Htlnp"] = exec.Result{Stdout: strings.Join(lines, "\n")}
+	b.rec.Errors["systemctl is-active"] = errors.New("inactive")
+	b.prov.Exec = &ssReel{b.rec}
+}
+
+// sansSession tient lieu de console : aucune session SSH à protéger — et
+// DetectAdmin ne va pas lire celle du poste qui lance les tests.
+func sansSession() (Session, bool) { return Session{}, false }
+
+func (b *banc) lire(path string) string {
+	b.t.Helper()
+	data, err := os.ReadFile(filepath.Join(b.root, path))
+	if err != nil {
+		b.t.Fatal(err)
+	}
+	return string(data)
+}
+
+// sshd déplacé de 22 à 2200 et redémarré : la session en cours, arrivée sur 22,
+// survit, mais ss ne montre plus sshd que sur 2200 — 22 comme 2200 sont déjà
+// fermés, le profil valant encore 22. Le plan qui porte le profil sur 2200 rend
+// l'accès ; la garde, qui comptait le port de la session alors que ss disait
+// sshd parti, le refusait, et seul --allow-lockout réparait.
+func TestGardeSessionIgnoreUnPortQueSshdAQuitté(t *testing.T) {
+	b := nouveauBanc(t, "sources:\n  bureau:\n    addresses: [10.200.0.2]\ntrusted: [bureau]\n"+
+		"policy:\n  incoming: deny\n", "ssh")
+	b.write("/etc/ssh/sshd_config", "Port 22\n")
+	b.prov.Admin = session("10.200.0.2", "22")
+	b.sshdÉcoute("22")
+	b.reconcilier()
+
+	b.write("/etc/ssh/sshd_config", "Port 2200\n")
+	// Là où ss se tait, le port de la session est le seul indice : sshd n'a
+	// peut-être pas été redémarré, et fermer 22 couperait la suivante.
+	b.sshdÉcoute()
+	if _, err := b.planErr(); err == nil || !strings.Contains(err.Error(), "arrivée sur le port 22") {
+		t.Fatalf("ss muet : le port de la session doit rester gardé : %v", err)
+	}
+
+	b.sshdÉcoute("2200")
+	steps, err := b.planErr()
+	if err != nil {
+		t.Fatalf("le plan qui ouvre le port où sshd écoute désormais doit passer : %v", err)
+	}
+	if _, err := engine.Execute(context.Background(), &engine.Plan{Steps: steps}, engine.Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := b.profil("ogs-ssh"); got != "2200/tcp" || !b.rec.Contains("ufw app update ogs-ssh") {
+		t.Errorf("le profil ssh doit suivre sshd sur 2200 : %s", got)
+	}
+}
+
+// Un profil ssh écarté (profiles.ssh.available: false), ou qu'aucune unité ne
+// signale, voit ses règles retirées. La garde des ports où sshd écoute exigeait
+// un profil disponible : depuis la console, sans session à protéger, rien ne
+// refusait de fermer 22 et 2200 à tous.
+func TestGardePortsDeSshdSansProfilSSH(t *testing.T) {
+	b := nouveauBanc(t, "sources:\n  bureau:\n    addresses: [10.200.0.2]\ntrusted: [bureau]\n"+
+		"policy:\n  incoming: deny\n", "ssh")
+	b.write("/etc/ssh/sshd_config", "Port 22\nPort 2200\n")
+	b.prov.Admin = sansSession
+	b.sshdÉcoute("22", "2200")
+	b.reconcilier()
+	desired, err := b.prov.Desired()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	faux := false
+	b.prov.Cfg.Profiles = map[string]config.UFWProfile{"ssh": {Available: &faux}}
+	_, err = b.planErr()
+	if err == nil || !strings.Contains(err.Error(), "sshd écoute sur le port 22, que plus rien n'ouvrirait") ||
+		!strings.Contains(err.Error(), "port 2200") || !strings.Contains(err.Error(), "écarté dans ufw.yaml") {
+		t.Fatalf("un profil ssh écarté ne doit pas fermer les ports où sshd écoute : %v", err)
+	}
+	b.prov.AllowLockout = true
+	if _, err := b.planErr(); err != nil {
+		t.Errorf("--allow-lockout passe outre : %v", err)
+	}
+	b.prov.AllowLockout = false
+
+	b.prov.Cfg.Profiles = nil
+	if err := os.Remove(filepath.Join(b.root, "lib/systemd/system/ssh.service")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.planErr(); err == nil || !strings.Contains(err.Error(), "aucune unité ssh") {
+		t.Errorf("un profil ssh que rien ne détecte ne doit pas fermer les ports où sshd écoute : %v", err)
+	}
+
+	// Qui ouvre ssh par ses propres règles n'est pas refusé : ogs ne les
+	// touche pas, et elles laissent passer après le plan.
+	b.write("/etc/ufw/user.rules", strings.Replace(rulesFile(desired, 4), "*filter\n", "*filter\n"+
+		tuple("limit tcp 22 0.0.0.0/0 any 0.0.0.0/0 in", "")+
+		tuple("allow tcp 2200 0.0.0.0/0 any 10.200.0.0/24 in", "poste de secours"), 1))
+	steps, err := b.planErr()
+	if err != nil {
+		t.Fatalf("les règles de l'administrateur ouvrent les ports de sshd : %v", err)
+	}
+	if d := diffs(t, steps); !strings.Contains(d, "ufw delete allow from 10.200.0.2 to any app ogs-ssh") {
+		t.Errorf("les règles d'ogs du profil indisponible partent :\n%s", d)
+	}
+}
+
+// Les gardes ne voyaient que les règles voulues : un « ufw limit OpenSSH » posé
+// à la main faisait refuser « ssh : aucune source » à chaque apply, et une
+// session que seule une règle de l'administrateur admet était refusée au
+// moindre changement — des ports de MariaDB, par exemple.
+func TestGardesComptentLesRèglesDeLAdministrateur(t *testing.T) {
+	b := nouveauBanc(t, "profiles:\n  web: {allow: [any]}\n", "ssh")
+	for _, c := range []struct {
+		regle string
+		admis bool
+	}{
+		{"limit tcp 22 0.0.0.0/0 any 0.0.0.0/0 OpenSSH - in", true},
+		{"allow_log tcp 22 0.0.0.0/0 any 192.0.2.0/24 in", true},
+		{"allow udp 22 0.0.0.0/0 any 0.0.0.0/0 in", false},
+		{"allow tcp 80 0.0.0.0/0 any 0.0.0.0/0 in", false},
+		// SSH par une interface, ou vers une adresse du serveur : un accès.
+		{"allow tcp 22 0.0.0.0/0 any 0.0.0.0/0 in_eth0", true},
+		{"allow tcp 22 10.8.0.1 any 0.0.0.0/0 in", true},
+		{"deny tcp 22 0.0.0.0/0 any 0.0.0.0/0 in", false},
+	} {
+		b.write("/etc/ufw/user.rules", "*filter\n"+tuple(c.regle, "")+"COMMIT\n")
+		_, err := b.planErr()
+		if refusé := err != nil && strings.Contains(err.Error(), "ssh : aucune source"); refusé == c.admis {
+			t.Errorf("« %s » : source ssh %v attendue, obtenu %v", c.regle, c.admis, err)
+		}
+	}
+
+	b = nouveauBanc(t, declarationType, "ssh", "mariadb")
+	b.prov.Admin = session("192.0.2.50", "22")
+	b.write("/etc/ufw/user.rules", "*filter\n"+tuple("allow tcp 22 0.0.0.0/0 any 198.51.100.0/24 in", "")+"COMMIT\n")
+	if _, err := b.planErr(); err == nil || !strings.Contains(err.Error(), "192.0.2.50, qu'aucune règle du profil ssh") {
+		t.Fatalf("une règle de l'administrateur qui n'admet pas la session ne la couvre pas : %v", err)
+	}
+	b.write("/etc/ufw/user.rules", "*filter\n"+tuple("allow tcp 22 0.0.0.0/0 any 192.0.2.0/24 in", "")+"COMMIT\n")
+	if _, err := b.planErr(); err != nil {
+		t.Fatalf("une session admise par une règle de l'administrateur n'est pas coupée : %v", err)
+	}
+
+	// Pare-feu réconcilié, la session admise par l'administrateur seul : un
+	// changement de port de MariaDB resserre le pare-feu, et la garde joue.
+	b.prov.Admin = sansSession
+	b.reconcilier()
+	b.prov.Admin = session("192.0.2.50", "")
+	b.write("/etc/ufw/user.rules", strings.Replace(b.lire("/etc/ufw/user.rules"), "*filter\n", "*filter\n"+
+		tuple("allow tcp 22 0.0.0.0/0 any 192.0.2.0/24 in", ""), 1))
+	b.prov.Cfg.Profiles["mysql"] = config.UFWProfile{Ports: []string{"3307/tcp"},
+		Allow: b.prov.Cfg.Profiles["mysql"].Allow}
+	steps, err := b.planErr()
+	if err != nil {
+		t.Fatalf("changer le port de MariaDB ne coupe pas une session admise par l'administrateur : %v", err)
+	}
+	if d := diffs(t, steps); !strings.Contains(d, "+ports=3307/tcp") {
+		t.Errorf("le port de MariaDB doit changer :\n%s", d)
+	}
+}
+
+// Ce qu'une règle laissée en place ouvre : celle de l'administrateur vaut par
+// ses propres ports ; une règle d'ogs reconnue est voulue, ou retirée. Sans
+// session, une règle liée à une interface ou à une adresse du serveur ouvre le
+// port du dehors ; pour une session, l'adresse du serveur doit être celle
+// qu'elle a jointe, et l'interface ne compte pas.
+func TestRèglesLaisséesEnPlace(t *testing.T) {
+	v4 := parseRules([]byte("*filter\n"+
+		tuple("allow any 22 0.0.0.0/0 any 0.0.0.0/0 ogs-ssh - in", "ogs: accès public à ssh")+
+		tuple("allow any any 0.0.0.0/0 any 192.0.2.0/24 in", "")+
+		tuple("allow tcp 2200:2300 0.0.0.0/0 any 198.51.100.7 in", "")+
+		tuple("allow tcp 22 10.0.0.1 any 0.0.0.0/0 in", "")+
+		tuple("allow tcp 2022 0.0.0.0/0 any 0.0.0.0/0 in_wg0", "")+
+		tuple("allow any 22 0.0.0.0/0 any 203.0.113.0/24 ogs-sftp - in", "à moi")), 4)
+	v6 := parseRules([]byte("*filter\n"+tuple("allow tcp 22 ::/0 any ::/0 in", "")), 6)
+	rules := append(v4, v6...)
+	profiles := map[string]Profile{"ogs-sftp": {UFWName: "ogs-sftp", Ports: []string{"2223/tcp"}}}
+	for _, c := range []struct {
+		port, from, local string
+		want              bool
+	}{
+		{"22", "203.0.113.99", "", false},        // ni la règle d'ogs, ni celle vers 10.0.0.1
+		{"22", "203.0.113.99", "10.0.0.1", true}, // arrivée à l'adresse que la règle vise
+		{"22", "203.0.113.99", "10.0.0.2", false},
+		{"8080", "192.0.2.5", "", true},    // tous les ports
+		{"2250", "198.51.100.7", "", true}, // une plage
+		{"2250", "198.51.100.8", "", false},
+		{"2223", "203.0.113.4", "", true}, // les ports du profil réécrit
+		{"22", "203.0.113.4", "", false},
+		{"22", "2001:db8::1", "", true},     // IPv6, depuis toute adresse de sa famille
+		{"2022", "203.0.113.99", "", false}, // par quelle interface est-elle arrivée ?
+		{"2250", "", "", true},              // depuis une source quelconque
+		{"2022", "", "", true},              // par le VPN
+	} {
+		s := Session{}
+		if c.from != "" {
+			s.Addr = netip.MustParseAddr(c.from)
+		}
+		if c.local != "" {
+			s.Local = netip.MustParseAddr(c.local)
+		}
+		if got := keptOpens(rules, profiles, tcpSpecs(c.port), s); got != c.want {
+			t.Errorf("port %s depuis %q vers %q : %v, attendu %v", c.port, c.from, c.local, got, c.want)
+		}
+	}
+	if keptOpens(v4, nil, tcpSpecs("22"), Session{Addr: netip.MustParseAddr("2001:db8::1")}) {
+		t.Error("une règle IPv4 n'admet pas un client IPv6")
+	}
+	s := Session{Addr: netip.MustParseAddr("203.0.113.99")}
+	if !viaInterface(rules, profiles, tcpSpecs("2022"), s) || viaInterface(rules, profiles, tcpSpecs("22"), s) {
+		t.Error("seule la règle liée à wg0 admettrait la session sur 2022")
+	}
+	// La boucle locale n'ouvre rien du dehors ; une session qui arrive par elle
+	// y passe.
+	lo := parseRules([]byte("*filter\n"+tuple("allow tcp 2023 0.0.0.0/0 any 127.0.0.1 in", "")+
+		tuple("allow tcp 2024 127.0.0.1 any 0.0.0.0/0 in", "")), 4)
+	local := Session{Addr: netip.MustParseAddr("127.0.0.1"), Local: netip.MustParseAddr("127.0.0.1")}
+	for _, port := range []string{"2023", "2024"} {
+		if keptOpens(lo, nil, tcpSpecs(port), Session{}) || !keptOpens(lo, nil, tcpSpecs(port), local) {
+			t.Errorf("boucle locale, port %s", port)
+		}
+	}
+	if !overlaps([]string{"2200:2300/tcp"}, []string{"22/tcp", "2250/tcp"}) || overlaps([]string{"22/udp"}, []string{"22"}) {
+		t.Error("recouvrement des ports")
+	}
+}
+
+// Qui n'ouvre ssh que par un VPN (« ufw allow in on wg0 to any port 22 »), ou
+// vers une adresse précise du serveur, garde un accès. La garde des ports de
+// sshd ne comptait qu'une règle sans interface ni destination : depuis la
+// console, elle refusait tout resserrement — un simple bannissement — en disant
+// qu'aucune règle de l'administrateur n'ouvrait le port.
+func TestGardePortsDeSshdCompteUnAccèsLiéÀUneInterface(t *testing.T) {
+	b := nouveauBanc(t, "sources:\n  bureau:\n    addresses: [10.200.0.2]\ntrusted: [bureau]\n"+
+		"policy:\n  incoming: deny\nprofiles:\n  ssh: {available: false}\n", "ssh")
+	b.write("/etc/ssh/sshd_config", "Port 22\n")
+	b.prov.Admin = sansSession
+	b.sshdÉcoute("22")
+	b.prov.AllowLockout = true
+	b.reconcilier()
+	b.prov.AllowLockout = false
+	desired, err := b.prov.Desired()
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.prov.Cfg.Ban = append(b.prov.Cfg.Ban, config.ParseUFWEntry("198.51.100.9"))
+	for _, regle := range []string{
+		"allow tcp 22 0.0.0.0/0 any 0.0.0.0/0 in_wg0",
+		"allow tcp 22 10.8.0.1 any 0.0.0.0/0 in",
+		"limit_log tcp 22 10.8.0.0/24 any 0.0.0.0/0 in_wg0",
+	} {
+		b.write("/etc/ufw/user.rules", strings.Replace(rulesFile(desired, 4), "*filter\n", "*filter\n"+
+			tuple(regle, "ssh par le VPN"), 1))
+		if _, err := b.planErr(); err != nil {
+			t.Errorf("« %s » ouvre le port 22 : bannir une adresse ne le ferme pas : %v", regle, err)
+		}
+	}
+	// Ce qui n'ouvre rien du dehors ne compte pas : la boucle locale, qu'ufw
+	// laisse passer de toute façon, une sortie, un routage, un port d'origine.
+	for _, regle := range []string{
+		"allow tcp 22 127.0.0.1 any 0.0.0.0/0 in",
+		"allow tcp 22 0.0.0.0/0 any 0.0.0.0/0 in_lo",
+		"allow tcp 22 0.0.0.0/0 any 0.0.0.0/0 out_eth0",
+		"route:allow tcp 22 0.0.0.0/0 any 0.0.0.0/0 in_wg0!out_eth0",
+		"allow tcp 22 0.0.0.0/0 1234 0.0.0.0/0 in",
+	} {
+		b.write("/etc/ufw/user.rules", strings.Replace(rulesFile(desired, 4), "*filter\n", "*filter\n"+
+			tuple(regle, ""), 1))
+		_, err := b.planErr()
+		if err == nil || !strings.Contains(err.Error(), "sshd écoute sur le port 22, que plus rien n'ouvrirait") {
+			t.Errorf("« %s » n'ouvre pas le port 22 du dehors : %v", regle, err)
+		}
+	}
+}
+
+// Pour une session, la question n'est plus « le port reste-t-il ouvert ? » mais
+// « la suivante passera-t-elle par le même chemin ? ». Une règle qui vise une
+// adresse du serveur se compare à celle que la session a jointe ; une règle
+// liée à une interface ne compte pas, rien ne disant laquelle la session a
+// empruntée — et le refus le dit, pour qu'on ne le croie pas aveugle à la règle.
+func TestGardeSessionParUnVPN(t *testing.T) {
+	b := nouveauBanc(t, "sources:\n  bureau:\n    addresses: [10.200.0.2]\ntrusted: [bureau]\n"+
+		"policy:\n  incoming: deny\nprofiles:\n  ssh: {available: false}\n", "ssh")
+	b.write("/etc/ssh/sshd_config", "Port 22\n")
+	b.prov.Admin = sansSession
+	b.sshdÉcoute("22")
+	b.prov.AllowLockout = true
+	b.reconcilier()
+	b.prov.AllowLockout = false
+	desired, err := b.prov.Desired()
+	if err != nil {
+		t.Fatal(err)
+	}
+	règle := func(r string) {
+		b.write("/etc/ufw/user.rules", strings.Replace(rulesFile(desired, 4), "*filter\n", "*filter\n"+
+			tuple(r, "ssh par le VPN"), 1))
+	}
+	b.prov.Cfg.Ban = append(b.prov.Cfg.Ban, config.ParseUFWEntry("198.51.100.9"))
+	b.prov.Admin = func() (Session, bool) {
+		return Session{Addr: netip.MustParseAddr("10.8.0.2"), Local: netip.MustParseAddr("10.8.0.1"), Port: "22"}, true
+	}
+
+	règle("allow tcp 22 10.8.0.1 any 10.8.0.0/24 in")
+	if _, err := b.planErr(); err != nil {
+		t.Errorf("la session a joint l'adresse que la règle vise : %v", err)
+	}
+	règle("allow tcp 22 0.0.0.0/0 any 10.8.0.0/24 in_wg0")
+	_, err = b.planErr()
+	if err == nil || !strings.Contains(err.Error(), "10.8.0.2, et le profil ssh n'est pas disponible") ||
+		!strings.Contains(err.Error(), "liée à une interface l'admettrait peut-être") {
+		t.Errorf("une règle liée à une interface ne couvre pas la session, et le refus le dit : %v", err)
+	}
+	// Arrivée à une autre adresse du serveur, la session ne passe pas par la
+	// règle qui vise celle du VPN.
+	règle("allow tcp 22 10.8.0.1 any 10.8.0.0/24 in")
+	b.prov.Admin = func() (Session, bool) {
+		return Session{Addr: netip.MustParseAddr("10.8.0.2"), Local: netip.MustParseAddr("203.0.113.1"), Port: "22"}, true
+	}
+	if _, err := b.planErr(); err == nil || strings.Contains(err.Error(), "interface") {
+		t.Errorf("la session a joint une autre adresse que celle de la règle : %v", err)
+	}
+	// Sans session, les deux ouvrent le port du dehors.
+	b.prov.Admin = sansSession
+	if _, err := b.planErr(); err != nil {
+		t.Errorf("depuis la console : %v", err)
+	}
+}
+
+// constat dit si doctor rend un constat dont le détail contient ce motif.
+func constat(findings []Finding, motif string) bool {
+	for _, f := range findings {
+		if strings.Contains(f.Detail, motif) {
+			return true
+		}
+	}
+	return false
+}
+
+// L'unité transitoire du retour automatique vit sous /run : un redémarrage dans
+// le délai l'efface, et ufw repart actif, sans filet. Rien ne le signalait —
+// confirm répondait « aucune activation en attente », doctor se taisait. Le
+// témoin posé sous /var/lib/ogs à l'armement survit au redémarrage.
+func TestTémoinDUneActivationNonConfirmée(t *testing.T) {
+	b := nouveauBanc(t, declarationType+"rollbackAfter: 30s\n", "ssh", "mariadb")
+	b.write("/var/lib/ogs/.garde", "")
+	b.prov.Exec = &ssReel{b.rec}
+	b.prov.Admin = session("203.0.113.10", "")
+	témoin := filepath.Join(b.root, "var/lib/ogs/ufw-unconfirmed")
+	ctx := context.Background()
+	activer := func() *engine.Step {
+		t.Helper()
+		b.write("/etc/ufw/ufw.conf", "ENABLED=no\nLOGLEVEL=low\n")
+		b.rec.Responses["systemctl is-active"] = exec.Result{Stdout: "inactive\n"}
+		var state *engine.Step
+		for _, s := range b.plan() {
+			if s.Resource == "firewall/state" {
+				state = s
+			}
+		}
+		if state == nil {
+			t.Fatal("l'activation manque au plan")
+		}
+		if err := state.Apply(ctx); err != nil || b.prov.Armed == 0 {
+			t.Fatalf("activation : %v (retour armé : %s)", err, b.prov.Armed)
+		}
+		if _, err := os.Stat(témoin); err != nil {
+			t.Fatalf("le témoin doit être posé à l'armement : %v", err)
+		}
+		return state
+	}
+	observer := func(enabled, timer bool) Observed {
+		t.Helper()
+		conf, active := "ENABLED=no\n", "inactive\n"
+		if enabled {
+			conf = "ENABLED=yes\n"
+		}
+		if timer {
+			active = "active\n"
+		}
+		b.write("/etc/ufw/ufw.conf", conf+"LOGLEVEL=low\n")
+		b.rec.Responses["systemctl is-active"] = exec.Result{Stdout: active}
+		obs, err := b.prov.Observe(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return obs
+	}
+
+	activer()
+	if obs := observer(true, true); !obs.RollbackPending || obs.RollbackLost() {
+		t.Errorf("en attente : %+v", obs)
+	}
+	// Redémarrage dans le délai : le minuteur a disparu, ufw est actif.
+	obs := observer(true, false)
+	if !obs.RollbackLost() {
+		t.Fatalf("le retour perdu doit se voir : %+v", obs)
+	}
+	if !constat(b.prov.Checks(obs, nil), "retour automatique a disparu") {
+		t.Error("doctor doit signaler le retour perdu")
+	}
+	if confirmed, err := b.prov.Confirm(ctx, obs); err != nil || !confirmed {
+		t.Errorf("la nouvelle session confirme l'activation au retour perdu : %v %v", confirmed, err)
+	}
+	if _, err := os.Stat(témoin); !os.IsNotExist(err) {
+		t.Errorf("confirm retire le témoin : %v", err)
+	}
+	if obs := observer(true, false); obs.Unconfirmed || constat(b.prov.Checks(obs, nil), "confirm") {
+		t.Errorf("confirmée, l'activation ne se signale plus : %+v", obs)
+	}
+
+	// Le retour a joué : ufw inactif, le témoin reste, et doctor dit pourquoi.
+	activer()
+	obs = observer(false, false)
+	if !obs.RolledBack() || !constat(b.prov.Checks(obs, nil), "le retour automatique a désactivé ufw") {
+		t.Errorf("le retour joué doit se voir : %+v", obs)
+	}
+	if confirmed, _ := b.prov.Confirm(ctx, obs); confirmed {
+		t.Error("un retour joué n'a rien à confirmer")
+	}
+	if _, err := os.Stat(témoin); err != nil {
+		t.Errorf("le témoin reste tant que rien n'a été confirmé : %v", err)
+	}
+
+	// L'activation défaite, ou ufw désactivé par ufw.yaml, retire le témoin.
+	state := activer()
+	if err := state.Compensate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(témoin); !os.IsNotExist(err) {
+		t.Errorf("la compensation retire le témoin : %v", err)
+	}
+	activer()
+	b.write("/etc/ufw/ufw.conf", "ENABLED=yes\nLOGLEVEL=low\n")
+	b.prov.Cfg.Active = new(bool)
+	for _, s := range b.plan() {
+		if s.Resource == "firewall/state" {
+			if err := s.Apply(ctx); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if _, err := os.Stat(témoin); !os.IsNotExist(err) {
+		t.Errorf("désactivé par ufw.yaml, ufw n'a plus d'activation à confirmer : %v", err)
+	}
+}
+
+// Une règle de l'administrateur qui admet l'adresse de la session sur un port
+// sans rapport (80) faisait choisir le message du port : « arrivée sur le port
+// 22, que le profil ssh n'ouvre pas (22/tcp) » — le profil l'ouvre, c'est
+// l'adresse qu'aucune règle ssh n'admet. Le refus nomme ce qui manque, et
+// seulement cela.
+func TestGardeSessionNommeCeQuiManque(t *testing.T) {
+	b := nouveauBanc(t, declarationType, "ssh", "mariadb")
+	b.write("/etc/ufw/user.rules", "*filter\n"+tuple("allow tcp 80 0.0.0.0/0 any 192.0.2.0/24 in", "")+"COMMIT\n")
+	b.prov.Admin = session("192.0.2.50", "22")
+	_, err := b.planErr()
+	if err == nil || strings.Contains(err.Error(), "arrivée sur le port") ||
+		!strings.Contains(err.Error(), "192.0.2.50, qu'aucune règle du profil ssh n'autorise") {
+		t.Errorf("l'adresse manque, non le port : %v", err)
+	}
+	// L'adresse et le port manquent ensemble : les deux remèdes.
+	b.prov.Admin = session("192.0.2.50", "2222")
+	_, err = b.planErr()
+	if err == nil || !strings.Contains(err.Error(), "ajouter cette adresse à trusted") ||
+		!strings.Contains(err.Error(), "le port 2222") {
+		t.Errorf("l'adresse et le port manquent : %v", err)
+	}
+	// L'adresse admise par la confiance, seul le port manque.
+	b.prov.Admin = session("203.0.113.10", "2222")
+	_, err = b.planErr()
+	if err == nil || !strings.Contains(err.Error(), "arrivée sur le port 2222") ||
+		strings.Contains(err.Error(), "ajouter cette adresse") {
+		t.Errorf("seul le port manque : %v", err)
+	}
+}
+
+// Un profil personnalisé qui ouvre un port de sshd est un accès comme un autre :
+// seul le profil « ssh » comptait, et un bannissement était refusé alors que
+// rien ne fermait ce port — comme la session qui y était arrivée.
+func TestGardesComptentLesAutresProfils(t *testing.T) {
+	b := nouveauBanc(t, "sources:\n  bureau:\n    addresses: [10.200.0.2]\ntrusted: [bureau]\n"+
+		"policy:\n  incoming: deny\nprofiles:\n  ssh: {ports: [22/tcp]}\n"+
+		"  sshalt: {ports: [2222/tcp], units: [ssh]}\n", "ssh")
+	b.write("/etc/ssh/sshd_config", "Port 22\nPort 2222\n")
+	b.prov.Admin = sansSession
+	b.sshdÉcoute("22", "2222")
+	b.prov.AllowLockout = true
+	b.reconcilier()
+	b.prov.AllowLockout = false
+
+	b.prov.Cfg.Ban = append(b.prov.Cfg.Ban, config.ParseUFWEntry("198.51.100.9"))
+	if _, err := b.planErr(); err != nil {
+		t.Errorf("sshalt ouvre 2222 : bannir une adresse ne le ferme pas : %v", err)
+	}
+	b.sshdÉcoute()
+	b.prov.Admin = session("10.200.0.2", "2222")
+	if _, err := b.planErr(); err != nil {
+		t.Errorf("la session arrivée sur 2222 repasse par sshalt : %v", err)
 	}
 }
