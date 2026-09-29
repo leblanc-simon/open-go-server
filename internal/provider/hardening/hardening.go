@@ -76,10 +76,13 @@ type Target struct {
 // Ce qui n'y figure pas est aussi un choix : /etc/php reste lisible parce que
 // l'interpréteur en ligne de commande, exécuté sous l'identité du projet par les
 // crons, y lit son php.ini — le restreindre changerait silencieusement le
-// comportement de PHP. Seul pool.d, qui porte les variables d'environnement donc
-// les mots de passe, est fermé. /etc/systemd/system reste lisible également : ses
-// unités sont écrites par ogs et ne portent aucun secret, et plusieurs outils
+// comportement de PHP. /etc/systemd/system reste lisible également : ses unités
+// sont écrites par ogs et ne portent aucun secret, et plusieurs outils
 // d'exploitation les lisent.
+//
+// pool.d, lui, n'est fermé par aucune cible, et ce n'est pas un choix : ses
+// fichiers, en 0644, portent les variables d'environnement des pools, donc
+// leurs mots de passe. C'est un point ouvert (§20 du cahier).
 func Defaults(homeRoot string) []Target {
 	targets := []Target{
 		{

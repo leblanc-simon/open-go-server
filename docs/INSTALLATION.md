@@ -16,7 +16,14 @@ serveurs administrés (Apache, Nginx, MySQL, PostgreSQL, RabbitMQ, PHP-FPM) ne s
 `ogs` administre ce qui est présent, et `ogs doctor` énumère ce qui manque.
 
 Désinstaller retire l'outil, jamais les projets : comptes, bases, vhosts, certificats et déclarations
-survivent. Seul le timer de renouvellement est arrêté.
+survivent. Seul le timer de renouvellement est arrêté, et son état noté : une réinstallation le rend tel
+qu'il était. La purge (`apt purge ogs`) retire en outre les deux unités de renouvellement, et garde — en
+le disant — `/etc/ogs` (déclarations, clé maître), `/var/lib/ogs` (état, comptes ACME, certificats que les
+vhosts servent encore, archives) et `/var/log/ogs`. Elle énumère les archives restantes : plus rien ne les
+purge, et elles portent le dump des bases.
+
+Le paquet ne livre ni les unités `ogs-renew`, ni `tmpfiles.d/ogs.conf`, ni `logrotate.d/ogs` : c'est
+`ogs apply` qui les écrit, d'après le parc.
 
 ## Depuis les sources
 
@@ -94,10 +101,20 @@ projet. C'est nécessaire — PostgreSQL ouvre par défaut toute base nouvelle �
 apt install ./ogs_1.1.0_amd64.deb
 ```
 
-Les migrations de schéma de la base d'état sont appliquées au premier lancement. Les déclarations de projet
-sont lues telles quelles : une version plus récente d'`ogs` n'exige jamais de réécrire les fichiers
-existants. Après une mise à jour, `ogs diff` sur l'ensemble du parc indique si les templates livrés ont
-évolué — et donc quels fichiers un `apply` réécrirait.
+Les migrations de schéma de la base d'état sont appliquées par le paquet lui-même, qui relance
+`ogs init --quiet` : un échec y est affiché, jamais fatal. Si la clé maître a disparu, le paquet ne relance
+pas `init` — il en engendrerait une neuve, et les secrets scellés ne se reliraient plus — et le dit, avec
+les deux remèdes : la restaurer depuis sa sauvegarde, ou lancer `ogs init` pour repartir d'une clé neuve.
+Une mise à jour ne touche pas au timer de renouvellement ; un timer d'ogs trouvé désactivé est signalé,
+sans passer outre. Les messages du paquet commencent par « `ogs :` ».
+
+Les déclarations de projet sont lues telles quelles : une version plus récente d'`ogs` n'exige jamais de
+réécrire les fichiers existants. Après une mise à jour, `ogs diff` sur l'ensemble du parc indique si les
+templates livrés ont évolué — et donc quels fichiers un `apply` réécrirait.
+
+Les versions jusqu'à 0.0.3 désactivaient le timer à chaque mise à jour, sans un mot : la mise à jour
+depuis l'une d'elles le réactive. `systemctl is-enabled ogs-renew.timer` dit où il en est, et
+`systemctl enable --now ogs-renew.timer` le rétablit.
 
 ## Applications Go, Node, Ruby et Python
 
@@ -138,21 +155,25 @@ ogs harden --explain    # pourquoi chaque restriction, et ce qu'elle peut casser
 ogs harden --apply      # applique, après confirmation
 ```
 
-Deux règles gouvernent la commande : elle **ne desserre jamais** — un répertoire déjà plus strict que la
-cible est laissé tel quel — et elle **ne suit aucun lien symbolique**. Un chemin absent signifie un service
-non installé : il n'y a rien à faire.
+Trois règles gouvernent la commande : elle **ne desserre jamais** — un répertoire déjà plus strict que la
+cible est laissé tel quel, et le mode posé est l'intersection du mode constaté et de la cible, setgid et
+sticky conservés — ; elle **ne suit aucun lien symbolique**, répertoire et fichiers étant modifiés par leur
+descripteur ; et elle **ne ferme rien sans le groupe du service qui lit** : une cible dont le compte ou le
+groupe est introuvable est rapportée « refusé », avec son motif, au lieu d'être fermée par le seul mode. Un
+chemin absent signifie un service non installé : il n'y a rien à faire.
 
 | Chemin | Cible | Pourquoi |
 |---|---|---|
 | `/etc/ogs` | `0700 root:root`, fichiers `0600` | clé maître, déclarations de projets, identifiants |
-| `/etc/letsencrypt` | `0700 root:root`, fichiers `0600`, récursif | clés privées |
-| `/etc/apache2`, `/etc/nginx` | `0750 root:root` | vhosts : domaines, chemins, authentifications |
+| `/etc/letsencrypt` | `0711`, propriétaire root, groupe et fichiers **inchangés**, sans récursion | clés privées ; certbot les protège lui-même sous `archive/` et `live/` (0700), la racine n'a plus qu'à ne pas s'énumérer |
+| `/etc/apache2`, `/etc/nginx` | `0750 root:www-data` | vhosts : domaines, chemins, authentifications |
 | `/etc/php` | `0755` — **inchangé** | le PHP en ligne de commande, exécuté sous l'identité du projet par les crons, y lit son `php.ini` |
-| `/etc/mysql` | `0750 root:root` | `debian.cnf` porte les identifiants de maintenance |
-| `/etc/postgresql` | `0750 root:postgres` | `pg_hba.conf` décrit qui peut se connecter |
+| `/etc/mysql` | `0750 root:mysql` | `debian.cnf` porte les identifiants de maintenance |
+| `/etc/postgresql` | `0750`, groupe `postgres`, propriétaire **inchangé** | `pg_hba.conf` décrit qui peut se connecter |
 | `/etc/rabbitmq` | `0750 root:rabbitmq`, fichiers `0640` | cookie Erlang, mot de passe d'administration |
 | `/etc/telegraf` | `0750 root:telegraf`, fichiers `0640` | jetons d'écriture des métriques |
-| `/etc/redis` | `0750 root:redis`, fichiers `0640` | `requirepass` en clair |
+| `/etc/redis` | `0770`, groupe `redis`, propriétaire **inchangé**, fichiers `0640` | `requirepass` en clair |
+| `/etc/opendkim` | `0750 root:opendkim`, fichiers `0640`, récursif | clés de signature et tables d'OpenDKIM |
 | `/etc/ssl/private` | `0710 root:ssl-cert` | convention Debian ; les services concernés sont dans le groupe |
 | `/etc/fail2ban` | `0750 root:root` | `jail.d` énumère les journaux du parc et les adresses jamais bannies |
 | `/etc/cron.d` | `0750 root:root` | révèle les commandes et les identités de chaque projet |
@@ -160,9 +181,38 @@ non installé : il n'y a rien à faire.
 | `/etc/sudoers.d` | `0750 root:root` | révèle les délégations accordées |
 | `/home` (`naming.homeRoot`) | `0711 root:root` | la racine des homes énumère le parc : chaque voisin, et le chemin de son code |
 
-Le groupe est celui du service quand le démon lit sa configuration sous sa propre identité — RabbitMQ,
-Telegraf, Redis, PostgreSQL. Pour Apache et Nginx, le processus maître lit en root et les workers héritent
-des descripteurs déjà ouverts : `root:root` suffit.
+Le groupe est celui du service qui lit sa configuration sous sa propre identité, et il n'est pas
+optionnel : un démon privé de la sienne ne le dit pas toujours.
+
+- **MariaDB** lit ses fichiers d'options sous `mysql` et ignore **sans un mot** celui qu'il ne peut pas
+  ouvrir : fermé en root:root, `/etc/mysql` le faisait repartir sur ses défauts, à l'écoute de toutes les
+  interfaces.
+- Les **workers d'Apache et de nginx** ouvrent à chaque requête, sous `www-data`, ce que désignent
+  `AuthUserFile`, `auth_basic_user_file` et les `RewriteMap`, et mod_md écrit son magasin : fermés à
+  `www-data`, un site protégé répond 500 alors qu'`apachectl -t` reste au vert.
+- **Redis** réécrit sa configuration par renommage dans `/etc/redis` (`CONFIG REWRITE`, Sentinel) : le
+  paquet le lui donne en `2770 redis:redis`, et le propriétaire reste le sien.
+- **PostgreSQL** garde le propriétaire que lui donne le paquet — `pg_createcluster`, lancé sous `postgres`,
+  y crée un répertoire par version. Contrepartie : `pg_wrapper` ne trouve plus le cluster pour un
+  utilisateur de projet, et un cron qui vise un cluster hors du port 5432 doit préciser `-p` ou `PGPORT`.
+- **RabbitMQ**, **Telegraf** et **OpenDKIM** lisent sous leur compte, `ssl-cert` sert les clés confiées
+  aux démons non root.
+- **certbot** écrit un certificat renouvelé en `0644 root:root`, et un démon qui ne tient que la clé par
+  `ssl-cert` lit ce certificat par les bits des autres : rien n'est donc repris aux fichiers de
+  `/etc/letsencrypt`, seule sa racine se ferme à l'énumération.
+
+Un fichier d'authentification HTTP se range donc sous `/etc/apache2` ou `/etc/nginx`, jamais dans les
+répertoires de surcharge des vhosts (`/etc/<moteur>/projects/…`), que `ogs` pose en `0750 root:root` : le
+maître les lit, les workers non.
+
+**Un parc durci par une version antérieure** n'est pas rouvert, `ogs` ne desserrant jamais. `/etc/mysql`,
+`/etc/apache2` et `/etc/nginx` en root:root reçoivent leur groupe au prochain `ogs harden --apply` ; les
+autres se réparent à la main :
+
+```sh
+chown redis /etc/redis && chmod 2770 /etc/redis          # CONFIG REWRITE et Sentinel
+chmod 0711 /etc/letsencrypt                              # puis rendre le groupe ssl-cert à la clé confiée
+```
 
 **La racine des homes** (D60) se traverse sans s'énumérer, comme le home d'un projet (D51) : servir un
 fichier n'exige que la traversée des répertoires et la lecture du fichier, et le serveur web n'a jamais
@@ -297,7 +347,31 @@ sudo ogs firewall confirm
 
 C'est cette nouvelle session qui prouve que le pare-feu laisse passer l'administration. Une session ouverte
 avant l'activation survit à des règles qui refuseraient la suivante. Sans confirmation, ufw se désactive de
-lui-même, et le prochain `apply` le réactivera, de nouveau à confirmer.
+lui-même, et le prochain `apply` le réactivera, de nouveau à confirmer ; un `confirm` tardif le dit — ufw
+inactif — et rend le code 6.
+
+**Un redémarrage dans le délai emporte le retour automatique** : son minuteur vit sous `/run`, et ufw repart
+actif, sans filet. L'activation laisse donc un témoin, `/var/lib/ogs/ufw-unconfirmed`, que
+`ogs firewall status` et `ogs doctor` signalent tant qu'aucun `confirm` ne l'a retiré. Le témoin rend l'état visible, il
+ne réarme rien : confirmer depuis une nouvelle session reste la seule preuve.
+
+### Les gardes contre la coupure
+
+`ogs` refuse une déclaration qui couperait la session SSH en cours, bannirait son adresse, fermerait un port
+où sshd écoute réellement — lu par `ss`, et sur une `ssh.socket` active — ou fermerait SSH à tous. Il juge ce
+qui **restera ouvert** : les règles voulues, et les vôtres, qu'il ne retire jamais. Changer les ports d'un
+profil qu'une règle emploie compte comme un retrait : `ufw app update` ferme l'ancien port.
+
+La garde se lève par **`--allow-lockout`**, sur `ogs firewall plan`, `apply`, `ban` et `unban` seulement. Le
+`--force` d'`ogs apply` — celui des fichiers retouchés — ne la lève jamais : on le donne pour un vhost, sans
+penser au pare-feu, et il retirait la dernière règle ssh. Une déclaration refusée ne bloque pas le reste du
+parc : `ogs apply` en fait une étape en échec, code 6, et seules les commandes `ogs firewall` rendent le
+code 3.
+
+Qui administre par un VPN : une règle à vous liée à une interface (`in on wg0`) garde SSH ouvert aux yeux de
+la garde quand aucune session n'est à protéger — depuis la console. Pour une session, rien ne dit par quelle
+interface elle est arrivée : la garde refuse alors, et le dit ; une règle vers l'adresse du serveur que la
+session a jointe, elle, se vérifie.
 
 ### Ce qu'ogs touche, et ce qu'il laisse
 
@@ -318,12 +392,17 @@ sudo ogs firewall unban 192.0.2.66
 ```
 
 `ban` et `unban` écrivent `ufw.yaml` sans en perdre les commentaires, puis appliquent. Les adresses de
-confiance sont aussi ajoutées à l'`ignoreip` des prisons fail2ban d'ogs, au prochain `ogs apply`.
+confiance sont aussi ajoutées à l'`ignoreip` des prisons fail2ban d'ogs, au prochain `ogs apply`. Sous
+`--dry-run`, ils refusent l'option (code 2) plutôt que de réécrire `ufw.yaml`. Un bannissement que la garde
+refuse reste en revanche écrit dans `ufw.yaml`, où le prochain apply le retrouve : le retirer à la main.
 
-### Deux pièges
+### Trois pièges
 
 - **Docker publie les ports de ses conteneurs en amont d'ufw** : un port publié est ouvert quelles que soient
   les règles. `ogs doctor` le signale.
+- **Apache et nginx installés tous deux, sans `web.engine`** : le profil web reste disponible — un serveur
+  qu'on ne sait pas nommer n'est pas l'absence de serveur web —, et un `ban` ne retire plus l'accès public
+  aux sites.
 - **Un FTP sans plage passive connue est refusé** : la connexion passerait, et chaque transfert resterait
   bloqué. Déclarez `profiles.ftp.passive`, ou `profiles.ftp.available: false` si proftpd ne sert qu'au
   SFTP.
@@ -352,3 +431,7 @@ Trois choses, par ordre d'importance :
 
 Les données des sites (homes, bases) relèvent de la politique de sauvegarde habituelle. `ogs db dump` et les
 archives produites par `ogs project delete` ne s'y substituent pas.
+
+Les copies que `--force` fait avant de reprendre un fichier retouché vont dans `/var/lib/ogs/backups`, sous
+`<nom>.ogs-bak-<horodatage>` — suffixé `.1`, `.2`… quand une autre sauvegarde de la même seconde porte déjà
+ce nom : un pool et un vhost s'appellent tous deux `<id>.conf`. Rien ne les purge.

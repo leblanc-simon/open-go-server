@@ -7,7 +7,7 @@ PostgreSQL, vhost et files RabbitMQ, pool PHP-FPM, vhost Apache ou Nginx, certif
 et services systemd. Un projet est décrit par un fichier YAML ; un moteur de réconciliation idempotent amène
 le serveur dans l'état décrit.
 
-Le cahier des charges technique complet — 75 décisions d'architecture arbitrées, spécification par module,
+Le cahier des charges technique complet — 90 décisions d'architecture arbitrées, spécification par module,
 plan de tests, découpage en lots — est dans [`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md).
 C'est la référence : toute contribution s'y adosse.
 
@@ -68,13 +68,14 @@ make integration-package   # installation, usage et désinstallation du .deb
 make integration-suppression # userdel n'aboutit que si les workers du pool sont déjà libérés
 make integration-web-durci # unité apache2 durcie (ProtectHome) : les journaux restent atteignables
 make integration-pare-feu  # ufw réel, connexions réelles : profils détectés, refus en tête, retour automatique
-make integration-all       # les dix-neuf, à la suite
+make integration-restauration # aucun lien traversé, chaque fichier rendu à son propriétaire
+make integration-all       # les vingt, à la suite
 
 # Hors série : rbenv et pyenv compilent depuis les sources (un quart d'heure).
 make integration-runtimes-compiles
 ```
 
-Ces scénarios ne sont pas décoratifs : ils ont mis au jour vingt défauts que les tests unitaires ne
+Ces scénarios ne sont pas décoratifs : ils ont mis au jour plus de trente défauts que les tests unitaires ne
 pouvaient pas voir — dont l'impossibilité de servir un site statique ou une application non-PHP en
 HTTPS, un challenge HTTP-01 qui ne pouvait aboutir sur aucun serveur, un accès PostgreSQL
 d'administration qui ne pouvait jamais s'authentifier, des services qui ne démarraient jamais au
@@ -167,7 +168,9 @@ sudo ogs php switch shopfr 8.4
 
 La compatibilité est lue dans la contrainte `require.php` du `composer.json` de
 l'application — pas dans une table figée. Une bascule incompatible est refusée avec
-le motif et sa source ; `--force` l'impose et le consigne. L'ordre d'application est
+le motif et sa source ; `--force` l'impose et le consigne. Le fichier est lu sans
+suivre de lien et borné à 1 Mio : un `composer.json` lié, spécial ou démesuré n'est
+pas lu, et c'est la table indicative qui décide, annoncée comme telle. L'ordre d'application est
 structurant : nouveau pool, puis réécriture du vhost sur le nouveau socket, puis
 seulement retrait de l'ancien pool. Les fichiers cron et les unités systemd ne sont
 jamais réécrits, puisqu'ils invoquent `~/.local/bin/php`.
@@ -207,8 +210,19 @@ sudo ogs cert renew --all      # ce que fait le timer ogs-renew deux fois par jo
 L'ordre importe : le vhost HTTP doit répondre avant le challenge HTTP-01, et le
 `/.well-known/acme-challenge` est servi **avant** la redirection vers HTTPS — sans
 quoi aucun renouvellement n'aboutirait. L'émission est non bloquante : si elle
-échoue, le site reste en ligne en HTTP avec un avertissement et une commande de
-reprise.
+échoue, un site neuf reste en ligne en HTTP avec un avertissement et une commande de
+reprise, et un site déjà en HTTPS **le reste** — un vhost est rendu d'après le
+certificat présent, jamais d'après la demande, et ajouter un alias ne lui retire pas
+son bloc 443.
+
+Le certificat d'un projet couvre aussi ses **redirections**. Une commande ACME
+échouant tout entière sur un seul nom refusé — une redirection dont le DNS pointe
+encore ailleurs —, l'émission se replie par paliers : sans les redirections en
+attente, sans aucune redirection, sur ce que couvre le certificat en place. Le site
+reste couvert, le nom refusé est nommé, le code est 6 ; loin de l'échéance, aucun nom
+déjà servi n'est retiré. `cert renew` recharge le serveur web dès qu'un certificat a
+changé, et nomme — au lieu de le passer en silence — un projet dont la demande est
+refusée.
 
 Les **préproductions partagent un wildcard** `*.preprod-pp.net` : créer une préprod
 ne déclenche donc aucun appel à l'autorité. Ce certificat exige le challenge DNS-01,
@@ -319,7 +333,12 @@ de configuration qu'ogs n'a pas écrit pour ce projet, une base qu'elle ne pourr
 sauvegarder (`--no-dump` lève ce refus) et, sans `--force`, le compte ou les bases d'un
 projet adopté. Une interruption reçue avant le premier retrait abandonne la suppression
 et relance les services arrêtés ; reçue après, elle laisse la suppression aller à son
-terme.
+terme. `--dry-run` y est refusé (code 2) : la commande ne sait pas simuler.
+
+La restauration applique d'abord la déclaration, puis remet le home tel que
+l'utilisateur l'avait laissé, **sans traverser aucun lien** — ni celui du trousseau
+commun, ni celui de l'interpréteur que l'apply vient de poser — et en rendant chaque
+fichier à qui le possédait : ce qui n'était pas à l'utilisateur revient à root.
 
 ### Superviser
 
@@ -358,13 +377,18 @@ sudo ogs diff boutiquefr   # ce qu'un premier apply changerait
 
 Le scan rapproche les ressources par ce qui est **vérifiable** — le socket FPM
 référencé par un vhost, l'utilisateur du pool, le docroot sous un home — et énonce
-ce qui ne l'est pas : la propriété d'une base n'est pas déductible, elle est donc
-signalée à confirmer.
+ce qui ne l'est pas : la propriété d'une base n'est pas déductible. Une base n'est
+donc rattachée qu'au seul site que son nom désigne, aux séparateurs près — `shop_fr`
+pour `shop.fr`, jamais `shopping` —, et déclarée qu'avec le seul compte de son nom,
+sous son hôte réel (`'shop'@'%'` reste `'%'`) ; sinon elle reste hors gestion, et
+l'adoption le dit avant d'écrire.
 
 **L'adoption ne renomme jamais.** Un site servi depuis `/var/www/boutique` par
 l'utilisateur `boutique` garde ces noms : les changer exigerait de recréer le compte
-et de migrer la base. Les écarts à la convention sont affichés à l'adoption, et
-`ogs diff` montre ce qu'un premier apply normaliserait — avant de le faire.
+et de migrer la base. Son vhost garde son fichier (`spec.web.vhosts[].file`), repris
+en place par `ogs apply --force`, qui en sauvegarde l'original. Les écarts à la
+convention sont affichés à l'adoption, et `ogs diff` montre ce qu'un premier apply
+normaliserait — avant de le faire.
 
 Les mots de passe existants sont inconnus d'ogs : ils ne sont **ni devinés ni
 réinitialisés**. `ogs db user rotate` permet d'en reprendre la main quand on le
@@ -423,7 +447,9 @@ est transmis par `SOCKET_PATH`, et si le code l'ignore, l'attente de disponibili
 - **Fournisseur DNS** : OVH seul est géré, refusé dès la déclaration pour tout autre.
 - **Répertoires sensibles** : `ogs harden` ferme les répertoires de configuration aux utilisateurs du
   serveur — qui y ont un compte local — sans jamais desserrer ce qui l'est déjà plus, et sans toucher
-  `/etc/php`, où le PHP des crons lit son `php.ini`. La racine des homes passe en 0711 : traversable, donc
+  `/etc/php`, où le PHP des crons lit son `php.ini`. Il ne ferme rien sans le groupe du service qui lit :
+  MariaDB lit `/etc/mysql` sous `mysql`, les workers web lisent `.htpasswd` sous `www-data`, et une cible
+  dont le groupe manque est refusée plutôt que fermée. La racine des homes passe en 0711 : traversable, donc
   les sites sont servis comme avant, mais plus énumérable — un `ls /home` ne donne plus la carte du parc.
   Le gain est partiel et annoncé comme tel : `/etc/passwd` énumère déjà les homes.
 - **Supervision** : ogs n'installe ni fail2ban ni Telegraf, il leur écrit ce qu'eux seuls ne peuvent pas
@@ -442,7 +468,18 @@ est transmis par `SOCKET_PATH`, et si le code l'ignore, l'attente de disponibili
   SFTP de proftpd sur 2222 —, et ne touche qu'aux règles dont le commentaire commence par `ogs:` ; celles
   de l'administrateur restent intactes. La première activation se défait d'elle-même au bout de cinq
   minutes faute de `ogs firewall confirm` lancé depuis une nouvelle session, et une déclaration qui
-  couperait la session SSH en cours est refusée.
+  couperait la session SSH en cours, ou fermerait un port où sshd écoute, est refusée. Seul
+  `--allow-lockout`, propre aux commandes `ogs firewall`, lève ce refus : jamais le `--force` des
+  fichiers retouchés.
+- **Appartenance** : un fichier n'est à un projet que par l'en-tête qu'ogs y écrit, jamais par son nom.
+  Un fichier posé à la main selon la convention de nommage n'est ni retiré ni écrasé en silence ; un
+  fichier retouché n'est remplacé, ou retiré, que sous `--force`, qui le sauvegarde dans
+  `/var/lib/ogs/backups` ; le fichier d'un autre projet ne l'est jamais.
+- **Docroots** : le serveur web ne suit un lien que vers ce qui appartient à son auteur — `www-data`,
+  membre du groupe de chaque projet, servirait sinon les fichiers d'un voisin —, et ne sert ni les
+  fichiers cachés (`.git`, `.env`), ni `composer.json`, `/.well-known/` excepté.
+- **`--dry-run`** : simulé par les commandes qui le savent, refusé (code 2) par les autres — jamais
+  ignoré. Aucun hook ne s'exécute sous ce drapeau.
 
 ## Codes de retour
 
@@ -454,10 +491,16 @@ est transmis par `SOCKET_PATH`, et si le code l'ignore, l'attente de disponibili
 | 3 | échec de validation | | 8 | privilèges insuffisants |
 | 4 | conflit | | 9 | opération annulée |
 
+Le 2 couvre aussi `--dry-run` demandé à une commande qui ne sait pas simuler ; le 9, un refus à la
+confirmation ou une interruption — notamment pendant le calcul d'un plan, avant le point de non-retour
+d'une suppression, ou pendant la copie d'un clone.
+
 ## Documentation
 
-- [`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md) — la référence : 75 décisions d'architecture
+- [`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md) — la référence : 90 décisions d'architecture
   arbitrées, spécification par module, plan de tests, découpage en lots.
+- [`docs/UTILISATION.md`](docs/UTILISATION.md) — déclarer un site, l'appliquer, le faire vivre ; fichiers
+  retouchés et `--force`, suppression et restauration, migration d'un ancien serveur.
 - [`docs/INSTALLATION.md`](docs/INSTALLATION.md) — installation, premier démarrage, sauvegarde, mise à jour.
 - [`docs/HOOKS.md`](docs/HOOKS.md) — raccorder l'outil au reste de l'exploitation.
 - `man ogs`, et une page par commande (`man ogs-site-create`) — engendrées depuis l'arbre des commandes,

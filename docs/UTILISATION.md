@@ -111,7 +111,11 @@ sudo ogs site create shop.fr \
 ```
 
 - `www.shop.fr` est servi par le même vhost et couvert par le même certificat ;
-- `ancien-shop.fr` reçoit un vhost de redirection permanente vers `shop.fr` ;
+- `ancien-shop.fr` reçoit un vhost de redirection permanente vers `shop.fr`, couvert lui aussi par le
+  certificat. Tant que son DNS ne désigne pas la machine, l'autorité le refuse, et avec lui toute la
+  demande : l'émission se replie alors sans lui, le site reste en HTTPS, et l'apply rend le code 6 en le
+  nommant. Une redirection depuis une adresse IP n'entre jamais dans le certificat : son vhost reste en
+  HTTP ;
 - `--messenger async` crée dans RabbitMQ un vhost, un utilisateur, l'exchange, la file `async` et sa file
   d'échec ; `ogs secrets env shopfr` donne alors aussi `MESSENGER_TRANSPORT_DSN` ;
 - `--service` démarre trois consommateurs de la file (voir [Les services](#les-services)) ;
@@ -268,7 +272,11 @@ spec:
 ```
 
 Ce qui est absent reste déduit : utilisateur, home, docroot `www/public`, vhosts principal et de
-redirection, certificat couvrant `boutique.fr` et `www.boutique.fr`.
+redirection, certificat couvrant `boutique.fr`, `www.boutique.fr` et la redirection `ancienne-boutique.fr`.
+
+Ajouter un alias à un site en HTTPS ne lui retire jamais son HTTPS : le vhost garde le certificat en place
+pour les noms qu'il couvre, et le nouveau nom, déclaré aussitôt, attend le sien — le port 80 sert son
+challenge. Si l'émission échoue, le site reste servi en HTTPS sur ses anciens noms, et le code est 6.
 
 ### 7. Une préproduction
 
@@ -416,7 +424,13 @@ d'exécution `/run/ogs/<id>`. Un worker qui doit écrire ailleurs échouera en �
 Deux situations, deux chemins :
 
 - les sites **restent sur la machine** et `ogs` doit les prendre en main : `ogs import scan`, puis
-  `ogs import adopt <id>`. Un projet adopté garde ses noms réels (compte, bases, pool) ;
+  `ogs import adopt <id>`. Un projet adopté garde ses noms réels (compte, bases, pool, fichier du vhost —
+  `spec.web.vhosts[].file` —, hôte des comptes de base). Une base n'est rattachée à un site que si son nom
+  le désigne, lui seul, aux séparateurs près (`shop_fr` pour `shop.fr`, jamais `shopping`), et déclarée
+  qu'avec le seul compte de son nom ; sinon elle reste hors gestion, et `import adopt` le dit, avec les
+  bases qu'il déclare, avant de rien écrire : la déclarer à la main dans `spec.databases`. Le premier
+  `ogs apply` d'un projet adopté refuse d'écraser ses fichiers d'origine, qu'`ogs` n'a pas écrits :
+  `ogs apply <id> --force` les reprend en place, après les avoir sauvegardés ;
 - les sites **changent de machine** : c'est une migration. Elle est décrite par un manifeste,
   rempli d'après le modèle [`migration.yaml`](migration.yaml), et exécutée par [`migrer.sh`](migrer.sh),
   sur la **nouvelle** machine et en root. La nouvelle machine tire fichiers et bases de l'ancienne par ssh : l'ancienne n'a besoin
@@ -456,19 +470,35 @@ docs/migrer.sh -m $M etat
 seules les lectures sont faites. Les sites sont groupés par **vague**, une vague partageant une fenêtre de
 maintenance ; commencer par une vague d'un petit site sans enjeu.
 
+Avant tout dépôt, le script refuse un projet que la cible porte déjà sans que la migration l'ait déposé, ou
+dont un autre projet — sur la cible, ou dans le manifeste — partage une base, un compte, un home ou un
+domaine, la préproduction comprise ; il refuse aussi un compte, un home ou une base qui existe déjà sur la
+cible. `prealables` passe les projets dont la bascule est engagée — leur DNS désigne déjà la cible — et
+n'avertit que d'un domaine qui n'a encore aucune adresse.
+
 - **Déclarer** dépose la déclaration **crons et services désactivés** : une tâche ne doit jamais tourner sur
   les deux serveurs à la fois. Le certificat échoue tant que le DNS désigne l'ancien serveur — code 6,
   attendu. Une zone chez OVH peut l'obtenir d'avance par `challenge: dns-01`.
 - **Synchroniser** ne coupe rien : l'ancien serveur continue de servir. La rejouer la veille de la bascule
-  réduit la dernière copie à presque rien.
+  réduit la dernière copie à presque rien. Une fois la bascule engagée, elle est **refusée** : la cible fait
+  foi, et une nouvelle copie écraserait ce que les visiteurs y ont écrit.
 - **Basculer** met l'ancien site en maintenance, attend que ses files RabbitMQ soient vides, arrête ses
   tâches et workers, fait la dernière copie, puis vérifie le nouveau site **avant** de toucher au DNS : en
   cas d'échec, l'ancien serveur est rétabli et les visiteurs n'ont rien vu. Le script attend ensuite que le
   DNS désigne la nouvelle machine — le changement d'enregistrement reste manuel —, réactive crons et
-  services, et `ogs apply` émet le certificat.
-- **Retour** (`migrer.sh -m $M --executer retour <id>`) désactive le projet sur la nouvelle machine et rétablit
-  tâches, workers et site sur l'ancienne. Les données écrites sur la nouvelle machine depuis la bascule ne
-  sont **pas** reportées.
+  services, et `ogs apply` émet le certificat. Une bascule interrompue se reprend en relançant la même
+  commande, sans nouvelle copie si la dernière a été faite.
+- **Retour** (`migrer.sh -m $M --executer retour <id>`), refusé sans bascule engagée, met le nouveau site en
+  maintenance, y désactive tâches et services, les rétablit sur l'ancienne machine, **attend que le DNS la
+  désigne de nouveau**, et seulement alors la sort de maintenance : pendant la propagation, les deux
+  machines écriraient chacune de leur côté. Un `ogs apply` en échec sur la nouvelle machine ne bloque pas le
+  retour : il le signale. Les données écrites sur la nouvelle machine depuis la bascule ne sont **pas**
+  reportées.
+
+`--sans-attente-dns` sert au domaine qui ne résoudra jamais exactement vers l'adresse du manifeste — CDN,
+répartiteur : la propagation n'est plus attendue, c'est l'exploitant qui la constate, et le script la lui
+fait confirmer **même sous `--oui`**. `--oui` dispense de confirmer une intention, jamais un fait que seul
+l'exploitant peut observer ; une entrée standard fermée vaut refus.
 
 Ce que le script ne fait pas : modifier le DNS, corriger les chemins absolus écrits en dur dans le code ou
 la base (`chemins_en_dur`, listés par `controle`), et publier la nouvelle clé DKIM — `ogs` en génère une
@@ -482,13 +512,74 @@ l'ancien serveur (`dependances_externes`).
 sudo ogs cert list                          # certificats et échéances (renouvellement automatique)
 sudo ogs db dump shopfr                     # sauvegarde de la base
 sudo ogs cron run shopfr planificateur      # exécuter une tâche tout de suite
-sudo ogs project delete shopfr              # archive complète, puis suppression
-sudo ogs project restore /var/lib/ogs/archives/shopfr-20260823-143000.tar.zst
 sudo ogs import scan                        # reprendre un serveur existant, en lecture seule
 sudo ogs                                    # interface en mode texte
 ```
 
 Toutes les commandes acceptent `-o json` ou `-o yaml`, et `man ogs-<commande>` détaille chacune.
+
+`ogs db dump -O <fichier>` et `ogs db restore -i <fichier>` n'écrivent ni ne lisent à travers un lien qu'un
+autre compte que root aurait pu poser — celui d'un home, par exemple —, ni dans un tube nommé ou un
+périphérique : la commande est refusée, et ce qui occupe le chemin laissé en place. La sauvegarde est créée
+en `0600`, au compte de root. `/dev/stdout`, `/dev/null` et `/dev/stdin` restent admis.
+
+## Fichiers retouchés et `--force`
+
+Chaque fichier qu'`ogs` écrit porte un en-tête qui nomme son projet et l'empreinte de son contenu. C'est ce
+en-tête, jamais le nom du fichier, qui dit à qui il appartient : un vhost ou un pool posé à la main selon la
+convention de nommage d'un projet — `shop_maintenance.conf` à côté de `shop.conf` — n'est pas à ce projet,
+et son apply ne le retire pas.
+
+| Le fichier | à l'écriture | au retrait (fichier devenu inutile) |
+|---|---|---|
+| écrit par ogs, intact | réécrit | retiré |
+| écrit par ogs, retouché à la main | refusé sans `--force` ; sous `--force`, sauvegardé puis réécrit | refusé sans `--force` ; sous `--force`, sauvegardé puis retiré |
+| sans en-tête d'ogs | refusé sans `--force` ; sous `--force`, sauvegardé puis repris | jamais retiré |
+| écrit par ogs pour un autre projet | refusé, `--force` compris (code 4) | jamais retiré |
+
+Un retrait refusé ne défait rien : l'apply aboutit, rend le code 6 et nomme le fichier, en trop mais non
+en défaut. Les sauvegardes vont dans `/var/lib/ogs/backups`, jamais à côté de l'original, sans jamais en
+écraser une autre. `--force` ne lève pas davantage les gardes du pare-feu, qui ont leur propre option
+(`ogs firewall … --allow-lockout`, voir [`INSTALLATION.md`](INSTALLATION.md)).
+
+## Supprimer et restaurer
+
+```sh
+sudo ogs project delete shopfr              # archive complète, puis suppression
+sudo ogs project delete shopfr --keep-data  # retire la configuration, garde bases, fichiers et compte
+sudo ogs project restore /var/lib/ogs/archives/shopfr-20260823-143000.tar.zst
+```
+
+**Avant la confirmation**, la suppression énumère ensemble tout ce qui la refuse, chaque refus avec ce qui le
+lève ; le code est celui du premier :
+
+- une racine qu'un autre projet partage, englobe ou contient, une racine liée ou qui n'appartient pas au
+  compte, un point de montage sous le home ou sous les journaux — rien ne lève ces refus : un partage monté
+  serait vidé pour tous ceux qui s'en servent ;
+- un fichier de configuration qu'`ogs` n'a pas écrit (sans son en-tête, illisible, ou lien vers un fichier hors du projet), et qui désigne peut-être son compte ou
+  son home — le vhost d'origine d'un site adopté : `ogs apply <id> --force` le confie à `ogs`, qui le
+  réécrit à son nom après l'avoir sauvegardé ;
+- le compte d'un projet qu'`ogs` n'a pas créé, et les bases d'un projet adopté : `--force`, qui les nomme
+  avant la confirmation ;
+- une base qu'elle ne pourrait pas sauvegarder : `--no-dump`. Un dump qui échoue en chemin abandonne la
+  suppression, rien n'étant retiré.
+
+Une interruption (Ctrl-C) reçue avant le premier retrait abandonne la suppression, retire l'archive et
+relance les services, code 9 ; reçue après, elle laisse la suppression aller à son terme — un home effacé
+sous un compte encore vivant serait le pire des états. Les refus sont éprouvés une seconde fois, l'archive
+faite : un partage monté pendant l'archivage fait encore renoncer, archive retirée et services relancés.
+`--dry-run` est refusé : `project delete` ne sait pas simuler.
+
+Deux choses ne suivent pas la règle commune. Le **certificat** du projet, clé privée comprise, reste en
+place et n'est pas archivé : `ogs cert delete <id>` le retire, sans quoi `doctor` en signale l'échéance
+indéfiniment. Le **fichier d'environnement** `/etc/ogs/env/<id>.env` part toujours, `--keep-data` compris,
+parce qu'il porte des secrets : sa copie scellée est dans l'archive, que la restauration réécrit — sous
+`--purge`, il n'en reste rien.
+
+La restauration recrée le projet — refusée s'il existe déjà —, applique sa déclaration, puis remet son home
+tel que l'utilisateur l'avait laissé, chaque fichier rendu à qui le possédait ; ce qui n'était pas à
+l'utilisateur revient à root. Un `authorized_keys` qu'il avait posé, un script à la place du lien `php`
+restent en place : l'apply suivant les signale (code 6) sans les remplacer. Il faut la même clé maître.
 
 `--dry-run` montre ce que ferait une commande qui sait simuler — `apply`, `site create`, `project create`,
 `cron add`, `php switch`… — sans rien toucher : ni fichier, ni compte, ni hook. Une commande qui ne le sait
@@ -503,3 +594,9 @@ pas — `project delete`, `project restore`, `cert renew`… — refuse l'option
 | 2    | usage                                    | 7    | verrou indisponible           |
 | 3    | validation                               | 8    | privilèges insuffisants       |
 | 4    | conflit                                  | 9    | annulé                        |
+
+Le **2** couvre aussi `--dry-run` demandé à une commande qui ne sait pas simuler, et une entrée de
+`db restore -i` refusée. Le **4** est aussi le fichier d'un autre projet, que `--force` ne lève pas. Le **6**
+est le code d'un certificat émis en partie, d'un retrait refusé, d'une copie de clone qui a écarté ou nommé
+quelque chose. Le **9** est un refus à la confirmation, ou une interruption — notamment pendant le calcul
+d'un plan, pendant une suppression avant son point de non-retour ou pendant la copie d'un clone.

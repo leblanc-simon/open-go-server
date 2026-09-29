@@ -107,7 +107,7 @@ Décisions arbitrées et figées pour la v1. Toute remise en cause est une évol
 | D22 | Sorties | `--output json\|yaml\|table`, codes de retour normalisés, complétion | Toute commande de lecture doit être sérialisable |
 | D23 | Nommage | **Un identifiant unique** dérivé du host nomme user, groupe, bases, vhost AMQP, pool, vhost web, unités, cron | Contrainte de longueur commune à 32 car. ; suffixes de rôle pour les ressources additionnelles |
 | D24 | Environnements | `prod` et `prep` ; la préproduction suffixe l'identifiant par **`prep`** (sans séparateur) et vit sur un domaine dédié : `<label de prod>.preprod-pp.net` (D58) | Réserve 4 car. sur les 32 disponibles ; le domaine est une clé de configuration globale |
-| D25 | Accès du serveur web | **Groupe privé par projet**, `www-data` ajouté comme **membre secondaire** de chaque groupe | Isolation inter-sites préservée ; `.env` et `var/` restent hors de portée de `www-data` |
+| D25 | Accès du serveur web | **Groupe privé par projet**, `www-data` ajouté comme **membre secondaire** de chaque groupe | Isolation inter-sites préservée ; `.env` et `var/` restent hors de portée de `www-data`. Corollaire : le serveur web ne suit un lien du docroot que vers ce qui appartient à son auteur (D87) — sous Apache, une course subsiste, que seule une identité de service par projet fermerait (§20) |
 | D26 | Certificats partagés | Un certificat peut être de **portée serveur** et référencé par `@<nom>` ; la préproduction utilise un wildcard `*.preprod-pp.net` unique | Impose DNS-01 et des credentials en écriture sur la zone ; supprime tout appel ACME à la création d'une préproduction |
 | D27 | DNS | **Hors périmètre** : un wildcard `*.preprod-pp.net` est créé manuellement une fois ; `doctor` vérifie seulement la résolution | Un seul serveur de préproduction par domaine |
 | D28 | Délégation | L'utilisateur du projet pilote ses services par **sudoers énuméré, sans métacaractère** ; `ogs my <verbe>` déduit le projet de **`SUDO_UID`** | Aucune cible à détourner ; fichier sudoers validé par `visudo -cf` avant activation ; dépend de `env_reset`, vérifié par `doctor` |
@@ -120,12 +120,12 @@ Décisions arbitrées et figées pour la v1. Toute remise en cause est une évol
 | D35 | Runtimes | `nvm`, `rbenv`, `pyenv`/`venv` installés **par utilisateur** dans son home, liens gérés dans `.local/bin/` (D70) | Une copie par site ; intégrité du runtime hors du contrôle de l'inventaire |
 | D36 | Écoute des applications | **Socket Unix** `0660 www-data:<id>` quand le runtime le permet ; sinon port TCP `2<runtime><incrément>` sur **127.0.0.1 exclusivement** | Isolation équivalente à celle des pools PHP |
 | D37 | Types livrés | **Prestashop** et **Symfony 3.4 → 8** (+ `static`, `php-plain` et les 4 runtimes) ; les autres frameworks s'ajoutent par `apptypes.yaml` sans code | Symfony 3.4 impose une variante distincte : docroot `web`, `app.php`, pas de Messenger |
-| D38 | Compatibilité PHP | La contrainte `require.php` du **`composer.json` de l'application** fait autorité ; table indicative en secours seulement | Aucune matrice figée à maintenir ; `php switch` refuse une bascule incompatible sans `--force` |
+| D38 | Compatibilité PHP | La contrainte `require.php` du **`composer.json` de l'application** fait autorité ; table indicative en secours seulement | Aucune matrice figée à maintenir ; `php switch` refuse une bascule incompatible sans `--force`. Le fichier est lu par descripteur, sans suivre de lien et borné à 1 Mio ; illisible ou refusé, c'est la table qui décide, annoncée comme telle (D82) |
 | D39 | Versions PHP | **7.4 à 8.5**, y compris des versions en fin de support | `doctor` les signale sans jamais bloquer : un Prestashop ancien peut exiger 7.4 |
 | D57 | Accès aux préproductions | **Aucune authentification** : elles sont accessibles par défaut, protégées seulement de l'indexation (`X-Robots-Tag`, `robots.txt`) | Une authentification à poser gêne le travail quotidien — recettes clients, tests d'intégration, webhooks de fournisseurs. La contrepartie est explicite : une préproduction est publique, donc sans donnée réelle |
 | D58 | Host de préproduction | Le sous-domaine reprend le host canonique **privé de son extension** (`jardindeco.fr` → `jardindeco.preprod-pp.net`) ; un host **déjà posé** sur le domaine de préproduction est pris **tel quel**, et l'identifiant se dérive alors de son seul label | L'extension n'apporte rien à un nom qui vit sur un domaine dédié. Et le host construit est celui qu'on a sous les yeux : le saisir tel quel est le réflexe naturel, qui donnait `jardindecopreprodppnet.preprod-pp.net`, le home du même nom et l'utilisateur `jardindecopreprodppnetprep`. Deux contreparties assumées : deux hosts ne différant que par leur extension revendiquent le même sous-domaine — la collision est refusée par le contrôle d'unicité du host effectif, jamais silencieuse ; seul le **dernier** label est retiré, reconnaître `co.uk` ou `com.br` exigeant une liste des suffixes publics, hors périmètre |
 | D59 | Unité du moteur web | ogs gère un complément d'unité `/etc/systemd/system/<moteur>.d/ogs.conf` qui **énumère** les répertoires de journaux des projets en `ReadWritePaths=-<chemin>` ; il est écrit **avant** les vhosts et déclenche un **redémarrage** du moteur, non un rechargement | Les distributions durcissent l'unité du serveur web — Ubuntu livre `apache2.service` avec `ProtectHome=read-only` — et un service ainsi protégé voit `/home` en lecture seule dans son seul espace de noms : le maître s'arrête en ouvrant le journal d'un vhost et emporte tous les sites, alors que `mount` affiche `rw` et que root écrit sans peine. `ReadWritePaths` remonte les chemins après application des protections, ce qui laisse le durcissement intact. Chaque répertoire est énuméré plutôt que la racine des homes : rien d'autre que les journaux n'a besoin de s'ouvrir. Le préfixe `-` est indispensable — un chemin absent fait échouer le service en 226/NAMESPACE — et le redémarrage l'est aussi : l'espace de noms est établi au démarrage, un `reload` ne le refait pas — **réduit par D71** à une seule entrée, `ReadWritePaths=-<logs.root>`, les journaux ayant quitté `/home` |
-| D56 | Droits des répertoires de configuration | `ogs harden` **rapporte** par défaut et n'applique qu'avec `--apply` ; il **ne desserre jamais** et **ne suit aucun lien symbolique** ; `/etc/php` reste ouvert à dessein | Les utilisateurs de projet ont un compte local : sans restriction ils dressent la carte du parc. Mais fermer un répertoire qu'un démon lit sous sa propre identité l'interromprait : le groupe cible est celui du service (rabbitmq, telegraf, redis, postgres, opendkim), et `/etc/php` reste lisible parce que le PHP en ligne de commande des crons y lit son `php.ini`. Un outil de sécurité qui desserrerait des droits déjà plus stricts serait une régression |
+| D56 | Droits des répertoires de configuration | `ogs harden` **rapporte** par défaut et n'applique qu'avec `--apply` ; il **ne desserre jamais** et **ne suit aucun lien symbolique** ; `/etc/php` reste ouvert à dessein | Les utilisateurs de projet ont un compte local : sans restriction ils dressent la carte du parc. Mais fermer un répertoire qu'un démon lit sous sa propre identité l'interromprait : le groupe cible est celui du service (rabbitmq, telegraf, redis, postgres, opendkim — liste **révisée par D85**, qui y ajoute mysql, www-data et le propriétaire laissé au service qui réécrit sa configuration, et refuse une cible sans son groupe), et `/etc/php` reste lisible parce que le PHP en ligne de commande des crons y lit son `php.ini`. Un outil de sécurité qui desserrerait des droits déjà plus stricts serait une régression |
 | D60 | Droits de la racine des homes | `ogs harden` ferme la racine des homes (`naming.homeRoot`) en **0711 root:root**, sans récursion ni `fileMode` | Un utilisateur de projet dresse la carte du parc d'un seul `ls /home` : le nom de chaque voisin, et le chemin de son code. La traversée reste ouverte à tous, donc rien ne change pour le serveur web — servir un fichier n'exige que la traversée des répertoires et la lecture du fichier (D51) — ni pour un projet qui atteint son propre home. Trois contreparties, toutes assumées : les globs non privilégiés (`ls /home`, `du -sh /home/*`) et la complétion cessent d'aboutir ; un agent de sauvegarde ou de supervision qui parcourrait `/home` sous une identité non root est à revoir ; et le gain est **partiel** — `/etc/passwd` est lisible par tous et énumère déjà les homes, ce qui fait de cette mesure une gêne, non une cloison. Le traitement n'est **jamais récursif** : sous la racine vivent les répertoires des projets, dont `model.defaultDirs` est le seul juge (D51), et un second juge ferait osciller le plan entre deux valeurs. La règle « ne desserre jamais » de D56 s'applique ici aussi, et elle mord : un `/home` en 0700 ne rend plus un seul fichier et reste pourtant en place — c'est `doctor` qui a la charge de le dire, aucune vérification de configuration ne le voyant. Une racine montée depuis le réseau (`/home` sur NFS) rend le verdict « refusé » plutôt qu'un échec de `chmod` : le mode y appartient au serveur, et un export en `root_squash` refuserait root lui-même |
 | D51 | Droits de l'arborescence | Home en **0711**, répertoires du projet en **0710** | Le home se traverse sans s'énumérer : servir un fichier n'exige que la traversée du répertoire et la lecture du fichier. Personne — pas même le serveur web — ne peut lister le contenu, ce qui ôte tout moyen de se promener dans l'arborescence. Le bit de groupe du home est indispensable : Unix retient la première classe applicable sans repli, donc un home en 0701 refuserait la traversée à `www-data` **parce qu'il est membre du groupe** |
 | D52 | Rétention des archives | **14 jours**, purgés par une étape du plan global ; zéro signifie « conserver indéfiniment » et doit être explicite | Une archive contient un dump de base, donc des données de clients : la garder sans terme n'est pas neutre. La purge est une étape annoncée, jamais un effet de bord |
@@ -141,8 +141,8 @@ Décisions arbitrées et figées pour la v1. Toute remise en cause est une évol
 | D46 | Création de base PostgreSQL | **`TEMPLATE template0`** systématiquement | L'encodage étant toujours explicite, créer depuis `template1` échoue dès que celui-ci a un autre encodage — le cas de tout cluster initialisé sans locale |
 | D41 | Droits de `/var/lib/ogs` | **0751** et non 0750 | Le serveur web doit traverser jusqu'à `acme-challenge` : en 0750 tout challenge HTTP-01 se voit refuser par un 403. Le bit d'exécution seul n'autorise pas l'énumération, et les contenus sensibles gardent leurs propres droits |
 | D42 | Webroot du challenge | Le client ACME écrit dans `<webroot>/.well-known/acme-challenge/` : **Apache aliase ce répertoire, nginx prend le webroot** et y accole l'URI | Les deux directives n'ont pas la même sémantique ; une seule valeur de template menait fatalement l'un des deux moteurs à un 404 |
-| D43 | TLS dans les templates | **Tous** les templates de vhost servent le HTTPS, non seulement ceux des sites PHP | Un site statique, une application derrière un proxy — donc tous les runtimes non-PHP — et un domaine redirigé ont autant besoin d'être chiffrés |
-| D40 | Hooks | **Deux portées** : un fichier de `/etc/ogs/hooks` nommé d'après l'événement s'applique à tout le parc, `spec.hooks` le remplace pour un projet. Criticité déduite du préfixe : `pre` interrompt, `post` avertit | Un hook s'exécute en root : le script doit vivre sous `/etc/ogs/hooks`, appartenir à root et n'être inscriptible par personne d'autre, sans quoi il est refusé — c'est une escalade de privilèges autrement. Aucun hook en `--dry-run` |
+| D43 | TLS dans les templates | **Tous** les templates de vhost servent le HTTPS, non seulement ceux des sites PHP | Un site statique, une application derrière un proxy — donc tous les runtimes non-PHP — et un domaine redirigé ont autant besoin d'être chiffrés. Le bloc 443 n'est rendu que pour un nom que couvre le certificat présent (D79), et celui du projet couvre aussi ses redirections (D80) |
+| D40 | Hooks | **Deux portées** : un fichier de `/etc/ogs/hooks` nommé d'après l'événement s'applique à tout le parc, `spec.hooks` le remplace pour un projet. Criticité déduite du préfixe : `pre` interrompt, `post` avertit | Un hook s'exécute en root : le script doit vivre sous `/etc/ogs/hooks`, appartenir à root et n'être inscriptible par personne d'autre, sans quoi il est refusé — c'est une escalade de privilèges autrement. Aucun hook en `--dry-run` : les commandes qui simulent s'arrêtent avant leurs hooks, les autres refusent l'option, et le `hook.Runner` lui-même n'exécute rien sous ce drapeau (D88) |
 | D61 | Clés SSH d'administration | Si **`/opt/default_authorized_keys`** existe, `.ssh/authorized_keys` de chaque projet est un **lien symbolique** vers ce fichier, `lchown` à l'utilisateur du projet ; l'étape est **non critique**, elle n'existe pas sans le fichier commun, et un `authorized_keys` **régulier** n'est jamais remplacé | Les opérateurs qui interviennent sur les projets sont les mêmes pour tout le parc : un trousseau unique se met à jour en un endroit, là où une copie par projet exigerait de repasser sur chacun d'eux à chaque arrivée ou départ — et figerait le trousseau au jour de la création du site. Le fichier commun n'est **pas géré par ogs** : l'administrateur le pose et le tient à jour, ogs ne fait que le lier. Quatre points acquis de la mécanique d'OpenSSH : sshd **résout le lien** avant tout contrôle, donc ce sont les droits de la cible qui décident et le mode du lien — 0777 immuable sous Linux — n'a aucun effet, ce qui interdit d'en faire un critère de dérive ; sous `StrictModes`, un fichier qui n'appartient pas à root ou à l'utilisateur, ou inscriptible au-delà de son propriétaire, est ignoré **en silence** ; le fichier est lu sous l'identité de l'utilisateur du projet, donc il doit aussi **lui être lisible** — 0644 root:root ; et `lchown`, non `chown`, sans quoi le trousseau commun passerait à l'utilisateur du dernier projet appliqué. C'est `doctor` qui porte ces contrôles, aucun n'étant visible depuis le plan. Un `authorized_keys` régulier déjà présent — reprise d'un serveur existant, clé posée par l'utilisateur du projet — porte l'accès de quelqu'un : le remplacer par un lien le lui retirerait sans un mot. L'étape échoue donc sans rien détruire, ce qui rend un avertissement et le code 6, et l'exploitant tranche. Le shell des projets étant ouvert par défaut (D62), le trousseau est utile sans réglage supplémentaire ; un parc qui referme le shell garde le lien en place mais inerte, sauf accès restreint à SFTP. Dans les deux cas, poser le lien n'ouvre par lui-même aucune surface : c'est sshd qui décide, et rien ici ne touche à sa configuration |
 | D62 | Shell des comptes de projet | **`/bin/bash`** par défaut, réglable pour tout le parc par **`user.shell`** dans `/etc/ogs/config.yaml` et projet par projet par `spec.user.shell` ; le shell déclaré est **réconcilié** (`usermod`), et un projet **adopté garde le sien** | Révise D15 et D33, qui fermaient le shell. La raison du renversement : un compte fermé rend inutilisables le trousseau de clés d'administration (D61), l'accès SFTP au docroot et tout dépannage à la main — trois usages quotidiens qu'il fallait rouvrir un projet à la fois. Ce que la décision ne change pas : ogs **ne touche pas à sshd**. Un shell ouvert n'ouvre par lui-même aucune connexion — il faut encore une clé autorisée et un sshd qui l'accepte — mais il faut le dire franchement, la surface d'attaque augmente : un compte de projet dont la clé fuite obtient un shell, là où `nologin` l'arrêtait net. D'où trois garde-fous. La valeur est **un réglage**, et la fermer se fait en une ligne pour tout le parc, `user.shell: /usr/sbin/nologin` ; le défaut est **de création**, donc le fichier d'un projet existant fait autorité ensuite — sans quoi un changement de configuration réécrirait le shell de tout le parc au prochain apply ; et un chemin **relatif** est refusé au chargement, `useradd` l'acceptant tel quel pour rendre un compte inutilisable sans un mot, quand `doctor` signale par ailleurs un shell absent du disque. La réconciliation est le corollaire nécessaire : sans elle `spec.user.shell` serait un état désiré que rien n'applique, et ouvrir ou fermer un projet existant demanderait un `usermod` à la main. Elle partage l'étape du compte avec la correction du home — deux étapes de même ressource se marcheraient dessus dans le plan comme dans l'audit. Un projet **adopté** est l'exception : son compte existait avant ogs, et l'import reprend son shell réel plutôt que d'imposer le défaut du parc, comme il garde ses autres noms |
 | D63 | Surcharges de vhost | Chaque vhost inclut **deux répertoires facultatifs** de `/etc/<moteur>/projects/<nom du vhost>/` : `vhost/*.conf` dans le contexte du vhost (`server` de nginx, `<VirtualHost>` d'Apache) et `docroot/*.conf` dans celui du répertoire servi (`location /`, `<Directory>`). Les répertoires sont créés par l'apply en **0750 root:root** et **déduits du rendu**, non d'une table | Un `blocks` de `spec` vit dans le fichier du projet, donc sous le contrôle d'ogs : le modifier demande un apply, et il n'a pas de sens pour un réglage que l'exploitant ajuste à la main. Le répertoire répond à ce besoin sans ouvrir la moindre brèche dans le modèle : ogs ne lit jamais ces fichiers, il ne fait que les faire inclure, et l'empreinte du vhost généré ne dépend pas d'eux — une surcharge déposée ne fait donc jamais dériver le plan. **Le masque est ce qui rend l'inclusion facultative** : nginx et Apache traitent un joker sans correspondance comme un silence, là où un chemin littéral introuvable est fatal — d'où `IncludeOptional` et non `Include`, ce dernier échouant sur un joker vide depuis 2.4. Le nommage suit le **fichier de vhost** (`shopfr`, non `shop.fr`) : un projet porte plusieurs vhosts, et un domaine principal qui change laisserait un répertoire orphelin que rien ne relie plus. La liste des contextes est **déduite du vhost rendu** — les templates sont surchargeables, et une table finirait par mentir : ogs créerait un répertoire que le vhost n'inclut pas, où les fichiers déposés seraient ignorés en silence. Un vhost de **proxy** n'a donc que le contexte du vhost — il ne sert aucun répertoire, et nginx refuse un second `location /` dans le même `server` — et un vhost de **redirection** n'en a aucun : son unique `server` porte le challenge ACME, qu'un `rewrite` déposé là mettrait par terre. Trois points de sécurité et d'exploitation, tous portés par `doctor` : ces fichiers sont lus par le processus **maître, en root**, donc le régime des hooks s'applique — root:root, inscriptible par personne d'autre, sans quoi ce compte dicte la configuration du serveur ; un fichier `.conf` déposé hors des sous-répertoires de contexte n'est chargé par personne et **rien ne le dit** ; un répertoire qu'aucun vhost ne référence plus garde des fichiers que leur auteur croit actifs. La suppression d'un projet emporte les répertoires **vides** et laisse le reste, comme l'`authorized_keys` de D61 : ogs n'a pas écrit ces fichiers. Deux pièges de sémantique que la fonctionnalité expose et qu'aucune vérification de configuration ne voit : sur nginx un `add_header` dans le contexte du docroot **annule** tous ceux hérités du `server` — HSTS et `X-Robots-Tag` compris — et une directive **dupliquée** y est une erreur fatale, là où Apache retient la dernière ; un rechargement refusé arrête donc tout le parc, ce que la revalidation de `web.Provider.Reload` rattrape sans pouvoir l'empêcher |
@@ -154,10 +154,25 @@ Décisions arbitrées et figées pour la v1. Toute remise en cause est une évol
 | D69 | Signature DKIM | ogs **génère et garde** une clé DKIM par domaine d'envoi d'un projet qui la demande (`spec.mail.dkim`, **opt-in**), écrit la `KeyTable` et la `SigningTable` d'**OpenDKIM** à partir du parc entier et **émet l'enregistrement à publier** ; il ne touche **ni au DNS, ni au MTA, ni à `opendkim.conf`**. Clé **RSA-2048** générée en Go, scellée dans le keystore (`<projet>/dkim/<domaine>/<sélecteur>`) et écrite en **0600 opendkim:opendkim** ; sélecteur daté (`ogs202609`) ; rotation en **deux temps** — `rotate` prépare, `activate` bascule et refuse tant que l'enregistrement publié ne correspond pas à la clé, sauf `--force`. Étapes **non critiques** ; la préproduction est **refusée à la validation** | Révise §1.3, qui plaçait la messagerie hors périmètre, pour la raison de D64 : OpenDKIM a besoin de ce qu'ogs seul sait — quels domaines appartiennent à quel projet, et quand un projet disparaît. Le reste de la messagerie demeure dehors : ni MTA, ni relais, ni SPF — qui dépend des relais empruntés, qu'ogs ignore —, ni DMARC. **Le DNS reste hors périmètre malgré D53** : les identifiants OVH ne couvrent que la zone de préproduction, les zones des clients vivent ailleurs, et écrire dans la zone d'un client n'engage pas la même confiance que dans la sienne ; `doctor` vérifie ce qui est publié. **Pourquoi deux temps** : passer d'une clé qui se vérifie à une clé dont la partie publique n'est pas publiée casse la signature de tout envoi — sous un DMARC `p=reject` sans SPF aligné, le courrier est rejeté. À la **création**, en revanche, on signe aussitôt : une signature invérifiable ne vaut pas moins qu'une absence de signature, DMARC les traitant de même, et faire dépendre l'apply d'une résolution DNS rendrait le plan instable d'une exécution à l'autre. **Pourquoi sceller** : une clé DKIM, contrairement à un mot de passe, ne se régénère pas sans action extérieure — la perdre oblige à republier chez le client ; le keystore est la source de vérité et le fichier en dérive, donc un fichier disparu est réécrit, jamais recréé avec une clé neuve. Le fichier de clé ne peut porter l'en-tête d'ogs : il est comparé au contenu scellé, et un écart est traité comme une modification à la main (`--force`). **Régime de `/etc/opendkim`** : ogs pose lui-même le répertoire et ses sous-répertoires en 0750 root:opendkim, et les tables en 0640 root:opendkim — exactement ce qu'`ogs harden` exige (D56). Deux juges en désaccord feraient osciller l'apply et harden, l'un rouvrant ce que l'autre ferme ; et harden, récursif sur `/etc/opendkim`, ne change jamais le propriétaire d'un fichier ni ne desserre un mode, si bien qu'une clé en 0600 opendkim:opendkim reste lisible au démon. **Pourquoi 0600** : sous `RequireSafeKeys`, défaut d'OpenDKIM, une clé lisible au-delà de son propriétaire est refusée — le régime 0640 de D65 ne convient pas ici. Et le refus n'est pas un silence : l'essai réel l'a montré, une clé refusée **ou absente** ne laisse pas partir le courrier sans signature, OpenDKIM rend une erreur temporaire et **le MTA garde en file tout le courrier du domaine**. D'où deux règles : une table ne désigne jamais une clé dont le fichier manque, et le fichier d'un domaine qui cesse d'être signé n'est retiré qu'**après** le rechargement des tables, OpenDKIM gardant en mémoire celles qu'il a chargées. **Pourquoi des tables de parc** : OpenDKIM n'en accepte qu'une de chaque, et recalculées depuis un sous-ensemble elles retireraient de la signature tous les autres projets — la leçon de logrotate et de tmpfiles ; elles vivent donc dans le plan global, et `doctor` vérifie qu'`opendkim.conf`, laissé à l'administrateur comme `telegraf.conf` (D65), les référence bien. **Pourquoi pas la préproduction** : elle ne doit jamais pouvoir signer au nom du domaine de production — un envoi de test parti vers de vrais clients serait authentifié. **Pourquoi l'opt-in** : beaucoup de projets envoient par un relais tiers qui signe de sa propre clé ; signer par défaut créerait des clés dont aucun courrier ne se sert. **Pourquoi RSA** : ed25519 (RFC 8463) est encore trop peu vérifié pour servir seul. Piège : une clé RSA-2048 dépasse les 255 octets d'une chaîne TXT, l'enregistrement émis est donc découpé et `doctor` recolle les morceaux avant de comparer. **Pourquoi OpenDKIM plutôt que rspamd** : ses tables sont des fichiers plats, recalculables comme logrotate ou fail2ban, là où rspamd est une tout autre pièce à supposer présente |
 | D70 | Liens gérés | L'interpréteur PHP et les liens des runtimes (`node`, `python`, `ruby`, `bundle`, `app`) vivent dans **`~/.local/bin`**, qui appartient à **l'utilisateur du projet** (0700) ; `.bin/` disparaît, retiré à la migration une fois les unités relues. Root y écrit **par descripteurs ouverts sans suivre de lien** (`openat`, `O_NOFOLLOW`), et un fichier posé à la place d'un lien n'est remplacé que sous `--force` | Révise D30, D35 et §7.1.2. `~/.local/bin` est le répertoire que la convention XDG réserve aux exécutables de l'utilisateur, et que le `.profile` de Debian ajoute au PATH : le shell ouvert par D62 y trouve la version déclarée sans rien configurer. Il appartient à l'utilisateur parce que pip, pipx et bien d'autres y écrivent : le fermer les casserait. **Et le fermer ne protégerait rien** : l'essai l'a montré, le home appartenant à l'utilisateur (D51), un sous-répertoire root se **renomme** sans privilège, puis se remplace — `.bin/` n'a jamais garanti la version effective contre l'utilisateur, seulement contre l'accident. La garantie devient donc ce qu'elle était dans les faits : un **état réconcilié**, rétabli à chaque apply. Ce que la décision ajoute est la contrepartie d'écrire en root chez quelqu'un d'autre : chaque composant du chemin est ouvert sans suivre de lien, et le lien est posé relativement au descripteur — un `~/.local` remplacé par un lien vers un autre répertoire fait refuser l'étape au lieu d'y faire écrire root. Le même traitement vaut désormais pour `.ssh/authorized_keys` (D61), que root posait jusque-là par son nom dans un répertoire de l'utilisateur. La migration retire l'ancienne entrée `.bin` des déclarations à la normalisation — sous sa forme exacte seulement, un `.bin` déclaré autrement l'ayant été par l'exploitant — et l'ancien répertoire en **fin de plan**, après le vidage des rechargements : une unité réécrite mais pas encore relue par systemd désigne toujours l'ancien lien. Seuls les liens connus sont retirés, et le répertoire ne part que vide |
 | D71 | Journaux hors du home | Les journaux d'Apache, de nginx, de PHP-FPM et des crons vivent dans **`/var/log/ogs-projects/<id>/`** — racine réglable par **`logs.root`** —, chaîne entièrement root : la racine en **0711 root:root**, le répertoire du projet en **0750 root:<id>**, tous les fichiers **pré-créés** en 0640 (`root:<id>` pour ce qu'écrit un maître root, `<id>:<id>` pour `php-error.log` et `cron-<nom>.log`, écrits sous l'identité du projet). Le home ne porte qu'un lien de commodité, **`~/logs → /var/log/ogs-projects/<id>`**, qu'aucun processus root n'emprunte. `spec.layout.logDir` est refusé hors de la racine, `spec.crons[].log` n'est plus qu'un nom de fichier | Révise D29, D59 et §7.1.2, et referme la faille constatée le 23/09/2026 : le home appartenant à l'utilisateur (D51), il **renommait** le `logs/` root sans privilège et en recréait un à lui, où `apache-error.log` devenait un lien vers un fichier système que le maître du serveur web ouvrait en root à son redémarrage suivant — au plus tard à la rotation quotidienne. D29 protégeait d'une substitution *dans* `logs/`, pas *de* `logs/`. Désormais plus aucun composant du chemin n'appartient à l'utilisateur : il n'a plus rien à renommer. Le lien du home ne rouvre rien — lui seul le suit —, et il rend la lecture triviale : `tail -f ~/logs/apache-error.log`, `zless` sur les archives, qui gardent le mode du fichier roté. **Deux défauts antérieurs se referment du même coup**, vus en le préparant : `php-error.log` n'était **jamais écrit** — les workers, qui ouvrent `php_admin_value[error_log]` sous l'identité du projet, ne pouvaient pas créer le fichier dans un répertoire root, et PHP se rabattait sur le journal global de FPM, où se mêlaient les erreurs de tous les projets — et les droits annoncés au §14.5 étaient faux, les journaux sortant en 0644 root:root et `php-slow.log` en 0600, illisible au projet ; la pré-création rend les droits vrais. **Logrotate** : aucun `su`, et il ne faut jamais en ajouter — un répertoire non inscriptible par un groupe non root passe le contrôle de sécurité du répertoire parent, et le rendre inscriptible au projet, pour laisser une application y créer ses fichiers, ferait refuser la rotation et rouvrirait la faille ; `create` reste sans mode ni propriétaire, chaque fichier gardant le sien ; jamais un chemin passant par le home, ni un `olddir` dans le home, logrotate suivant le lien en root. **Le complément d'unité** du serveur web se réduit à une entrée fixe, conservée par prudence envers un `ProtectSystem=strict` : son contenu ne change plus à la création d'un projet, qui **ne redémarre donc plus le serveur web**. **Contrepartie** : les journaux quittent `/home` pour `/var`, qui porte aussi `/var/lib/mysql` et `/var/lib/postgresql` — un journal d'accès qui s'emballe peut remplir la partition et arrêter les bases. D'où `logs.root`, dont `doctor` contrôle la chaîne de propriété, et l'avertissement de `doctor` sur l'espace libre ; `maxsize` borne déjà chaque fichier. `www-data`, membre du groupe de chaque projet (D25), lit tous les journaux, comme auparavant. Les journaux applicatifs (`var/log/`) restent hors périmètre, gérés par l'application. **Migration**, sans perte de lignes : le nouveau répertoire est créé et les fichiers courants y sont copiés ; vhosts, pool, cron et complément d'unité sont réécrits puis rechargés, les serveurs ouvrant alors les nouveaux fichiers ; les lignes écrites dans l'ancien entre la copie et le rechargement sont ajoutées au nouveau, les fichiers rotés déplacés sous leur nom — logrotate poursuit la numérotation —, puis l'ancien `~/logs` est retiré et le lien posé à sa place. L'ancien répertoire vivant dans le home, l'utilisateur a pu le substituer : il n'est lu que par descripteur ouvert sans suivre de lien, **s'il appartient à root**, et seuls ses fichiers réguliers appartenant à root ou au projet sont repris — sans quoi root recopierait un `apache-error.log → /etc/shadow` dans un répertoire que ce même utilisateur lit. À défaut, rien n'est lu, et `doctor` le signale |
-| D72 | Pare-feu | ogs réconcilie **ufw** avec **`/etc/ogs/ufw.yaml`**, fichier distinct de `config.yaml` dont l'**absence** vaut « ogs ne touche pas à ufw ». Il écrit un seul fichier de profils, **`/etc/ufw/applications.d/ogs`**, aux profils préfixés **`ogs-`** et dérivés de ce qui est installé (unités systemd, `sshd_config`, `proftpd.conf`, `vsftpd.conf`, `redis.conf`…) ; toute règle passe par la **commande ufw**, jamais par `user.rules`. Une règle est à ogs si son commentaire commence par **`ogs:`** ; les autres sont laissées intactes et signalées. **Sources nommées** (propriétaire, adresses), adresses de **confiance** — une règle **par profil disponible**, et reprises dans l'`ignoreip` des prisons fail2ban —, **bannissements** placés en tête. Commentaire déclaré ou **engendré** d'après la source et son propriétaire. La **première activation** se défait d'elle-même au bout de `rollbackAfter` (5 min) faute de `ogs firewall confirm` ; une déclaration qui **couperait la session SSH** en cours, bannirait son adresse ou fermerait SSH à tous est refusée sauf `--force`. Une déclaration refusée ou invalide n'est **jamais tentée** : code 3 pour `ogs firewall`, avertissement (code 6) dans le plan global, **dont le reste s'applique**. Étapes **non critiques**, mais politiques et activation refusent de s'appliquer si une règle a échoué | Révise §1.3, qui plaçait les règles de pare-feu hors périmètre, pour la raison de D64 : ufw ne sait pas quels services tournent sur quels ports — un sshd sur 2200, le SFTP de proftpd sur 2222, la plage passive du FTP —, et ogs, lui, le lit. **Pourquoi un fichier à part** : il n'a pas le rythme de `config.yaml` — on bannit un soir de scan, on ouvre au poste d'un prestataire le temps d'une intervention —, et son absence est une décision que rien d'autre ne porte. **Pourquoi des profils ogs** : ceux des paquets (`OpenSSH`, `Apache Full`) figent des ports qu'ogs ne maîtrise pas, et `applications.d` leur appartient. **Pourquoi la commande et non le fichier** : `user.rules` est le reflet de ce qu'ufw a chargé, et le réécrire désaccorderait les deux jusqu'au prochain rechargement. **Pourquoi la marque** : sans elle, reconnaître ses règles demanderait un inventaire à tenir en plus d'ufw, qui se désaccorderait au premier `ufw delete` manuel ; avec elle, ce qui n'est pas marqué appartient à l'administrateur, sans exception. **Pourquoi une règle par profil pour la confiance**, plutôt qu'un `allow from` global : ce dernier ouvrirait aussi les ports qui ne doivent jamais sortir de la boucle locale — MariaDB, le vhost d'état (D66), les applications (D36) —, le jour où l'un d'eux écouterait ailleurs. **Pourquoi le retour automatique** : la session qui active un pare-feu mal écrit est celle qu'il coupe, et plus rien de ce qu'elle a lancé ne tourne pour réparer ; c'est donc systemd qui porte la désactivation (`systemd-run --on-active`). Seule la première activation l'arme (arbitrage du 24/09/2026) : une fois la confirmation obtenue depuis une nouvelle session, les apply suivants sont gardés par la vérification de la session. **Pourquoi le plan global ne s'arrête pas** : `project delete` recalcule par lui les prisons de fail2ban et la rotation des journaux (D68) ; une faute de frappe dans `ufw.yaml` ne doit pas priver le parc de ce recalcul — c'est la règle de `parcNonBloquante`. **Pourquoi en tête** : ufw retient la première règle qui correspond, et un refus posé après une autorisation plus large ne servirait jamais. Trois pièges d'ufw, tous invisibles à une lecture de sa sortie : il **refuse l'apostrophe** dans un commentaire — ogs la remplace par l'apostrophe typographique ; il **remplace en place** le commentaire d'une règle identique, mais `prepend` **ignore** une règle existante, si bien qu'un commentaire se corrige par la commande d'ajout ordinaire ; une règle d'application porte les ports du profil au moment où elle a été posée, d'où `ufw app update` quand un profil change — et ufw refuse une application inconnue **jusque dans `ufw delete`**, d'où le retrait des règles d'un profil **avant** de retirer le profil |
+| D72 | Pare-feu | ogs réconcilie **ufw** avec **`/etc/ogs/ufw.yaml`**, fichier distinct de `config.yaml` dont l'**absence** vaut « ogs ne touche pas à ufw ». Il écrit un seul fichier de profils, **`/etc/ufw/applications.d/ogs`**, aux profils préfixés **`ogs-`** et dérivés de ce qui est installé (unités systemd, `sshd_config`, `proftpd.conf`, `vsftpd.conf`, `redis.conf`…) ; toute règle passe par la **commande ufw**, jamais par `user.rules`. Une règle est à ogs si son commentaire commence par **`ogs:`** ; les autres sont laissées intactes et signalées. **Sources nommées** (propriétaire, adresses), adresses de **confiance** — une règle **par profil disponible**, et reprises dans l'`ignoreip` des prisons fail2ban —, **bannissements** placés en tête. Commentaire déclaré ou **engendré** d'après la source et son propriétaire. La **première activation** se défait d'elle-même au bout de `rollbackAfter` (5 min) faute de `ogs firewall confirm` ; une déclaration qui **couperait la session SSH** en cours, bannirait son adresse, fermerait un port où sshd écoute ou fermerait SSH à tous est refusée sauf `--allow-lockout` (**révisé par D86** : à l'origine `--force`, que le plan global transmettait, et qui ne lève plus cette garde). Une déclaration refusée ou invalide n'est **jamais tentée** : code 3 pour `ogs firewall`, avertissement (code 6) dans le plan global, **dont le reste s'applique**. Étapes **non critiques**, mais politiques et activation refusent de s'appliquer si une règle a échoué | Révise §1.3, qui plaçait les règles de pare-feu hors périmètre, pour la raison de D64 : ufw ne sait pas quels services tournent sur quels ports — un sshd sur 2200, le SFTP de proftpd sur 2222, la plage passive du FTP —, et ogs, lui, le lit. **Pourquoi un fichier à part** : il n'a pas le rythme de `config.yaml` — on bannit un soir de scan, on ouvre au poste d'un prestataire le temps d'une intervention —, et son absence est une décision que rien d'autre ne porte. **Pourquoi des profils ogs** : ceux des paquets (`OpenSSH`, `Apache Full`) figent des ports qu'ogs ne maîtrise pas, et `applications.d` leur appartient. **Pourquoi la commande et non le fichier** : `user.rules` est le reflet de ce qu'ufw a chargé, et le réécrire désaccorderait les deux jusqu'au prochain rechargement. **Pourquoi la marque** : sans elle, reconnaître ses règles demanderait un inventaire à tenir en plus d'ufw, qui se désaccorderait au premier `ufw delete` manuel ; avec elle, ce qui n'est pas marqué appartient à l'administrateur, sans exception. **Pourquoi une règle par profil pour la confiance**, plutôt qu'un `allow from` global : ce dernier ouvrirait aussi les ports qui ne doivent jamais sortir de la boucle locale — MariaDB, le vhost d'état (D66), les applications (D36) —, le jour où l'un d'eux écouterait ailleurs. **Pourquoi le retour automatique** : la session qui active un pare-feu mal écrit est celle qu'il coupe, et plus rien de ce qu'elle a lancé ne tourne pour réparer ; c'est donc systemd qui porte la désactivation (`systemd-run --on-active`). Seule la première activation l'arme (arbitrage du 24/09/2026) : une fois la confirmation obtenue depuis une nouvelle session, les apply suivants sont gardés par la vérification de la session. **Pourquoi le plan global ne s'arrête pas** : `project delete` recalcule par lui les prisons de fail2ban et la rotation des journaux (D68) ; une faute de frappe dans `ufw.yaml` ne doit pas priver le parc de ce recalcul — c'est la règle de `parcNonBloquante`. **Pourquoi en tête** : ufw retient la première règle qui correspond, et un refus posé après une autorisation plus large ne servirait jamais. Trois pièges d'ufw, tous invisibles à une lecture de sa sortie : il **refuse l'apostrophe** dans un commentaire — ogs la remplace par l'apostrophe typographique ; il **remplace en place** le commentaire d'une règle identique, mais `prepend` **ignore** une règle existante, si bien qu'un commentaire se corrige par la commande d'ajout ordinaire ; une règle d'application porte les ports du profil au moment où elle a été posée, d'où `ufw app update` quand un profil change — et ufw refuse une application inconnue **jusque dans `ufw delete`**, d'où le retrait des règles d'un profil **avant** de retirer le profil |
 | D73 | Moteur web | Le moteur web est un choix **de machine** : celui qui est installé, ou `web.engine` de `/etc/ogs/config.yaml` si Apache et nginx le sont tous deux. `site create` n'a plus d'option `--engine`, et un `spec.web.engine` hérité est **relu sans erreur puis effacé** à la normalisation | Précise §7.6 et le §10.2, qui laissaient croire à un choix par projet. L'option écrivait `spec.web.engine` dans la déclaration, mais **aucun code ne lisait ce champ** : un projet déclaré en nginx recevait un vhost Apache sans un mot (constaté le 24/09/2026). Honorer le champ contredirait la règle d’un seul moteur piloté par serveur (§7.6) — vhosts, fragment de portée serveur, complément d'unité, vhost de statut et rechargements sont tous calculés pour un moteur. Le champ reste accepté à la lecture parce que le décodage est **strict** : le retirer du modèle ferait refuser toute déclaration écrite avec l'ancienne option. Au passage, une option inconnue rend désormais le code d'usage 2, et non 1 |
 | D74 | Cycle de vie de PHP-FPM | Le rechargement d'une version PHP suit ses pools : **rechargé** si FPM tourne, **activé et démarré** (`reset-failed` puis `enable --now`) s'il est arrêté, **arrêté et désactivé** (`disable --now`) quand plus aucun `pool.d/*.conf` n'existe — d'ogs ou de l'administrateur | FPM refuse de tourner sans pool (« No pool defined »). Une installation qui retire le `www.conf` de la distribution — pour qu'aucun pool ne tourne sous `www-data` — laisse donc chaque version arrêtée tant qu'aucun projet ne l'emploie. ogs ne faisait que `systemctl reload` : au premier site, le rechargement échouait sur une unité inactive et le site répondait 503 sur un simple code 6 ; au départ du dernier, recharger un maître sans pool le tuait, et l'unité restée activée échouait à chaque démarrage. Démarrer ne suffit pas : sans `enable`, la version ne repartirait pas au redémarrage de la machine. Scénario `fpm-sans-pool` |
 | D75 | Application `custom` | Un type d'application **`custom`** supervise une commande déclarée (**`spec.app.command`**, recopiée dans `ExecStart`), sans runtime ni lien géré, derrière un vhost de proxy **obligatoire**. Écoute sur un **port** par défaut (code 5, `25xxx`). La commande commence par un **chemin absolu** et tient sur une ligne ; `runtime` et `entrypoint` y sont refusés, `command` l'est pour les autres types. **`spec.app.envFile: true`** — admis pour toute application supervisée — branche **`/etc/ogs/env/<id>.env`**, emplacement **non réglable**, créé vide en **0600 root:root** (répertoire 0700) puis **jamais réécrit** ; un lien à sa place est refusé, des droits ouverts sont resserrés. Il est **scellé** dans l'archive d'un projet supprimé, puis retiré | Les types à runtime couvrent quatre écosystèmes ; tout le reste — un binaire Rust, un serveur Java, un outil livré compilé — n'avait d'autre issue qu'une unité écrite à la main, hors de la réconciliation. **Pourquoi un port** : un socket suppose que le code lise `SOCKET_PATH`, et ogs ne sait rien de ce qu'il lance. **Pourquoi un chemin absolu** : il écarte du même coup les préfixes d'`ExecStart` — `+` et `!` lanceraient la commande en root, au mépris de `User=` —, et un saut de ligne ferait écrire une directive de plus dans l'unité. Les variables, elles, sont développées par systemd (`${LISTEN_ADDR}`) : aucun gabarit à inventer. **Pourquoi un emplacement imposé** pour le fichier d'environnement : systemd le lit **en root, avant** le changement d'identité ; dans le home (D51), l'utilisateur le remplacerait par un lien vers le `.env` d'un voisin, et root injecterait les secrets de celui-ci dans son processus — la classe de faille que D70 et D71 ont refermée. **Pourquoi 0600 root:root** plutôt qu'un 0640 lisible au projet : le projet n'a pas à le lire, et c'est le régime qu'`ogs harden` impose sous `/etc/ogs` — deux juges en désaccord feraient osciller le plan. **Pourquoi jamais réécrit** : son contenu, des secrets le plus souvent, est l'affaire de l'exploitant ; ogs n'en porte ni l'empreinte ni le contrôle de dérive. Pas de tiret devant `EnvironmentFile=` : un fichier retiré doit faire échouer le démarrage, non priver l'application de ses secrets en silence. **Pourquoi un proxy obligatoire** : un démon sans HTTP a déjà sa place, `spec.services` ; l'admettre ici aurait demandé d'enseigner au plan web et à l'attente de disponibilité un type sans point d'écoute. Au passage, l'unité applicative `ogs-<id>-app@.service` est désormais retirée à la suppression du projet : elle survivait, invisible de `systemctl list-units` faute d'instance chargée ; et les affectations `Environment=` de toutes les unités sont **citées quand la valeur l'exige** — systemd découpant la ligne sur les blancs, une valeur à espaces arrivait tronquée au processus —, une valeur simple gardant son rendu pour ne réécrire ni redémarrer aucune unité existante |
+| D76 | Appartenance des fichiers gérés | Un fichier n'appartient à un projet que si **l'en-tête d'ogs** le dit — le projet et la ressource de sa ligne `projet: … ressource: …`, cherchée sous la marque dans les trois premières lignes comme le fait `Inspect` (`fs.ManagedResource`) —, **jamais par son nom** ni par un préfixe. **Tout retrait passe par les cinq états** (`removal.File`, l'état relu à l'application) : un fichier intact part ; un fichier retouché ne part que sous `--force`, sauvegardé ; un fichier sans la marque ou marqué pour un autre projet ne part jamais, `--force` compris — refus non critique, code 6. Un projet n'**écrit** jamais le fichier d'un autre (`fs.CheckOwner`, code 4, `--force` compris) ; si ce dernier n'est plus déclaré, le message parle d'un reste à retirer à la main. Un vhost adopté désigne son fichier réel par **`spec.web.vhosts[].file`** : réservé aux adoptés, nom simple, `.conf` exigé sous Apache (code 3). La liste des vhosts d'un projet et le nom de leurs fichiers ont **une seule source**, `model.Project.VHosts`, `VHostName` et `VHostFile`, que lisent le provider web et la clé d'unicité « fichier de vhost » (§3.3.6). Une sauvegarde ne réutilise **jamais un nom** : `O_EXCL`, puis `.1`, `.2`… (`fs.writeBackup`). `project delete` garde un critère plus strict, `fs.ManagedProject` : la marque en première ligne | Révise §6.4, qui ne connaissait les cinq états qu'à l'écriture. L'attribution par préfixe faisait retirer au premier apply de `shop`, en code 0 et sans copie, le pool et le vhost de `shop_api` : `shop_api.conf` n'est pas un pool de `shop`, c'est le fichier principal de son voisin (R1-01). Le nom tronqué d'un vhost nginx adopté — `shop.fr` et `shop.de`, fichiers sans extension selon l'usage Debian — en faisait deux « obsolètes » du même projet, retirés avec le site voisin (R1-11). Un fichier cron ou sudoers retouché partait sans copie, alors que son écrasement était refusé (R1-34). **Pourquoi l'en-tête lu comme `Inspect`** : ce que l'un attribue, l'autre doit le juger de même — exiger la marque en tête laissait sans maître le fichier d'un voisin retouché au-dessus de son en-tête, que `--force` réécrivait alors au compte du mauvais projet. **Pourquoi `ManagedProject` reste strict** : il décide seul de ce que la suppression retire, sans passer par les cinq états, et ne pas reconnaître un fichier retouché le laisse en place — le choix prudent. **Pourquoi `file`** : l'adoption ne renomme jamais (§9), et sans lui le premier apply écrivait un second fichier servant les mêmes domaines. **Pourquoi `O_EXCL`** : pool et vhost s'appellent tous deux `<id>.conf`, cron et sudoers `ogs-<id>`, Telegraf et fail2ban `ogs.conf` ; un même apply forcé les sauvegarde dans la même seconde, et la seconde copie écrasait la première, que le plan annonçait sauvegardée. **Pourquoi une source unique** : recopiée du provider au contrôle d'unicité, la règle aurait divergé sans un mot, le contrôle approuvant des collisions que l'apply aurait trouvées. Corollaire : un fichier qui porte le nom exact d'un pool du projet dans une autre version sans qu'ogs l'ait écrit pour lui — le pool d'origine d'un projet adopté, resté après un `php switch` — est signalé (code 6) et jamais retiré |
+| D77 | Garde-fous de la suppression | `project delete` prend le verrou global, puis prononce **tous ses refus avant la confirmation**, en un seul message où chacun porte son remède, avec le code du premier — ce que rien ne lève, puis ce que lève `--force`, puis `--no-dump`. **Rien ne lève** : une racine dangereuse par sa forme (« / », chemin relatif, emplacement système) ; une racine égale, ancêtre ou descendante de la racine ou du docroot d'un autre projet — une déclaration voisine illisible compte comme un refus ; une racine liée, qui n'est pas un répertoire ou qui a un autre propriétaire ; un **point de montage** sous la racine ou sous les journaux (`/proc/self/mountinfo`) ; un fichier laissé en place qu'ogs n'a pas écrit — sans son en-tête, illisible, ou lien vers un fichier hors du projet ; celui qu'ogs a écrit pour un autre projet est seulement laissé et nommé (remède proposé d'abord : `ogs apply <id> --force`). **`--force` lève** le compte sans la marque `ogs=` et les bases et comptes SGBD d'un projet adopté, nommés avant la confirmation. **`--no-dump` lève** une base inobservable ; un dump en échec abandonne avant tout retrait. Les refus sont **éprouvés de nouveau au point de non-retour**, après l'archive. Avant ce point, un refus, un dump en échec ou une **interruption** (code 9) retirent l'archive et relancent les services arrêtés ; après lui, le contexte est détaché et la suppression va à son terme, l'interruption étant seulement signalée. Seuls partent les fichiers dont l'en-tête désigne le projet (`fs.ManagedProject`) — hors le fichier d'environnement de D75, qui n'en porte pas et part toujours, scellé dans l'archive, le répertoire des clés DKIM du projet (`/etc/opendkim/keys/<id>`) et le répertoire `.wants` de sa cible, retirés en bloc. Sous `--keep-data`, rien n'est refusé, mais l'archive ne recopie pas une arborescence que la suppression n'aurait pas pu effacer. `validate.Uniqueness` refuse les **homes imbriqués** | Précise §7.1.6 et §13. Un refus prononcé après le point de non-retour ne sauvait plus que ce qu'il gardait : le compte non créé par ogs était refusé une fois tout le reste démonté, et le `--force` qu'il conseillait échouait faute de déclaration (R1-19). Un refus qui en masque un autre fait suivre un remède coûteux — retirer le vhost d'un site adopté, c'est couper le site — avant d'apprendre le suivant. Une racine englobante issue d'un import effaçait le home d'un voisin (R1-02) ; `os.RemoveAll` franchit les points de montage, et seule `mountinfo` montre un montage lié (R1-03) ; un dump en échec laissait partir `DROP DATABASE` sans sauvegarde (R1-12) ; un refus de taille laissait les services arrêtés (R1-72). **Pourquoi refuser un fichier qu'ogs n'a pas écrit** : il reste en place, et il désigne peut-être ce que la suppression efface — un vhost adopté qui journalise sous le home rend la configuration d'Apache invalide une fois le home parti, un pool partagé avec un site voisin le fait tomber en 502 (R1-24). **Pourquoi l'interruption** : `main` annule le contexte, il n'arrête pas le processus ; rien ne le consultait, et la suppression continuait, chaque commande échouant sur « context canceled », jusqu'à un home effacé sous un compte et des workers FPM vivants (R1-15). **Pourquoi aller à son terme passé le point de non-retour** : y renoncer laisserait le pire état — home effacé sous un compte vivant, prison fail2ban désignant des journaux disparus, qui empêche le démon de redémarrer. **Contreparties** : passé ce point, seul SIGKILL arrête le processus, le temps de la phase — brève, sauf l'effacement d'un gros home ; une interruption pendant l'archivage d'une arborescence attend la fin de celle-ci. Un parc écrit avant D77 peut porter deux homes imbriqués, laissés par un import : le refus vaut alors pour toute commande qui éprouve l'unicité, même au sujet d'un troisième projet, et le message dit que le conflit peut précéder la commande en cours |
+| D78 | Bases à l'import | Une base n'est rattachée qu'au **seul** candidat que son nom désigne — son identifiant, ou le compte de son pool —, **aux séparateurs près, jamais par préfixe** (`shop_fr`, `shop-fr`, `shopfr` et `Shop.FR` se valent ; `shop` et `shopping`, non). Elle n'est déclarée qu'avec le **seul** compte du moteur qui porte ce nom, et sous son **hôte réel** (`host: '%'`) ; faute de quoi elle reste **non gérée**, et le scan comme l'adoption disent pourquoi — l'adoption affiche avant la confirmation les bases déclarées, leur compte et leur hôte. Le provider de bases **refuse de créer** un compte MySQL dont le nom existe déjà sous un autre hôte : étape non critique en échec, qui nomme le compte existant et la porte de sortie, rien n'étant exécuté ni scellé | Révise §9, qui corrélait par « similarité de nom ». La propriété d'une base n'est pas déductible, et ce que la déclaration engage ne se rattrape pas : son compte reçoit tous les droits à l'apply, et `project delete` supprime la base et le compte. Le préfixe donnait à `shop.fr` la base de `shopping.fr` et le compte de `shop.com`, le compte le plus court l'emportant, et le premier candidat dans l'ordre alphabétique prenait toutes les bases qui lui ressemblaient (R1-04). **Pourquoi l'hôte** : `'shop'@'%'` et `'shop'@'localhost'` sont deux comptes, et MySQL retient pour chaque connexion celui dont l'hôte est le plus précis ; déclarer `localhost` créait à l'apply un homonyme au mot de passe tiré, et l'application voyait son mot de passe refusé, par le socket comme par 127.0.0.1 (R1-09). Le refus du provider couvre les déclarations écrites avant cette règle, qui portent encore `host: localhost`. **Pourquoi non déclarée plutôt que déclarée sans compte** : tout le provider suppose un compte — création, `GRANT`, DSN, suppression. **Pourquoi pas un compte neuf** : il n'est pas neutre sur une base existante ; sur PostgreSQL, l'apply révoque `CONNECT` à `PUBLIC` et donne le schéma `public` au nouveau rôle, ce qui coupe le rôle réel. **Pourquoi deux hôtes font une ambiguïté** : retenir `localhost` reviendrait à deviner celui que l'application emploie. Le repli par nom du pool exige lui aussi l'égalité : un pool « shop » n'est plus rapproché de `shop.fr` par son seul nom, le socket restant une preuve. Contrepartie : une base nommée autrement que le site (`shop_prod`) reste non gérée, à déclarer à la main |
+| D79 | Rendu TLS d'un vhost | Le bloc 443 d'un vhost est rendu dès que le certificat **présent et non expiré** couvre **l'un** de ses noms, et non tous. Son nom canonique — le `ServerName`, et la cible de la redirection du port 80 — est le premier nom couvert. Les noms en attente restent déclarés dans les deux blocs : le port 80 sert leur challenge avant toute redirection. La bascule sur le nouveau certificat suit l'émission, dont l'étape porte le rechargement du serveur web (`tls.Provider.WebReload`). `PlanTLS` réécrit, émission réussie ou non, tout vhost dont le rendu d'après le matériel présent diffère du fichier en place. Une redirection vise https si sa cible, quand c'est un nom du projet, est couverte, et vise une cible étrangère en https dès que le TLS est voulu. Un certificat **expiré n'est plus présenté**, qu'il soit de projet ou partagé, et `status` le dit « expiré » | Révise §6.2, étapes 6 à 9. Juger le vhost sur la demande le faisait redescendre en HTTP seul dès qu'un alias était ajouté ou le principal changé, puis le rechargeait ainsi avant même le challenge. Si l'émission échouait, il le restait : HSTS rendait le site injoignable à qui l'avait déjà visité, et les autres recevaient sur le port 443 le site d'un autre client (R1-06). **Pourquoi « l'un des noms » et non le seul principal** : quand le principal change en gardant l'ancien parmi les alias, c'est l'ancien que couvre le certificat. **Pourquoi comparer au fichier en place** : un repli peut couvrir la cible d'une redirection écrite en http quand rien n'était couvert, et le visiteur ferait sinon un saut de plus jusqu'au prochain apply. **Trois états transitoires**, que `plan` montre tous et que le prochain apply résorbe, `cert renew` ne réécrivant aucun vhost : (1) après une réémission réussie par le timer à la suite d'un changement de principal, le nom canonique reste celui de transition ; (2) un vhost de redirection resté en HTTP faute de couverture — en particulier celui qu'une version antérieure servait avec un certificat qui ne le couvrait pas — ne retrouve pas son bloc 443 après un renouvellement réussi par le seul timer ; (3) une redirection que le repli de D80 a retirée du certificat garde son bloc 443 jusqu'au prochain apply, ce que le message du repli annonce. Faire réécrire les vhosts par le timer lui imposerait le verrou global et l'écriture de configuration |
+| D80 | Redirections et repli d'émission | Le certificat d'un projet couvre ses domaines principaux, ses alias **puis ses redirections**, hormis celles qu'aucune demande ACME ne peut porter (une adresse IP : son vhost reste en HTTP seul). Les noms du vhost principal sont **essentiels** (`Request.Essential`) ; dans un certificat déclaré, un joker l'est dès qu'il couvre un nom servi. Quand la demande complète échoue, l'émission se **replie par paliers**, du plus large au plus étroit : sans les redirections en attente, puis sans aucune redirection, puis ce que couvre le certificat en place, puis les noms essentiels qu'il couvre. Le premier palier qui aboutit est un succès partiel : code 6, « ✓ … (en partie) », rechargement retenu (`engine.PartialError`), jamais compensé. **Loin de l'échéance** (plus de 30 jours, sans `--force`), un palier n'est tenté que s'il **ajoute un nom sans retirer aucun de ceux que le certificat en place sert** ; celui qui en retirerait un est réservé à l'échéance, et le message donne sa date et son recours. Le timer ne réémet pour la seule couverture que si la déclaration a été appliquée telle quelle (`spec_hash`). `cert renew` recharge le serveur web dès qu'un certificat a changé, et signale (code 6) un projet dont la demande est refusée au lieu de le passer | Révise le lot L3, qui excluait les redirections du certificat, et précise D43 : un domaine redirigé veut être chiffré, et son vhost 443 présentait un certificat qui ne le couvrait pas (R1-32). **Pourquoi un repli** : une commande ACME échoue tout entière sur un seul nom refusé ; une redirection dont le DNS pointe ailleurs empêchait sinon le renouvellement du site, qui tombait à l'échéance. **Pourquoi des paliers et non les seuls noms déjà couverts** : un alias ajouté ou un nouveau principal ne pouvait jamais être couvert tant qu'une redirection était refusée. lego ne nomme le nom refusé que dans un texte qu'ogs ne lit pas, et pas du tout quand la tentative est suspendue : chaque palier écarte une classe de noms, la moins précieuse d'abord, en quatre demandes de plus au plus, chacune sous sa propre clé de suspension. **Pourquoi « ce que couvre le certificat en place » avant les seuls noms essentiels** : ce palier garde une redirection déjà servie, comme `www.shop.fr`, que le HSTS `includeSubDomains` oblige à joindre en HTTPS. **Pourquoi ne rien retirer loin de l'échéance** : c'est la règle de D79 appliquée au certificat — un nom servi en HTTPS ne redescend pas parce qu'une réémission est en attente ; un refus peut aussi être passager, et réémettre à l'identique consommerait les quotas de l'autorité. Près de l'échéance, le site passe avant tout. **Pourquoi écarter les adresses IP plutôt que les refuser** : la validation les admet et la redirection a du sens ; les garder faisait refuser la demande entière — plus d'apply, et le renouvellement du parc passait le projet en silence, le certificat allant à l'expiration. **Pourquoi signaler un projet non examiné** : le timer rendait 0 pendant qu'un certificat expirait. **Pourquoi recharger dès qu'un certificat change** : un échec ailleurs dans le parc privait sinon les certificats renouvelés de leur rechargement, et le serveur présentait l'ancien matériel jusqu'à son expiration (R1-64, R1-88). **Pourquoi pas un certificat distinct pour les redirections** : il ne protège pas d'un alias en attente, et il casse les changements de rôle — un alias devenu redirection passerait en HTTP le temps de l'émission. **Pourquoi la déclaration appliquée** : un alias écrit mais pas encore appliqué n'est servi par aucun vhost, et chaque passage du timer compterait un échec, jusqu'à suspendre l'apply qui suit. **Contreparties** : une redirection dont le DNS ne pointe jamais ici produit un code 6 à chaque apply et à chaque passage du timer — la retirer, ou déclarer `spec.certificates` ; une redirection déjà couverte puis refusée retarde, loin de l'échéance, la couverture d'un nom ajouté à côté jusqu'à la fenêtre de renouvellement, ce que `cert renew <id> --force` impose tout de suite |
+| D81 | Archive et restauration sans suivre de lien | L'archivage parcourt le home **par descripteurs** (`fs.Dir` : `openat`, `O_NOFOLLOW`) ; chaque entrée est décrite par le descripteur ouvert, jamais par le constat qui l'a précédé, et une entrée changée entre les deux est écartée. Chaque en-tête de l'archive porte son uid et son gid, et le manifeste (`owners`, facultatif) le propriétaire de la racine de chaque arborescence. La restauration extrait **après l'apply**, par descripteurs, sans jamais traverser un lien, en création exclusive : ce que l'apply a posé dans le home neuf — trousseau (D61), interpréteur (D70), `~/logs` (D71) — est remplacé **en tant que lien** par ce que l'archive porte ; un répertoire existant n'est jamais remplacé. Chaque entrée reçoit son propriétaire **sur son descripteur** (un lien par un descripteur `O_PATH`) : au compte recréé ce qui était à l'utilisateur d'origine, **à root tout le reste**, dans le groupe du projet si c'était le sien, son mode d'origine gardé. Une archive qui ne porte pas de propriétaires est jugée sur sa déclaration **telle qu'archivée**, avant normalisation. Une entrée écartée rend le code 6 | Précise §13. Écrire par le nom faisait réécrire en root, par les liens que l'apply venait de poser, le trousseau commun de tout le parc ou le binaire PHP du système (R1-10). `filepath.Walk` et `os.Open` laissaient l'utilisateur faire archiver `/etc/ogs/master.key` en substituant un ancêtre ou un fichier entre le constat et l'ouverture (R1-59). Le `chown -R` de `www/` laissait à root `authorized_keys`, les sessions et le site d'un projet adopté hors de `www/` (R1-55). **Pourquoi pas tout rendre à l'utilisateur** : un lien dur vers `/etc/shadow`, qu'un `fs.protected_hardlinks=0` lui laisse poser dans son home, lui reviendrait lisible ; rendu à root avec son mode, il n'étend la lecture à personne. Ni refus ni masque de mode : un refus aurait perdu, à la restauration, les téléversements `www-data` d'un site adopté. **Pourquoi après l'apply** : les identifiants du compte recréé sont indispensables au remappage, et rien n'est jamais chowné après coup. **Pourquoi la déclaration archivée** : la normalisation retire l'entrée `logs` root ; l'ancien `~/logs` d'une archive antérieure à D71 revenait alors à l'utilisateur, et la migration le refusait à chaque apply comme substitué — il revient désormais à root, et l'apply suivant le migre, ce que la restauration annonce. **Pas de relèvement de `version`** : un ogs antérieur ignore `owners` et restaure comme avant ; relever la version aurait bloqué une restauration après retour arrière du paquet, sans rien protéger. Un bail `F_SETLEASE` fait échouer une ouverture non bloquante : l'ouverture retente le temps que le noyau le rompe (50 s au plus), puis échoue en le nommant. Limite : dans une archive sans propriétaires, rien ne distingue un lien dur ou un `~/logs` substitué. Scénario `restauration` |
+| D82 | Root dans le home, hors apply | Les commandes qui lisent ou écrivent en root dans le home d'un projet **sans plan** — `user key show` et `rotate`, `site clone`, `php switch` — n'y passent **que par des descripteurs** ouverts sans suivre de lien (`fs.OpenDirAt`, `fs.DirAt`, `fs.CopyTreeAt`) : un composant lié fait refuser l'opération, jamais suivre. **Clé de déploiement** : `.ssh` doit être un vrai répertoire au compte du projet ; une clé qui n'est pas un fichier régulier du projet, qui dépasse **16 Kio** ou dont la partie publique n'est pas du texte imprimable sur une ligne n'est ni lue, ni affichée, ni sauvegardée ; la nouvelle paire est posée par `unlinkat` puis `openat` en `O_EXCL` et `O_NOFOLLOW`, mode et propriétaire sur le descripteur. **Copie du clone** : les liens sont recopiés comme liens ; seuls les fichiers de l'**uid source** sont repris ; fichiers spéciaux et répertoires au-delà de **1024 niveaux** sont écartés — tous comptés, les 50 premiers nommés et cités, code 6 ; les liens physiques internes sont reposés et les fichiers creux restent creux, root n'écrivant jamais plus de données que la source n'en occupait avant la copie ; propriétaire, mode et dates sont posés sur le descripteur ; ni ACL, ni attributs étendus, ni bits setuid et setgid des fichiers ne sont reportés. La copie suit l'**annulation** (SIGINT, SIGTERM) : code 9, projet cible créé avec un contenu partiel, base non copiée. **`php switch`** lit `composer.json` par descripteur, borné à **1 Mio** ; illisible ou refusé, c'est la table indicative qui décide, annoncée comme telle. La version d'un runtime se lit en lançant son lien **sous l'identité du projet** | Précise D38, §7.1.4 et §7.1.5. Le plan d'apply refuse un répertoire lié (`statDir`, étape critique), mais ces commandes le court-circuitent : elles tournent en root dans un répertoire que l'utilisateur possède (D51) et renomme sans privilège. `user key rotate` créait la paire dans la cible d'un `.ssh` lié et la donnait au projet — avec `/etc/apt/apt.conf.d` pour cible, une exécution en root au prochain `apt-get update` —, et `key show` lisait tout fichier (R1-13) ; `site clone` recopiait en root, par `cp -a www/.`, la cible d'un `www` lié, que `chown -R` donnait ensuite à la préproduction servie (R1-63). **Pourquoi l'uid source et non le compte de liens** : un lien physique vers `/etc/shadow` n'a plus qu'un lien dès que `useradd` — celui du clone même — réécrit le fichier par renommage. **Pourquoi des bornes** : taille, profondeur, nombre d'entrées et durée sont aux mains du locataire ; un fichier creux ne lui coûte aucun bloc, et `mkdir a; cd a` empile des milliers de niveaux pour quelques Mio, là où `cp -a` s'arrêtait de lui-même sur `PATH_MAX`. La mémoire de root reste linéaire : aucun chemin n'est retenu par niveau, alors qu'elle croissait comme le carré de la profondeur (800 Mio pour 8 000 niveaux). **Pourquoi l'annulation** : `cp -a` mourait avec son groupe de processus ; une copie faite dans le processus ne s'arrête que si elle consulte le contexte. **Pourquoi la table plutôt qu'un avertissement** pour un `composer.json` illisible : l'avertissement seul désarmait le garde-fou de D38, et l'utilisateur le déclenchait à volonté en posant un lien — ou bloquait la commande sur un tube, `/dev/zero` (S1R-30). **Pourquoi sous l'identité du projet** : exécuter en root ce que désigne un lien de l'utilisateur, c'est lui laisser choisir ce que root exécute (S1R-08). **Prix assumé** : ce qui appartient à root ou à `www-data` dans le `www` de production n'est pas recopié — sur un projet adopté, le rendre au compte de production avant le premier clone. SIGHUP n'est pas capté : une session ssh coupée pendant un long clone l'arrête net (§20) |
+| D83 | Répertoires du projet et chemins désignés | **Sous le home, root n'atteint un répertoire que par descripteurs depuis la racine du projet**, à l'observation, à l'écriture comme à la compensation : `fs.EnsureDirAt`, `SetDirAt` et `LstatAt` ouvrent la racine en `O_NOFOLLOW`, puis chaque composant par `openat` relatif au précédent, et posent mode et propriétaire sur le descripteur ; la compensation d'une création passe par `fs.RemoveEmptyDirAt`. Un parent qui n'est pas un répertoire véritable fait échouer l'étape en le nommant (`DirState.LinkedParent`) ; un parent absent est créé au mode et au propriétaire de l'entrée. `fs.EnsureDir`, qui résout les parents par leur nom, ne sert plus qu'à la racine du projet, dont les parents appartiennent à root. **Hors du home, un chemin désigné en ligne de commande** (`db dump -O`, `db restore -i`) est parcouru depuis « / » par descripteurs (`fs.OpenParentDir`) : un lien n'y est suivi que si **seul root a pu le poser** — dans un répertoire à root, non inscriptible par le groupe ni par les autres, atteint par une chaîne entièrement de ce type, 40 liens au plus ; seul un fichier ordinaire ou un nom absent est admis, une sauvegarde étant recréée en `O_EXCL` et en 0600 ; `/dev/stdout`, `/dev/stderr`, `/dev/null` et `/dev/stdin` restent ouverts par leur nom | Généralise D70 aux répertoires de `model.defaultDirs`. `O_NOFOLLOW` ne protège que le **dernier** composant : root résolvait les parents par leur nom, et un parent jugé conforme au plan pouvait être remplacé par un lien avant l'étape de l'enfant — la confirmation d'« ogs apply » en laisse tout le temps. Un `~/.local` remplacé par un lien vers `/usr/local` faisait ainsi donner `/usr/local/bin` au projet, en tête de son propre PATH, et le plan annonçait « mode 0755 → 0700 » pour la cible du lien (S1R-03). `db dump -O` et `db restore -i` écrivaient et lisaient en root à travers un lien posé dans un home, et un tube nommé bloquait la commande (S1R-12). **Pourquoi « seul root a pu le poser » plutôt qu'aucun lien** : c'est le critère du §15 — aucun composant qu'un non-root contrôle —, et refuser tout lien casserait `project delete`, `project restore` et `site clone` sur une machine où `/var/lib/ogs`, `/home` ou `/var/run` sont des liens posés par l'administrateur. **Pourquoi les quatre noms de `/dev`** : `/dev/stdout`, `/dev/stderr` et `/dev/stdin` sont des liens « magiques » vers `/proc/self/fd`, que seul le noyau sait suivre, et `/dev/null` un périphérique caractère, que la règle du fichier ordinaire refuserait. Le refus d'une entrée de restauration tombe avant la confirmation, en code 2. Le propriétaire de l'entrée n'est pas contrôlé : un lien physique vers la sauvegarde d'un voisin appartient à root, qui est admis — seul `fs.protected_hardlinks` ferme ce cas —, et le refuser bloquerait un usage légitime |
+| D84 | Clone sous garde | `site clone` ne **réécrit pas** la configuration applicative — ogs ne connaît ni `APP_SECRET`, ni les clés d'API, ni le relais de courrier — : il la **neutralise** et **dit ce qu'il n'a pas pu neutraliser**. Il ne recopie pas les fichiers que le type consacre à la configuration d'un environnement (`AppType.Config`), ni ses caches (`AppType.Cache`) ; il **masque à longueur égale**, dans la copie comme dans la déclaration, les secrets qu'ogs connaît de la source — les mots de passe qu'il a générés pour ses bases et son transport, les valeurs d'au moins 12 caractères de `/etc/ogs/env/<id>.env` (D75) ; il remplace la racine de la source par celle du clone dans la déclaration ; il reprend tâches et services **désactivés**. Il nomme, avec le **code 6**, chaque fichier retenu ou expurgé, chaque variable déclarée reprise, chaque lien dont la cible sort de la destination, chaque autre nom physique d'un fichier retenu déjà recopié, chaque secret qu'il n'a pas pu chercher et l'installeur exposé (`AppType.Installer`). La sortie dit, pour tout type, ce qui passe tel quel : les autres fichiers de `www/`, le reste des chaînes expurgées, le contenu de la base. `--dry-run` l'annonce | Précise §7.1.4. Recopié tel quel, `www/` faisait travailler la préproduction sur la base et la file de la production, `.env.local` et `parameters.php` compris (R4-05), et donnait ses secrets au compte de préproduction (S1R-10) ; les tâches de production partaient actives sur une copie des données (R1-98). **Pourquoi masquer plutôt que retirer** : une application privée de sa configuration offre son installeur — un WordPress sans `wp-config.php`, un Prestashop dont `install/` a survécu — à qui visite la préproduction, publique (D57). **Pourquoi à longueur égale** : elle préserve les fichiers creux, les chaînes PHP sérialisées et les liens physiques. **Pourquoi nommer les variables déclarées** : elles atteignent l'application par FPM ou systemd sans passer par sa configuration, et ogs n'en connaît pas le sens. **Pourquoi nommer les liens qui sortent** : la copie ne les suit pas, la préproduction les suivra — jusque dans le home de la production. **Pourquoi remplacer la racine** : la commande d'une application `custom` est absolue sous la racine du projet, et le clone lançait le programme de la production. **Écartés** : ne copier que le docroot (Symfony ne tournerait plus, et le docroot de Prestashop est `www`) ; les marqueurs `@ogs:` de `migrer.sh`, qui supposent un exploitant qui les a posés ; refuser le clone. **Limites** : `--with-data` recopie la base telle quelle — `ps_configuration` et `ps_shop_url` pour Prestashop —, ce qui est annoncé mais non réécrit ; les secrets qu'ogs ne connaît pas passent en clair dans les fichiers qu'aucun type ne consacre à la configuration, annoncés en bloc ; l'analyse des liens est lexicale |
+| D85 | Durcissement : le groupe du lecteur | `ogs harden` **ne ferme rien sans le groupe du service qui lit** : `/etc/mysql` en root:**mysql**, `/etc/apache2` et `/etc/nginx` en root:**www-data**, `/etc/postgresql` au groupe postgres, **propriétaire laissé** ; `/etc/redis` en **0770**, groupe redis, propriétaire laissé, fichiers 0640 ; `/etc/letsencrypt` en **0711**, propriétaire root, groupe et fichiers inchangés, sans récursion. Une cible dont le compte ou le groupe est introuvable est **refusée**, avec son motif, au lieu d'être fermée par le seul mode. Le mode posé est l'**intersection** du constaté et de la cible — harden retire des droits, il n'en accorde aucun —, setgid et sticky conservés, le groupe posé avant le mode. Répertoire et fichiers sont ouverts sans suivre de lien et modifiés **par leur descripteur** | Révise D56, dont la table fermait des répertoires lus sous une identité non root sans leur donner le groupe du service. MariaDB (`User=mysql`) ignore **en silence** un fichier d'options illisible et repart sur ses défauts, à l'écoute de toutes les interfaces (R2-01). Les workers d'Apache et de nginx ouvrent à la requête `AuthUserFile`, `auth_basic_user_file`, les `RewriteMap` et le magasin de mod_md : fermés à `www-data`, le site protégé rendait une 500, `apachectl -t` restant au vert — là où le risque annoncé était « aucun » (R2-02). Redis réécrit sa configuration par renommage dans `/etc/redis`, que le paquet lui donne en 2770 (`CONFIG REWRITE`, Sentinel) (R2-03). Rendre à root la clé confiée au groupe ssl-cert, ou fermer aux autres le certificat renouvelé que certbot écrit en 0644 root:root, coupait à son redémarrage suivant tout démon non root qui les sert (R2-04). `pg_createcluster`, lancé sous postgres, crée des répertoires de version (R2-05). Une cible sans son groupe affichait « ✓ » sans rien faire, puis « à restreindre » à perpétuité (R2-06). **Pourquoi l'intersection** : avec `/etc/redis` en 0770, l'ancien calcul aurait donné l'écriture de groupe à un répertoire 0755 root:root. **Pourquoi par descripteur** : laisser `/etc/redis` à redis ouvre une course permanente — un lien posé entre le constat et l'écriture ferait poser par root le groupe redis et un mode lisible sur un autre fichier. **Contreparties** : `pg_wrapper` ne trouve plus le cluster pour un utilisateur de projet, donc un cron hors du port 5432 doit préciser `-p` ; un parc durci par une version antérieure n'est pas rouvert — `/etc/redis` en 0750 root:redis, `/etc/letsencrypt` en 0700 —, ogs ne desserrant jamais : la réparation est manuelle (INSTALLATION.md). `/etc/mysql`, `/etc/apache2` et `/etc/nginx` en root:root reçoivent en revanche leur groupe au prochain `--apply` |
+| D86 | Gardes du pare-feu | Une déclaration qui couperait la session SSH en cours (adresse et port ensemble), bannirait son adresse, fermerait un port où sshd **écoute réellement** ou fermerait SSH à tous est refusée sauf **`--allow-lockout`**, option propre aux commandes `ogs firewall` (`plan`, `apply`, `ban`, `unban`) : le `--force` des fichiers retouchés (§6.4) ne la lève **jamais**, et le plan global jamais non plus. Les gardes jugent **ce qui restera ouvert** après le plan : les règles voulues de tout profil qui ouvre les ports visés, et les règles de l'administrateur qu'il laisse en place. **Changer les ports d'un profil qu'une règle emploie est un resserrement**, gardé comme un retrait. Sans session à protéger, une règle liée à une interface (hors `lo`) ou vers une adresse du serveur compte ; pour une session, la règle doit admettre son adresse et, si elle vise une adresse du serveur, celle que la session a jointe (3e champ de `SSH_CONNECTION`) — une règle liée à une interface ne la couvre pas, et le refus le dit. Le port de la session ne compte pas là où `ss` dit que sshd n'écoute plus. Deux moteurs sans `web.engine` ne rendent pas le profil web indisponible. La première activation pose un **témoin**, `/var/lib/ogs/ufw-unconfirmed` (0600 root), retiré par `confirm`, par la compensation et par `active: false` | Révise D72. **Pourquoi une option à part** : `--force` se donne pour un vhost ou une rotation retouchés, sans penser au pare-feu ; porté jusqu'au plan global, il levait la garde dans `ogs apply <id> --force`, `project delete --force` ou `mail dkim activate --force`, et retirait la dernière règle ssh qu'un apply sans lui refusait de retirer (R2-10). **Pourquoi les ports d'un profil** : `ufw app update` ferme l'ancien port ; un `Port 2222 # annoté` que la lecture de `sshd_config` prenait tel quel faisait retomber le profil à 22 et fermait le port où sshd écoutait, sans garde et en code 0 (R2-09). **Pourquoi compter les règles de l'administrateur** : ogs ne les retire jamais, donc l'accès qu'elles portent survit au plan ; les ignorer faisait refuser un `ufw limit OpenSSH` à chaque apply et chaque bannissement de qui gère ssh lui-même, et l'on prenait l'habitude de lever une garde qui emportait avec elle celle du bannissement de sa propre adresse. **Pourquoi deux questions** : sans session, la garde demande si le port restera ouvert du dehors — compter pour rien une règle `in on wg0` refusait, depuis la console, chaque bannissement de qui administre par un VPN ; pour une session, elle demande si la suivante passera par le même chemin, ce que rien ne dit d'une interface. **Pourquoi le port de la session ne compte pas partout** : sshd déplacé et redémarré, la session reste sur l'ancien port, et la garde refusait le plan même qui ouvrait le nouveau. **Pourquoi le profil web** : un profil tenu pour absent voyait ses règles retirées, et `firewall ban` retirait l'accès public de tous les sites, garde HTTP-01 comprise (R2-11). **Pourquoi un témoin** : l'unité transitoire du retour vit sous `/run` ; un redémarrage dans le délai l'efface, et ufw repart actif sans filet — `confirm` répondait « rien à confirmer », `status` et `doctor` se taisaient (R2-13). Le témoin distingue l'attente, le retour perdu et le retour joué — `confirm` rend alors 6 —, mais **ne réarme rien** : un redémarrage dans le délai ne vaut toujours pas retour (§20) |
+| D87 | Docroots : liens et fichiers cachés | Le serveur web ne suit un lien symbolique du docroot que **vers ce qui appartient à son auteur** : Apache `Options -FollowSymLinks +SymLinksIfOwnerMatch`, posé sur la racine du projet comme sur le docroot ; nginx `disable_symlinks if_not_owner from=<racine du projet>`. Sous `AllowOverride All` (Prestashop), un `.htaccess` ne peut régler que `Indexes`, `MultiViews` et `SymLinksIfOwnerMatch` (`Options=`). Les fichiers et répertoires **cachés** — `.git`, `.env`, `.htaccess` — et `composer.json` et `composer.lock` ne sont servis par aucun vhost qui sert un répertoire (`php-fpm`, `static`), `/.well-known/` excepté : Apache par `RedirectMatch 403`, rendu dès la traduction de l'URL, avant tout contrôle d'accès, et pour `composer.*` par un `<If "%{REQUEST_FILENAME} …">` ; nginx par deux `location ~ … { deny all; }` en tête des expressions régulières. Sous nginx, le vhost PHP éprouve `$ogs_fichier` et non `$uri` dans `try_files` — les deux ne diffèrent que pour « / », qui devient le nom réservé `/.ogs-accueil/`, défini par le fragment de portée serveur (D50) —, et le vhost statique n'a plus de `try_files` | `www-data` est membre du groupe de chaque projet (D25) : suivre tout lien lui faisait servir publiquement les fichiers d'un voisin, désignés par un lien posé dans un docroot, que le pool du projet — sous son propre compte — ne pouvait même pas lire (S1R-01). Le contrôle part de la **racine du projet**, non du docroot : le home appartient à l'utilisateur (D51), qui remplace sans privilège le docroot lui-même par un lien, et Apache éprouve chaque composant avec les options du répertoire qui le contient ; `-FollowSymLinks` est explicite, Debian le posant sur `<Directory />`. Le déploiement documenté (`git pull`) place `.git` dans le docroot des sites `php-plain` et Prestashop (S1R-14). **Pourquoi `RedirectMatch` et `<If>`** : Apache fusionne les `<Location>` dans l'ordre du fichier, et un `<Location /> Require …` déposé en surcharge (D63) pour réserver le site à un réseau rouvrait un `<LocationMatch>` comme un `<FilesMatch>` ; MultiViews négocie « /composer » vers `composer.json` par une sous-requête sur le fichier, qui ne passe par aucun `RedirectMatch` — d'où un refus sur le nom du fichier, dans un `<If>`, qu'Apache fusionne après les `<Location>`. MultiViews ne s'exerce que dans un répertoire que `www-data` peut énumérer — le docroot en 0710 lui répond 403 (AH00686) —, soit un `vendor/*/composer.json` créé sous l'umask du projet. Le `RedirectMatch` n'est pas élargi à « /composer » sans extension, qui bloquerait des URL applicatives. **Pourquoi `$ogs_fichier`** : sous `disable_symlinks`, nginx ouvre un répertoire en lecture au lieu d'un `stat()`, et le docroot en 0710 ne se lit pas — l'accueil écrivait une ligne « crit », ou rendait 404. Une `location` dédiée à « / » l'aurait soustrait aux surcharges du docroot. **Changements visibles** : sous nginx, un site statique redirige un répertoire demandé sans barre finale (301) et répond 403 à un lien refusé ; un lien vers le fichier d'un autre compte ne répond plus ; un `.ogs-accueil/` posé par un projet Prestashop conduit son accueil à un 403. **Limite, portée au §20** : sous Apache, `SymLinksIfOwnerMatch` contrôle **le nom avant l'ouverture** — un lien permuté en boucle par un compte doté d'un shell (D62) a passé 126 fois sur 27 364 requêtes en dix secondes ; nginx compare sur le descripteur ouvert et n'y est pas sujet. La fermer demande de servir chaque projet sous une autre identité que `www-data`. Une surcharge ou un `.htaccess` qui poserait lui-même un `<If>` accordant l'accès rouvrirait la variante négociée : c'est un geste délibéré, et le `RedirectMatch` protège toujours l'URL directe |
+| D88 | `--dry-run` tenu en un seul endroit | `--dry-run`, option globale, a **une conduite inscrite par commande** dans une table unique, `internal/cli/dryrun.go`, lue sur le chemin complet de la commande et jamais héritée d'un parent. **Simulation** : la commande décrit ce qu'elle ferait et s'arrête avant son hook « pre » et avant sa première écriture — `apply`, `site create`, `site clone`, `project create`, `import adopt`, `cert issue`, `php switch`, `cron add`, `db add`, `mail dkim enable` et `disable`, `amqp messenger`, `firewall apply`, `harden`. **Consultation** : l'option est sans objet, et l'audit d'une consultation (`secrets show`, `secrets env`, `my status`) est conservé. **Toute autre commande refuse l'option**, code 2, avant toute préparation — ni configuration, ni base, ni verrou —, y compris une commande ajoutée plus tard. Le `hook.Runner` lui-même résout le hook, contrôles de sécurité compris, et l'annonce « non exécuté » au lieu de le lancer | Précise D40 et §6.1. Une option globale est reçue par des commandes qui ne la lisent pas : `project delete --dry-run` supprimait pour de bon — archive, bases, vhost, compte, home, `preDelete` et `postDelete` en root — et rendait 0 ; `project restore` et `cert renew` de même (R3-20) ; `firewall ban --dry-run` réécrivait `ufw.yaml` (R2-14). **Pourquoi une table** : la conduite de chaque commande se relit d'un coup d'œil, et `TestDryRunChaqueCommandeSimuleOuRefuse` parcourt l'arbre des commandes en relevant le préfixe et les tables de la base d'état avant et après chacune. **Pourquoi refuser par défaut** : c'est le seul défaut sûr — une commande nouvelle ne peut pas ignorer l'option par oubli. **Pourquoi refuser plutôt que simuler** `project delete`, `project restore` et `cert renew` : une simulation fidèle rejouerait les remparts de D77, une demi-simulation serait trompeuse. **Pourquoi garder l'audit d'une consultation** : une divulgation non journalisée sous `--dry-run` serait une porte dérobée. **Pourquoi le `Runner`** : la règle de D40 tient ainsi même pour un appelant qui oublierait de s'arrêter, et la simulation dit ce que l'exécution rencontrerait — un hook inscriptible par tous reste refusé. Le verrou global n'est pas un état : `apply --dry-run` le prend pour calculer sur un système immobile. **Réserve** : comme `plan`, `diff` et `status`, `apply --dry-run` attribue dans la base d'état le numéro de pool ou le port d'un projet jamais appliqué — celui que l'apply lui donnera (§20). Les commandes qui éditent une déclaration (`cron remove`, `service add`, `db user add`…) refusent l'option : leur apprendre à simuler est une fonctionnalité à venir |
+| D89 | Paquet et timer de renouvellement | Le paquet **ne tient pas l'état** du timer `ogs-renew`, qu'il ne livre pas : il le **note au retrait et le rend**. Le prerm n'arrête et ne désactive le timer qu'au seul `remove`, après avoir noté son état dans `/var/lib/ogs/ogs-renew.timer.avant-retrait` ; `upgrade`, `failed-upgrade` et `deconfigure` n'y touchent pas. Le postinst rend l'état noté — `config.yaml` présent ou non —, réactive un timer portant l'en-tête d'ogs quand `configure` reçoit une version inférieure ou égale à 0.0.3, et signale sur stderr un timer d'ogs laissé désactivé, sans passer outre. À une mise à jour, il lance `ogs init --quiet >/dev/null`, **sauf si la clé maître manque** : il le dit alors et laisse le choix à l'administrateur. Un postrm, qui n'agit qu'à la purge, retire les deux unités d'ogs reconnues à leur en-tête et le témoin, garde `/etc/ogs`, `/var/lib/ogs` et `/var/log/ogs` en le disant, et énumère les archives, que plus rien ne purge | Révise §17. Le prerm des versions jusqu'à 0.0.3 désactivait le timer sur `upgrade`, et rien ne le réactivait — apply ne demande l'activation qu'à l'écriture du fichier d'unité : après la première mise à jour, plus aucun certificat ne se renouvelait, sans qu'aucune commande ne le dise (R3-14). **Pourquoi réparer dans le postinst** : à une mise à jour, dpkg exécute le prerm de la version **en place** (`upgrade <nouvelle>`), puis le postinst de la nouvelle (`configure <ancienne>`) — un défaut de prerm ne se corrige que dans le postinst suivant. **Pourquoi un état noté plutôt qu'un drapeau** : un timer que l'administrateur a désactivé doit le rester à la réinstallation. **Pourquoi pas `deb-systemd-helper`** : le timer n'est pas une unité livrée, c'est le plan global d'`ogs apply` qui l'écrit. **Pourquoi un postrm** : sans postrm ni fichier de configuration, dpkg oubliait le paquet dès le retrait, et `apt purge` n'avait plus rien à faire (R3-17). **Pourquoi écarter la sortie standard d'`ogs init`** : apt donne à dpkg un pseudo-terminal, où toute commande d'ogs interroge le terminal sur sa couleur de fond ; sans répondant, comme sous unattended-upgrades, elle attend cinq secondes et laisse la requête dans le journal d'apt. **Pourquoi ne pas lancer `init` sans clé maître** : il en engendrerait une neuve sans un mot sous `--quiet`, et les secrets scellés ne se reliraient plus — c'est la neuve que l'administrateur sauvegarderait. **Dépendance au numéro** : une construction corrigée encore numérotée 0.0.3 réactiverait, à la mise à jour suivante, un timer que l'administrateur avait désactivé — d'où une étiquette au-delà de 0.0.3 avant toute diffusion (R3-19). Banc `packaging/scripts_test.go`, scénario `paquet` |
+| D90 | Migration entre machines | La migration d'un ancien serveur vers une machine gérée par ogs est un **script livré à part**, `docs/migrer.sh`, piloté par un manifeste rempli hors du dépôt d'après `docs/migration.yaml`, exécuté en root sur la **cible**, qui tire fichiers et bases de la source par ssh ; rien n'est modifié sans `--executer`. (1) **Garde d'appartenance** : avant tout dépôt, un projet est refusé si la cible porte déjà ce projet sans que la migration l'ait déposé, si un autre projet déclare l'une de ses bases, son compte ou son home ou sert l'un de ses domaines — aux clés de `validate.Uniqueness`, host effectif d'une préproduction compris —, ou si son compte, son home, une base ou un utilisateur de base y existe déjà ; deux projets du manifeste ne partagent rien. (2) **La bascule est enregistrée** : engagée, elle fait refuser `synchroniser` — la cible fait foi — et une bascule reprise ne refait pas la copie finale ; `retour` est refusé sans bascule, met la cible en maintenance, rétablit tâches et workers sur la source, **attend le DNS** avant de rouvrir la source, et ne dépend pas d'un apply réussi sur la cible. (3) **Root n'écrit jamais par un chemin que fournit la source ou le compte du projet** : la source est recopiée dans un miroir du répertoire de travail, un sous-arbre par destination, jamais l'un sous l'autre, et le côté qui écrit dans le home tourne sous le compte du projet (`rsync -s`). (4) `ssh -n` partout où ssh ne porte pas un protocole ; socket de contrôle dans le répertoire privé de l'exécution, `ControlPersist` court, maître fermé en sortie ; valeurs de configuration et secrets passés par l'environnement du seul processus, jamais en argument. (5) `--oui` dispense de confirmer une intention, **jamais un fait que seul l'exploitant peut observer** — la propagation constatée sous `--sans-attente-dns` | Le script est antérieur à la revue du 25/09/2026, qui y a trouvé quatre critiques et un majeur : ssh consommait l'entrée standard des boucles `while read`, et seul le premier élément de chaque liste était traité (R3-01) ; `synchroniser` rejoué après la bascule supprimait la base de production et, par `rsync --delete`, les fichiers déposés depuis sur la cible (R3-02) ; sans garde, il supprimait la base d'un voisin ou reprenait un projet existant (R3-03) ; le socket de multiplexage, sous un nom stable de `/tmp`, laissait un compte local tenir le rôle de connexion maître pour les commandes root vers la source (S2R-04) ; les secrets passaient en argument de `python3`, lisibles de tous dans `/proc/<pid>/cmdline` (S2R-07). Root écrivait par le nom sous le home du projet, à rebours de D70 et D71, et un lien reçu de la source dans le miroir le menait hors du miroir (R3-07). **Pourquoi un script et non une commande d'ogs** : il pilote deux machines, dont une qu'ogs ne gère pas, pour un geste ponctuel ; il ne touche ogs que par ses commandes. **Pourquoi les clés de l'unicité** : une production et sa préproduction partagent `metadata.host` sans rien partager d'autre ; seule la comparaison qu'ogs lui-même fait ne se trompe ni dans un sens ni dans l'autre. **Pourquoi `--oui` ne suffit pas** : il vaut consentement, non constat ; un `retour` sous `--oui` rouvrait sinon la source sans que personne n'ait vu le DNS revenu. **Limites** : le script réplique `naming.EffectiveHost` en Python — aucune commande d'ogs ne rend un projet normalisé sans le déposer —, dérive qu'une telle commande supprimerait ; la lecture en root de la source suit un lien que le compte web de la source y aurait posé (`shared/uploads → /etc`), ce que la lecture sous son identité casserait sur les téléversements de `www-data`. Banc `test/migration` |
 
 ---
 
@@ -244,7 +259,7 @@ spec:
     - engine: mysql               # mysql | mariadb | postgres
       name: shopfr
       user: shopfr
-      host: localhost             # hôte autorisé pour le grant
+      host: localhost             # hôte du compte ; celui du compte réel pour une base adoptée (D78)
       charset: utf8mb4
       collation: utf8mb4_unicode_ci
       privileges: all             # all | crud | readonly | [liste]
@@ -299,6 +314,7 @@ spec:
   web:                            # le moteur est celui de la machine (D73)
     vhosts:
       - name: shopfr
+        # file: shop.fr           # vhost adopté seulement : nom réel de son fichier (D76)
         template: php-fpm         # static | php-fpm | proxy | redirect
         domains: [shop.fr, www.shop.fr]
         docroot: /home/shop.fr/www/public
@@ -506,7 +522,9 @@ et un test unitaire dédié le verrouille.
 
 Sont uniques sur le serveur, et vérifiés avant tout apply : l'identifiant de projet, le host effectif, le
 home, chaque domaine servi, le nom d'utilisateur Linux, chaque nom de base et d'utilisateur de base, le
-vhost AMQP, chaque nom de pool et de socket, chaque nom d'unité systemd.
+vhost AMQP, chaque nom de pool et de socket, chaque nom d'unité systemd, chaque **fichier de vhost** — le
+vhost `b2b` du projet `shop` s'écrit dans `shop_b2b.conf`, fichier principal d'un projet `shop_b2b`, et le
+nom réel d'un vhost adopté compte aussi (D76) — ; aucun home n'est **sous** celui d'un autre projet (D77).
 
 Deux collisions réelles, refusées en code 4 avec le nom du projet détenteur et la suggestion d'un `--id`
 explicite :
@@ -523,6 +541,12 @@ explicite :
   domaine primaire de la déclaration et seulement calculée à défaut : un projet déclaré avant un changement
   de convention sert toujours le nom inscrit dans son fichier, et le recalculer inventerait des conflits
   entre des vhosts qui n'en ont aucun.
+- **Homes imbriqués** : un import en produit sans y penser — un docroot `/var/www/boutique` devient un home,
+  celui de `blog.boutique.fr` (`/var/www/boutique/blog`) un autre, dessous —, et `project delete` du premier
+  effaçait le second, toujours déclaré et servi (D77). Un parc écrit avant ce contrôle peut en porter : le
+  refus vaut alors pour toute commande qui éprouve l'unicité, même au sujet d'un troisième projet, et le
+  message dit que le conflit peut précéder la commande en cours. Le remède est de corriger
+  `spec.layout.root` de l'un des deux.
 
 ---
 
@@ -554,6 +578,9 @@ explicite :
     certificates/_wildcard.preprod-pp.net/{…}                             certificat partagé
   acme-challenge/                         webroot partagé HTTP-01
   archives/<id>-<horodatage>.tar.zst    archives de suppression
+  backups/                                0700 — sauvegardes de --force, jamais à côté de l'original (§6.4)
+  ufw-unconfirmed                         0600 — témoin d'une activation d'ufw jamais confirmée (D86)
+  ogs-renew.timer.avant-retrait           état du timer noté par le prerm au retrait du paquet (D89)
 
 /var/log/ogs/
   ogs.log                                 log applicatif structuré
@@ -614,12 +641,14 @@ En-tête obligatoire de tout fichier généré :
 
 ```
 # Généré par ogs — NE PAS MODIFIER À LA MAIN
-# projet: shopfr  ressource: vhost/shopfr  empreinte: sha256:1f3a…  généré: 2026-08-22T14:30:11Z
+# projet: shopfr  ressource: web/vhost/shopfr  empreinte: sha256:1f3a…  généré: 2026-08-22T14:30:11Z
 # Pour personnaliser : /etc/ogs/templates/apache/php-fpm.conf.tmpl
 ```
 
 L'empreinte permet de détecter une modification manuelle : `ogs diff` signale le fichier comme « modifié
-hors ogs » et `apply` refuse de l'écraser sans `--force`.
+hors ogs » et `apply` refuse de l'écraser sans `--force`. Le projet et la ressource de la ligne qui suit
+la marque sont le **seul** critère d'appartenance d'un fichier (D76) : son nom ne prouve rien, et ogs ne
+retire ni n'écrit un fichier que cette ligne attribue à un autre projet.
 
 ---
 
@@ -772,6 +801,12 @@ Contrainte : aucune dépendance C, `CGO_ENABLED=0`, binaire statique.
    Mettre à jour l'état observé, écrire l'audit, exécuter les hooks post
 ```
 
+`--dry-run` s'arrête **avant le hook `preApply`** et avant la première écriture : ni fichier, ni compte, ni
+hook. Ce cycle est celui des commandes qui savent simuler ; une commande qui ne le sait pas refuse l'option
+en code 2 avant toute préparation, au lieu de l'ignorer (D88). Réserve : le calcul du plan attribue déjà,
+dans la base d'état, le numéro de pool ou le port applicatif d'un projet jamais appliqué — celui que l'apply
+lui donnera —, et `plan` n'est donc pas tout à fait « sans écriture » (§20).
+
 ### 6.2 Ordre des dépendances
 
 Ordre de création (l'ordre de suppression est l'inverse exact) :
@@ -782,10 +817,10 @@ Ordre de création (l'ordre de suppression est l'inverse exact) :
 3. bases de données et utilisateurs
 4. vhost AMQP, utilisateur, exchanges, queues, bindings, policies
 5. pools PHP-FPM
-6. vhosts web (HTTP seul dans un premier temps)
+6. vhosts web, rendus d'après le certificat présent (HTTP seul s'il n'y en a pas, D79)
 7. reload web  ← prérequis du challenge HTTP-01
-8. certificats TLS
-9. réécriture des vhosts avec TLS, reload web
+8. certificats TLS, repli par paliers si la demande complète échoue (D80) ; l'étape porte le reload web
+9. bascule des vhosts dont le rendu d'après le matériel présent diffère du fichier en place, reload web
 10. tâches cron
 11. runtime applicatif (nvm, rbenv, pyenv, venv) pour les types non-PHP
 12. unités systemd, daemon-reload, enable, start
@@ -795,7 +830,9 @@ Ordre de création (l'ordre de suppression est l'inverse exact) :
 ```
 
 L'étape 7 est structurante : le challenge HTTP-01 exige que le vhost HTTP réponde déjà. Le vhost est donc
-écrit en deux passes.
+écrit en deux passes. La première ne retire jamais le HTTPS d'un vhost que le certificat présent sert déjà :
+un alias ajouté ou un principal changé restent déclarés dans les deux blocs, servis par le port 80 pour leur
+challenge, et le bloc 443 garde les noms déjà couverts (D79).
 
 **Exception, environnement `prep`** : le certificat wildcard partagé existant déjà, les étapes 7 à 9 se
 réduisent à une seule passe — le vhost est écrit directement en HTTP + HTTPS, suivi d'un unique reload.
@@ -827,6 +864,10 @@ Chaque `Step` porte un booléen `Critical` :
 Terminé avec 1 avertissement (code 6). Audit : 4f2a9c.
 ```
 
+Une émission refusée pour un seul nom se replie par paliers (D80) : le site reste en HTTPS sur ce qui a pu
+être couvert, l'étape s'annonce « ✓ … (en partie) » suivie de l'avertissement qui nomme ce qui manque, et
+le code est 6 — un succès partiel n'est jamais compensé. Loin de l'échéance, aucun nom servi n'est retiré.
+
 Si le rollback lui-même échoue, l'outil s'arrête, affiche l'état exact atteint et les commandes de
 nettoyage manuel, et renvoie le code 1. Aucune tentative silencieuse.
 
@@ -836,7 +877,18 @@ nettoyage manuel, et renvoie le code 1. Aucune tentative silencieuse.
   diff unifié affiché.
 - L'empreinte SHA-256 du dernier contenu écrit est stockée en base. Si le fichier sur disque diverge à la
   fois du rendu attendu et de l'empreinte enregistrée, il a été **modifié à la main** : `apply` refuse et
-  exige `--force` (qui sauvegarde l'original en `.ogs-bak-<horodatage>`).
+  exige `--force` (qui sauvegarde l'original sous `<nom>.ogs-bak-<horodatage>`, suffixé `.1`, `.2`… si une
+  autre sauvegarde de la même seconde porte déjà ce nom — D76).
+- **Le retrait suit les mêmes cinq états que l'écriture** (D76, `removal.File`) : un fichier devenu inutile
+  — pool, vhost et ses liens, vhost de statut, cron, sudoers, Telegraf, fail2ban, tables et clés DKIM —
+  part s'il est intact ; retouché, il ne part que sous `--force`, après la même sauvegarde ; sans la marque
+  d'ogs, ou marqué pour un autre projet, il ne part jamais. Un retrait refusé est une étape **non
+  critique** en échec (code 6) : le fichier resté est en trop, pas en défaut, et rien n'est compensé pour
+  lui. Un fichier qu'on ne peut pas lire avant de le retirer est une erreur ordinaire (`removal.InspectError`,
+  code 1), ni un conflit ni une faute de déclaration.
+- **`--force` reprend un fichier d'ogs retouché, ou jamais écrit par ogs ; il ne donne jamais à un projet
+  le fichier d'un autre** (`fs.CheckOwner`, code 4), et il ne lève pas davantage les gardes du pare-feu
+  contre la coupure d'accès, qui ont leur propre option (D86).
 - La copie est déposée dans **`/var/lib/ogs/backups`** (0700 root), jamais à côté de l'original. Un
   répertoire de configuration est toujours relu en entier par quelqu'un, et la copie qu'on y laisse ment à
   ce lecteur : `/etc/logrotate.d` est chargé tout entier hors une liste de suffixes tabous où le nôtre ne
@@ -969,6 +1021,16 @@ Règle générale, que ces deux cas illustrent : **un répertoire root dans le h
 l'utilisateur**. Ce qu'un processus root ouvre en écriture vit hors du home, ou est écrit par des
 descripteurs ouverts sans suivre de lien.
 
+La règle vaut pour **chaque composant**, non pour le seul dernier (D83) : `O_NOFOLLOW` ne protège que la
+feuille, et un parent jugé conforme au plan peut être remplacé par un lien avant l'étape de l'enfant — la
+confirmation d'un apply en laisse tout le temps. Les répertoires de l'arborescence sont donc atteints
+depuis la racine du projet, un composant après l'autre (`fs.EnsureDirAt`, `SetDirAt`, `LstatAt`), à
+l'observation, à l'écriture comme à la compensation ; un parent qui n'est pas un répertoire véritable fait
+échouer l'étape en le nommant, au lieu d'annoncer la correction de ce qu'on trouverait au bout du lien.
+Seule la racine du projet, dont les parents appartiennent à root, est encore atteinte par son nom. Les
+commandes qui travaillent dans le home hors de tout plan — clé de déploiement, clone, `php switch` —
+suivent la même règle (D82), de même que l'archive et la restauration (D81).
+
 #### 7.1.3 Accès du serveur web : arbitrage
 
 Le mode retenu (D25) est `webAccess: group`.
@@ -1068,8 +1130,28 @@ de préproduction par serveur — `*.srv1.preprod-pp.net`, en changeant `environ
 machine — soit l'activation de la création automatique d'enregistrements DNS, prévue comme évolution et non
 livrée en v1.
 
-`ogs site clone shop.fr --to prep` (lot L6) crée la préproduction puis copie le docroot et restaure un dump
-de la base de production dans celle de préproduction.
+`ogs site clone shop.fr --to prep` (lot L6) crée la préproduction, recopie `www/` sous garde (D82, D84),
+puis restaure un dump de la base de production dans celle de préproduction.
+
+La copie ne suit aucun lien : un lien est recopié comme lien, et un `www` source qui en est un fait refuser
+la copie. Elle ne reprend que les fichiers du compte de production ; ceux de root ou de `www-data`, les
+fichiers spéciaux et ce qui se trouve au-delà de 1024 niveaux sont écartés, nommés (50 au plus, cités) et
+comptés, et la commande rend alors 6. Les liens physiques internes sont reposés et les fichiers creux
+restent creux ; ni ACL, ni attributs étendus, ni bits setuid et setgid des fichiers ne sont reportés. Un
+Ctrl-C ou un SIGTERM arrête la copie et rend le code 9 : la préproduction est créée avec une partie du
+contenu, la base n'est pas copiée, et `ogs project delete <id>` la retire avant un nouveau clone.
+
+La copie **neutralise ce qu'ogs connaît de la production, et nomme le reste** (D84). Les fichiers où le
+type d'application range la configuration d'un environnement (`.env.local` de Symfony, `parameters.php`
+de Prestashop, `.env` d'une application servie par un runtime) et ses caches compilés ne sont pas
+recopiés ; les mots de passe qu'ogs a générés pour les bases et le transport de la production, et les
+valeurs d'au moins 12 caractères de son fichier d'environnement, sont masqués à longueur égale dans la
+copie comme dans la déclaration ; la racine de la production y est remplacée par celle de la
+préproduction ; tâches et services sont repris désactivés. Chaque fichier retenu ou expurgé, chaque
+variable déclarée reprise, chaque lien dont la cible sort de la préproduction, chaque secret qu'ogs n'a pas
+pu chercher et un installeur Prestashop resté en place sont nommés, avec le code 6. Le reste — tout autre
+fichier de `www/`, le reste d'une chaîne dont seul le mot de passe est masqué, le contenu de la base — passe
+tel quel, et la sortie le dit. `--dry-run` annonce ce qui sera retenu, masqué et repris.
 
 #### 7.1.5 Clé de déploiement
 
@@ -1102,7 +1184,15 @@ ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI… ogs:shopfr@srv1
   commande, n'entre pas dans le keystore (elle vit sur le disque, protégée par ses permissions) et n'apparaît
   dans aucun log.
 - `ogs user key rotate <id>` régénère la paire ; l'ancienne clé publique est affichée pour permettre son
-  retrait chez l'hébergeur, et l'opération est journalisée.
+  retrait chez l'hébergeur, l'ancienne clé privée sauvegardée dans `/var/lib/ogs/backups` sans jamais
+  écraser une autre sauvegarde, et l'opération est journalisée.
+- `show` et `rotate` tournent hors de tout plan (D82). Ils ouvrent `.ssh` par descripteur, sans suivre de
+  lien, et refusent un `.ssh` lié ou qui n'appartient pas au projet — `ogs apply` le rétablit. Une clé qui
+  n'est pas un fichier régulier du projet, qui dépasse 16 Kio ou, pour la clé publique, qui n'est pas du
+  texte imprimable sur une ligne n'est ni lue, ni affichée, ni sauvegardée : un lien physique vers un
+  fichier de root, une clé creuse de 1 Gio, une séquence d'échappement destinée au terminal de l'exploitant.
+  La nouvelle paire est posée par `unlinkat` puis `openat` en `O_EXCL` et `O_NOFOLLOW`, avec mode et
+  propriétaire posés sur le descripteur.
 - `known_hosts` est pré-rempli par `ssh-keyscan` pour les hôtes déclarés dans
   `deployment.knownHosts` (par défaut `github.com`, `gitlab.com`), avec affichage des empreintes obtenues
   pour vérification. En l'absence de réseau, le fichier reste vide et un avertissement est émis :
@@ -1150,8 +1240,10 @@ sshd : c'est elle, et les clés du trousseau, qui décident de ce qui entre.
 
 `userdel` sans `--remove` (l'arborescence est traitée par la logique d'archivage), suppression du groupe,
 retrait de `www-data` du groupe. Refus de supprimer un utilisateur non créé par `ogs` (absent de la base
-d'état et sans marqueur `ogs=` dans le champ commentaire) sans `--force`. Le marqueur ne peut contenir ni `:`,
-séparateur de champs de `/etc/passwd`, ni `,`, séparateur de sous-champs du GECOS.
+d'état et sans marqueur `ogs=` dans le champ commentaire) sans `--force`. Le refus est prononcé à l'entrée
+de la commande, avant la confirmation et dans le même message que tous les autres refus de la
+suppression (D77), non au moment de retirer le compte, quand plus rien ne se relance. Le marqueur ne peut
+contenir ni `:`, séparateur de champs de `/etc/passwd`, ni `,`, séparateur de sous-champs du GECOS.
 
 Un `userdel` en échec ne fait pas abandonner l'arborescence : le home part quand même, et le compte restant
 est signalé avec la liste des processus qui le tiennent — lue dans `/proc`, `userdel` ne nommant que le
@@ -1207,12 +1299,27 @@ base : il bascule alors explicitement sur `mysql_native_password`, choix consign
 **Observation** : `information_schema.SCHEMATA`, `mysql.user`, `SHOW GRANTS`. Les privilèges observés sont
 normalisés puis comparés à l'état désiré ; un écart produit un `Update` (révocation ciblée + grant).
 
+**Un nom sous deux hôtes fait deux comptes** (D78). `'shop'@'%'` et `'shop'@'localhost'` coexistent, et
+MySQL retient pour chaque connexion celui dont l'hôte est le plus précis : créer le second à côté du
+premier ferait refuser le mot de passe de l'application, par le socket comme par 127.0.0.1. Quand le compte
+déclaré — principal ou additionnel — est absent sous son hôte mais que son nom existe sous un autre,
+l'observation le relève et le plan rend une étape non critique en échec, qui nomme le compte existant et
+la porte de sortie (déclarer son hôte réel, ou retirer l'autre compte) : rien n'est exécuté, aucun mot de
+passe n'est scellé. Les comptes additionnels partagent l'hôte de leur déclaration.
+
 **Contraintes** : identifiants échappés par backquotes doublées ; longueur d'utilisateur 32 caractères
 (MySQL 8) contre 80 (MariaDB 10.6+), la limite la plus stricte est appliquée pour la portabilité ; détection
 MariaDB par `SELECT VERSION()`.
 
 **Dump/restore** : `mysqldump --single-transaction --routines --triggers --default-character-set=utf8mb4`,
 compression zstd, sortie vers fichier ou stdout. Restauration avec confirmation si la base n'est pas vide.
+Le chemin désigné par `db dump -O` ou `db restore -i` est parcouru depuis « / » par descripteurs (D83) :
+un lien n'y est suivi que si seul root a pu le poser, et seul un fichier ordinaire — ou, pour une
+sauvegarde, un nom absent — est admis ; un lien posé dans un home, un tube nommé, un périphérique sont
+refusés — et laissés en place —, avant la confirmation et en code 2 pour une restauration. Un fichier
+ordinaire déjà présent est délié, puis la sauvegarde recréée par le descripteur du répertoire en
+`O_EXCL`, en 0600, à root. `/dev/stdout`, `/dev/stderr`, `/dev/null` et
+`/dev/stdin` restent admis. Il en va de même pour PostgreSQL (§7.3).
 
 ### 7.3 PostgreSQL
 
@@ -1237,7 +1344,12 @@ requièrent une connexion à la base cible ; le comportement de `public` a chang
 durcissement est appliqué systématiquement. Suppression : `DROP DATABASE … WITH (FORCE)` sur PG 13+, sinon
 terminaison préalable des connexions via `pg_terminate_backend`.
 
-**Dump/restore** : `pg_dump -Fc` (format custom) et `pg_restore`.
+**Dump/restore** : `pg_dump -Fc` (format custom) et `pg_restore`. Chemins désignés comme au §7.2 (D83).
+
+**Base adoptée** : le durcissement de D45 s'applique aussi à une base préexistante reprise par l'import.
+Quand le rôle déclaré ne la possède pas, l'apply exécute `REVOKE CONNECT … FROM PUBLIC`,
+`REVOKE ALL ON SCHEMA public` et `ALTER SCHEMA public OWNER` : c'est une normalisation au sens du §9, que le
+premier `diff` montre, mais elle peut couper d'autres rôles qui s'y connectaient. Point ouvert (§20).
 
 ### 7.4 RabbitMQ
 
@@ -1389,6 +1501,10 @@ rétabli au prochain apply ; un fichier régulier posé à sa place n'est rempla
 Toute erreur avant l'étape 5 annule proprement ; après l'étape 5, la compensation restaure l'ancien pool, le
 vhost et le lien. `daemon-reload` n'est pas nécessaire, aucune unité n'ayant changé.
 
+L'ancien pool part sous le régime des cinq états (D76) : retouché, il exige `--force` et une sauvegarde. Un
+fichier qui porte le nom exact d'un pool du projet dans une autre version sans qu'ogs l'ait écrit pour lui —
+le pool d'origine d'un projet adopté, resté actif après la bascule — est signalé et laissé en place, code 6.
+
 ### 7.6 Serveurs web
 
 Modèle unifié : un `VirtualHost` décrit domaines, docroot, pool, TLS et options ; chaque moteur en produit
@@ -1425,11 +1541,20 @@ sa configuration.
     ServerName shop.fr
     ServerAlias www.shop.fr
     DocumentRoot /home/shop.fr/www/public
-    <Directory /home/shop.fr/www/public>
-        AllowOverride All
-        Require all granted
-        Options -Indexes +FollowSymLinks
+    <Directory /home/shop.fr>
+        Options -FollowSymLinks +SymLinksIfOwnerMatch
     </Directory>
+    <Directory /home/shop.fr/www/public>
+        AllowOverride None
+        Require all granted
+        Options -Indexes -FollowSymLinks +SymLinksIfOwnerMatch
+        FallbackResource /index.php
+    </Directory>
+    RedirectMatch 403 "/\.(?!well-known/)"
+    RedirectMatch 403 "/composer\.(json|lock)$"
+    <If "%{REQUEST_FILENAME} =~ m#/composer\.(json|lock)$#">
+        Require all denied
+    </If>
     <FilesMatch \.php$>
         SetHandler "proxy:unix:/run/php/php8.5-fpm-18501-shopfr.sock|fcgi://localhost"
     </FilesMatch>
@@ -1443,7 +1568,14 @@ sa configuration.
 ```
 
 **Nginx** : équivalent avec `fastcgi_pass unix:…`, `include snippets/fastcgi-php.conf`, `location ^~
-/.well-known/acme-challenge/ { root /var/lib/ogs/acme-challenge; }`, `try_files $uri /index.php$is_args$args`.
+/.well-known/acme-challenge/ { root /var/lib/ogs/acme-challenge; }`, `disable_symlinks if_not_owner
+from=/home/shop.fr`, deux `location ~ /\.(?!well-known/)` et `location ~ /composer\.(json|lock)$` en
+`deny all` en tête des expressions régulières, `try_files $ogs_fichier /index.php$is_args$args` —
+`$ogs_fichier`, défini par le fragment de portée serveur, ne diffère de `$uri` que pour « / » (D87).
+
+Sous `AllowOverride All` (Prestashop), la directive devient `AllowOverride All
+Options=Indexes,MultiViews,SymLinksIfOwnerMatch` : un `.htaccess` règle ces trois options, jamais
+`FollowSymLinks`, `ExecCGI` ni `Includes`, et une autre option y fait répondre 500.
 
 **Modules requis** — vérifiés par `doctor` : Apache `proxy_fcgi`, `setenvif`, `rewrite`, `ssl`, `headers`,
 `http2` ; Nginx compilé avec `http_ssl_module` et `http_v2_module`.
@@ -1454,6 +1586,18 @@ sa configuration.
   n'est pas gérée (les deux peuvent être installés, un seul est piloté).
 - Détection de conflit : refus d'écrire un vhost dont un domaine est déjà servi par une configuration
   existante, gérée ou non.
+- Un vhost n'est à un projet que par son en-tête (D76) : un fichier posé à la main selon la convention de
+  nommage n'est jamais pris pour un vhost obsolète du projet, et part moins encore ; s'il sert l'un de ses
+  domaines, c'est un conflit (code 4). Le lien d'activation part avec le fichier, et seulement s'il le
+  désigne.
+- **Liens du docroot** (D87) : suivis seulement vers ce qui appartient à leur auteur, contrôle posé dès la
+  racine du projet — `www-data`, membre de tous les groupes, servirait sinon les fichiers d'un voisin.
+  Sous Apache, le contrôle précède l'ouverture et porte sur le nom : une course subsiste (§20) ; nginx
+  compare sur le descripteur ouvert.
+- **Fichiers cachés et métadonnées de dépendances** (D87) : `/.git`, `/.env`, `.htaccess`… et
+  `composer.json`, `composer.lock` ne sont jamais servis, `/.well-known/` excepté — le challenge ACME et
+  `security.txt` y vivent. Le refus d'Apache est rendu dès la traduction de l'URL, avant tout contrôle
+  d'accès : aucun `Require` d'un `.htaccess` ou d'une surcharge ne le rouvre.
 
 #### 7.6.1 Surcharges de vhost (D63)
 
@@ -1487,7 +1631,17 @@ en root, et le moteur seul les valide :
   `X-Robots-Tag` de préproduction compris : une surcharge qui pose un en-tête doit reposer les autres ;
 - un `rewrite … last` déposé dans le contexte du vhost d'un site en clair est évalué **avant** le choix du
   `location`, donc avant le bloc du challenge ACME : le renouvellement du certificat cesse d'aboutir. Le
-  vhost de redirection n'offre pour cette raison **aucun** point de surcharge.
+  vhost de redirection n'offre pour cette raison **aucun** point de surcharge ;
+- sur Apache, un `<Location />` de surcharge — la restriction ordinaire d'un site à un réseau — rouvrirait
+  un refus porté par `<LocationMatch>` ou `<FilesMatch>`, les sections fusionnant dans l'ordre du fichier :
+  d'où le refus des fichiers cachés par `RedirectMatch`. `Options +MultiViews`, qu'une surcharge du
+  docroot peut poser, négocie « /composer » vers `composer.json` par une sous-requête que le
+  `RedirectMatch` ne voit pas : le refus porte donc aussi sur le nom du fichier, dans un `<If>`, fusionné
+  après les `<Location>` (D87). La négociation exige de lister le répertoire : elle échoue sur le docroot,
+  en 0710 (AH00686), et ne s'exerce que dans un sous-répertoire que `www-data` peut énumérer. Seule une
+  surcharge qui poserait elle-même un `<If>` contraire rouvrirait la variante ;
+- sur nginx, `/.ogs-accueil/` est un nom réservé : le vhost PHP y conduit « / » (D87), et un répertoire de
+  ce nom posé dans le docroot d'un Prestashop fait rendre 403 à son accueil, sans rien servir.
 
 **Contrôles de `doctor`** : propriétaire root et absence d'écriture par un tiers sur les répertoires comme
 sur les fichiers — même régime que les hooks (D40), et pour la même raison : qui écrit là dicte la
@@ -1534,8 +1688,24 @@ RandomizedDelaySec=3600
 Persistent=true
 ```
 
-`ogs cert renew --all` renouvelle les certificats expirant sous 30 jours (seuil configurable), puis
-déclenche les reloads groupés et les hooks `postCertRenew`.
+`ogs cert renew --all` renouvelle les certificats expirant sous 30 jours (seuil configurable), et ceux qui
+ne couvrent plus les domaines demandés d'une déclaration appliquée telle quelle — c'est ce qui reprend seul
+l'émission d'un alias dont le DNS ne pointait pas encore ici. Il lance le hook `postCertRenew` pour les
+certificats qui ont changé, et recharge le serveur web **dès qu'un certificat a changé**, même si un autre
+a échoué. Un projet dont la demande est refusée n'est pas passé en silence : il est nommé (« certificat non
+examiné, déclaration refusée »), compté parmi les échecs, et le reste du parc est renouvelé (code 6).
+
+**Ce que couvre le certificat d'un projet** (D80) : ses domaines principaux, ses alias, puis ses
+redirections — hormis une adresse IP, qu'aucune demande ACME ne peut porter, et dont le vhost reste en HTTP
+seul. Une commande ACME échouant tout entière sur un seul nom refusé, l'émission se replie par paliers :
+sans les redirections en attente, sans aucune redirection, sur ce que couvre le certificat en place, puis
+sur les seuls noms du vhost principal qu'il couvre. Loin de l'échéance et sans `--force`, un palier qui
+retirerait un nom que le certificat en place sert est réservé à l'échéance ; le message en donne la date,
+et `cert renew <id> --force` l'impose tout de suite.
+
+**Ce que présente un vhost** (D79) : le certificat présent, dès qu'il couvre l'un de ses noms — jamais la
+demande, qui peut attendre une émission. Un certificat expiré n'est plus présenté, et `status` le dit
+« expiré ».
 
 **Garde-fous** :
 - Vérification préalable de la résolution DNS du domaine vers une IP locale (avertissement, non bloquant
@@ -1543,7 +1713,9 @@ déclenche les reloads groupés et les hooks `postCertRenew`.
 - Respect des quotas Let's Encrypt : 5 échecs consécutifs par domaine déclenchent une pause de 1 heure
   enregistrée en base ; `--staging` bascule sur l'environnement de test.
 - Clés privées en 0600 root, certificats en 0644.
-- Révocation explicite (`ogs cert revoke`) avant suppression d'un projet si l'option est activée.
+- Révocation explicite, à la demande (`ogs cert revoke`) : aucune option ne la déclenche à la suppression
+  d'un projet, qui ne révoque ni ne retire le certificat du projet — `ogs cert delete <id>` le retire ensuite (`ogs cert revoke <id>` avant, si la révocation est voulue)
+  ensuite, le certificat n'étant plus référencé (§13 ; limite connue, §20).
 - Un certificat partagé n'est jamais révoqué ni supprimé par la suppression d'un projet (§7.7.4).
 
 **Certificats partagés (portée serveur)**
@@ -1836,6 +2008,13 @@ contrainte `require.php` est lue et confrontée à la version du pool. Un écart
 manière bloquante pour une incompatibilité déclarée, sous forme d'avertissement si la contrainte est absente
 ou illisible. Ce choix évite d'embarquer une matrice qui vieillit à chaque sortie.
 
+`php switch` lit `composer.json` en root dans un répertoire que l'utilisateur possède : il l'ouvre par
+descripteur, sans suivre de lien ni pour `www` ni pour le fichier, n'ouvre pas un fichier spécial et borne
+la lecture à 1 Mio (D82). Un fichier illisible ou refusé décide **comme un fichier absent**, par la table
+indicative, et la commande l'annonce comme tel (« ⚠ composer.json non lu ») plutôt que comme vérifié : le
+traiter en simple avertissement désarmait le garde-fou, et l'utilisateur pouvait le faire à volonté en
+posant un lien.
+
 Table indicative, utilisée seulement en l'absence de `composer.json` exploitable :
 
 | Application | PHP compatible |
@@ -1921,7 +2100,9 @@ y a de projets, et le lien `.local/bin/node` pointe vers un binaire situé dans 
 l'utilisateur contrôle : il peut donc en changer le contenu. Cela ne crée aucune escalade — il exécuterait ce
 binaire sous sa propre identité de toute façon. La garantie « la version effective est celle de
 l'inventaire » est, pour tous les liens, celle d'un état réconcilié à chaque apply (D70). `ogs status`
-compare la version rapportée par `.local/bin/<runtime> --version` à celle déclarée et signale l'écart.
+compare la version rapportée par `.local/bin/<runtime> --version` à celle déclarée et signale l'écart. Ce
+binaire est lancé **sous l'identité du projet**, jamais en root (D82) : l'utilisateur choisit ce que
+désigne le lien, et l'exécuter en root lui laisserait choisir ce que root exécute.
 
 #### 7.11.3 Écoute : socket Unix par défaut
 
@@ -2315,10 +2496,10 @@ sorties omettent `dns` ou `https`, une clé inconnue.
 
 | Profil | Ports par défaut | Disponible si | Ports lus dans |
 |---|---|---|---|
-| `ssh` | 22/tcp | `ssh.service`, `sshd.service` | `sshd_config` et ses `Include` — chaque `Port` s'ajoute |
+| `ssh` | 22/tcp | `ssh.service`, `sshd.service` | `sshd_config` et ses `Include` — chaque `Port` s'ajoute ; un commentaire de fin de ligne (`Port 2222 # …`) est ôté, comme le fait sshd, un « # » collé à un mot en faisant partie |
 | `sftp` | 2222/tcp | `proftpd.service` et un contexte `SFTPEngine on` | le `Port` de ce contexte |
 | `ftp` | 21/tcp + plage passive | proftpd (contexte hors SFTP, `Port` ≠ 0), vsftpd, pure-ftpd | `PassivePorts`, `pasv_min_port`/`pasv_max_port`, `PassivePortRange` |
-| `web` | 80,443/tcp | le moteur retenu | — |
+| `web` | 80,443/tcp | le moteur retenu ; Apache et nginx installés sans `web.engine`, disponible quand même — un serveur qu'on ne sait pas nommer n'est pas l'absence de serveur web (D86) | — |
 | `mysql` | 3306/tcp | mariadb, mysql, mysqld | — |
 | `postgresql` | 5432/tcp | postgresql | — |
 | `redis` | 6379/tcp | redis-server, redis | `redis.conf` ; `port 0` : indisponible |
@@ -2377,13 +2558,37 @@ retirer. Une règle de l'administrateur de même définition qu'une règle voulu
 sienne : ogs ne lui donne pas sa marque.
 
 Refusé au plan : une adresse IPv6 alors qu'`IPV6=no`, un FTP autorisé dont la plage passive est
-inconnue, un `web` fermé alors qu'un projet émet ses certificats par HTTP-01. Refusé sauf `--force` : une
-politique entrante fermée sans aucune source SSH, et — quand le plan retire un accès — une session SSH en
-cours qu'aucune règle SSH ne couvrirait, dont l'adresse serait bannie, ou un port où sshd **écoute
-réellement** (`ss -tlnp`) que le profil n'ouvre pas — aucune lecture de `sshd_config` ne couvre toutes ses
-syntaxes, et c'est ce port-là que la politique par défaut coupe. Limite connue : sous tmux ou screen, un
-shell garde le `SSH_CONNECTION` de la connexion qui l'a créé ; rattaché depuis une autre adresse, la garde
-contrôle l'ancienne. Un refus, comme un `ufw.yaml`
+inconnue, un `web` fermé alors qu'un projet émet ses certificats par HTTP-01 — y compris par un profil web
+indisponible ou écarté, dont les règles marquées partiraient.
+
+Refusé sauf **`--allow-lockout`** (D86), option des seules commandes `ogs firewall` (`plan`, `apply`, `ban`,
+`unban`) — le `--force` des fichiers retouchés (§6.4) ne la lève jamais, le plan global jamais non plus :
+une politique entrante fermée sans aucune source SSH. Refusé de même, quand le plan **resserre** le
+pare-feu — retrait de règle, refus nouveau, politique entrante, activation, ou **ports changés d'un profil
+qu'une règle emploie**, `ufw app update` fermant l'ancien port :
+
+- une session SSH en cours que rien ne laisserait plus passer, adresse et port ensemble ;
+- une session dont l'adresse serait bannie ;
+- un port où sshd **écoute réellement** (`ss -tlnp`, et les `ListenStream` d'une `ssh.socket` active) que
+  plus rien n'ouvrirait — ni un profil, qu'il soit disponible, écarté ou non détecté, ni une règle de
+  l'administrateur. Aucune lecture de `sshd_config` ne couvre toutes ses syntaxes, et c'est ce port-là que
+  la politique par défaut coupe.
+
+Les gardes jugent **ce qui restera ouvert** après le plan : les règles voulues de tout profil qui ouvre les
+ports visés, et les règles de l'administrateur qu'il laisse en place. Une règle de l'administrateur compte
+si c'est une autorisation entrante (`allow` ou `limit`, journalisée ou non) qui ne restreint pas le port
+d'origine ; une règle de routage, de sortie, à port d'origine ou venant de la boucle locale ne compte pas.
+Sans session à protéger, elle compte même liée à une interface autre que `lo`, ou visant une adresse du
+serveur autre que la boucle locale. Pour une session, elle doit admettre son adresse et, si elle vise une adresse du serveur, celle que
+la session a jointe — 3e champ de `SSH_CONNECTION`, l'adresse vue après translation, celle que filtre ufw ;
+une règle liée à une interface ne la couvre pas, rien ne disant par où la session est arrivée, et le refus
+le dit. Les ports visés pour la session sont ceux où sshd écoute ; à défaut, celui où elle est arrivée
+(4e champ) ; à défaut, ceux du profil. Le port de la session ne compte pas quand `ss` dit que sshd n'y
+écoute plus : il refusait le plan même qui ouvrait le port où sshd avait été déplacé. Une règle de
+l'administrateur sur un profil `ogs-*` prend les nouveaux ports de ce profil.
+
+Limite connue : sous tmux ou screen, un shell garde le `SSH_CONNECTION` de la connexion qui l'a créé ;
+rattaché depuis une autre adresse, la garde contrôle l'ancienne. Un refus, comme un `ufw.yaml`
 invalide, n'est jamais tenté : `ogs firewall plan|apply` rend le code 3 ; le plan global en fait une
 étape non bloquante en échec — le reste du parc s'applique, et l'apply rend le code 6 en nommant le motif.
 `ogs firewall confirm` ne lit pas `ufw.yaml` : un fichier cassé depuis l'activation ne doit pas empêcher de
@@ -2399,6 +2604,20 @@ Quand ufw passe d'inactif à actif, ogs programme d'abord `systemd-run --unit=og
 minuteur. Faute de confirmation, ufw se désactive de lui-même. Un minuteur qui ne peut pas être programmé
 interdit l'activation ; `rollbackAfter: 0` s'en passe.
 
+Avant le minuteur, ogs pose le **témoin** `/var/lib/ogs/ufw-unconfirmed` (0600 root, D86). Il est retiré par
+`confirm`, par la compensation et par la désactivation que demande `active: false` ; si le minuteur ne
+peut pas être programmé, le témoin est retiré et l'activation refusée. Il distingue trois états :
+
+- **en attente** : minuteur actif ;
+- **retour perdu** : ufw actif, plus de minuteur — ce que laisse un redémarrage dans le délai, l'unité
+  transitoire vivant sous `/run`. `status` et `doctor` le signalent, et `confirm`, depuis une nouvelle
+  session, confirme ;
+- **retour joué** : ufw inactif. `confirm` rend 6 et renvoie à `ogs firewall apply`.
+
+`confirm` sur un ufw inactif rend 6, sauf si `ufw.yaml` est absent ou déclare `active: false` ; il n'est lu
+que pour cela, et cassé il ne décide rien. Le témoin rend l'état visible, il ne réarme rien : un redémarrage
+dans le délai ne vaut pas retour (§20).
+
 #### fail2ban
 
 Les adresses de confiance rejoignent l'`ignoreip` de chaque prison `ogs-` (D68) : une adresse qui a accès
@@ -2411,19 +2630,22 @@ bannir. `ogs firewall apply` ne réconcilie que le pare-feu ; les prisons suiven
 ogs firewall init                      ufw.yaml de départ d'après ce qui est installé
 ogs firewall status | profiles | rules | sources
 ogs firewall whois <adresse>           à qui elle appartient, ce qui lui est permis
-ogs firewall plan | apply              le pare-feu seul
+ogs firewall plan | apply [--allow-lockout]    le pare-feu seul
 ogs firewall confirm                   confirme une première activation
-ogs firewall ban <adresse|source> [--comment] [--no-apply]
-ogs firewall unban <adresse|source> [--no-apply]
+ogs firewall ban <adresse|source> [--comment] [--no-apply] [--allow-lockout]
+ogs firewall unban <adresse|source> [--no-apply] [--allow-lockout]
 ```
 
 `ban` et `unban` écrivent `ufw.yaml` — il reste la source de vérité (D1) — en passant par l'arbre du
 document : les commentaires de l'exploitant, qui disent souvent pourquoi une adresse est là, survivent. Le
-document modifié est validé avant d'être écrit.
+document modifié est validé avant d'être écrit. Sous `--dry-run`, ils refusent l'option (code 2) au lieu de
+réécrire `ufw.yaml` (D88). Un bannissement que la garde refuse reste en revanche écrit dans `ufw.yaml`, où
+le prochain apply le retrouve (§20).
 
 #### Ce que `doctor` porte
 
-- ufw installé, actif si `ufw.yaml` le veut, activation en attente de confirmation ;
+- ufw installé, actif si `ufw.yaml` le veut, activation en attente de confirmation — ou jamais confirmée
+  et privée de son retour automatique, que le témoin révèle après un redémarrage ;
 - pour chaque profil disponible qui a des règles, un port qui n'écoute nulle part — le service arrêté, ou
   un sshd déplacé que le profil n'ouvre pas — ou qui n'écoute que la boucle locale, où la règle n'ouvre
   rien ;
@@ -2483,8 +2705,12 @@ système d'UID ≥ 1000 avec home sous `/home` ou `/var/www`, bases MySQL/Postgr
 vhosts et queues RabbitMQ, crontabs utilisateur et `/etc/cron.d`, unités systemd hors paquets, certificats
 existants (`/etc/letsencrypt/live`, `/etc/ssl`).
 
-**Corrélation** : regroupement par similarité de nom, par docroot commun, par utilisateur du pool, par
-socket FPM référencé dans un vhost. L'identifiant proposé est celui que produirait la règle de dérivation
+**Corrélation** : regroupement par nom — le même aux séparateurs près (`shop_fr`, `shop-fr`, `shopfr`),
+**jamais un préfixe** (D78) —, par docroot commun, par utilisateur du pool, par socket FPM référencé dans un
+vhost. Une base n'est rattachée qu'une fois tous les candidats connus, et au seul que son nom désigne :
+son identifiant, ou le compte de son pool ; des candidats de même identifiant — un vhost doublé en
+`-le-ssl` par certbot — comptent pour un seul projet. Un compte de base n'est rattaché que s'il est seul de
+son nom, hôtes compris. L'identifiant proposé est celui que produirait la règle de dérivation
 (§3.3) appliquée au `ServerName` du vhost ; il est modifiable à l'adoption, et l'écart entre le nommage
 existant et le nommage canonique est affiché. **L'adoption ne renomme jamais** : les ressources gardent
 leurs noms réels, l'identifiant `ogs` n'étant qu'une clé de regroupement. Un renommage vers la convention
@@ -2518,6 +2744,24 @@ Non géré (laissé strictement intact) :
   les détections de conflit la prennent en compte.
 - Après adoption, un `ogs diff <projet>` montre l'écart entre l'existant et ce que `ogs` produirait. Le
   premier `apply` normalise la configuration (et le montre avant d'agir).
+- **Une base dont le nom désigne plusieurs projets, ou dont aucun compte — ou plus d'un, hôtes compris —
+  ne porte le nom, n'est pas déclarée** (D78) : elle reste non gérée, chaque candidat concerné reçoit une
+  note, et l'adoption affiche avant la confirmation les bases qu'elle déclare, avec leur compte et leur
+  hôte. Une base déclarée l'est sous l'**hôte réel** de son compte (`host: '%'`). ogs ne crée, n'accorde ni
+  ne supprime jamais un compte deviné ; une base qu'aucun nom ne rattache se déclare à la main dans
+  `spec.databases`.
+- **Un vhost adopté garde son fichier** : l'import porte son nom réel dans `spec.web.vhosts[].file` (D76),
+  que l'apply reprend en place — sous `--force`, l'original étant sauvegardé — au lieu d'écrire un second
+  fichier à côté. Le pool d'origine d'un projet adopté, laissé actif par un `php switch`, est signalé et
+  jamais retiré.
+- Un home adopté sous celui d'un autre projet est refusé par le contrôle d'unicité (§3.3.6, D77).
+
+**Migration vers une autre machine** : quand les sites changent de serveur, l'import ne s'applique pas —
+la reprise passe par `docs/migrer.sh` et son manifeste (D90), exécutés en root sur la nouvelle machine, qui
+tire fichiers et bases de l'ancienne par ssh. Le script ne touche ogs que par ses commandes : il dépose
+chaque déclaration, crons et services désactivés, puis synchronise, vérifie et bascule par vagues, et sait
+revenir en arrière. Il refuse un projet dont un autre, sur la cible ou dans le manifeste, partage une base,
+un compte, un home ou un domaine, et toute resynchronisation une fois la bascule engagée.
 
 **Certificats certbot** : deux options à l'adoption — conserver les chemins certbot et laisser son timer
 opérer, ou migrer vers le stockage `ogs` avec réémission (recommandé pour l'homogénéité, coûte une émission
@@ -2599,7 +2843,7 @@ ogs
 │
 ├── firewall init | status | profiles | rules | sources   pare-feu ufw (§7.14)
 ├── firewall whois <adresse>
-├── firewall plan | apply | confirm
+├── firewall plan | apply | confirm   --allow-lockout lève les gardes contre la coupure (D86)
 ├── firewall ban | unban <adresse|source>
 │
 ├── cron add | remove | list | enable | disable | run
@@ -2650,8 +2894,12 @@ ogs site create shop.fr --env prep
 Comportement : construit le projet en mémoire, écrit `/etc/ogs/projects/shopfr.yaml`, affiche le plan, demande
 confirmation, applique en saga, puis affiche le récapitulatif avec les chaînes de connexion générées.
 
-Options transverses de toutes les commandes mutantes : `--dry-run`, `--yes`, `--non-interactive`, `--force`,
-`--output`, `--verbose`, `--quiet`, `--no-hooks`, `--config`.
+Options transverses : `--dry-run`, `--yes`, `--non-interactive`, `--force`, `--output`, `--verbose`,
+`--quiet`, `--no-hooks`, `--config`. `--dry-run` est **simulé** par les commandes qui le savent et
+**refusé** — code 2, avant toute préparation — par les autres, jamais ignoré (D88) : la conduite de chaque
+commande est inscrite dans `internal/cli/dryrun.go`. `--force` reprend un fichier retouché ou non géré, après
+sauvegarde (§6.4) ; il ne donne jamais à un projet le fichier d'un autre et ne lève pas les gardes du
+pare-feu, qui ont leur option (D86).
 
 **`--prefix <répertoire>`** décale l'ensemble des chemins système sous un répertoire et simule les commandes
 système. C'est la seule dérogation au root-strict (D21) : sans elle, aucun test automatisé ne serait
@@ -2665,14 +2913,14 @@ n'exécute aucune commande réelle.
 |---|---|
 | 0 | succès |
 | 1 | erreur d'exécution |
-| 2 | erreur d'usage (arguments invalides) |
+| 2 | erreur d'usage (arguments invalides, `--dry-run` demandé à une commande qui ne sait pas simuler, entrée de restauration refusée) |
 | 3 | échec de validation (spécification incohérente) |
 | 4 | conflit (ressource déjà existante ou possédée par un autre projet) |
 | 5 | dépendance absente (paquet, module, plugin, service arrêté) |
 | 6 | succès partiel (étapes non critiques en échec) |
 | 7 | verrou indisponible (autre instance en cours) |
 | 8 | privilèges insuffisants (non root) |
-| 9 | opération annulée par l'utilisateur |
+| 9 | opération annulée par l'utilisateur — refus à la confirmation, confirmation exigée en mode non interactif sans `--yes`, ou interruption (SIGINT, SIGTERM), notamment pendant le calcul d'un plan, d'une suppression avant son point de non-retour (D77) ou d'une copie de clone (D82) |
 
 ### 10.4 Sorties machine
 
@@ -2762,10 +3010,10 @@ Scripts exécutés par `ogs` aux points suivants :
 |---|---|---|
 | `preCreate` | avant la première étape d'un projet neuf | oui |
 | `postCreate` | après la dernière étape réussie | non |
-| `preDelete` | avant toute suppression | oui |
-| `postDelete` | après suppression et archivage | non |
+| `preDelete` | avant toute suppression, une fois les refus d'entrée levés, la confirmation donnée et la taille de l'archive admise ; les remparts étant éprouvés de nouveau après l'archive, une suppression peut encore être abandonnée après un `preDelete` réussi (D77) | oui |
+| `postDelete` | après suppression, archivage et recalcul des fichiers de parc | non |
 | `preApply` / `postApply` | encadrent tout apply | non |
-| `postCertRenew` | après renouvellement réussi | non |
+| `postCertRenew` | après renouvellement réussi, même si un autre a échoué | non |
 | `postPhpSwitch` | après bascule de version | non |
 
 Contrat : le script reçoit le contexte JSON sur stdin (projet, action, ressources touchées, chemins), les
@@ -2774,46 +3022,92 @@ maximal de 300 s (configurable), et son stdout/stderr est capturé dans les logs
 retour non nul sur un hook critique interrompt l'opération et déclenche le rollback. `--no-hooks` désactive
 l'ensemble.
 
+Aucun hook ne s'exécute sous `--dry-run` (D40, D88) : une commande qui simule s'arrête avant son hook `pre`,
+une commande qui ne sait pas simuler refuse l'option avant tout geste — `project delete --dry-run` ne lance
+ni `preDelete` ni `postDelete` —, et le `hook.Runner` lui-même, sous ce drapeau, résout le script, contrôles
+de sécurité compris, puis l'annonce « non exécuté (--dry-run) » : un hook qui serait refusé à l'exécution
+l'est aussi en simulation.
+
 ---
 
 ## 13. Archivage et suppression
 
 `ogs project delete shopfr` (mode par défaut, D6) :
 
-1. Hook `preDelete`.
-2. Arrêt et désactivation des services, suppression des unités.
-3. Suppression du fichier cron.
-4. Désactivation du vhost, reload web.
-5. Dump des bases du projet (`mysqldump` / `pg_dump`).
-6. Constitution de l'archive `/var/lib/ogs/archives/shopfr-20260822-1430.tar.zst` contenant : YAML du projet,
-   configurations générées (vhost, pool, unités, cron), dumps de bases, secrets **chiffrés**, arborescence
-   `/home/shop.fr`, journaux du projet (`<logs.root>/<id>`, D71), et un manifeste JSON décrivant tout ce qui a
-   été supprimé.
-7. Suppression des ressources vivantes : bases et utilisateurs SGBD, vhost et utilisateur AMQP, pool FPM,
-   fichiers de configuration, certificats (révocation si configurée), clés DKIM — dont les tables
-   d'OpenDKIM sont recalculées. Le compte rendu nomme les enregistrements DNS à retirer : ogs ne les a pas
-   publiés (D69).
+1. **Verrou et remparts** (D77). Le verrou global est pris comme pour un apply, puis **tous les refus**
+   sont prononcés, avant la confirmation, en un seul message où chacun porte son remède — le code est
+   celui du premier : ce que rien ne lève (racine dangereuse par sa forme, partagée avec un autre projet
+   ou l'englobant, liée, au mauvais propriétaire ; point de montage sous la racine ou sous les journaux ;
+   fichier qu'ogs n'a pas écrit — sans son en-tête, illisible, ou lien vers un fichier hors du projet — et qu'il laisserait en place), puis ce que lève `--force`
+   (compte sans la marque `ogs=`, bases et comptes SGBD d'un projet adopté, nommés avant la confirmation),
+   puis ce que lève `--no-dump` (base inobservable). Viennent ensuite la confirmation, la taille de
+   l'archive et l'espace disque.
+2. Hook `preDelete`.
+3. Arrêt des services du projet — sa cible systemd ; le cron et le pool restent actifs jusqu'aux étapes 6
+   et 8.
+4. Constitution de l'archive `/var/lib/ogs/archives/shopfr-20260822-1430.tar.zst` contenant : YAML du projet,
+   configurations générées qui vont partir, dumps de bases (`mysqldump` / `pg_dump`), secrets **chiffrés**
+   — fichier d'environnement de D75 compris —, arborescence `/home/shop.fr`, journaux du projet
+   (`<logs.root>/<id>`, D71), et un manifeste JSON décrivant tout ce qui a été supprimé. L'arborescence et
+   les journaux sont parcourus par descripteurs, sans suivre aucun lien (D81). Un dump en échec
+   **abandonne** la suppression : une base ne part jamais sans sa sauvegarde.
+5. **Point de non-retour.** Une interruption reçue jusqu'ici, ou un rempart que l'archive a laissé naître
+   — un partage monté pendant ce temps, une déclaration voisine —, fait retirer l'archive et relancer les
+   services : code 9 ou code du refus, rien n'est retiré. Au-delà, le contexte est détaché : la suppression
+   va à son terme, et une interruption n'est que signalée.
+6. Retrait des fichiers générés dont l'en-tête désigne le projet (`fs.ManagedProject`, D76) : unités, cron,
+   vhosts et leurs liens, pool, sudoers ; les répertoires de surcharge (D63) s'ils sont vides. Un fichier
+   qu'ogs a écrit pour un autre projet reste en place, nommé (code 6) ; celui qu'ogs n'a pas écrit a été
+   refusé à l'étape 1, sauf sous `--keep-data`, où il est lui aussi laissé et nommé. Le fichier
+   d'environnement de D75, lui, ne porte aucun en-tête — ogs n'en écrit jamais le contenu — et part **dans
+   tous les cas**, `--keep-data` et `--purge` compris : il porte des secrets. Sa copie scellée reste dans
+   l'archive ; sous `--purge`, il n'en reste rien. Le compte rendu nomme les enregistrements DKIM à retirer
+   du DNS : ogs ne les a pas publiés (D69).
+7. Suppression des ressources vivantes : bases et utilisateurs SGBD — ceux d'un projet adopté sous
+   `--force` seulement —, vhost et utilisateur AMQP. Le certificat du projet n'est ni retiré, ni révoqué, ni
+   archivé (§20, limites connues).
 8. **Rechargement des serveurs** — PHP-FPM et le moteur web — puis `daemon-reload`. Cette étape précède
    impérativement la suivante : les workers du pool tournent sous l'utilisateur du projet, et `userdel`
    refuse un compte dont un processus vit encore. Un serveur à l'arrêt n'a rien à recharger et ne produit
    donc aucun avertissement. Le rechargement du moteur web revalide la configuration au préalable (§6.5).
 9. Suppression de l'utilisateur système, du groupe — `www-data` en est d'abord retiré (§7.1.6) — et de
-   l'arborescence.
+   l'arborescence, dont les remparts sont éprouvés une dernière fois juste avant l'effacement ; puis des
+   journaux sous `<logs.root>/<id>` (D71), sauf point de montage, et du répertoire d'exécution
+   `/run/ogs/<id>`.
 10. Le projet est marqué `archived` en base ; son YAML est déplacé dans `projects/archived/`.
-11. Hook `postDelete`.
+11. Recalcul des fichiers de parc — prisons fail2ban, rotation, tmpfiles, Telegraf, tables d'OpenDKIM —,
+    puis retrait des clés DKIM du projet, une fois les tables rechargées sans elles.
+12. Hook `postDelete`.
 
-Une étape en échec n'interrompt pas les suivantes : ce qui peut être démonté l'est, et la commande rend le
-**code 6** en énumérant ce qui subsiste. Une suppression annoncée comme un succès alors qu'elle laisse un
-compte et un home derrière elle est le pire des états possibles.
+Avant le point de non-retour, tout refus, tout dump en échec et toute interruption arrêtent le geste et
+relancent ce qui a été arrêté (D77). Après lui, une étape en échec n'interrompt pas les suivantes : ce qui
+peut être démonté l'est, et la commande rend le **code 6** en énumérant ce qui subsiste. Une suppression
+annoncée comme un succès alors qu'elle laisse un compte et un home derrière elle est le pire des états
+possibles.
 
-Options : `--purge` supprime sans archiver (double confirmation, saisie de l'identifiant exigée) ; `--keep-data`
-conserve bases et fichiers en ne désactivant que le service ; `--no-dump` saute l'étape 5.
+Options : `--purge` supprime sans archiver ; sa confirmation exige la saisie de l'identifiant, et ni
+`--yes` ni le mode non interactif ne la remplacent (code 9). `--keep-data` retire la configuration — vhost,
+pool, cron, sudoers, unités, fichier d'environnement, clés DKIM — et sort le projet de l'inventaire, mais
+garde le compte, les bases, le vhost AMQP, le home et les journaux. Aucun rempart ne la refuse : un fichier
+qu'ogs n'a pas écrit pour ce projet est seulement laissé et nommé (code 6), l'archive ne recopie pas une
+arborescence ni des journaux que la suppression n'aurait pas pu effacer, et un dump en échec n'y coûte
+qu'un avertissement. `--no-dump` archive sans les bases. `--dry-run` est refusé (code 2, D88) : une
+simulation fidèle rejouerait tous les remparts.
 
-`ogs project restore <archive>` recrée le projet depuis une archive : YAML rejoué, dumps restaurés, secrets
-déchiffrés et réinjectés. Nécessite la même clé maître.
+`ogs project restore <archive>` recrée le projet depuis une archive, dans cet ordre : déclaration rejouée
+— refusée si le projet existe déjà (code 4) —, secrets réinjectés scellés, fichier d'environnement
+réécrit, apply du projet, puis l'arborescence remise dans le home **après** l'apply, et enfin, sauf
+`--with-data=false`, les dumps rechargés. Nécessite la même clé maître. L'extraction ne suit aucun lien et
+rend chaque entrée à qui la possédait (D81) : ce que l'apply avait posé et que l'utilisateur avait remplacé
+revient tel qu'il l'avait laissé — un `authorized_keys` régulier, un script à la place du lien `php`, un
+répertoire à la place de `~/logs` —, et l'apply suivant le traite selon ses règles (D61, D70, D71), avec le
+code 6 tant que ces fichiers restent en place. L'ancien `~/logs` d'une archive antérieure à D71 revient à
+root, et c'est l'apply suivant qui le migre, ce que la restauration annonce. Une arborescence restaurée en
+partie rend le code 6 ; `--dry-run` est refusé (code 2).
 
 Garde-fous : si la taille cumulée à archiver dépasse un seuil configurable (défaut 5 Gio), confirmation
-explicite avec l'estimation affichée ; vérification de l'espace disque disponible avant de commencer.
+explicite avec l'estimation affichée ; vérification de l'espace disque disponible, avant que rien ne soit
+arrêté — une arborescence que l'archive ne recopie pas n'y compte pas.
 
 ---
 
@@ -2842,15 +3136,16 @@ indications de traçabilité, sans valeur de preuve puisque falsifiables par qui
 
 ### 14.4 `ogs status` et `ogs doctor`
 
-- `status` : vue consolidée par projet — services (actifs/attendus), expiration des certificats,
-  profondeur des queues, pools FPM (processus actifs/max), dérive de configuration, dernière exécution des
-  crons. Code de retour non nul si un problème est détecté, ce qui le rend utilisable en supervision.
+- `status` : vue consolidée par projet — services (actifs/attendus), expiration des certificats — un
+  certificat expiré est dit « expiré », et n'est plus présenté (D79) —, profondeur des queues, pools FPM
+  (processus actifs/max), dérive de configuration, dernière exécution des crons. Code de retour non nul si un problème est détecté, ce qui le rend utilisable en supervision.
 - `doctor` : vérifie paquets et binaires attendus, modules Apache/Nginx, plugin RabbitMQ management,
   accessibilité des sockets SGBD, permissions de `/etc/ogs` et de la clé maître, cohérence entre la base
   d'état et le système, présence des unités `ogs-renew`, versions PHP utilisables, clés DKIM et
   enregistrements publiés (§7.13), chaîne de propriété et espace libre du répertoire des journaux (D71),
-  ports écoutés des profils du pare-feu et Docker en amont d'ufw (§7.14). Chaque anomalie est
-  accompagnée de la commande de correction.
+  ports écoutés des profils du pare-feu, Docker en amont d'ufw et activation jamais confirmée, que le
+  témoin révèle après un redémarrage (§7.14, D86). Chaque anomalie est accompagnée de la commande de
+  correction.
 
 ---
 
@@ -2963,12 +3258,15 @@ Points de conception :
 | Injection shell | Aucun `sh -c` : `exec.CommandContext` avec arguments séparés. Les rares cas nécessitant un shell (lignes de cron) passent par une génération contrôlée et un échappement explicite. |
 | Traversée de chemin | Tout chemin issu de la spécification est nettoyé et vérifié comme appartenant à une racine autorisée (`/home`, `/etc/ogs`, `/var/lib/ogs`, `/var/log/ogs`). |
 | Écrasement de configuration non gérée | En-tête et empreinte obligatoires ; refus d'écrire sur un fichier sans en-tête `ogs` sans `--force`, avec sauvegarde préalable. |
+| Retrait du fichier d'un autre | Un fichier n'est à un projet que par son en-tête, jamais par son nom ni par un préfixe (D76) ; tout retrait passe par les cinq états — un fichier sans la marque ou marqué pour un autre projet ne part jamais, `--force` compris —, et un projet n'écrit jamais le fichier d'un autre. Une sauvegarde ne réutilise jamais un nom (`O_EXCL`). |
 | Fuite de secrets | Masquage systématique dans les logs, l'audit et les messages d'erreur (filtre appliqué à la sortie, pas seulement au site d'appel) ; `secrets show` seul chemin de divulgation, audité. |
 | Permissions trop larges | Modes explicites à chaque écriture (jamais dépendants du umask) ; `doctor` vérifie et propose la correction. |
-| Escalade via hooks | Hooks refusés s'ils ne sont pas possédés par root et non inscriptibles par autrui ; chemin obligatoirement sous `/etc/ogs/hooks/`. |
+| Escalade via hooks | Hooks refusés s'ils ne sont pas possédés par root et non inscriptibles par autrui ; chemin obligatoirement sous `/etc/ogs/hooks/`. Aucun hook sous `--dry-run`, le `hook.Runner` lui-même s'y refusant (D88). |
+| Option ignorée | `--dry-run`, option globale, est simulé ou refusé (code 2) par chaque commande, jamais ignoré ; la conduite de chacune est inscrite dans une table unique, et une commande nouvelle refuse l'option par défaut (D88). |
 | Abus de quota ACME | Compteur d'échecs par domaine, pause automatique, mode staging pour les tests. |
 | Déni de service par erreur | Validation de configuration avant tout reload ; restauration automatique du fichier précédent en cas d'échec de validation. |
-| Suppression accidentelle | Archivage par défaut, double confirmation et saisie de l'identifiant pour `--purge`, refus sur ressources non gérées. |
+| Suppression accidentelle | Archivage par défaut, saisie de l'identifiant pour `--purge`, que `--yes` ne remplace pas, refus sur ressources non gérées. Tous les refus avant la confirmation, éprouvés de nouveau au point de non-retour : racine partagée ou englobante, point de montage, fichier laissé en place qu'ogs n'a pas écrit, base sans sauvegarde possible ; une interruption avant ce point est un abandon qui relance les services (D77). |
+| Rattachement deviné à l'import | Une base n'est rattachée qu'au seul candidat que son nom désigne, aux séparateurs près, et déclarée qu'avec le seul compte de son nom, sous son hôte réel ; sinon elle reste non gérée. Aucun compte SGBD n'est créé à côté d'un homonyme sous un autre hôte (D78). |
 | Fuite entre sites | Groupe privé par projet, jamais de groupe partagé entre utilisateurs de sites ; `.env` en 0600, `var/` en 0700 ; `open_basedir` limité au home ; le pool FPM tourne sous l'utilisateur du projet, `www-data` n'exécute aucun code applicatif. |
 | Application exposée hors du proxy | Écoute imposée sur socket Unix `0770 <id>:<id>` ou sur `127.0.0.1` exclusivement ; `doctor` signale tout port applicatif en écoute sur `0.0.0.0` (§7.11.3). |
 | Fuite de la clé de déploiement | Clé privée en 0600, propriété de l'utilisateur, jamais restituée par une commande ni écrite dans un log ; déploiement en tirage, donc aucune clé à confier à un tiers. |
@@ -2978,7 +3276,17 @@ Points de conception :
 | Escalade root par lien symbolique de log | Les journaux vivent hors du home, dans une chaîne de répertoires entièrement root, et sont pré-créés (D71) : l'utilisateur ne peut ni substituer un fichier, ni substituer le répertoire. Le lien `~/logs` n'est emprunté par aucun processus root. Aucun processus root n'ouvre en écriture un chemin dont un non-root contrôle un composant (§7.1.2). |
 | Élargissement de la délégation sudo | Commandes énumérées sans métacaractère, jamais de `systemctl` nu ; `ogs my` ne prend aucun argument et déduit le projet de `SUDO_UID`, que sudo positionne sous `env_reset` ; validation `visudo -cf` avant activation, revalidation par `doctor` (§7.9.1). |
 | Exécution croisée via un pool FPM | Socket Unix `0660 www-data:<id>` par défaut : seuls le serveur web et l'utilisateur du projet peuvent s'y connecter. Le mode TCP, dépourvu d'authentification, exige `--allow-tcp` et un avertissement explicite (§7.5). |
-| Détournement de l'interpréteur | Le lien `php` vit dans `~/.local/bin`, au compte de l'utilisateur (D70) : il peut le changer, sans autre effet qu'une exécution sous sa propre identité, et l'apply suivant le rétablit. Root l'écrit sans jamais suivre de lien : un répertoire substitué fait refuser l'étape au lieu de faire écrire root ailleurs. |
+| Détournement de l'interpréteur | Le lien `php` vit dans `~/.local/bin`, au compte de l'utilisateur (D70) : il peut le changer, sans autre effet qu'une exécution sous sa propre identité, et l'apply suivant le rétablit. Root l'écrit sans jamais suivre de lien : un répertoire substitué fait refuser l'étape au lieu de faire écrire root ailleurs. La version d'un runtime se lit en lançant son lien sous l'identité du projet, jamais en root (D82). |
+| Parent substitué dans le home | `O_NOFOLLOW` ne protège que la feuille : chaque répertoire du projet est atteint depuis sa racine par descripteurs, composant par composant, à l'observation comme à l'écriture et à la compensation ; un parent lié fait échouer l'étape en le nommant (D83). |
+| Lecture ou copie root dans le home hors apply | `user key`, `site clone` et `php switch` n'y passent que par des descripteurs ouverts sans suivre de lien ; ils contrôlent le propriétaire sur le descripteur — un lien physique ne se voit pas comme un lien —, bornent taille, profondeur, données écrites et entrées nommées, citent les noms, et suivent l'annulation. Root ne recopie ni n'affiche pour autrui ce que le compte source ne possède pas (D82). |
+| Archive et restauration par le nom | L'archivage et l'extraction parcourent le home par descripteurs, sans jamais traverser un lien ; chaque entrée restaurée reçoit son propriétaire sur son descripteur, et tout ce qui n'était pas à l'utilisateur revient à root (D81). |
+| Chemin désigné en ligne de commande | `db dump -O` et `db restore -i` ne suivent un lien que si seul root a pu le poser, et n'admettent qu'un fichier ordinaire ; une sauvegarde est recréée en `O_EXCL`, en 0600 (D83). |
+| Lien du docroot servi par `www-data` | Membre de tous les groupes (D25), le serveur web ne suit un lien que vers ce qui appartient à son auteur, contrôle posé dès la racine du projet (D87). Sous Apache, le contrôle précède l'ouverture : course résiduelle pour un compte doté d'un shell (§20). |
+| Dépôt exposé par le docroot | Fichiers et répertoires cachés, `composer.json` et `composer.lock` jamais servis, `/.well-known/` excepté ; le refus d'Apache tient sous les surcharges D63 et sous MultiViews (D87). |
+| Secrets de la production en préproduction | `site clone` ne recopie pas la configuration connue du type, masque les secrets qu'ogs connaît, dans la copie comme dans la déclaration, et nomme ce qu'il n'a pas pu neutraliser, code 6 (D84). |
+| Démon coupé de sa configuration | `ogs harden` ne ferme rien sans le groupe du service qui lit, refuse une cible dont le groupe est introuvable, ne desserre jamais et écrit par descripteur (D85). |
+| Coupure de l'accès d'administration | Les gardes du pare-feu jugent ce qui restera ouvert, ports où sshd écoute réellement compris, et ne se lèvent que par `--allow-lockout`, jamais par le `--force` des fichiers ; une première activation laisse un témoin qui survit au redémarrage (D86). |
+| Migration entre machines | `docs/migrer.sh` n'écrit jamais en root par un chemin que fournit la source ou le compte du projet ; socket de contrôle ssh dans un répertoire privé de l'exécution ; secrets passés par l'environnement du seul processus, jamais en argument (D90). |
 
 ---
 
@@ -3012,7 +3320,8 @@ Scénarios exigés :
    après correction.
 6. Échec critique injecté au milieu d'un `apply` → rollback vérifié ressource par ressource, système
    identique à l'état initial.
-7. Cycle complet suppression avec archivage puis `project restore` → projet fonctionnel à l'identique.
+7. Cycle complet suppression avec archivage puis `project restore` → projet fonctionnel à l'identique
+   (scénario `restauration`, détaillé en 37).
 8. `import scan` sur un conteneur préconfiguré « à la main » → adoption correcte, ressources non gérées
    laissées intactes, premier `diff` cohérent.
 9. Deux `apply` simultanés → le second échoue en code 7 sans effet de bord.
@@ -3071,7 +3380,9 @@ Scénarios exigés :
 29. **Échec d'installation de runtime** (réseau coupé) : le site est créé, le service reste à l'arrêt, code
     de retour 6, et la reprise après rétablissement du réseau aboutit.
 30. **Clé de déploiement** : générée sans passphrase, permissions correctes, `user key show` n'expose que la
-    partie publique, `rotate` remplace la paire, et la clé survit à un cycle archivage/restauration.
+    partie publique, `rotate` remplace la paire au compte du projet et refuse un `.ssh` lié ; une clé liée
+    physiquement à un fichier de root, creuse de 1 Gio ou non imprimable n'est ni affichée ni sauvegardée
+    (D82) ; et la clé survit à un cycle archivage/restauration.
 31. **Supervision** : le vhost d'état répond sur la boucle locale pour les **deux moteurs** — `stub_status`
     et `server-status` ne s'exposent pas de la même façon, et `SCRIPT_NAME` ne parvient pas à FPM par le
     même chemin —, le statut d'un pool traverse le serveur web jusqu'à FPM, et le vhost refuse tout le
@@ -3114,9 +3425,91 @@ Scénarios exigés :
     Un bannissement placé en tête bloque une adresse que le web ouvre à tous ; relu après une
     autorisation, il est inopérant, et le plan le replace en tête. Une règle de l'administrateur survit,
     une règle d'ogs orpheline part ; `doctor` signale un service qui n'écoute que la boucle locale ;
-    `active: false` désactive ufw.
+    `active: false` désactive ufw. Les gardes de D86 : `confirm` après le retour automatique dit ufw
+    inactif et rend 6 ; un retour perdu — son unité arrêtée comme un redémarrage l'efface — laisse le
+    témoin, que `status`, `doctor` et `confirm` lisent ; un `Port` annoté garde son port ; des ports ssh qui
+    fermeraient celui où sshd écoute sont refusés, `ogs apply --force` compris, de même qu'un profil ssh
+    écarté, sauf si l'administrateur ouvre ssh lui-même, fût-ce par une seule interface — ce qui, pour une
+    session, ne suffit pas, et le refus le dit ; sshd déplacé, le plan qui suit son nouveau port passe ;
+    deux moteurs sans `web.engine`, bannir ne retire aucun accès au web.
+35. **Appartenance par l'en-tête** (D76, scénario `nginx`) : un vhost posé à la main selon la convention de
+    nommage du projet — `statictest_maintenance` — et son lien restent en place après un apply du projet
+    qui aboutit.
+36. **Remparts de la suppression** (D77, scénario `suppression`) : un partage monté sous le home et un
+    fichier cron écrit à la main au nom du projet sont nommés ensemble dans un seul refus, sous `--force`,
+    avant tout retrait ; le contenu du partage reste intact et le pool tourne toujours.
+37. **Restauration** (D81, scénario `restauration`, sous systemd) : un home que l'utilisateur a modifié —
+    `authorized_keys` régulier, script à la place du lien `php`, répertoire à la place de `~/logs`, lien dur
+    vers un fichier du système — est restauré sans qu'aucun lien posé par l'apply de la restauration ne
+    soit traversé : trousseau commun, interpréteur, fichier système et répertoire des journaux intacts,
+    home rendu à l'utilisateur, lien dur à root, apply suivant en code 6. L'aller-retour ordinaire rétablit
+    les liens gérés, le site est servi, apply et diff sont vides. L'ancien `~/logs` d'un projet antérieur à
+    D71 revient à root, puis l'apply suivant le migre. `project restore --dry-run` rend 2 sans rien créer.
+38. **Émission et repli** (D79, D80, scénario `pebble`) : un alias dont l'émission échoue ne retire pas le
+    HTTPS du site ; un alias qui résout, à côté d'une redirection refusée, est couvert sans attendre et
+    présenté sans rechargement manuel ; une redirection refusée ne coûte pas le renouvellement du site ;
+    une redirection depuis une adresse IP ne bloque ni l'apply ni le renouvellement, son vhost restant en
+    HTTP ; un renouvellement partiel recharge quand même le serveur, qui présente le nouveau numéro de
+    série.
+39. **Root dans le home hors apply** (D82, scénario `site-complet`) : la rotation de la clé pose la paire
+    au compte du projet et refuse un `.ssh` lié ; `site clone` écarte et nomme un lien physique vers un
+    fichier de root, repose les liens physiques internes, garde creux un fichier creux, borne la profondeur
+    à 1024 niveaux en citant un nom forgé ; un SIGTERM pendant la copie rend 9 aussitôt, sans répertoire
+    laissé à root.
+40. **Clone sous garde** (D84, scénario `mysql`) : le mot de passe de la production, écrit dans la
+    configuration comme le guide l'indique, est masqué dans la copie, ce qui reste ne s'authentifie plus, et
+    la préproduction travaille sur sa propre base ; la sortie nomme le reste de `www/` et la base copiée.
+41. **Hôte réel d'un compte adopté** (D78, scénario `mysql`) : à côté d'un `'vitrinefr'@'%'` créé à la
+    main, aucun `'vitrinefr'@'localhost'` n'est créé et le refus est annoncé ; déclaré `host: '%'`, le compte
+    est reconnu, son mot de passe fonctionne toujours et le diff suivant est vide.
+42. **Durcissement** (D85, scénario `harden`) : après `harden --apply`, MariaDB lit toujours son
+    `bind-address` sous l'identité `mysql`, `www-data` lit un fichier d'authentification rangé sous
+    `/etc/nginx`, `/etc/postgresql` reste à postgres et le cluster redémarre.
+43. **Docroots** (D87, scénarios `nginx` et `site-complet`) : `.git`, `.env` et `composer.json` répondent
+    403, `/.well-known/` reste servi ; un lien vers le fichier d'un autre projet n'est pas suivi — le témoin
+    établit que `www-data` le lit par son groupe —, un lien vers ses propres fichiers l'est, un docroot
+    remplacé par un lien ne sert rien. Sous nginx, l'accueil reste servi sous `disable_symlinks` pour toute
+    méthode, un répertoire sans barre finale est redirigé, et les surcharges du docroot valent pour « / » ;
+    sous Apache, le refus tient sous le `<Location />` d'une surcharge et sous MultiViews, éprouvé dans un
+    sous-répertoire que `www-data` peut lister.
+44. **Répertoires et chemins désignés** (D83, scénarios `systemd` et `postgres`) : un `~/.local` remplacé
+    par un lien vers `/usr/local` entre le plan et son exécution — par un hook `preApply` — fait échouer
+    l'apply, `/usr/local/bin` intact ; `db dump -O` et `db restore -i` à travers un lien posé par le projet
+    sont refusés, la cible du lien intacte, alors qu'un lien que seul root a pu poser (`/var/run`) reste
+    suivi.
+45. **`--dry-run` refusé** (D88, scénarios `hooks` et `restauration`) : `project delete --dry-run` rend 2,
+    le site reste servi et aucun hook n'est lancé ; `project restore --dry-run` rend 2, sans déclaration,
+    compte ni home.
+46. **Paquet** (D89, scénario `paquet`) : le paquet construit est réétiqueté trois fois, dont une « 0.0.3 »
+    qui porte le prerm d'origine et pas de postrm. Installation de 0.0.3, mise à jour depuis elle, puis entre
+    deux versions corrigées : le timer reste actif, et aucun script ne signale quoi que ce soit (`ogs : …`)
+    ni ne laisse de requête au terminal. Le retrait arrête le timer et garde le paquet en « rc », la
+    réinstallation le rend actif, la purge retire les unités et dit ce qu'elle garde. Les scripts sont
+    lancés par `apt-get -o DPkg::Path="$PATH"` : apt 3 fixe leur `PATH` sans `/usr/local`, où vivent la
+    trace et le substitut de `systemctl`.
 
-### 16.3 Intégration continue
+### 16.3 Bancs hors conteneur
+
+Deux bancs éprouvent, dans `make test`, ce qui n'est pas du Go d'ogs :
+
+- **`test/migration`** rejoue `docs/migrer.sh` (D90) contre un ancien serveur simulé : un répertoire local
+  joint par un faux ssh qui lit l'entrée standard comme le vrai, des moteurs de base, une crontab,
+  `supervisorctl`, `dig`, `curl` et `runuser` simulés ; `rsync`, `install`, `python3` et ogs — construit
+  depuis le dépôt, en mode préfixé — sont les vrais, derrière des enveloppes qui notent chaque appel. Le
+  banc ne tourne pas en root : ce qu'il vérifie, c'est l'identité que le script demande pour chaque
+  écriture. Il saute ses tests si un outil manque (`python3-yaml`, `rsync`, `flock`…).
+- **`packaging/scripts_test.go`** exécute les scripts de maintenance tels que dpkg les enchaîne — retrait,
+  mise à jour depuis le prerm des versions jusqu'à 0.0.3, réinstallation, purge — dans un bac à sable où
+  `systemctl` et `ogs` sont des doublures qui notent leurs appels et tiennent l'état d'activation des
+  unités ; le vrai `dpkg` sert aux comparaisons de versions, et son absence fait sauter le banc. Il vérifie
+  aussi que les dérogations lintian suivent les numéros de ligne des scripts.
+
+Un test parcourt aussi l'arbre des commandes : `TestDryRunChaqueCommandeSimuleOuRefuse` relève le préfixe
+et les tables de la base d'état avant et après chaque commande sous `--dry-run` (D88), l'aide et la
+complétion que cobra ajoute à l'exécution comprises : une commande inscrite comme simulation ou
+consultation doit avoir un cas qui l'éprouve, toute autre doit refuser l'option sans rien toucher.
+
+### 16.4 Intégration continue
 
 GitHub Actions : `go vet`, `staticcheck`, `golangci-lint`, `gofumpt` en vérification, tests unitaires avec
 détecteur de concurrence, tests d'intégration par matrice (2 distributions × 2 serveurs web), `govulncheck`,
@@ -3130,9 +3523,32 @@ build multi-architecture. Les tests d'intégration sont obligatoires avant fusio
   `linux/amd64` et `linux/arm64`.
 - GoReleaser : archives `.tar.gz`, paquet `.deb` (nfpm) et `.rpm` (préparé, non testé en v1), sommes de
   contrôle signées.
-- Contenu du `.deb` : `/usr/bin/ogs`, unités `ogs-renew.service` et `ogs-renew.timer`, `tmpfiles.d/ogs.conf`,
-  `logrotate.d/ogs`, complétions bash/zsh/fish, pages de manuel générées par Cobra, `postinst` exécutant
-  `ogs init --quiet` de façon idempotente.
+- Contenu du `.deb` : `/usr/bin/ogs`, complétions bash/zsh/fish, pages de manuel générées par Cobra,
+  `changelog.gz`, `README`, le cahier des charges et les dérogations lintian ; les répertoires `/etc/ogs`
+  (0700), `/etc/ogs/hooks` (0700), `/var/lib/ogs` (0751) et `/var/log/ogs` (0700). Il ne livre **ni** les
+  unités `ogs-renew`, **ni** `tmpfiles.d/ogs.conf`, **ni** `logrotate.d/ogs` : c'est le plan global
+  d'`ogs apply` qui les écrit sur la machine administrée, d'après son parc.
+- Scripts de maintenance (D89) :
+  - **postinst** : sans configuration, il annonce `ogs init` et n'engendre jamais la clé maître à l'insu de
+    l'administrateur. À une mise à jour ou une réinstallation, il lance `ogs init --quiet >/dev/null`,
+    idempotent, qui crée les répertoires nouveaux et migre la base d'état — un échec est affiché, jamais
+    fatal —, sauf si la clé maître a disparu : il le dit alors, avec les deux remèdes, au lieu d'en laisser
+    engendrer une neuve. Enfin il rend au timer de renouvellement l'état que le paquet lui a pris, et
+    signale sur stderr un timer d'ogs laissé désactivé ;
+  - **prerm** : au seul `remove`, il note l'état du timer puis l'arrête et le désactive ; `upgrade`,
+    `failed-upgrade` et `deconfigure` n'y touchent pas ;
+  - **postrm** : il n'agit qu'à la purge — retire les deux unités d'ogs, reconnues à leur en-tête, et le
+    témoin du prerm ; garde `/etc/ogs`, `/var/lib/ogs` (état, comptes ACME, certificats que les vhosts
+    servent encore, archives, dumps, sauvegardes de `--force`) et `/var/log/ogs`, et le dit ; énumère les
+    archives, que plus rien ne purge. Sa seule présence compte : sans postrm ni fichier de configuration,
+    dpkg oubliait le paquet dès le retrait, et `apt purge` n'avait plus rien à faire.
+- Un problème que signale un script — migration en échec, clé maître absente, timer non activé ou dont
+  l'état n'a pas pu être noté — l'est sur stderr, préfixé « `ogs : ` » : c'est ce que le scénario `paquet`
+  surveille à l'installation, à la mise à jour et au retrait (§16.2, 46).
+- Diffusion : poser une étiquette au-delà de 0.0.3 avant toute diffusion des scripts de D89. `make package`
+  numérote d'après la dernière étiquette, et une construction corrigée encore numérotée 0.0.3 ferait
+  réactiver, à la mise à jour suivante, un timer que l'administrateur avait désactivé — apt tiendrait
+  d'ailleurs pour déjà installé un paquet de même numéro.
 - Documentation : `README` (installation, prise en main), `docs/` (référence des commandes générée depuis
   Cobra, référence du format YAML, guide des templates et hooks, guide de migration/import).
 - Licence : **WTFPL** (fichier `LICENSE`). La WTFPL ne comportant **aucune clause d'exclusion de
@@ -3159,7 +3575,7 @@ build multi-architecture. Les tests d'intégration sont obligatoires avant fusio
 | **L7 — TUI** | inspecteur, panneau de détail, actions contextuelles, suivi de logs, wizard de création | Création complète d'un projet depuis la TUI, parité avec la CLI |
 | **L8 — Import** | scan multi-sources, corrélation, adoption interactive, ressources non gérées | Adoption d'un serveur préconfiguré sans régression |
 | **L9 — Applications non-PHP** | types d'application, providers `runtime` (nvm, rbenv, pyenv, venv), templates de service Go/Node/Python/Ruby, vhosts de proxy, attente de disponibilité | Scénarios d'intégration 22 à 25 validés |
-| **L10 — Industrialisation** | hooks de parc et de projet, complétions dynamiques bash/zsh/fish, 96 pages de manuel engendrées, paquet `.deb` (nfpm), CI GitHub Actions, dix-neuf scénarios d'intégration conteneurisés (Apache, PHP, nginx, hooks, MariaDB, PostgreSQL, RabbitMQ, ACME, systemd et cron, runtimes, durcissement, paquet, suppression, moteur web durci, supervision, signature DKIM, journaux, pare-feu, FPM sans pool), plus un scénario optionnel pour les runtimes qui compilent, documentation d'exploitation | Paquet installable, documentation publiée |
+| **L10 — Industrialisation** | hooks de parc et de projet, complétions dynamiques bash/zsh/fish, 96 pages de manuel engendrées, paquet `.deb` (nfpm), CI GitHub Actions, vingt scénarios d'intégration conteneurisés (Apache, PHP, nginx, hooks, MariaDB, PostgreSQL, RabbitMQ, ACME, systemd et cron, runtimes, durcissement, paquet, suppression, moteur web durci, supervision, signature DKIM, journaux, pare-feu, FPM sans pool, restauration), plus un scénario optionnel pour les runtimes qui compilent, documentation d'exploitation | Paquet installable, documentation publiée |
 
 ### Ce que les essais sur système réel ont corrigé
 
@@ -3208,6 +3624,36 @@ Les lots L0 à L2 constituent le socle minimal utilisable ; L3 à L6 apportent l
 finalisent le produit. L9 (applications non-PHP) est le seul lot réellement détachable : le produit est
 complet sans lui pour un parc exclusivement PHP.
 
+### Ce que la revue de code du 25/09/2026 a corrigé
+
+Une revue fonctionnelle puis de sécurité, chaque constat soumis à une réfutation et à une reproduction
+avant d'être retenu, a donné lieu à quinze lots de correction, chacun relu par un vérificateur
+indépendant avant d'être intégré, l'ensemble éprouvé par les vingt scénarios. La plupart des constats critiques
+avaient un point commun : **un nom, un préfixe ou un chemin pris pour une preuve** — d'appartenance, de
+propriété, de ce qu'un lien désigne.
+
+| Lot | Défaut principal | Conséquence en exploitation | Décision |
+|---|---|---|---|
+| A | fichiers obsolètes attribués par le préfixe `<id>_` ; retraits hors des cinq états | `apply shop` retirait le pool et le vhost de `shop_api`, en code 0 et sans copie | D76 |
+| B | refus de la suppression prononcés après le point de non-retour, un à la fois ; `os.RemoveAll` à travers les montages | home d'un voisin effacé, partage NFS vidé, `DROP DATABASE` sans sauvegarde, services laissés arrêtés | D77 |
+| C | bases et comptes rattachés par préfixe à l'import ; hôte du compte perdu | la base de `shopping.fr` accordée puis supprimée avec `shop.fr` ; mot de passe de l'application refusé | D78 |
+| D | vhost rendu d'après la demande de certificat ; redirections hors du certificat | un alias ajouté faisait perdre le HTTPS du site ; domaine redirigé servi avec un certificat qui ne le couvre pas | D79, D80 |
+| E | archive et restauration par le nom | trousseau commun et binaire PHP réécrits en root, `master.key` archivable par l'utilisateur | D81 |
+| F | clé de déploiement, clone et `php switch` en root par le nom, hors de tout plan | paires créées dans `/etc/apt/apt.conf.d`, `www` lié recopié et donné à la préproduction | D82 |
+| G | `harden` fermait des répertoires sans le groupe de leur lecteur | MariaDB repartait sur ses défauts, à l'écoute de toutes les interfaces ; sites protégés en 500 | D85 |
+| H | port de sshd fermé sans garde ; `--force` des fichiers levant les gardes du pare-feu | une commande sans rapport coupait l'accès d'administration | D86 |
+| I, I2 | boucles, rejeux, gardes d'appartenance, socket et secrets de `docs/migrer.sh` | seul le premier projet migré ; base de production supprimée par une resynchronisation | D90 |
+| J | prerm désactivant le timer à chaque mise à jour du paquet | plus aucun certificat renouvelé après la première mise à jour, sans un mot | D89 |
+| K | `--dry-run` ignoré par les commandes qui ne le lisaient pas | `project delete --dry-run` supprimait le projet, hooks compris, en code 0 | D88 |
+| L | liens du docroot suivis sous `www-data` ; fichiers cachés servis | un projet servait les fichiers d'un voisin ; `.git` et `.env` publics | D87 |
+| M | parents des répertoires du projet résolus par leur nom ; chemins de `db dump -O` / `restore -i` | `/usr/local/bin` donné au projet ; écriture root à travers un lien d'un home | D83 |
+| N | `site clone` recopiait la configuration et les secrets de la production | la préproduction écrivait dans la base et la file de la production | D84 |
+
+Les lots ont porté sur les constats critiques et sur les majeurs de même cause : la plupart des constats
+majeurs et mineurs relevés par la revue restent à traiter, et le rapport de revue en tient la liste. Le §20
+ne porte que les points que les correctifs ont laissés ouverts en connaissance de cause, et les majeurs de
+sécurité non traités.
+
 ---
 
 ## 19. Exigences non fonctionnelles
@@ -3233,7 +3679,8 @@ complet sans lui pour un parc exclusivement PHP.
 1. Les sauvegardes sont hors périmètre, mais l'archivage à la suppression réalise malgré tout un dump SQL
    ponctuel (via `mysqldump`/`pg_dump`) : sans lui, une archive serait inexploitable. Aucune planification
    ni rétention n'est fournie pour autant. Si tu préfères une archive strictement limitée aux fichiers de
-   configuration, l'étape 5 du §13 disparaît et `--no-dump` devient le comportement par défaut.
+   configuration, les dumps de l'étape 4 du §13 disparaissent et `--no-dump` devient le comportement
+   par défaut.
 2. Un seul moteur web est piloté par serveur ; les deux peuvent être installés, mais la topologie
    Nginx-frontal-vers-Apache-backend n'est pas gérée en v1.
 3. Les paquets (Apache, Nginx, PHP, SGBD, RabbitMQ) sont installés et maintenus hors `ogs` ; `doctor`
@@ -3303,3 +3750,120 @@ complet sans lui pour un parc exclusivement PHP.
 - **`ogs db restore` sur une base non vide** : la sauvegarde étant un script SQL, la restauration échoue
   sur le premier objet existant. Faut-il une option `--clean` — donc destructive — ou l'exigence d'une
   base vide reste-t-elle la règle ?
+
+**Points ouverts après la revue du 25/09/2026** — à arbitrer :
+
+- **Course de `SymLinksIfOwnerMatch` sous Apache** (D87, rattachée à D25). Apache contrôle le nom du lien
+  avant d'ouvrir la cible : un lien permuté en boucle par un compte doté d'un shell (D62) a passé 126 fois
+  sur 27 364 requêtes en dix secondes. nginx, qui compare sur le descripteur ouvert, n'y est pas sujet. La
+  fermer demande de servir chaque projet sous une autre identité que `www-data` — une identité de service
+  par projet, qui révise D25.
+- **Un redémarrage avant confirmation d'ufw vaut-il retour ?** (D86, constat R2-13 traité en partie). Le
+  témoin `/var/lib/ogs/ufw-unconfirmed` rend l'état visible, mais ne défait rien : l'unité transitoire du
+  retour vit sous `/run`, et ufw repart actif sans filet. Piste : un complément d'unité
+  `/etc/systemd/system/ufw.service.d/ogs-rollback.conf`
+  (`ExecStartPre=-/bin/sed -i s/^ENABLED=.*/ENABLED=no/ /etc/ufw/ufw.conf`), posé avec le témoin et retiré
+  avec lui, à éprouver par un redémarrage dans le délai. Écartés : `ENABLED=no` aussitôt — `ufw status`
+  dirait inactif, et le plan réactiverait — et `systemctl disable ufw` — un `ufw enable` manuel laisserait
+  ensuite le pare-feu éteint à chaque démarrage.
+- **`CONNECT` révoqué à `PUBLIC` sur une base PostgreSQL adoptée** (D45, D78, §7.3). Quand le rôle déclaré
+  ne possède pas la base, l'apply révoque `CONNECT` et les droits du schéma `public` à `PUBLIC` et donne le
+  schéma au rôle : c'est la normalisation du §9, montrée au premier `diff`, mais elle coupe tout autre rôle
+  qui s'y connectait. La garder, la réserver aux bases créées par ogs, ou l'exiger explicitement ?
+- **Numéros attribués par le calcul du plan** (D88). `plan`, `diff`, `status`, l'aperçu de la TUI et
+  `apply --dry-run` inscrivent dans la base d'état le numéro de pool ou le port applicatif d'un projet jamais
+  appliqué — celui que l'apply lui donnera. Corriger demande de lire sans inscrire au calcul, d'inscrire
+  dans l'étape sous le verrou, et de tenir en mémoire les réservations d'une exécution.
+- **Transition entre deux certificats** (D79). Une préproduction servie par le wildcard qui reçoit un alias
+  hors du wildcard bascule sur son propre certificat, et son vhost passe en HTTP seul le temps de
+  l'émission. La corriger demande de distinguer la référence présentée de la référence demandée, ce qui
+  touche la protection de `cert delete` pour le certificat partagé.
+- **Points d'entrée PHP de Prestashop sous nginx** (D87). `rewrite ^/api/` envoie l'API webservice vers
+  `/webservice/dispatcher.php`, que `location ~ \.php$ { return 404; }` refuse : `GET /api/…` rend 404, comme
+  tout point d'entrée autre que `index.php`. Antérieur à la revue ; choix assumé ou défaut ?
+- **Une commande qui rende un projet normalisé sans le déposer** (D90). `docs/migrer.sh` réplique en
+  Python `naming.EffectiveHost`, fidèlement aujourd'hui, mais cette copie ne suivra pas une évolution du
+  nommage ; un `ogs project export -f <fichier>` la supprimerait.
+- **Plan global exécuté sans être affiché** (constat R2-12). `ogs apply`, `site create`, `site clone` et
+  `project delete` exécutent le plan global sans le montrer ni le confirmer — activation d'ufw, retraits
+  d'accès, purge des archives (D52) —, et `apply --dry-run` l'omet de l'affichage, sans l'exécuter.
+
+Limites connues, laissées en l'état :
+
+- **Suppression** (D77) : passé le point de non-retour, seul SIGKILL arrête le processus ; une
+  interruption pendant l'archivage d'une arborescence attend la fin de celle-ci, `archive.AddTree` ne
+  consultant pas le contexte ; sous `--keep-data`, un partage monté sous le home écarte de l'archive toute
+  l'arborescence, et non le seul sous-arbre monté ; le compte « N ressource(s) » compte deux fois les
+  fichiers générés. Le **certificat du projet**, clé privée comprise, n'est ni archivé, ni retiré, ni
+  révoqué : `doctor` en signale l'échéance puis l'expiration sans fin, jusqu'à un `ogs cert delete <id>` à la
+  main (constat R1-22). Le **fichier d'environnement** de D75 part même sous `--keep-data`, et sans aucune
+  copie sous `--purge` (constat R1-76). Le **cron et le pool** restent actifs pendant l'archivage — ils ne
+  partent qu'après elle, avec les fichiers générés et le rechargement de FPM —, si bien qu'une écriture
+  postérieure au dump manque à l'archive (constat R1-17). L'estimation de la taille de l'archive parcourt
+  encore le home par ses noms (`filepath.Walk`), et non par descripteurs comme l'archive elle-même (D81) :
+  elle ne lit aucun contenu, mais un répertoire remplacé par un lien pendant le parcours en fausse le total.
+- **Compensation d'un apply** : « rollback effectué : le système est revenu à son état initial »
+  s'affiche même quand la saga n'a pas tout défait — une base préexistante n'est jamais compensée, si bien
+  qu'un `GRANT` ou un compte que l'étape venait d'y poser reste en place. Le message promet plus que la
+  compensation.
+- **Première émission d'un certificat** (D80) : sans certificat en place, les paliers de repli se réduisent
+  aux noms essentiels, alias compris ; un alias dont le DNS ne pointe pas encore ici empêche donc tout
+  certificat, et le site reste en HTTP seul jusqu'à la bascule de l'alias ou à son retrait.
+- **Clone** (D82, D84) : SIGHUP n'est pas capté — une session ssh coupée pendant un long clone l'arrête net
+  et laisse à root, en 0700, les répertoires en cours de copie : le lancer sous tmux ou screen ;
+  `--with-data` recopie la base telle quelle — `ps_configuration` et `ps_shop_url` pour Prestashop —, ce
+  qui est annoncé mais non réécrit, et un échec de cette copie ne compte pas dans le code 6 ; les chemins
+  de la source dans les fichiers de `www/` ne sont pas réécrits ; l'analyse des liens est lexicale, et toute
+  cible absolue, `/usr/share/javascript` compris, est nommée et rend 6 ; `site clone` n'éprouve pas
+  l'unicité du parc entier. Une entrée de la source retirée entre l'énumération de son répertoire et son
+  ouverture (`ENOENT` à `openat`) **arrête toute la copie**, là où le même cas relevé par `fstatat` est
+  sauté : le clone d'un site vivant, dont l'application crée et retire des fichiers, peut échouer sans
+  cause durable — le relancer. `--dry-run` ne prédit ni les liens qui sortent de `www/` — il annonce
+  seulement que le code 6 viendra « si la copie rencontre » l'un d'eux — ni l'installeur resté exposé
+  (`AppType.Installer`), que seule la copie constate.
+- **Liens posés par root dans le home** : `fs.SymlinkAt` et la copie du clone posent encore le
+  propriétaire d'un lien par `fchownat` sur un nom, là où `fs.Dir` passe par un descripteur `O_PATH` ; la
+  fenêtre ne s'exploite que si `fs.protected_hardlinks` est désactivé.
+- **Racine d'un projet adopté hors convention** (D83) : ses parents sont encore résolus par leur nom
+  (`fs.EnsureDir`), à root sous la racine des homes, mais pas nécessairement ailleurs.
+- **Import** (D78) : aucun rattachement par indice vérifiable — `GRANT` de l'utilisateur du pool,
+  propriétaire `datdba` —, si bien qu'une base nommée autrement que le site reste non gérée ; les comptes
+  additionnels d'une base adoptée sous `'%'` sont créés sous `'%'` ; un compte qui existe déjà sans secret
+  scellé peut recevoir, au premier apply qui corrige ses privilèges, un mot de passe tiré que
+  `CREATE USER IF NOT EXISTS` n'applique pas — `secrets env` le rend alors faux ; deux candidats de même
+  identifiant (vhost doublé en `-le-ssl`) : `import adopt` retient le dernier ; les crons restent rattachés
+  par sous-chaîne du compte, notés et jamais déclarés.
+- **`db restore`** passe le script au client du super-utilisateur du moteur, sans le confiner à la base
+  cible (constat R1-14).
+- **Pare-feu** : un bannissement que la garde refuse reste écrit dans `ufw.yaml`, où le prochain apply le
+  retrouve (constat R2-14, dont seul le volet `--dry-run` est traité).
+- **Durcissement** (D85) : un parc durci par une version antérieure n'est pas rouvert ; `doctor` ne compte
+  pas les cibles refusées faute de groupe, et ne relève ni les `AuthUserFile`, `auth_basic_user_file`,
+  `RewriteMap` rangés sous `/etc`, ni un cluster PostgreSQL hors du port 5432 ; les répertoires de
+  surcharge de D63, en 0750 root:root, ne se lisent pas par les workers — un fichier d'authentification n'y
+  a pas sa place ; `hardening.targets` accepte des modes écrits en décimal (constat R2-07) ; les fichiers de
+  `pool.d`, en 0644, portent les variables d'environnement des pools, que rien ne ferme (constat R2-08) ; le
+  rapport affiche un 2770 comme un 0770.
+- **Paquet et timer** (D89) : apply ne réactive le timer qu'en réécrivant son fichier, et ni `doctor` ni
+  `status` ne le contrôlent, contrairement à ce que demande le §14.4 (constat R1-49) ; `ogs init --quiet`
+  engendre sans un mot une clé maître absente — le postinst l'évite, pas un appel direct — et repose à
+  chaque mise à jour les modes de `Paths.Dirs()`, `/etc/ogs/templates` en 0750 contre le 0700 récursif
+  d'`ogs harden` : deux juges pour un même chemin ; sous `--quiet`, le journal du timer ne dit que
+  « N renouvellement(s) en échec », le détail restant dans l'audit.
+- **Migration** (D90) : la lecture en root sur la source suit un lien que le compte web de la source y
+  aurait posé (`shared/uploads → /etc`) ; la lire sous son identité casserait sur les téléversements de
+  `www-data`.
+- **Complétion** : cobra crée la commande `completion` à l'exécution, si bien que l'annotation qui la
+  dispenserait de root et sa traduction restent sans effet — `ogs completion bash` exige root et répond en
+  anglais.
+- **Majeurs de sécurité non traités** par les lots, reproduits par la revue :
+  - `AllowOverride All` sur le docroot Prestashop fait appliquer par `www-data`, identité partagée par
+    tous les projets, les directives qu'un `.htaccess` du projet choisit (constat S2R-01 ; D87 borne les
+    `Options`, pas le reste) ;
+  - aucun port TCP attribué à un projet — application en mode port, pool FPM `listen: tcp` — n'est réservé :
+    un autre compte local peut l'occuper le premier, et la sonde de disponibilité ne regarde pas qui écoute
+    (constat S2R-02) ;
+  - aucun nom de compte SGBD n'est réservé : un projet peut déclarer `root`, `postgres` ou le compte de
+    supervision (constat S2R-05) ;
+  - les secrets d'un projet restent au keystore après `project delete`, `--purge` et la purge des archives
+    comprises, et un projet recréé sous le même identifiant en hérite (constat R1-21).

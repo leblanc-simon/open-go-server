@@ -667,10 +667,13 @@ func (p *Provider) vhostStep(proj *model.Project, bp *VHostPlan) []*engine.Step 
 // redirection n'a rien à personnaliser, et son unique server porte le challenge
 // ACME.
 //
-// Les répertoires sont en 0750 root:root, comme le reste de /etc/nginx après
-// « ogs harden » : leur contenu est lu par le processus maître, **en root**. Un
-// fichier que le compte d'un projet pourrait écrire lui donnerait un « root / »
-// ou un « alias » sur ce qu'il veut, donc la lecture de tout le système par HTTP.
+// Les répertoires sont en 0750 root:root, plus fermés que le répertoire du
+// moteur, qu'« ogs harden » laisse en root:www-data : leur contenu est lu par le
+// processus maître, **en root**. Un fichier que le compte d'un projet pourrait
+// écrire lui donnerait un « root / » ou un « alias » sur ce qu'il veut, donc la
+// lecture de tout le système par HTTP. Corollaire : un fichier que les workers
+// ouvrent à la requête, sous www-data — auth_basic_user_file, AuthUserFile —,
+// n'a pas sa place ici, où ils ne le liraient pas.
 func (p *Provider) includeStep(bp *VHostPlan) *engine.Step {
 	if len(bp.IncludeDirs) == 0 {
 		return nil

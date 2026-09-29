@@ -32,11 +32,11 @@ en root. Un script modifiable par un utilisateur de projet serait une élévatio
 |---|---|---|
 | `preCreate` | avant la création d'un projet | oui |
 | `postCreate` | après la création complète | non |
-| `preDelete` | avant la suppression, services encore actifs | oui |
-| `postDelete` | après suppression et archivage | non |
+| `preDelete` | avant la suppression, une fois les refus d'entrée levés et la confirmation donnée, services encore actifs | oui |
+| `postDelete` | après suppression et archivage, fichiers de parc recalculés | non |
 | `preApply` | avant l'exécution d'un plan, après confirmation | oui |
 | `postApply` | après l'exécution | non |
-| `postCertRenew` | après un renouvellement de certificat | non |
+| `postCertRenew` | après un renouvellement de certificat, même si un autre a échoué | non |
 | `postPhpSwitch` | après un changement de version PHP | non |
 
 Un hook **critique** qui échoue interrompt l'opération : c'est le principe même d'un `pre-` — il garde la
@@ -106,3 +106,19 @@ ogs apply shopfr -v             # afficher la sortie des hooks
 En `--dry-run` et avec `ogs plan`, **aucun hook n'est exécuté** : un calcul de plan ne doit rien déclencher
 au dehors. Le corollaire mérite d'être connu — le refus d'un hook `pre-` ne se constate qu'à l'`apply`, un
 plan calculé n'est donc pas la garantie qu'il sera autorisé.
+
+La règle vaut pour toute commande, de trois façons. Une commande qui sait simuler — `apply`, `site create`,
+`site clone`… — s'arrête avant son hook `pre-`. Une commande qui ne le sait pas refuse l'option, code 2,
+avant tout geste : `ogs project delete shopfr --dry-run` ne lance ni `preDelete` ni `postDelete`, là où il
+supprimait autrefois le projet pour de bon, hooks compris. Et un hook atteint malgré tout sous
+`--dry-run` est résolu — emplacement, propriétaire, droits : un script qui serait refusé l'est aussi en
+simulation — puis annoncé `non exécuté (--dry-run)`, sans être lancé.
+
+Le `preDelete` garde la porte d'une suppression, mais il n'est pas seul : `project delete` énumère d'abord
+tous ses refus — racine partagée, point de montage, fichier qu'ogs n'a pas écrit, base qu'il ne pourrait
+pas sauvegarder… — et demande la confirmation. Le hook ne voit donc qu'une suppression que l'outil
+accepte à l'entrée, et son refus l'arrête avant que rien ne soit arrêté ni archivé. Son accord n'est pas
+pour autant le dernier mot : l'archive faite, les remparts sont éprouvés de nouveau, et un partage monté ou
+une déclaration voisine posée entre-temps fait encore renoncer — l'archive retirée, les services relancés,
+code du refus, ou 9 pour une interruption reçue pendant l'archivage. `postDelete` n'est alors pas lancé :
+un script qui prépare la suppression dans son `preDelete` doit savoir qu'elle peut ne pas avoir lieu.
