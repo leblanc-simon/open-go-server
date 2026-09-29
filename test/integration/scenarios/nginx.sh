@@ -106,8 +106,13 @@ fi
 echo
 echo "--- PHP exécuté par le socket FastCGI, sous l'identité du projet ---"
 mkdir -p /home/php.test/www/public
+# Le front controller répond 404 sur /absent, pour la page d'erreur éprouvée plus
+# bas. Il est écrit une fois pour toutes : FPM tourne avec l'opcache
+# (revalidate_freq=2), et un script réécrit puis interrogé dans les deux
+# secondes répond encore par l'ancien code.
 cat > /home/php.test/www/public/index.php <<'PHP'
-<?php echo "php actif sous ", posix_getpwuid(posix_geteuid())["name"];
+<?php if ($_SERVER["REQUEST_URI"] === "/absent") { http_response_code(404); }
+echo "php actif sous ", posix_getpwuid(posix_geteuid())["name"];
 PHP
 chown -R phptest:phptest /home/php.test/www
 reponse=$(curl -sk --resolve php.test:443:127.0.0.1 https://php.test/)
@@ -135,6 +140,210 @@ if [ "$code" = "200" ] && [ -s /tmp/piege.out ]; then
     echo "ÉCHEC : le fichier PHP a été servi tel quel — son code source est exposé"
     exit 1
 fi
+
+echo
+echo "--- l'accueil reste servi sous disable_symlinks ---"
+# « / » désigne le docroot lui-même, en 0710 (D51) : sous disable_symlinks,
+# nginx n'éprouve plus un répertoire par stat() mais l'ouvre en lecture, ce que
+# www-data ne peut pas. try_files manquerait l'accueil — 404 sur un site
+# statique, une ligne « crit » par visite sur un site PHP, dont l'accueil est
+# éprouvé plus haut.
+recu=$(curl -sk --resolve static.test:443:127.0.0.1 https://static.test/)
+echo "static.test/ : $recu"
+if [ "$recu" != "bonjour statique" ]; then
+    echo "ÉCHEC : l'accueil du site statique n'est plus servi"
+    exit 1
+fi
+# Sans try_files, un répertoire demandé sans barre finale est redirigé vers son
+# nom qui la porte, comme sous Apache, puis servi par son index.
+mkdir -p /home/static.test/www/doc
+echo 'index du répertoire' > /home/static.test/www/doc/index.html
+chown -R statictest:statictest /home/static.test/www/doc
+cible=$(curl -sk -o /dev/null -w '%{http_code} %{redirect_url}' --resolve static.test:443:127.0.0.1 https://static.test/doc)
+recu=$(curl -sk --resolve static.test:443:127.0.0.1 https://static.test/doc/)
+echo "static.test/doc : $cible ; /doc/ : $recu"
+if [ "$cible" != "301 https://static.test/doc/" ] || [ "$recu" != "index du répertoire" ]; then
+    echo "ÉCHEC : un répertoire du site statique n'est plus servi par son index"
+    exit 1
+fi
+rm -rf /home/static.test/www/doc
+# L'accueil d'un site PHP atteint le front controller quelle que soit la méthode :
+# le module index ne traite que GET, HEAD et POST, et une location qui lui
+# confierait « / » répondrait 405 au pré-vol CORS d'une API servie à la racine.
+for methode in OPTIONS PUT DELETE PATCH; do
+    code=$(curl -sk -o /tmp/methode.out -w '%{http_code}' -X "$methode" --resolve php.test:443:127.0.0.1 https://php.test/)
+    echo "$methode php.test/ : HTTP $code"
+    if ! grep -q "php actif sous phptest" /tmp/methode.out; then
+        echo "ÉCHEC : $methode sur l'accueil n'atteint pas le front controller"
+        exit 1
+    fi
+done
+if grep -h "Permission denied" /var/log/ogs-projects/statictest/nginx-error.log \
+    /var/log/ogs-projects/phptest/nginx-error.log 2>/dev/null | grep -q "/www"; then
+    echo "ÉCHEC : nginx tente d'ouvrir en lecture un répertoire du projet"
+    grep -h "Permission denied" /var/log/ogs-projects/*/nginx-error.log | tail -2
+    exit 1
+fi
+
+echo
+echo "--- l'accueil reste sous les surcharges du docroot (D63) ---"
+# Le contexte du docroot est celui de location / : ce qu'une surcharge y dépose
+# vaut pour « / » comme pour le reste du site. Une location dédiée à l'accueil
+# l'y soustrairait — un contrôle d'accès protégerait /autre-page, et laisserait
+# servir l'accueil —, et y inclure le contexte rendrait fatale toute location
+# qu'une surcharge imbrique.
+recharger_nginx() {
+    if ! nginx -t 2>/tmp/nginx-t.out; then
+        echo "ÉCHEC : nginx refuse la configuration"
+        tail -2 /tmp/nginx-t.out
+        exit 1
+    fi
+    systemctl reload nginx
+    sleep 1
+}
+docroot_php=/etc/nginx/projects/phptest/docroot
+echo 'deny all;' > "$docroot_php/10-essai.conf"
+recharger_nginx
+for chemin in / /autre-page; do
+    code=$(curl -sk -o /tmp/surcharge.out -w '%{http_code}' --resolve php.test:443:127.0.0.1 "https://php.test$chemin")
+    echo "deny all, php.test$chemin : HTTP $code"
+    if [ "$code" != "403" ] || grep -q "php actif" /tmp/surcharge.out; then
+        echo "ÉCHEC : le contrôle d'accès du docroot ne protège pas $chemin"
+        exit 1
+    fi
+done
+# Une directive de réécriture — maintenance — vaut aussi pour l'accueil.
+echo 'return 503;' > "$docroot_php/10-essai.conf"
+recharger_nginx
+code=$(curl -sk -o /dev/null -w '%{http_code}' --resolve php.test:443:127.0.0.1 https://php.test/)
+echo "return 503, php.test/ : HTTP $code"
+if [ "$code" != "503" ]; then
+    echo "ÉCHEC : la maintenance déposée dans le contexte du docroot épargne l'accueil"
+    exit 1
+fi
+# Une location imbriquée reste admise : nginx refuse une location préfixe sous
+# une regex ou une correspondance exacte (« location "/prive/" is outside
+# location "^/$" »), et le parc entier avec elle.
+printf 'location /prive/ {\n    deny all;\n}\n' > "$docroot_php/10-essai.conf"
+recharger_nginx
+recu=$(curl -sk --resolve php.test:443:127.0.0.1 https://php.test/)
+if [[ "$recu" != *"php actif sous phptest"* ]]; then
+    echo "ÉCHEC : l'accueil n'est plus servi avec une location imbriquée"
+    exit 1
+fi
+rm -f "$docroot_php/10-essai.conf"
+# Une page d'erreur du front controller, reprise par nginx : la redirection
+# interne change l'URI, et $ogs_fichier doit la suivre — une valeur gardée de la
+# première évaluation renverrait au front controller au lieu de la page. Le
+# témoin : sans interception, /absent rend bien le 404 du front controller.
+code=$(curl -sk -o /tmp/absent.out -w '%{http_code}' --resolve php.test:443:127.0.0.1 https://php.test/absent)
+echo "php.test/absent sans interception : HTTP $code, $(cat /tmp/absent.out)"
+if [ "$code" != "404" ] || ! grep -q "php actif sous phptest" /tmp/absent.out; then
+    echo "ÉCHEC : le front controller ne rend pas son 404, l'essai serait creux"
+    exit 1
+fi
+echo 'page erreur' > /home/php.test/www/public/erreur.html
+chown phptest:phptest /home/php.test/www/public/erreur.html
+printf 'fastcgi_intercept_errors on;\nerror_page 404 /erreur.html;\n' > /etc/nginx/projects/phptest/vhost/10-essai.conf
+recharger_nginx
+recu=$(curl -sk --resolve php.test:443:127.0.0.1 https://php.test/absent)
+echo "page d'erreur de php.test/absent : $recu"
+rm -f /etc/nginx/projects/phptest/vhost/10-essai.conf /home/php.test/www/public/erreur.html
+recharger_nginx
+if [ "$recu" != "page erreur" ]; then
+    echo "ÉCHEC : la page d'erreur statique n'est pas servie après une redirection interne"
+    exit 1
+fi
+
+echo
+echo "--- les fichiers cachés et les métadonnées du dépôt ne sont pas servis ---"
+# Le dépôt tiré dans www/ en est la racine, et www/ est le docroot d'un site
+# statique : .git, .env et composer.json y sont à portée de requête.
+racine=/home/static.test/www
+mkdir -p "$racine/.git" "$racine/.well-known" "$racine/sous"
+echo '[remote "origin"] SECRET-OGS' > "$racine/.git/config"
+echo 'DATABASE_URL=SECRET-OGS' > "$racine/.env"
+echo 'DATABASE_URL=SECRET-OGS' > "$racine/sous/.env"
+echo '{"name": "SECRET-OGS"}' > "$racine/composer.json"
+echo '{"packages": "SECRET-OGS"}' > "$racine/composer.lock"
+echo 'Contact: mailto:securite@static.test' > "$racine/.well-known/security.txt"
+chown -R statictest:statictest "$racine/.git" "$racine/.well-known" "$racine/sous" \
+    "$racine/.env" "$racine/composer.json" "$racine/composer.lock"
+for chemin in /.git/config /.env /sous/.env /composer.json /composer.lock; do
+    code=$(curl -sk -o /tmp/cache.out -w '%{http_code}' --resolve static.test:443:127.0.0.1 "https://static.test$chemin")
+    echo "$chemin : HTTP $code"
+    if [ "$code" = "200" ] || grep -q "SECRET-OGS" /tmp/cache.out; then
+        echo "ÉCHEC : $chemin est servi"
+        exit 1
+    fi
+done
+# /.well-known/ (RFC 8615) reste servi depuis le docroot, et le challenge ACME
+# depuis son webroot — il est éprouvé plus haut.
+recu=$(curl -sk --resolve static.test:443:127.0.0.1 https://static.test/.well-known/security.txt)
+echo "/.well-known/security.txt : $recu"
+if [ "$recu" != "Contact: mailto:securite@static.test" ]; then
+    echo "ÉCHEC : /.well-known/ n'est plus servi"
+    exit 1
+fi
+# Symfony sert www/public : un .env déposé par erreur dans le docroot est refusé
+# de même.
+echo 'APP_SECRET=SECRET-OGS' > /home/php.test/www/public/.env
+chown phptest:phptest /home/php.test/www/public/.env
+if curl -sk --resolve php.test:443:127.0.0.1 https://php.test/.env | grep -q "SECRET-OGS"; then
+    echo "ÉCHEC : le .env du docroot Symfony est servi"
+    exit 1
+fi
+rm -rf "$racine/.git" "$racine/sous" "$racine/.env" "$racine/composer.json" "$racine/composer.lock" \
+    /home/php.test/www/public/.env
+
+echo
+echo "--- un lien vers les fichiers d'un autre projet n'est pas suivi ---"
+# www-data est membre du groupe de chaque projet (D25) : suivre un lien posé dans
+# le docroot de static.test lui ferait servir les fichiers de php.test, que le
+# compte de static.test ne peut pas lire. Le site statique n'a pas de try_files :
+# nginx répond 403, comme Apache. Un site PHP retomberait sur son front
+# controller ; ce qui compte alors est que le contenu ne sorte pas.
+echo 'SECRET-DE-PHPTEST' > /home/php.test/www/config.txt
+chown phptest:phptest /home/php.test/www/config.txt
+chmod 0640 /home/php.test/www/config.txt
+# Le témoin : www-data lit bien ce fichier par son groupe — sans quoi le refus ne
+# prouverait rien.
+if ! su -s /bin/sh -c 'cat /home/php.test/www/config.txt' www-data | grep -q SECRET-DE-PHPTEST; then
+    echo "ÉCHEC : www-data ne lit pas le fichier de phptest, l'essai serait creux"
+    exit 1
+fi
+echo 'page interne' > /home/static.test/www/interne.txt
+chown statictest:statictest /home/static.test/www/interne.txt
+su -s /bin/sh -c 'cd /home/static.test/www && ln -s /home/php.test/www/config.txt vol.txt &&
+    ln -s /home/php.test/www voisin && ln -s interne.txt lien.txt' statictest
+for chemin in /vol.txt /voisin/config.txt; do
+    code=$(curl -sk -o /tmp/lien.out -w '%{http_code}' --resolve static.test:443:127.0.0.1 "https://static.test$chemin")
+    echo "$chemin : HTTP $code"
+    if [ "$code" != "403" ] || grep -q SECRET-DE-PHPTEST /tmp/lien.out; then
+        echo "ÉCHEC : un lien du docroot de statictest sert les fichiers de phptest"
+        exit 1
+    fi
+done
+# Un lien vers ses propres fichiers reste servi : bundles Symfony, médias.
+recu=$(curl -sk --resolve static.test:443:127.0.0.1 https://static.test/lien.txt)
+echo "/lien.txt : $recu"
+if [ "$recu" != "page interne" ]; then
+    echo "ÉCHEC : un lien vers les fichiers du projet lui-même n'est plus servi"
+    exit 1
+fi
+# Le docroot lui-même remplacé par un lien : le home appartient à statictest
+# (D51), qui renomme www sans le moindre privilège.
+su -s /bin/sh -c 'mv /home/static.test/www /home/static.test/www.orig &&
+    ln -s /home/php.test/www /home/static.test/www' statictest
+code=$(curl -sk -o /tmp/lien.out -w '%{http_code}' --resolve static.test:443:127.0.0.1 https://static.test/config.txt)
+echo "docroot remplacé par un lien, /config.txt : HTTP $code"
+rm /home/static.test/www && mv /home/static.test/www.orig /home/static.test/www
+if [ "$code" != "403" ] || grep -q SECRET-DE-PHPTEST /tmp/lien.out; then
+    echo "ÉCHEC : le docroot remplacé par un lien sert les fichiers de phptest"
+    exit 1
+fi
+rm -f /home/static.test/www/vol.txt /home/static.test/www/voisin /home/static.test/www/lien.txt \
+    /home/static.test/www/interne.txt /home/php.test/www/config.txt
 
 echo
 echo "--- vhost de proxy : nginx relaie, l'applicatif est absent ---"

@@ -161,7 +161,7 @@ func TestNginxSymfonyFrontController(t *testing.T) {
 	p := project(t, "shop.fr", model.KindSymfony, "6.4", "8.5")
 	bp := buildMain(t, prov, p)
 	c := string(bp.Content)
-	if !strings.Contains(c, "try_files $uri /index.php$is_args$args;") {
+	if !strings.Contains(c, "try_files $ogs_fichier /index.php$is_args$args;") {
 		t.Errorf("front controller Symfony absent :\n%s", c)
 	}
 	if strings.Contains(c, "rewrite ^/api/") {
@@ -1276,36 +1276,101 @@ func TestNginxSnippetDefinesProxyVariables(t *testing.T) {
 	}
 }
 
-func TestProxyVHostReferencesOnlyDefinedVariables(t *testing.T) {
-	// Toute variable employée par un vhost doit être fournie par nginx ou par le
-	// fragment d'ogs : une variable inconnue est une erreur de configuration, pas
-	// un avertissement.
-	prov, _ := fixture(t, "nginx")
-	prov.Certificate = certificatCouvrant("shop.fr", "www.shop.fr")
-	p := project(t, "shop.fr", model.KindGo, "", "")
-	p.Spec.Web.VHosts = prov.vhosts(p)
-	p.Spec.Web.VHosts[0].Options = map[string]any{"proxyTarget": "127.0.0.1:20101"}
-	bp, err := prov.Build(p, prov.vhosts(p)[0])
-	if err != nil {
-		t.Fatal(err)
-	}
-	fragment, err := prov.Templates.Render("nginx/http-snippet.conf", map[string]any{})
-	if err != nil {
-		t.Fatal(err)
+// Toute variable employée par un vhost doit être fournie par nginx ou par le
+// fragment d'ogs : une variable inconnue est une erreur de configuration, pas un
+// avertissement, et nginx refuse alors le parc entier. Chaque vhost est éprouvé,
+// en HTTP seul comme en TLS : les deux rendus n'ont pas les mêmes directives.
+func TestLesVHostsNginxNEmploientQueDesVariablesDefinies(t *testing.T) {
+	cas := []struct {
+		nom          string
+		kind         model.AppKind
+		version, php string
+		role         string
+	}{
+		{nom: "statique", kind: model.KindStatic},
+		{nom: "php-plain", kind: model.KindPHPPlain, php: "8.5"},
+		{nom: "symfony", kind: model.KindSymfony, version: "6.4", php: "8.5"},
+		{nom: "prestashop", kind: model.KindPrestashop, php: "8.5"},
+		{nom: "proxy", kind: model.KindGo},
+		{nom: "redirection", kind: model.KindStatic, role: "redirect"},
 	}
 	// Les variables intégrées à nginx qu'emploient nos templates.
 	integrees := map[string]bool{
 		"$http_upgrade": true, "$host": true, "$remote_addr": true, "$scheme": true,
 		"$proxy_add_x_forwarded_for": true, "$request_uri": true, "$uri": true,
 		"$is_args": true, "$args": true, "$document_root": true,
-		"$fastcgi_script_name": true, "$1": true, "$2": true, "$3": true, "$4": true, "$5": true,
+		"$fastcgi_script_name": true, "$query_string": true,
+		"$1": true, "$2": true, "$3": true, "$4": true, "$5": true,
 	}
-	for _, mot := range regexp.MustCompile(`\$[a-z_]+`).FindAllString(string(bp.Content), -1) {
-		if integrees[mot] || strings.Contains(string(fragment), mot) {
-			continue
+	// Le fragment définit une variable par une « map » ; la nommer dans un
+	// commentaire ne la définit pas.
+	definies := func(t *testing.T, prov *Provider) (string, map[string]bool) {
+		t.Helper()
+		fragment, err := prov.Templates.Render("nginx/http-snippet.conf", map[string]any{})
+		if err != nil {
+			t.Fatal(err)
 		}
-		t.Errorf("variable %s employée par le vhost mais définie nulle part", mot)
+		out := map[string]bool{}
+		for _, m := range regexp.MustCompile(`(?m)^map\s+\S+\s+(\$[a-z_]+)\s*\{`).FindAllStringSubmatch(string(fragment), -1) {
+			out[m[1]] = true
+		}
+		return string(fragment), out
 	}
+	verifier := func(t *testing.T, prov *Provider, contenu string) {
+		t.Helper()
+		_, parLeFragment := definies(t, prov)
+		for _, l := range strings.Split(contenu, "\n") {
+			if strings.HasPrefix(strings.TrimSpace(l), "#") {
+				continue
+			}
+			for _, mot := range regexp.MustCompile(`\$[a-z_]+`).FindAllString(l, -1) {
+				if integrees[mot] || parLeFragment[mot] {
+					continue
+				}
+				t.Errorf("variable %s employée par le vhost mais définie nulle part :\n%s", mot, contenu)
+			}
+		}
+	}
+	t.Run("fragment", func(t *testing.T) {
+		prov, _ := fixture(t, "nginx")
+		fragment, _ := definies(t, prov)
+		verifier(t, prov, fragment)
+	})
+	for _, c := range cas {
+		for _, tls := range []bool{false, true} {
+			nom := c.nom + "/http"
+			if tls {
+				nom = c.nom + "/tls"
+			}
+			t.Run(nom, func(t *testing.T) {
+				prov, _ := fixture(t, "nginx")
+				if tls {
+					prov.Certificate = certificatCouvrant("shop.fr", "www.shop.fr", "ancien.fr")
+				}
+				p := project(t, "shop.fr", c.kind, c.version, c.php)
+				if c.kind == model.KindGo {
+					p.Spec.Web.VHosts = prov.vhosts(p)
+					p.Spec.Web.VHosts[0].Options = map[string]any{"proxyTarget": "127.0.0.1:20101"}
+				}
+				vhosts := prov.vhosts(p)
+				if c.role == "redirect" {
+					p.Spec.Domains = append(p.Spec.Domains, model.Domain{Name: "ancien.fr", Role: "redirect"})
+					vhosts = prov.vhosts(p)[1:]
+				}
+				bp, err := prov.Build(p, vhosts[0])
+				if err != nil {
+					t.Fatal(err)
+				}
+				verifier(t, prov, string(bp.Content))
+			})
+		}
+	}
+	t.Run("supervision", func(t *testing.T) {
+		prov, _ := fixture(t, "nginx")
+		verifier(t, prov, rendStatus(t, prov, []*model.Project{
+			project(t, "shop.fr", model.KindPHPPlain, "", "8.5"),
+		}))
+	})
 }
 
 // logPaths n'extrait que des chemins : le format nommé d'un CustomLog Apache et

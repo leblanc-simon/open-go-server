@@ -317,6 +317,9 @@ func (p *Provider) Build(proj *model.Project, vh model.VHost) (*VHostPlan, error
 		"LogDir":          proj.Spec.Layout.LogDir,
 		"FrontController": frontController,
 		"AllowOverride":   at.AllowOverride,
+		// La racine du projet borne le suivi des liens : tout composant sous elle,
+		// docroot compris, est à la main de l'utilisateur (D51).
+		"Root": proj.Spec.Layout.Root,
 		// Deux valeurs distinctes : Apache aliase le répertoire des jetons, nginx
 		// prend le webroot et y accole l'URI.
 		"ACMEChallenge":     p.Paths.ACMEChallenge(),
@@ -1015,8 +1018,8 @@ func (p *Provider) PlanDropIn(ctx context.Context, projects []*model.Project) ([
 }
 
 // PlanSnippet produit l'étape du fragment de portée serveur. Elle est globale :
-// le fichier ne dépend d'aucun projet, mais tous les vhosts de proxy en
-// dépendent.
+// le fichier ne dépend d'aucun projet, mais les vhosts de proxy en dépendent
+// ($connection_upgrade), et ceux des sites PHP aussi ($ogs_fichier).
 func (p *Provider) PlanSnippet() (*engine.Step, error) {
 	path := p.Engine.SnippetPath()
 	if path == "" {

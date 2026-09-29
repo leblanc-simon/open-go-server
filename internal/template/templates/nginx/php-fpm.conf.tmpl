@@ -31,6 +31,15 @@ server {
     access_log {{ .LogDir }}/nginx-access.log;
     error_log  {{ .LogDir }}/nginx-error.log;
     client_max_body_size {{ .ClientMaxBodySize }};
+
+    # Un lien symbolique n'est suivi que vers ce qui appartient à son auteur.
+    # www-data est membre du groupe de chaque projet (D25) : suivre tout lien lui
+    # ferait servir les fichiers d'un voisin, désignés par un lien posé dans ce
+    # docroot, que le pool du projet — sous son propre compte — ne peut pas lire.
+    # Le contrôle part de la racine du projet, et non du docroot : le home
+    # appartient à l'utilisateur (D51), qui y remplace sans privilège le docroot
+    # lui-même par un lien.
+    disable_symlinks if_not_owner from={{ .Root }};
 {{- if .Noindex }}
 
     # Préproduction : interdiction d'indexation.
@@ -39,12 +48,32 @@ server {
         return 200 "User-agent: *\nDisallow: /\n";
     }
 {{- end }}
+
+    # Fichiers et répertoires cachés — .git, .env, .htaccess — et métadonnées de
+    # dépendances : la racine d'un dépôt tiré par « git pull » est souvent le
+    # docroot lui-même (php-plain, Prestashop). /.well-known/ (RFC 8615) reste
+    # servi : le challenge ACME et security.txt y vivent. En tête des regex :
+    # nginx retient la première qui correspond.
+    location ~ /\.(?!well-known/) {
+        deny all;
+    }
+    location ~ /composer\.(json|lock)$ {
+        deny all;
+    }
+
+    # try_files éprouve $ogs_fichier, et non $uri : les deux ne diffèrent que
+    # pour « / », le docroot lui-même, que www-data traverse sans pouvoir le lire
+    # (0710, D51) et que disable_symlinks ferait ouvrir en lecture. Le fragment
+    # de portée serveur d'ogs définit la variable. « / » reste ainsi dans
+    # location /, donc sous ses surcharges (D63), et atteint le front controller
+    # quelle que soit la méthode.
 {{ if eq .AppKind "php-prestashop" }}
     # Prestashop s'appuie sur .htaccess, que nginx ne lit pas : les règles de
     # réécriture doivent être fournies ici, sans quoi le site n'est qu'à moitié
-    # fonctionnel (images, pages de catégorie, API).
+    # fonctionnel (images, pages de catégorie, API). Le deuxième essai cherche un
+    # répertoire : pour « / », c'est le nom réservé .ogs-accueil/ (fragment d'ogs).
     location / {
-        try_files $uri $uri/ /{{ .FrontController }}$is_args$args;
+        try_files $ogs_fichier $ogs_fichier/ /{{ .FrontController }}$is_args$args;
         include {{ .IncludeDocroot }}/*.conf;
     }
     rewrite ^/api/?(.*)$ /webservice/dispatcher.php?url=$1 last;
@@ -60,7 +89,7 @@ server {
 {{- else }}
     # Front controller unique : tout passe par {{ .FrontController }}.
     location / {
-        try_files $uri /{{ .FrontController }}$is_args$args;
+        try_files $ogs_fichier /{{ .FrontController }}$is_args$args;
         include {{ .IncludeDocroot }}/*.conf;
     }
 {{- end }}

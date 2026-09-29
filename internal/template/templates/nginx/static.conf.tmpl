@@ -30,6 +30,14 @@ server {
     index index.html;
     access_log {{ .LogDir }}/nginx-access.log;
     error_log  {{ .LogDir }}/nginx-error.log;
+
+    # Un lien symbolique n'est suivi que vers ce qui appartient à son auteur.
+    # www-data est membre du groupe de chaque projet (D25) : suivre tout lien lui
+    # ferait servir les fichiers d'un voisin, désignés par un lien posé dans ce
+    # docroot. Le contrôle part de la racine du projet, et non du docroot : le
+    # home appartient à l'utilisateur (D51), qui y remplace sans privilège le
+    # docroot lui-même par un lien.
+    disable_symlinks if_not_owner from={{ .Root }};
 {{- if .Noindex }}
 
     # Préproduction : interdiction d'indexation.
@@ -39,8 +47,28 @@ server {
     }
 {{- end }}
 
+    # Fichiers et répertoires cachés — .git, .env, .htaccess — et métadonnées de
+    # dépendances : la racine d'un dépôt tiré par « git pull » est le docroot
+    # lui-même. /.well-known/ (RFC 8615) reste servi : le challenge ACME et
+    # security.txt y vivent.
+    location ~ /\.(?!well-known/) {
+        deny all;
+    }
+    location ~ /composer\.(json|lock)$ {
+        deny all;
+    }
+
+    # Aucun try_files : « / » est le docroot lui-même, que www-data traverse
+    # sans pouvoir le lire (0710, D51). Sous disable_symlinks, nginx n'éprouve
+    # plus un répertoire par stat() mais l'ouvre en lecture, et try_files
+    # rendrait 404 sur l'accueil. Le traitement ordinaire fait le même travail
+    # sans éprouver le docroot : le fichier demandé est servi, et l'accueil l'est
+    # par le module index, qui n'ouvre que le fichier d'index. Deux différences
+    # avec « try_files $uri $uri/ =404 », qui alignent nginx sur Apache : un
+    # répertoire demandé sans barre finale est redirigé vers son nom qui la
+    # porte, et un lien refusé répond 403, non 404. « / » reste dans location /,
+    # donc sous ses surcharges (D63).
     location / {
-        try_files $uri $uri/ =404;
         include {{ .IncludeDocroot }}/*.conf;
     }
 {{- range .Blocks }}

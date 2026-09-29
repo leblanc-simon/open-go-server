@@ -140,6 +140,82 @@ func TestHelpers(t *testing.T) {
 	}
 }
 
+// Tout template embarqué qui sert un docroot ne suit un lien que vers ce qui
+// appartient à son auteur, et refuse les fichiers cachés et les métadonnées de
+// dépendances : www-data est membre du groupe de chaque projet (D25), et le
+// dépôt tiré dans www/ en est souvent la racine. Le contrôle porte sur les
+// sources, pour qu'un template ajouté demain n'y échappe pas ; l'effet du rendu
+// est éprouvé par les tests du provider web.
+func TestLesTemplatesQuiServentUnDocrootLeProtegent(t *testing.T) {
+	set := New("")
+	voulus := map[string][]string{
+		"apache/": {
+			"<Directory {{ .Root }}>\n        Options -FollowSymLinks +SymLinksIfOwnerMatch\n",
+			"Options -Indexes -FollowSymLinks +SymLinksIfOwnerMatch\n",
+			// Un refus rendu dès la traduction de l'URL : un <Location /> déposé
+			// dans le contexte du vhost (D63) rouvrirait un <LocationMatch>.
+			"RedirectMatch 403 \"/\\.(?!well-known/)\"\n",
+			"RedirectMatch 403 \"/composer\\.(json|lock)$\"\n",
+			// La variante que MultiViews négocie ne passe pas par la traduction
+			// de l'URL : le refus porte aussi sur le fichier, dans un <If>, que
+			// ce <Location /> ne rouvre pas.
+			"<If \"%{REQUEST_FILENAME} =~ m#/composer\\.(json|lock)$#\">\n        Require all denied\n    </If>\n",
+		},
+		"nginx/": {
+			"disable_symlinks if_not_owner from={{ .Root }};\n",
+			"location ~ /\\.(?!well-known/) {\n        deny all;\n",
+			"location ~ /composer\\.(json|lock)$ {\n        deny all;\n",
+		},
+	}
+	examines := map[string]bool{}
+	for _, nom := range set.Names() {
+		src, err := set.Read(nom)
+		if err != nil {
+			t.Fatal(err)
+		}
+		s := string(src)
+		moteur := nom[:strings.Index(nom, "/")+1]
+		sert := (moteur == "apache/" && strings.Contains(s, "DocumentRoot ")) ||
+			(moteur == "nginx/" && strings.Contains(s, "root {{ .Docroot }};"))
+		if !sert {
+			continue
+		}
+		examines[nom] = true
+		for _, v := range voulus[moteur] {
+			if !strings.Contains(s, v) {
+				t.Errorf("%s sert un docroot sans %q", nom, v)
+			}
+		}
+		if strings.Contains(s, "+FollowSymLinks") {
+			t.Errorf("%s rouvre FollowSymLinks", nom)
+		}
+		if strings.Contains(s, "<LocationMatch") && strings.Contains(s, "Require all denied") {
+			t.Errorf("%s refuse par <LocationMatch> : un <Location /> postérieur le rouvre", nom)
+		}
+		// Pour « / », try_files éprouverait le docroot lui-même, que www-data
+		// traverse sans pouvoir le lire (D51) : disable_symlinks le lui fait
+		// ouvrir en lecture. $ogs_fichier, que définit le fragment, l'épargne.
+		for _, l := range strings.Split(s, "\n") {
+			l = strings.TrimSpace(l)
+			if moteur == "nginx/" && strings.HasPrefix(l, "try_files ") && strings.Contains(l, "$uri") {
+				t.Errorf("%s : « %s » éprouve $uri, donc le docroot pour « / »", nom, l)
+			}
+		}
+		// « All » ouvre toutes les options à un .htaccess, FollowSymLinks compris,
+		// sauf si un « Options= » le suit.
+		for _, l := range strings.Split(s, "\n") {
+			if i := strings.Index(l, "AllowOverride All"); i >= 0 && !strings.Contains(l[i:], " Options=") {
+				t.Errorf("%s : « %s » laisse un .htaccess rétablir FollowSymLinks", nom, strings.TrimSpace(l))
+			}
+		}
+	}
+	for _, nom := range []string{"apache/php-fpm.conf", "apache/static.conf", "nginx/php-fpm.conf", "nginx/static.conf"} {
+		if !examines[nom] {
+			t.Errorf("%s n'est plus reconnu comme servant un docroot : le contrôle ne le voit pas", nom)
+		}
+	}
+}
+
 func TestSystemdEnvQuotesOnlyWhenNeeded(t *testing.T) {
 	cases := map[[2]string]string{
 		// Une valeur simple garde son rendu : les unités existantes ne changent pas.

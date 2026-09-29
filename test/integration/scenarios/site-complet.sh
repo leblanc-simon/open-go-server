@@ -342,6 +342,156 @@ fi
 echo "PHP est exécuté sous l'identité du projet, comme prévu."
 
 echo
+echo "--- les fichiers cachés et les métadonnées du dépôt ne sont pas servis ---"
+# php-plain sert www/, la racine même du dépôt qu'un « git pull » y tire :
+# .git, .env et composer.json y sont à portée de requête, et AllowOverride None
+# ne laisse aucun .htaccess y remédier.
+racine=/home/php.test/www
+mkdir -p "$racine/.git" "$racine/.well-known" "$racine/sous"
+echo '[remote "origin"] SECRET-OGS' > "$racine/.git/config"
+echo 'DATABASE_URL=SECRET-OGS' > "$racine/.env"
+echo 'DATABASE_URL=SECRET-OGS' > "$racine/sous/.env"
+echo '{"name": "SECRET-OGS"}' > "$racine/composer.json"
+echo '{"packages": "SECRET-OGS"}' > "$racine/composer.lock"
+echo 'Contact: mailto:securite@php.test' > "$racine/.well-known/security.txt"
+chown -R phptest:phptest "$racine/.git" "$racine/.well-known" "$racine/sous" \
+    "$racine/.env" "$racine/composer.json" "$racine/composer.lock"
+for chemin in /.git/config /.env /sous/.env /composer.json /composer.lock; do
+    code=$(curl -s -o /tmp/cache.out -w '%{http_code}' -H 'Host: php.test' "http://127.0.0.1$chemin")
+    echo "$chemin : HTTP $code"
+    if [ "$code" != "403" ] || grep -q "SECRET-OGS" /tmp/cache.out; then
+        echo "ÉCHEC : $chemin n'est pas refusé"
+        exit 1
+    fi
+done
+# /.well-known/ (RFC 8615) reste servi : security.txt, et le challenge ACME.
+recu=$(curl -s -H 'Host: php.test' http://127.0.0.1/.well-known/security.txt)
+echo "/.well-known/security.txt : $recu"
+if [ "$recu" != "Contact: mailto:securite@php.test" ]; then
+    echo "ÉCHEC : /.well-known/ n'est plus servi"
+    exit 1
+fi
+mkdir -p /var/lib/ogs/acme-challenge/.well-known/acme-challenge
+echo jeton > /var/lib/ogs/acme-challenge/.well-known/acme-challenge/essai
+recu=$(curl -s -H 'Host: php.test' http://127.0.0.1/.well-known/acme-challenge/essai)
+echo "jeton ACME : $recu"
+if [ "$recu" != "jeton" ]; then
+    echo "ÉCHEC : le challenge ACME n'est plus servi"
+    exit 1
+fi
+# Une restriction d'accès ordinaire, déposée dans le contexte du vhost (D63) pour
+# réserver le site au réseau du bureau : Apache fusionne les <Location> dans
+# l'ordre du fichier, et celle-ci, incluse après les refus, rouvre .git et .env à
+# tous ceux qu'elle admet si ces refus ne sont que des <LocationMatch>.
+cat > /etc/apache2/projects/phptest/vhost/10-bureau.conf <<'CONF'
+<Location />
+    Require expr "%{REMOTE_ADDR} == '127.0.0.1'"
+</Location>
+CONF
+# MultiViews, ouverte par une surcharge du docroot, négocie « /composer » vers
+# composer.json par une sous-requête sur le fichier, que le RedirectMatch ne voit
+# pas. Le refus de ce fichier par son nom doit tenir sous le <Location /> du
+# bureau, qui rouvrirait un <FilesMatch>.
+#
+# L'essai vit dans un sous-répertoire que www-data peut énumérer : la négociation
+# lit le répertoire pour trouver les variantes, et la racine du docroot, en 0710
+# (D51), ne se liste pas — elle y répondrait 403 (AH00686), et le témoin mentirait.
+# C'est d'ailleurs là qu'est l'exposition réelle : un vendor/*/composer.json créé
+# sous l'umask du projet.
+echo 'Options +MultiViews' > /etc/apache2/projects/phptest/docroot/10-negociation.conf
+install -d -m 0750 -o phptest -g phptest "$racine/nego"
+echo 'page négociée' > "$racine/nego/negocie.txt"
+echo '{"secret": "SECRET-OGS"}' > "$racine/nego/composer.json"
+chown phptest:phptest "$racine/nego/negocie.txt" "$racine/nego/composer.json"
+if ! apache2ctl configtest 2>&1 | tail -1; then
+    echo "ÉCHEC : la restriction du bureau rend la configuration invalide"
+    exit 1
+fi
+apache2ctl graceful
+sleep 1
+for chemin in /.git/config /.env /composer.json; do
+    code=$(curl -s -o /tmp/cache.out -w '%{http_code}' -H 'Host: php.test' "http://127.0.0.1$chemin")
+    echo "sous <Location /> du bureau, $chemin : HTTP $code"
+    if [ "$code" != "403" ] || grep -q "SECRET-OGS" /tmp/cache.out; then
+        echo "ÉCHEC : un <Location /> de surcharge rouvre $chemin"
+        exit 1
+    fi
+done
+# Le témoin : MultiViews est bien active — sans quoi le refus ne prouverait rien.
+recu=$(curl -s -H 'Host: php.test' http://127.0.0.1/nego/negocie)
+echo "/nego/negocie : $recu"
+if [ "$recu" != "page négociée" ]; then
+    echo "ÉCHEC : MultiViews ne négocie pas /nego/negocie, l'essai serait creux"
+    exit 1
+fi
+# La variante refusée, Apache répond 404 ou passe la main au front controller :
+# seul compte que composer.json ne sorte pas.
+code=$(curl -s -o /tmp/cache.out -w '%{http_code}' -H 'Host: php.test' http://127.0.0.1/nego/composer)
+echo "/nego/composer sous MultiViews : HTTP $code"
+if grep -q "SECRET-OGS" /tmp/cache.out; then
+    echo "ÉCHEC : MultiViews sert composer.json sous le nom /nego/composer"
+    exit 1
+fi
+rm -f /etc/apache2/projects/phptest/vhost/10-bureau.conf \
+    /etc/apache2/projects/phptest/docroot/10-negociation.conf
+rm -rf "$racine/nego"
+apache2ctl graceful
+sleep 1
+rm -rf "$racine/.git" "$racine/sous" "$racine/.env" "$racine/composer.json" "$racine/composer.lock" \
+    /var/lib/ogs/acme-challenge/.well-known/acme-challenge/essai
+
+echo
+echo "--- un lien vers les fichiers d'un autre projet n'est pas suivi ---"
+# www-data est membre du groupe de chaque projet (D25) : suivre un lien posé dans
+# le docroot de php.test lui ferait servir les fichiers de keys.test, que le pool
+# de php.test — sous son propre compte — ne peut pas lire.
+echo 'SECRET-DE-KEYSTEST' > /home/keys.test/www/config.txt
+chown keystest:keystest /home/keys.test/www/config.txt
+chmod 0640 /home/keys.test/www/config.txt
+gpasswd -a www-data keystest >/dev/null
+apache2ctl graceful
+sleep 1
+# Le témoin : www-data lit bien ce fichier par son groupe — sans quoi le refus ne
+# prouverait rien.
+if ! su -s /bin/sh -c 'cat /home/keys.test/www/config.txt' www-data | grep -q SECRET-DE-KEYSTEST; then
+    echo "ÉCHEC : www-data ne lit pas le fichier de keystest, l'essai serait creux"
+    exit 1
+fi
+echo 'page interne' > /home/php.test/www/interne.txt
+chown phptest:phptest /home/php.test/www/interne.txt
+su -s /bin/sh -c 'cd /home/php.test/www && ln -s /home/keys.test/www/config.txt vol.txt &&
+    ln -s /home/keys.test/www voisin && ln -s interne.txt lien.txt' phptest
+for chemin in /vol.txt /voisin/config.txt; do
+    code=$(curl -s -o /tmp/lien.out -w '%{http_code}' -H 'Host: php.test' "http://127.0.0.1$chemin")
+    echo "$chemin : HTTP $code"
+    if [ "$code" != "403" ] || grep -q SECRET-DE-KEYSTEST /tmp/lien.out; then
+        echo "ÉCHEC : un lien du docroot de phptest sert les fichiers de keystest"
+        exit 1
+    fi
+done
+# Un lien vers ses propres fichiers reste servi : bundles Symfony, médias.
+recu=$(curl -s -H 'Host: php.test' http://127.0.0.1/lien.txt)
+echo "/lien.txt : $recu"
+if [ "$recu" != "page interne" ]; then
+    echo "ÉCHEC : un lien vers les fichiers du projet lui-même n'est plus servi"
+    exit 1
+fi
+# Le docroot lui-même remplacé par un lien : le home appartient à phptest (D51),
+# qui renomme www sans le moindre privilège. Apache éprouve ce composant avec les
+# options du home, d'où le <Directory> de la racine du projet.
+su -s /bin/sh -c 'mv /home/php.test/www /home/php.test/www.orig &&
+    ln -s /home/keys.test/www /home/php.test/www' phptest
+code=$(curl -s -o /tmp/lien.out -w '%{http_code}' -H 'Host: php.test' http://127.0.0.1/config.txt)
+echo "docroot remplacé par un lien, /config.txt : HTTP $code"
+rm /home/php.test/www && mv /home/php.test/www.orig /home/php.test/www
+if [ "$code" != "403" ] || grep -q SECRET-DE-KEYSTEST /tmp/lien.out; then
+    echo "ÉCHEC : le docroot remplacé par un lien sert les fichiers de keystest"
+    exit 1
+fi
+rm -f /home/php.test/www/vol.txt /home/php.test/www/voisin /home/php.test/www/lien.txt \
+    /home/php.test/www/interne.txt /home/keys.test/www/config.txt
+
+echo
 echo "--- surcharges de vhost : les deux contextes prennent effet (D63) ---"
 # Ce qu'aucun test unitaire ne voit : Apache charge-t-il réellement ces fichiers,
 # et dans le contexte annoncé ? Chaque fichier porte une directive que le

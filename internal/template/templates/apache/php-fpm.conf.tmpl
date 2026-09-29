@@ -43,15 +43,63 @@
 {{- end }}
 
 {{- define "apache-body" }}
+    # Un lien symbolique n'est suivi que vers ce qui appartient à son auteur.
+    # www-data est membre du groupe de chaque projet (D25) : suivre tout lien lui
+    # ferait servir les fichiers d'un voisin, désignés par un lien posé dans ce
+    # docroot, que le pool du projet — sous son propre compte — ne peut pas lire.
+    # Le contrôle part de la racine du projet : le home appartient à
+    # l'utilisateur (D51), qui y remplace sans privilège le docroot lui-même par
+    # un lien, et Apache éprouve chaque composant avec les options du répertoire
+    # qui le contient. « -FollowSymLinks » est explicite : Debian le pose sur
+    # <Directory />, dont héritent des options relatives. Le contrôle d'Apache
+    # précède l'ouverture et porte sur le nom : un lien permuté entre les deux
+    # passe, ce qu'un utilisateur disposant d'un shell (D62) provoque en boucle.
+    # nginx compare sur le descripteur ouvert et n'y est pas sujet. Fermer cette
+    # course demande une autre identité que www-data pour servir le projet (D25).
+    <Directory {{ .Root }}>
+        Options -FollowSymLinks +SymLinksIfOwnerMatch
+    </Directory>
     <Directory {{ .Docroot }}>
-        AllowOverride {{ if .AllowOverride }}All{{ else }}None{{ end }}
+{{- if .AllowOverride }}
+        # Options= vient après All, qui ouvre toutes les options : un .htaccess
+        # peut régler Indexes, MultiViews et SymLinksIfOwnerMatch — le retirer ne
+        # fait que cesser de suivre les liens —, jamais rétablir FollowSymLinks.
+        # Toute autre option y est refusée, et le répertoire répond 500 : ExecCGI
+        # ou Includes feraient exécuter du code sous www-data, et Apache ne
+        # distingue pas la pose du retrait.
+        AllowOverride All Options=Indexes,MultiViews,SymLinksIfOwnerMatch
+{{- else }}
+        AllowOverride None
+{{- end }}
         Require all granted
-        Options -Indexes +FollowSymLinks
+        Options -Indexes -FollowSymLinks +SymLinksIfOwnerMatch
 {{- if not .AllowOverride }}
         FallbackResource /{{ .FrontController }}
 {{- end }}
         IncludeOptional {{ .IncludeDocroot }}/*.conf
     </Directory>
+
+    # Fichiers et répertoires cachés — .git, .env, .htaccess — et métadonnées de
+    # dépendances : la racine d'un dépôt tiré par « git pull » est souvent le
+    # docroot lui-même (php-plain, Prestashop). /.well-known/ (RFC 8615) reste
+    # servi : le challenge ACME et security.txt y vivent. Le refus est rendu dès
+    # la traduction de l'URL, avant tout contrôle d'accès : aucun « Require » ne
+    # le rouvre, qu'il vienne d'un .htaccess ou d'un <Location /> déposé dans le
+    # contexte du vhost (D63) pour réserver le site à un réseau ou à un mot de
+    # passe — Apache fusionne ces sections dans l'ordre du fichier, et la
+    # dernière qui règle l'accès l'emporte.
+    RedirectMatch 403 "/\.(?!well-known/)"
+    RedirectMatch 403 "/composer\.(json|lock)$"
+    # MultiViews, qu'un .htaccess de Prestashop ou une surcharge du docroot
+    # peuvent ouvrir, négocie « /composer » vers composer.json : la variante est
+    # cherchée par une sous-requête sur le fichier, qui ne passe pas par la
+    # traduction de l'URL. Le refus porte donc aussi sur le nom du fichier, dans
+    # une section <If> : fusionnée après les <Location>, elle tient sous celui
+    # d'une surcharge, qui rouvrirait un <FilesMatch>. Les fichiers cachés n'y
+    # sont pas sujets : l'URL demandée porte déjà « /. ».
+    <If "%{REQUEST_FILENAME} =~ m#/composer\.(json|lock)$#">
+        Require all denied
+    </If>
 
     # Le PHP est traité par FPM sous l'identité du projet : le serveur web ne
     # sert que le statique et n'exécute aucun code applicatif.

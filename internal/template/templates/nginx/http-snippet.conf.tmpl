@@ -10,3 +10,25 @@ map $http_upgrade $connection_upgrade {
     default upgrade;
     ''      close;
 }
+
+# Ce que try_files éprouve avant le front controller d'un site PHP : l'URI
+# elle-même, sauf « / ». Celle-ci désigne le docroot, que www-data traverse sans
+# pouvoir le lire (0710, D51) ; sous disable_symlinks, nginx n'éprouve plus un
+# répertoire par stat() mais l'ouvre en lecture, et chaque visite de l'accueil
+# écrirait une ligne « crit » avant d'atteindre le front controller. Pour « / »,
+# try_files éprouve donc un nom réservé, que la barre finale destine à un
+# répertoire : le premier essai cherche un fichier, ne le retient jamais et passe
+# à l'alternative suivante sans rien écrire. Le deuxième essai de Prestashop,
+# « $ogs_fichier/ », cherche en revanche un répertoire : qu'un projet crée
+# .ogs-accueil/ dans son docroot, et son accueil y est conduit puis refusé en 403
+# par le refus des chemins cachés — rien n'est servi, le projet ne nuit qu'à
+# lui-même. Une location dédiée à « / » soustrairait l'accueil aux surcharges du
+# docroot (D63), et les y inclure rendrait fatale toute location qu'une
+# surcharge imbrique : nginx refuse une location préfixe sous une regex ou une
+# correspondance exacte. « volatile » : une redirection interne (error_page)
+# change l'URI, la valeur ne se garde pas.
+map $uri $ogs_fichier {
+    volatile;
+    default $uri;
+    /       /.ogs-accueil/;
+}
