@@ -606,6 +606,11 @@ func writeBackup(dir, base string, data []byte, perm os.FileMode, now time.Time)
 // descripteur : ce qui est corrigé est le répertoire constaté, jamais la cible
 // d'un lien posé entre l'observation et l'écriture. Même règle que « harden »,
 // qui ne suit aucun lien (D56).
+//
+// Les parents, eux, sont résolus par leur nom : EnsureDir ne convient qu'à un
+// chemin dont les parents appartiennent à root — la racine d'un projet, sous la
+// racine des homes. Les sous-répertoires du projet passent par EnsureDirAt, qui
+// part de sa racine et ne suit de lien à aucun composant.
 func EnsureDir(path string, mode os.FileMode, owner Owner) error {
 	info, err := os.Lstat(path)
 	switch {

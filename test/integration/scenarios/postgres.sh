@@ -205,6 +205,40 @@ if [ "${lignes:-0}" != "1" ]; then
 fi
 
 echo
+echo "--- dump et restauration : aucun lien posé par le projet n'est suivi ---"
+# Le home appartient à l'utilisateur (D51). Un lien à la place de la destination
+# faisait tronquer puis réécrire par root le fichier de son choix ; un lien à la
+# place de l'entrée faisait charger dans sa base un fichier que root seul lit —
+# ici la sauvegarde qui vient d'être faite.
+printf 'témoin\n' > /root/temoin-dump
+su -s /bin/bash shopfr -c 'ln -sfn /root/temoin-dump ~/sauvegarde.sql'
+if ogs db dump shopfr shopfr -O /home/shop.fr/sauvegarde.sql >/tmp/dump-lien.log 2>&1; then
+    cat /tmp/dump-lien.log
+    echo "ÉCHEC : une sauvegarde à travers un lien du home doit être refusée"
+    exit 1
+fi
+if [ "$(cat /root/temoin-dump)" != "témoin" ]; then
+    echo "ÉCHEC : root a réécrit la cible du lien posé par le projet"
+    exit 1
+fi
+su -s /bin/bash shopfr -c "ln -sfn $dump ~/a-restaurer.sql"
+if ogs db restore shopfr shopfr --input /home/shop.fr/a-restaurer.sql --yes >/tmp/restore-lien.log 2>&1; then
+    cat /tmp/restore-lien.log
+    echo "ÉCHEC : une restauration à travers un lien du home doit être refusée"
+    exit 1
+fi
+su -s /bin/bash shopfr -c 'rm -f ~/sauvegarde.sql ~/a-restaurer.sql'
+rm -f /root/temoin-dump
+# Un lien que seul root a pu poser reste suivi : /var/run vers /run.
+if [ -L /var/run ]; then
+    ogs db dump shopfr shopfr -O /var/run/ogs-essai-dump.sql >/dev/null 2>&1 ||
+        { echo "ÉCHEC : un lien posé par root (/var/run) doit être suivi"; exit 1; }
+    [ -s /run/ogs-essai-dump.sql ] || { echo "ÉCHEC : la sauvegarde n'est pas au bout de /var/run"; exit 1; }
+    rm -f /run/ogs-essai-dump.sql
+fi
+echo "liens du projet refusés, lien de root suivi"
+
+echo
 echo "--- suppression ---"
 ogs project delete shopfr --yes >/dev/null 2>&1
 restantes=$(pg "SELECT datname FROM pg_database WHERE datname LIKE 'shopfr%'")

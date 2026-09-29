@@ -3,12 +3,15 @@ package db
 import (
 	"compress/gzip"
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 
 	"leblanc.io/open-go-server/internal/exec"
+	"leblanc.io/open-go-server/internal/fs"
 	"leblanc.io/open-go-server/internal/model"
 )
 
@@ -30,14 +33,20 @@ func (p *Provider) Dump(ctx context.Context, proj *model.Project, decl model.Dat
 	if _, err := os.Stat(tool); err != nil {
 		return "", fmt.Errorf("%s est absent : installer les outils clients du moteur %s", tool, decl.Engine)
 	}
-	if err := os.MkdirAll(filepath.Dir(output), 0o750); err != nil {
+	// La destination est résolue avant la sauvegarde : un chemin refusé l'est sans
+	// avoir fait tourner le dump d'une base entière pour rien.
+	dir, name, err := dumpDir(output)
+	if err != nil {
 		return "", err
+	}
+	if dir != nil {
+		defer dir.Close()
 	}
 	res, err := p.Exec.Run(ctx, exec.Command{Name: tool, Args: args})
 	if err != nil {
 		return "", err
 	}
-	f, err := openDump(output)
+	f, err := openDump(output, dir, name)
 	if err != nil {
 		return "", err
 	}
@@ -56,38 +65,90 @@ func (p *Provider) Dump(ctx context.Context, proj *model.Project, decl model.Dat
 	return output, nil
 }
 
+// outputStreams sont les destinations qu'ogs ouvre par leur nom, sans parcours :
+// les flux standard et /dev/null — et stdinPath la seule source. /dev/stdout est
+// un lien vers /proc/self/fd/1, lui-même un lien « magique » vers un descripteur
+// du processus, que seul le noyau sait suivre : le parcours d'OpenParentDir n'y
+// mènerait nulle part. Aucun compte de projet ne contrôle ces noms.
+var outputStreams = map[string]bool{"/dev/stdout": true, "/dev/stderr": true, "/dev/null": true}
+
+const stdinPath = "/dev/stdin"
+
+// dumpDir ouvre le répertoire de la destination d'une sauvegarde, créé au
+// besoin, et contrôle ce qui occupe déjà son nom. Il rend un répertoire nul pour
+// un flux standard (outputStreams).
+//
+// La destination est souvent le home d'un projet, à la demande de son
+// utilisateur, et l'utilisateur possède ce home (D51) : il y pose un lien à la
+// place du fichier, ou d'un répertoire du chemin, vers le fichier de root de son
+// choix. Ouverte par son nom, la destination faisait tronquer puis réécrire par
+// root la cible du lien — et le contenu d'un dump, les données de sa base, lui
+// est en partie dicté. Le chemin est donc parcouru sans suivre un lien qu'un
+// autre compte que root aurait pu poser (fs.OpenParentDir), et seul un fichier
+// ordinaire, ou rien, peut occuper le nom.
+func dumpDir(output string) (*fs.Dir, string, error) {
+	if outputStreams[output] {
+		return nil, "", nil
+	}
+	dir, name, err := fs.OpenParentDir(output, true, 0o750)
+	if err != nil {
+		return nil, "", err
+	}
+	if err := checkDumpEntry(dir, name, output); err != nil {
+		dir.Close()
+		return nil, "", err
+	}
+	return dir, name, nil
+}
+
+// checkDumpEntry refuse ce qui, à la place de la destination, n'est pas un
+// fichier ordinaire. Un lien, d'abord : il n'est jamais suivi, et jamais délié —
+// ce n'est pas la sauvegarde que l'on remplacerait. Un tube nommé ou un
+// périphérique ensuite : le retrait ne remettrait pas les droits à zéro, il
+// détruirait l'objet, et écrire à travers livrerait les données à qui l'a posé.
+// Un répertoire enfin, qu'une destination mal visée — « -O /var/backups/dumps »
+// — ne doit pas supprimer.
+func checkDumpEntry(dir *fs.Dir, name, output string) error {
+	info, err := dir.Lstat(name)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		return nil
+	case err != nil:
+		return err
+	case info.Mode().IsRegular():
+		return nil
+	case info.Mode()&os.ModeSymlink != 0:
+		return fmt.Errorf("%s est un lien symbolique, posé dans un répertoire qu'un autre compte que root peut "+
+			"modifier : ogs n'écrit pas une sauvegarde à travers lui — désigner le chemin réel", output)
+	case info.IsDir():
+		return fmt.Errorf("%s est un répertoire : désigner le fichier de la sauvegarde", output)
+	}
+	return fmt.Errorf("%s n'est pas un fichier ordinaire (tube nommé, socket ou périphérique) : ogs n'y écrit "+
+		"pas de sauvegarde", output)
+}
+
 // openDump ouvre la destination d'une sauvegarde, avec des permissions
 // restrictives : un dump contient l'intégralité des données de l'application.
 //
-// Sur un **fichier ordinaire**, le retrait préalable et O_EXCL interdisent
-// d'écrire dans un inode qu'on n'a pas créé soi-même : réutiliser un fichier
-// préexistant lui laisserait son propriétaire et son mode, le 0600 annoncé ici
-// ne s'appliquant qu'à la création — et une course sur le retrait échoue
-// franchement au lieu de livrer les données dans l'inode d'un autre.
+// Sur un fichier ordinaire, le retrait préalable et la création exclusive
+// interdisent d'écrire dans un inode qu'on n'a pas créé soi-même : réutiliser un
+// fichier préexistant lui laisserait son propriétaire et son mode, le 0600
+// annoncé ici ne s'appliquant qu'à la création — et une course sur le retrait
+// échoue franchement au lieu de livrer les données dans l'inode d'un autre. Le
+// retrait et la création passent par le descripteur du répertoire, sans suivre
+// de lien : O_EXCL refuse un lien reposé entre les deux (fs.Dir.Create).
 //
-// Ce raisonnement ne vaut que pour le fichier ordinaire, et c'est tout l'objet
-// de la distinction. Sur un périphérique, un tube nommé, un socket ou un lien —
-// « -O /dev/null », « -O /dev/stdout » —, il n'y a ni mode ni propriétaire à
-// assainir : le retrait ne remettrait pas les droits à zéro, il **détruirait**
-// l'objet, sous une commande dont le contrat est d'écrire là où l'exploitant lui
-// dit d'écrire. On écrit alors à travers, sans jamais délier. Un répertoire suit
-// le même chemin et rend EISDIR à l'ouverture, comme avant qu'on ne durcisse.
-func openDump(output string) (*os.File, error) {
-	info, err := os.Lstat(output)
-	if err != nil && !os.IsNotExist(err) {
-		return nil, err
-	}
-	if err == nil && !info.Mode().IsRegular() {
-		// Sans O_CREATE : un lien pendant doit rendre son erreur, non faire écrire
-		// le dump dans le fichier que le lien désigne.
+// Un flux standard est ouvert par son nom et écrit à travers, sans jamais être
+// délié. Il peut mener à un fichier ordinaire — « -O /dev/stdout » sous une
+// redirection — : l'ouverture sans O_TRUNC y laisserait la queue d'un contenu
+// plus long, et tronquer n'a de sens que là, un périphérique ou un tube ne se
+// tronquant pas.
+func openDump(output string, dir *fs.Dir, name string) (*os.File, error) {
+	if dir == nil {
 		f, err := os.OpenFile(output, os.O_WRONLY, 0)
 		if err != nil {
 			return nil, err
 		}
-		// Un lien peut mener à un fichier ordinaire — « -O /dev/stdout » sous une
-		// redirection. L'ouverture sans O_TRUNC y laisserait la queue d'un contenu
-		// plus long ; tronquer n'a de sens que là, un périphérique ou un tube ne se
-		// tronquant pas.
 		if st, err := f.Stat(); err == nil && st.Mode().IsRegular() {
 			if err := f.Truncate(0); err != nil {
 				f.Close()
@@ -96,10 +157,42 @@ func openDump(output string) (*os.File, error) {
 		}
 		return f, nil
 	}
-	if err := os.Remove(output); err != nil && !os.IsNotExist(err) {
+	// Le nom a pu changer pendant la sauvegarde : il est jugé de nouveau.
+	if err := checkDumpEntry(dir, name, output); err != nil {
 		return nil, err
 	}
-	return os.OpenFile(output, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err := dir.Remove(name); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	return dir.Create(name, 0o600, fs.KeepOwner)
+}
+
+// OpenInput ouvre, en lecture, la sauvegarde qu'une restauration doit charger.
+//
+// Elle est chargée sous le super-utilisateur du moteur, dans une base que le
+// projet lit : lue par son nom, depuis un home où l'utilisateur pose un lien à
+// sa place, elle livrait au projet tout fichier que root peut lire — la
+// sauvegarde d'un voisin sous /var/lib/ogs/dumps, dont le nom se devine à la
+// seconde près. Le chemin est donc parcouru sans suivre un lien qu'un autre
+// compte que root aurait pu poser (fs.OpenParentDir), et seul un fichier
+// ordinaire est ouvert, constaté sur son descripteur : ni lien, ni tube nommé
+// — qui bloquerait la restauration —, ni périphérique. /dev/stdin est ouvert
+// par son nom, comme les flux de sortie (outputStreams).
+func OpenInput(input string) (*os.File, error) {
+	if input == stdinPath {
+		return os.Open(input)
+	}
+	dir, name, err := fs.OpenParentDir(input, false, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer dir.Close()
+	f, err := dir.OpenFile(name)
+	if errors.Is(err, fs.ErrNotRegular) {
+		return nil, fmt.Errorf("%s n'est pas un fichier ordinaire, ou c'est un lien posé dans un répertoire qu'un "+
+			"autre compte que root peut modifier : ogs ne le restaure pas — désigner le fichier réel", input)
+	}
+	return f, err
 }
 
 // dumpCommand construit la commande de sauvegarde du moteur.
@@ -161,9 +254,14 @@ func (p *Provider) Restore(ctx context.Context, proj *model.Project, decl model.
 	if err := checkIdentifier("nom de base", decl.Name); err != nil {
 		return err
 	}
-	data, err := os.ReadFile(input)
+	f, err := OpenInput(input)
 	if err != nil {
 		return err
+	}
+	data, err := io.ReadAll(f)
+	f.Close()
+	if err != nil {
+		return fmt.Errorf("lecture de %s : %w", input, err)
 	}
 	var tool string
 	var args []string

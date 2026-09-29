@@ -232,6 +232,34 @@ grep -q "répertoire" /tmp/apply-piege.log || { cat /tmp/apply-piege.log; echo "
 echo "  ~/.local remplacé par un lien : refusé, rien n'a été écrit ailleurs"
 su -s /bin/bash shopfr -c 'rm ~/.local && mv ~/.local.vrai ~/.local'
 
+# Le même détour, mais après le plan : au plan, ~/.local est conforme et
+# ~/.local/bin à créer ; le hook preApply, qui tourne entre le plan et son
+# exécution — la fenêtre que la confirmation d'« ogs apply » laisse à
+# l'utilisateur —, remplace ~/.local par un lien vers /usr/local. Root résolvait
+# de nouveau ~/.local/bin par son nom et donnait /usr/local/bin au projet, en tête
+# de son propre PATH.
+su -s /bin/bash shopfr -c 'mv ~/.local/bin ~/.local/bin.vrai'
+avant=$(stat -c '%a %U:%G' /usr/local/bin)
+mkdir -p /etc/ogs/hooks
+cat > /etc/ogs/hooks/pre-apply <<'HOOK'
+#!/bin/sh
+su -s /bin/bash shopfr -c 'mv ~/.local ~/.local.vrai && ln -s /usr/local ~/.local'
+HOOK
+chmod 0750 /etc/ogs/hooks/pre-apply
+if ogs apply shopfr --yes >/tmp/apply-course.log 2>&1; then
+    cat /tmp/apply-course.log
+    echo "ÉCHEC : un parent substitué entre le plan et l'exécution doit faire échouer l'apply"
+    exit 1
+fi
+rm -f /etc/ogs/hooks/pre-apply
+apres=$(stat -c '%a %U:%G' /usr/local/bin)
+if [ "$avant" != "$apres" ]; then
+    echo "ÉCHEC : /usr/local/bin est passé de $avant à $apres, par le parent substitué"
+    exit 1
+fi
+su -s /bin/bash shopfr -c 'rm ~/.local && mv ~/.local.vrai ~/.local && mv ~/.local/bin.vrai ~/.local/bin'
+echo "  ~/.local substitué pendant l'apply : refusé, /usr/local/bin intact ($apres)"
+
 echo
 echo "--- migration : l'ancien .bin/ disparaît, les services restent debout ---"
 # Un projet d'avant D70 : .bin/ en root, et sa déclaration dans le fichier.

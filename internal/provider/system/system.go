@@ -2,12 +2,12 @@ package system
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"leblanc.io/open-go-server/internal/config"
@@ -66,9 +66,14 @@ type DirState struct {
 	// Symlink signale un lien symbolique posé à la place du répertoire. Il n'est
 	// jamais suivi : sa cible a été choisie par l'utilisateur du projet.
 	Symlink bool
-	Mode    os.FileMode
-	UID     int
-	GID     int
+	// LinkedParent signale un parent, sous la racine du projet, qui n'est pas un
+	// répertoire véritable — le plus souvent un lien posé à sa place. Le
+	// répertoire n'est alors ni observé ni corrigé : on n'y parvient qu'en
+	// suivant ce parent.
+	LinkedParent bool
+	Mode         os.FileMode
+	UID          int
+	GID          int
 }
 
 // Observe inspecte le système pour un projet donné.
@@ -92,7 +97,7 @@ func (p *Provider) Observe(_ context.Context, proj *model.Project) (Observed, er
 		}
 	}
 	for _, path := range p.paths(proj) {
-		obs.Dirs[path] = statDir(path)
+		obs.Dirs[path] = statDir(proj.Spec.Layout.Root, path)
 	}
 	return obs, nil
 }
@@ -114,8 +119,23 @@ func (p *Provider) paths(proj *model.Project) []string {
 // propriétaire du projet sur la cible — une écriture root arbitraire, par le
 // chemin même que la propriété root de logs/ ferme ailleurs. C'est la règle que
 // « harden » applique déjà à /etc (D56).
-func statDir(path string) DirState {
-	info, err := os.Lstat(path)
+//
+// Les parents non plus ne sont pas suivis : sous la racine root, le chemin est
+// parcouru composant par composant (fs.LstatAt). Un os.Lstat de .local/bin
+// traversait un .local devenu lien, et le plan décrivait — puis corrigeait — le
+// bin/ de sa cible. La racine elle-même est lue par son nom : ses parents
+// appartiennent à root.
+func statDir(root, path string) DirState {
+	var info os.FileInfo
+	var err error
+	if rel, rerr := filepath.Rel(root, path); rerr == nil && rel != "." {
+		info, err = fs.LstatAt(root, rel)
+		if errors.Is(err, fs.ErrNotDirectory) {
+			return DirState{Exists: true, LinkedParent: true, UID: -1, GID: -1}
+		}
+	} else {
+		info, err = os.Lstat(path)
+	}
 	if err != nil {
 		return DirState{}
 	}
@@ -292,18 +312,23 @@ func (p *Provider) dirSteps(proj *model.Project, obs Observed) ([]*engine.Step, 
 	if err != nil {
 		return nil, fmt.Errorf("spec.layout.mode : %w", err)
 	}
+	// rel est le chemin relatif à la racine, vide pour la racine elle-même : c'est
+	// par lui, depuis un descripteur de la racine, que les sous-répertoires sont
+	// atteints — jamais par leur chemin complet.
 	type target struct {
 		path  string
+		rel   string
 		mode  os.FileMode
 		owner string
 	}
-	targets := []target{{proj.Spec.Layout.Root, rootMode, ""}}
+	root := proj.Spec.Layout.Root
+	targets := []target{{root, "", rootMode, ""}}
 	for _, d := range proj.Spec.Layout.Dirs {
 		mode, err := fs.ParseMode(d.Mode)
 		if err != nil {
 			return nil, fmt.Errorf("spec.layout.dirs[%s].mode : %w", d.Path, err)
 		}
-		targets = append(targets, target{filepath.Join(proj.Spec.Layout.Root, d.Path), mode, d.Owner})
+		targets = append(targets, target{filepath.Join(root, d.Path), d.Path, mode, d.Owner})
 	}
 
 	// Le propriétaire attendu se lit dans l'état déjà observé, jamais par une
@@ -346,6 +371,18 @@ func (p *Provider) dirSteps(proj *model.Project, obs Observed) ([]*engine.Step, 
 			(state.UID != wantUID || state.GID != wantGID)
 
 		switch {
+		case state.LinkedParent:
+			// Même refus que pour un lien à sa place, et pour la même raison : on
+			// n'atteint ce répertoire qu'en suivant un parent que l'utilisateur a
+			// substitué. L'étape du parent le dit déjà ; celle-ci ne doit pas
+			// annoncer la correction de ce qu'on trouverait au bout du lien.
+			s := engine.NewStep("system/dir/"+t.path, engine.Update,
+				fmt.Sprintf("répertoire %s : un parent n'est pas un répertoire véritable (lien symbolique ?)", t.path))
+			s.Apply = func(context.Context) error {
+				return fmt.Errorf("%s : un de ses parents n'est pas un répertoire véritable (lien "+
+					"symbolique ?) : ogs ne le suit pas ; le rétablir avant de réappliquer", t.path)
+			}
+			steps = append(steps, s)
 		case state.Symlink:
 			// Étape critique, et sans correction automatique : la suite du plan écrit
 			// dans ce répertoire — docroot, sessions, clé de déploiement —, et la
@@ -362,12 +399,18 @@ func (p *Provider) dirSteps(proj *model.Project, obs Observed) ([]*engine.Step, 
 			steps = append(steps, s)
 		case !state.Exists:
 			s := engine.NewStep("system/dir/"+t.path, engine.Create, "répertoire "+desired)
-			s.Apply = func(ctx context.Context) error { return p.ensureDir(proj, t.path, t.mode, t.owner) }
+			s.Apply = func(ctx context.Context) error { return p.ensureDir(proj, t.rel, t.mode, t.owner) }
 			s.Compensate = func(context.Context) error {
-				// os.Remove échoue sur un répertoire non vide, et c'est voulu : un
+				// Le retrait échoue sur un répertoire non vide, et c'est voulu : un
 				// chemin de compensation ne détruit jamais de données. Seuls les
-				// répertoires restés vides sont retirés.
-				_ = os.Remove(t.path)
+				// répertoires restés vides sont retirés — atteints comme à la
+				// création, sans suivre de lien en chemin : un os.Remove par le nom
+				// retirerait le répertoire vide que désigne un parent substitué.
+				if t.rel == "" {
+					_ = os.Remove(t.path)
+				} else {
+					_, _ = fs.RemoveEmptyDirAt(root, t.rel)
+				}
 				return nil
 			}
 			steps = append(steps, s)
@@ -384,11 +427,11 @@ func (p *Provider) dirSteps(proj *model.Project, obs Observed) ([]*engine.Step, 
 			}
 			s := engine.NewStep("system/dir/"+t.path, engine.Update,
 				fmt.Sprintf("répertoire %s : %s", t.path, strings.Join(quoi, ", ")))
-			s.Apply = func(ctx context.Context) error { return p.ensureDir(proj, t.path, t.mode, t.owner) }
+			s.Apply = func(ctx context.Context) error { return p.ensureDir(proj, t.rel, t.mode, t.owner) }
 			// Le propriétaire est reposé lui aussi : un rollback qui ne rendrait que
 			// le mode laisserait le chown en place, donc la dérive corrigée à moitié.
 			s.Compensate = func(context.Context) error {
-				return restoreDir(t.path, previous, prevUID, prevGID)
+				return restoreDir(root, t.rel, previous, prevUID, prevGID)
 			}
 			steps = append(steps, s)
 		default:
@@ -398,30 +441,31 @@ func (p *Provider) dirSteps(proj *model.Project, obs Observed) ([]*engine.Step, 
 	return steps, nil
 }
 
-// restoreDir repose le mode et le propriétaire d'un répertoire sans jamais
-// suivre de lien. Une compensation intervient après coup, et le plan a beau
-// refuser un chemin lié, l'utilisateur du projet — qui écrit dans son home
-// (0711, §7.1.2) — a pu substituer un lien entre l'apply et le rollback :
-// os.Chmod et os.Chown le suivraient, et rendraient à la cible le mode et le
-// propriétaire d'origine du répertoire, c'est-à-dire ceux du projet. Le mode et
-// le propriétaire sont donc posés sur le descripteur, ouvert en O_NOFOLLOW.
-func restoreDir(path string, mode os.FileMode, uid, gid int) error {
-	d, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_DIRECTORY, 0)
-	if err != nil {
-		return fmt.Errorf("ouverture de %s : %w", path, err)
-	}
-	defer d.Close()
-	if err := d.Chmod(mode); err != nil {
-		return err
-	}
+// restoreDir repose le mode et le propriétaire du répertoire rel de la racine
+// root — la racine elle-même si rel est vide — sans jamais suivre de lien, ni à
+// l'entrée ni en chemin. Une compensation intervient après coup, et le plan a
+// beau refuser un chemin lié, l'utilisateur du projet — qui écrit dans son home
+// (0711, §7.1.2) — a pu substituer un lien entre l'apply et le rollback, à la
+// place du répertoire ou de l'un de ses parents : os.Chmod et os.Chown le
+// suivraient, et rendraient à la cible le mode et le propriétaire d'origine du
+// répertoire, c'est-à-dire ceux du projet. Le mode et le propriétaire sont donc
+// posés sur le descripteur du répertoire atteint depuis la racine (fs.SetDirAt).
+func restoreDir(root, rel string, mode os.FileMode, uid, gid int) error {
+	owner := fs.KeepOwner
 	if uid >= 0 && gid >= 0 {
-		return d.Chown(uid, gid)
+		owner = fs.Owner{UID: uid, GID: gid}
 	}
-	return nil
+	return fs.SetDirAt(root, rel, mode, owner)
 }
 
-// ensureDir crée ou corrige un répertoire avec le propriétaire attendu.
-func (p *Provider) ensureDir(proj *model.Project, path string, mode os.FileMode, owner string) error {
+// ensureDir crée ou corrige le répertoire rel du projet — sa racine si rel est
+// vide — avec le propriétaire attendu. Un sous-répertoire est atteint depuis la
+// racine, composant par composant et sans suivre de lien (fs.EnsureDirAt) : le
+// plan a jugé ses parents, mais à l'observation, et l'utilisateur a pu en
+// remplacer un depuis — la confirmation d'« ogs apply » lui en laisse tout le
+// temps. La racine vit sous la racine des homes, qui appartient à root : elle
+// est créée par son nom, son dernier composant n'étant jamais suivi.
+func (p *Provider) ensureDir(proj *model.Project, rel string, mode os.FileMode, owner string) error {
 	target := fs.KeepOwner
 	if !p.Exec.Simulated() {
 		uid, gid, err := p.ResolveOwner(proj, owner)
@@ -430,7 +474,10 @@ func (p *Provider) ensureDir(proj *model.Project, path string, mode os.FileMode,
 		}
 		target = fs.Owner{UID: uid, GID: gid}
 	}
-	return fs.EnsureDir(path, mode, target)
+	if rel == "" {
+		return fs.EnsureDir(proj.Spec.Layout.Root, mode, target)
+	}
+	return fs.EnsureDirAt(proj.Spec.Layout.Root, rel, mode, target)
 }
 
 // ResolveOwner traduit le propriétaire attendu en identifiants numériques. Les

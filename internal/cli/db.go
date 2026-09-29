@@ -259,9 +259,14 @@ func newDBRestoreCommand(app *App) *cobra.Command {
 			if input == "" {
 				return exitf(CodeUsage, "préciser le fichier à restaurer avec --input")
 			}
-			if _, err := os.Stat(input); err != nil {
+			// Le contrôle de la restauration elle-même, avant la confirmation : un
+			// lien ou un fichier spécial est refusé avant qu'on ne demande d'écraser
+			// la base. Un os.Stat suivait le lien.
+			f, err := db.OpenInput(input)
+			if err != nil {
 				return exitf(CodeUsage, "%v", err)
 			}
+			f.Close()
 			p, err := app.loadProject(args[0])
 			if err != nil {
 				return err
