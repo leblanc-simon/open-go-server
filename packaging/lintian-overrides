@@ -15,10 +15,15 @@ ogs: non-standard-dir-perm 0700 != 0755 [var/log/ogs/]
 # sans pouvoir énumérer le reste de l'état.
 ogs: non-standard-dir-perm 0751 != 0755 [var/lib/ogs/]
 
-# « deb-systemd-invoke » vaut pour les unités livrées par un paquet. Le timer de
-# renouvellement n'en est pas une : c'est « ogs init » qui l'écrit, sur la
-# machine administrée. Le paquet ne peut que l'arrêter s'il existe.
-ogs: maintainer-script-calls-systemctl [prerm:10]
+# « deb-systemd-helper » et « deb-systemd-invoke » valent pour les unités livrées
+# par un paquet, dont ils tiennent l'état. Le timer de renouvellement n'en est
+# pas une : c'est le plan global d'« ogs apply » qui l'écrit, sur la machine
+# administrée. Le paquet l'arrête au retrait (prerm), et lui rend ensuite l'état
+# qu'il lui a pris : à la réinstallation, ou après une mise à jour depuis une
+# version dont le prerm le désactivait (postinst). Les numéros de ligne sont
+# vérifiés par packaging/scripts_test.go.
+ogs: maintainer-script-calls-systemctl [prerm:37]
+ogs: maintainer-script-calls-systemctl [postinst:27]
 
 # Le projet est écrit en français, journal des versions compris ; le contrôle
 # orthographique de lintian ne connaît que l'anglais et prend « authentification »

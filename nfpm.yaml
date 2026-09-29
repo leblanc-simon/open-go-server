@@ -90,6 +90,10 @@ contents:
     file_info:
       mode: 0700
 
+# Le postrm n'agit qu'à la purge, mais sa seule présence compte : sans lui ni
+# fichier de configuration, dpkg oubliait le paquet dès le retrait, et
+# « apt purge » n'avait plus rien à faire.
 scripts:
   postinstall: packaging/postinstall.sh
   preremove: packaging/preremove.sh
+  postremove: packaging/postremove.sh
