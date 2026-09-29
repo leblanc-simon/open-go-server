@@ -212,6 +212,20 @@ func newImportAdoptCommand(app *App) *cobra.Command {
 			app.printf("adoption de %s\n", p.ID())
 			app.printf("  utilisateur %s\n", p.Spec.User.Name)
 			app.printf("  racine      %s\n", p.Spec.Layout.Root)
+			// Une base déclarée voit son compte recevoir tous les droits à l'apply,
+			// et « project delete » les supprime l'une et l'autre : l'exploitant doit
+			// les voir avant de confirmer, compte et hôte compris, comme ce qui a
+			// été laissé de côté et pourquoi. Le scan seul le disait.
+			for _, d := range p.Spec.Databases {
+				compte := d.User
+				if d.Engine != "postgres" {
+					compte += "@" + d.Host
+				}
+				app.printf("  base        %s %s (compte %s)\n", d.Engine, d.Name, compte)
+			}
+			for _, u := range chosen.Uncertain {
+				app.printf("  ⚠ %s\n", u)
+			}
 			if diffs := importer.Diverges(p, app.homeRoot(), app.Cfg.PrepDomain()); len(diffs) > 0 {
 				// L'écart est annoncé maintenant : un « apply » normaliserait sans
 				// prévenir, et c'est exactement ce qu'il faut éviter de découvrir après.

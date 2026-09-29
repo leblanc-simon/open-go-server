@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"leblanc.io/open-go-server/internal/config"
@@ -126,6 +127,9 @@ type DBState struct {
 	// juger conformes : un compte additionnel déclaré « readonly » et créé jadis
 	// en « all » garderait ses droits d'écriture sans que rien ne l'annonce.
 	ExtraGrants map[string]string
+	// OtherHosts énumère, pour chaque compte MySQL absent sous l'hôte déclaré —
+	// principal ou additionnel —, les hôtes sous lesquels son nom existe déjà.
+	OtherHosts map[string][]string
 	// Unavailable porte le motif si le moteur n'est pas joignable.
 	Unavailable error
 }
@@ -141,7 +145,7 @@ func (p *Provider) Observe(ctx context.Context, proj *model.Project) (Observed, 
 	for _, decl := range proj.Spec.Databases {
 		state := DBState{Declaration: decl, Grants: map[string]string{},
 			Extensions: map[string]bool{}, ExtraUsers: map[string]bool{},
-			ExtraGrants: map[string]string{}}
+			ExtraGrants: map[string]string{}, OtherHosts: map[string][]string{}}
 		client, err := p.clientFor(decl)
 		if err != nil {
 			state.Unavailable = err
@@ -186,9 +190,17 @@ func (p *Provider) Observe(ctx context.Context, proj *model.Project) (Observed, 
 			}
 		} else {
 			state.UserExists = users[decl.User+"@"+host]
+			if !state.UserExists {
+				if other := otherHosts(users, decl.User, host); len(other) > 0 {
+					state.OtherHosts[decl.User] = other
+				}
+			}
 			for _, u := range decl.ExtraUsers {
 				state.ExtraUsers[u.User] = users[u.User+"@"+host]
 				if !state.ExtraUsers[u.User] {
+					if other := otherHosts(users, u.User, host); len(other) > 0 {
+						state.OtherHosts[u.User] = other
+					}
 					continue
 				}
 				// Une lecture en échec laisse l'entrée vide, donc non conforme :
@@ -257,6 +269,26 @@ func (p *Provider) Plan(ctx context.Context, proj *model.Project, obs Observed) 
 		if !state.DBExists {
 			action = engine.Create
 		}
+		// Un compte dont le nom existe sous un autre hôte n'est pas créé : MySQL
+		// retient pour chaque connexion le compte à l'hôte le plus précis, et un
+		// 'shop'@'localhost' neuf, au mot de passe tiré, masquerait 'shop'@'%' pour
+		// toute connexion locale. C'était le sort de toute base adoptée tant que
+		// l'import déclarait l'hôte par défaut — l'application perdait l'accès à sa
+		// base au premier apply —, et les déclarations écrites alors le restent.
+		// L'étape n'est pas critique : le site n'a pas à tomber pour un compte
+		// qu'on refuse de créer.
+		if masked := maskedAccounts(decl, state, host); masked != "" {
+			reason := fmt.Errorf("base %s %s : %s existe déjà sous un autre hôte que %q, et un homonyme "+
+				"sous celui-ci changerait le compte que MySQL retient pour une partie des connexions — "+
+				"il préfère l'hôte le plus précis. Déclarer l'hôte réel (champ host de spec.databases), "+
+				"ou retirer l'autre compte", decl.Engine, decl.Name, masked, host)
+			s := engine.NewStep(resource, action, fmt.Sprintf(
+				"base %s %s — compte refusé : %s existe sous un autre hôte", decl.Engine, decl.Name, masked))
+			s.Critical = false
+			s.Apply = func(context.Context) error { return reason }
+			steps = append(steps, s)
+			continue
+		}
 		summary := fmt.Sprintf("base %s %s (utilisateur %s, privilèges %s)",
 			decl.Engine, decl.Name, decl.User, priv)
 		s := engine.NewStep(resource, action, summary)
@@ -292,6 +324,38 @@ func grantsConform(engine, observed string, priv Privilege) bool {
 		return observed != ""
 	}
 	return MySQLGrantsSatisfied(observed, priv)
+}
+
+// otherHosts énumère les hôtes sous lesquels le compte MySQL user existe, hors
+// l'hôte déclaré. Les comptes sont relevés sous la forme « user@host » ; un hôte
+// ne contient jamais « @ », d'où la coupure au dernier.
+func otherHosts(users map[string]bool, user, host string) []string {
+	var out []string
+	for account := range users {
+		i := strings.LastIndex(account, "@")
+		if i < 0 || account[:i] != user || account[i+1:] == host {
+			continue
+		}
+		out = append(out, account[i+1:])
+	}
+	sort.Strings(out)
+	return out
+}
+
+// maskedAccounts nomme les comptes existants qu'un compte à créer sous l'hôte
+// déclaré masquerait, ou rend une chaîne vide.
+func maskedAccounts(decl model.Database, state DBState, host string) string {
+	users := []string{decl.User}
+	for _, u := range decl.ExtraUsers {
+		users = append(users, u.User)
+	}
+	var out []string
+	for _, user := range users {
+		for _, other := range state.OtherHosts[user] {
+			out = append(out, fmt.Sprintf("'%s'@'%s'", user, other))
+		}
+	}
+	return strings.Join(out, ", ")
 }
 
 func extensionsSatisfied(decl model.Database, state DBState) bool {

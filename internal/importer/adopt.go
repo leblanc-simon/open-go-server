@@ -3,6 +3,7 @@ package importer
 import (
 	"fmt"
 	"path/filepath"
+	"strings"
 
 	"leblanc.io/open-go-server/internal/model"
 	"leblanc.io/open-go-server/internal/naming"
@@ -76,17 +77,34 @@ func Adopt(c Candidate, homeRoot, prepDomain string, opts ...model.NormalizeOpti
 				p.Spec.Web.VHosts[0].Pool = model.MainPoolName
 			}
 		case KindDatabase:
-			decl := db.DefaultDatabase(p, r.Attr("engine"))
+			// Un compte seul de son nom, ou aucun : le premier d'une liste — le plus
+			// court, dans l'ordre alphabétique — était celui d'un voisin, qu'ogs
+			// accordait à l'apply et supprimait avec le projet. Sans compte sûr, la
+			// base n'est pas déclarée : Correlate l'a déjà laissée hors gestion, et
+			// cette garde tient pour un candidat composé ailleurs.
+			compte, ok := compteSur(r)
+			if !ok {
+				notes = append(notes, fmt.Sprintf("base %s non déclarée : %s", r.Name, sansCompteSur(r)))
+				continue
+			}
+			engine := r.Attr("engine")
+			decl := db.DefaultDatabase(p, engine)
 			// Le nom réel est conservé : renommer une base exigerait de la recréer.
 			decl.Name = r.Name
-			if users := splitList(r.Attr("users")); len(users) > 0 {
-				decl.User = accountName(users[0])
+			// L'hôte aussi est un nom réel : 'shop'@'%' et 'shop'@'localhost' sont
+			// deux comptes. Déclarer le second faisait créer à l'apply un compte
+			// neuf, au mot de passe tiré, que MySQL préfère au premier pour toute
+			// connexion locale — et l'application perdait l'accès à sa base.
+			user, host := splitAccount(engine, compte)
+			decl.User = user
+			if host != "" {
+				decl.Host = host
 			}
 			p.Spec.Databases = append(p.Spec.Databases, decl)
 			notes = append(notes, fmt.Sprintf(
 				"le mot de passe de %s est inconnu d'ogs : il n'est ni deviné ni réinitialisé. "+
 					"Employer « ogs db user rotate %s %s » pour en reprendre la main",
-				decl.User, p.ID(), decl.User))
+				compte, p.ID(), decl.User))
 		case KindCertificate:
 			if r.Attr("source") == "certbot" {
 				notes = append(notes, fmt.Sprintf(
@@ -125,14 +143,18 @@ func Adopt(c Candidate, homeRoot, prepDomain string, opts ...model.NormalizeOpti
 	return p, notes, nil
 }
 
-// accountName retire la partie hôte d'un compte MySQL.
-func accountName(account string) string {
-	for i := 0; i < len(account); i++ {
-		if account[i] == '@' {
-			return account[:i]
-		}
+// splitAccount sépare le nom et l'hôte d'un compte tel que le scan le relève :
+// « user@host » pour MySQL et MariaDB, qui les concatènent, le rôle seul pour
+// PostgreSQL, qui n'a pas d'hôte et dont un rôle peut contenir « @ ». Un hôte
+// n'en contient jamais : la coupure se fait au dernier.
+func splitAccount(engine, account string) (string, string) {
+	if engine == "postgres" {
+		return account, ""
 	}
-	return account
+	if i := strings.LastIndex(account, "@"); i >= 0 {
+		return account[:i], account[i+1:]
+	}
+	return account, ""
 }
 
 // Diverges compare la déclaration adoptée à ce qu'ogs aurait produit, et renvoie

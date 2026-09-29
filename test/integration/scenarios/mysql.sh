@@ -176,5 +176,42 @@ echo "bases et utilisateur supprimés ; le leurre, qui n'appartenait pas au proj
 mariadb -N -e "SELECT schema_name FROM information_schema.schemata WHERE schema_name='shopfrXstats'"
 
 echo
+echo "--- un compte existant sous un autre hôte n'est pas masqué ---"
+# Le cas d'un serveur repris : 'vitrinefr'@'%', dont l'application connaît le mot
+# de passe. MySQL retient pour chaque connexion le compte à l'hôte le plus
+# précis : un 'vitrinefr'@'localhost' créé à côté ferait refuser ce mot de passe
+# par le socket comme par 127.0.0.1.
+mariadb -e "CREATE DATABASE vitrinefr; CREATE USER 'vitrinefr'@'%' IDENTIFIED BY 'ancien';
+            GRANT ALL PRIVILEGES ON vitrinefr.* TO 'vitrinefr'@'%'"
+ogs site create vitrine.fr --kind static --db mysql --tls=false --yes >/tmp/vitrine.log 2>&1
+if mariadb -N -e "SELECT host FROM mysql.user WHERE user='vitrinefr'" | grep -qx localhost; then
+    echo "ÉCHEC : 'vitrinefr'@'localhost' a été créé à côté de 'vitrinefr'@'%'"
+    exit 1
+fi
+if ! grep -q "existe déjà sous un autre hôte" /tmp/vitrine.log; then
+    echo "ÉCHEC : le refus de créer l'homonyme n'est pas annoncé"
+    tail -5 /tmp/vitrine.log
+    exit 1
+fi
+# Déclaré sous son hôte réel — ce que fait désormais l'import —, le compte est
+# reconnu : ni second compte, ni mot de passe posé, ni écart au diff suivant.
+sed -i "s/^\( *\)host: localhost$/\1host: '%'/" /etc/ogs/projects/vitrinefr.yaml
+ogs apply vitrinefr --yes >/dev/null 2>&1
+if mariadb -N -e "SELECT host FROM mysql.user WHERE user='vitrinefr'" | grep -qx localhost; then
+    echo "ÉCHEC : l'hôte déclaré n'est pas celui que l'apply emploie"
+    exit 1
+fi
+if ! mariadb -h 127.0.0.1 -u vitrinefr -pancien vitrinefr -e 'SELECT 1' >/dev/null 2>&1; then
+    echo "ÉCHEC : l'application a perdu l'accès à sa base"
+    exit 1
+fi
+if ogs diff vitrinefr 2>&1 | grep -qi "base mysql vitrinefr"; then
+    echo "ÉCHEC : le compte relu sous '%' reste en écart"
+    ogs diff vitrinefr 2>&1 | tail -4
+    exit 1
+fi
+echo "'vitrinefr'@'%' est reconnu sous son hôte réel, et son mot de passe fonctionne toujours"
+
+echo
 echo "RÉSULTAT : le provider MySQL fonctionne sur un vrai serveur — privilèges"
 echo "           bornés, motif échappé, rotation effective, suppression complète."

@@ -174,22 +174,6 @@ func Correlate(resources []Resource, homeRoot, prepDomain string) ([]Candidate, 
 			}
 		}
 
-		// Les bases : rapprochées par nom, avec une incertitude assumée sur la
-		// propriété, qui n'est pas déductible du serveur.
-		base, _ := naming.BaseID(candidate.Host)
-		for _, database := range byKind[KindDatabase] {
-			if claimed[key(database)] {
-				continue
-			}
-			if similar(database.Name, base) ||
-				(candidate.User != "" && similar(database.Name, candidate.User)) {
-				candidate.Resources = append(candidate.Resources, database)
-				claimed[key(database)] = true
-				candidate.Uncertain = append(candidate.Uncertain,
-					fmt.Sprintf("propriété de la base %s à confirmer : elle n'est pas déductible",
-						database.Name))
-			}
-		}
 		// Les certificats couvrant l'un des domaines.
 		for _, cert := range byKind[KindCertificate] {
 			if Managed(cert) || claimed[key(cert)] {
@@ -225,6 +209,11 @@ func Correlate(resources []Resource, homeRoot, prepDomain string) ([]Candidate, 
 		}
 		candidates = append(candidates, candidate)
 	}
+
+	// Les bases, une fois tous les candidats connus : rattachées vhost par vhost,
+	// elles revenaient au premier rencontré dans l'ordre alphabétique, sans égard
+	// pour les suivants qu'elles désignaient aussi bien.
+	rattacherBases(candidates, byKind[KindDatabase], claimed)
 
 	// Tout ce qui n'a pas été rattaché reste non géré, et ne sera jamais touché.
 	var unmanaged []Resource
@@ -318,14 +307,113 @@ func guessKind(docroot, phpVersion string) model.AppKind {
 	return model.KindPHPPlain
 }
 
-// similar rapproche deux noms en ignorant les séparateurs : « shop_fr »,
-// « shop-fr » et « shopfr » désignent en pratique le même site.
-func similar(a, b string) bool {
-	na, nb := normalizeName(a), normalizeName(b)
-	if na == "" || nb == "" {
-		return false
+// rattacherBases confie chaque base au seul projet que son nom désigne : celui
+// dont l'identifiant ou le compte système porte ce nom, séparateurs mis à part.
+// La propriété d'une base n'est pas déductible du serveur, et ce qu'elle engage
+// ne se rattrape pas : le compte d'une base déclarée reçoit tous les droits à
+// l'apply, et « project delete » supprime l'une et l'autre. Le nom n'est donc un
+// indice que s'il ne désigne personne d'autre, et le compte que s'il est seul de
+// son nom (compteSur). Faute de quoi la base reste non gérée, et chaque candidat
+// concerné dit pourquoi : tranchée en silence, l'ambiguïté donnait à shop.fr la
+// base et le compte de shop.com.
+//
+// Plusieurs candidats peuvent porter le même identifiant — certbot double le vhost
+// d'un site d'un « -le-ssl » au même ServerName. Ils désignent un seul projet, et
+// la base leur revient à tous : un seul d'entre eux peut être adopté.
+func rattacherBases(candidates []Candidate, databases []Resource, claimed map[string]bool) {
+	for _, database := range databases {
+		if claimed[key(database)] {
+			continue
+		}
+		designes := map[string][]int{}
+		var projets []string
+		for i, c := range candidates {
+			if !similar(database.Name, c.ID) && !similar(database.Name, c.User) {
+				continue
+			}
+			projet := orHost(c)
+			if _, vu := designes[projet]; !vu {
+				projets = append(projets, projet)
+			}
+			designes[projet] = append(designes[projet], i)
+		}
+		switch {
+		case len(projets) == 0:
+			// Aucun indice : la base reste non gérée, et rien n'est à signaler.
+		case len(projets) > 1:
+			sort.Strings(projets)
+			for _, projet := range projets {
+				var autres []string
+				for _, autre := range projets {
+					if autre != projet {
+						autres = append(autres, autre)
+					}
+				}
+				for _, i := range designes[projet] {
+					candidates[i].Uncertain = append(candidates[i].Uncertain, fmt.Sprintf(
+						"base %s laissée hors gestion : son nom désigne aussi %s",
+						database.Name, strings.Join(autres, ", ")))
+				}
+			}
+		default:
+			compte, sur := compteSur(database)
+			for _, i := range designes[projets[0]] {
+				c := &candidates[i]
+				if !sur {
+					c.Uncertain = append(c.Uncertain, fmt.Sprintf(
+						"base %s laissée hors gestion : %s — la déclarer à la main une fois son compte établi",
+						database.Name, sansCompteSur(database)))
+					continue
+				}
+				c.Resources = append(c.Resources, database)
+				c.Uncertain = append(c.Uncertain, fmt.Sprintf(
+					"propriété de la base %s à confirmer : elle n'est pas déductible (compte %s, "+
+						"rapproché par son nom)", database.Name, compte))
+			}
+			if sur {
+				claimed[key(database)] = true
+			}
+		}
 	}
-	return na == nb || strings.HasPrefix(na, nb) || strings.HasPrefix(nb, na)
+}
+
+// orHost désigne un candidat par son identifiant, à défaut par son host.
+func orHost(c Candidate) string {
+	if c.ID != "" {
+		return c.ID
+	}
+	return c.Host
+}
+
+// compteSur rend le compte d'une base quand il est seul à porter son nom. Le nom
+// est le seul indice — la propriété d'une base n'est pas déductible —, et deux
+// comptes de ce nom sous deux hôtes, ou à un séparateur près, sont deux comptes :
+// retenir l'un d'eux, c'était deviner celui que l'application emploie, puis lui
+// accorder la base et le supprimer avec le projet.
+func compteSur(database Resource) (string, bool) {
+	comptes := splitList(database.Attr("users"))
+	if len(comptes) != 1 {
+		return "", false
+	}
+	return comptes[0], true
+}
+
+// sansCompteSur dit pourquoi une base n'a pas de compte sûr.
+func sansCompteSur(database Resource) string {
+	comptes := splitList(database.Attr("users"))
+	if len(comptes) == 0 {
+		return "aucun compte ne porte son nom"
+	}
+	return fmt.Sprintf("plusieurs comptes portent son nom (%s)", strings.Join(comptes, ", "))
+}
+
+// similar rapproche deux noms en ignorant les séparateurs : « shop_fr »,
+// « shop-fr » et « shopfr » désignent en pratique le même site. Rien de plus : un
+// préfixe rapprochait « shop » de « shopping » comme de « shop_old », et le premier
+// candidat venu s'appropriait la base, le pool ou le compte d'un voisin.
+func similar(a, b string) bool {
+	na := normalizeName(a)
+	return na != "" && na == normalizeName(b)
 }
 
 func normalizeName(s string) string {

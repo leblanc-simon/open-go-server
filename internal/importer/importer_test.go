@@ -2,14 +2,18 @@ package importer
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 
 	"leblanc.io/open-go-server/internal/config"
 	"leblanc.io/open-go-server/internal/model"
+	"leblanc.io/open-go-server/internal/provider/db"
 	"leblanc.io/open-go-server/internal/provider/web"
+	"leblanc.io/open-go-server/internal/spec"
 )
 
 // legacyServer construit un serveur « configuré à la main », tel qu'on en
@@ -349,13 +353,22 @@ func TestDivergesAnnouncesNormalisation(t *testing.T) {
 }
 
 func TestSimilarIgnoresSeparators(t *testing.T) {
+	// Les séparateurs, et rien d'autre : un préfixe rapprochait « shop » de
+	// « shopping » et de « shop_old », et le premier candidat venu prenait la base
+	// et le compte du voisin — qu'ogs accordait à l'apply puis supprimait avec le
+	// projet.
 	cases := map[[2]string]bool{
 		{"shop_fr", "shopfr"}:      true,
 		{"shop-fr", "shopfr"}:      true,
-		{"shopfr", "shopfrprep"}:   true,
-		{"boutique", "boutiquefr"}: true,
+		{"shop_fr", "shop-fr"}:     true,
+		{"Shop.FR", "shopfr"}:      true,
+		{"shopfr", "shopfrprep"}:   false,
+		{"boutique", "boutiquefr"}: false,
+		{"shop", "shopping"}:       false,
+		{"shop_old", "shop"}:       false,
 		{"shop", "autre"}:          false,
 		{"", "shopfr"}:             false,
+		{"", ""}:                   false,
 	}
 	for pair, want := range cases {
 		if got := similar(pair[0], pair[1]); got != want {
@@ -542,5 +555,367 @@ func TestCorrelateRetientLeCompteAuHomeLePlusProfond(t *testing.T) {
 	}
 	if c.Shell != "/bin/bash" {
 		t.Errorf("shell retenu %q : c'est celui du compte du voisin", c.Shell)
+	}
+}
+
+// clientFige joue le moteur MySQL d'un serveur repris : des bases et des comptes,
+// ceux-ci au format du vrai client — « user@host », tel que CONCAT le rend.
+type clientFige struct {
+	bases, comptes []string
+}
+
+func ensemble(noms []string) map[string]bool {
+	out := map[string]bool{}
+	for _, n := range noms {
+		out[n] = true
+	}
+	return out
+}
+
+func (c *clientFige) Endpoint(context.Context) (db.Endpoint, error) { return db.Endpoint{}, nil }
+func (c *clientFige) Databases(context.Context) (map[string]bool, error) {
+	return ensemble(c.bases), nil
+}
+func (c *clientFige) Users(context.Context) (map[string]bool, error) {
+	return ensemble(c.comptes), nil
+}
+func (c *clientFige) Grants(context.Context, string, string) (map[string]string, error) {
+	return map[string]string{}, nil
+}
+func (c *clientFige) Extensions(context.Context, string) (map[string]bool, error) {
+	return map[string]bool{}, nil
+}
+func (c *clientFige) Exec(context.Context, string) error {
+	return fmt.Errorf("le scan est en lecture seule")
+}
+func (c *clientFige) ExecIn(context.Context, string, string) error {
+	return fmt.Errorf("le scan est en lecture seule")
+}
+func (c *clientFige) Close() error { return nil }
+
+// serveurAvecBases construit un serveur repris dont chaque site a son vhost, son
+// pool désigné par le socket et son compte système — le cas de confiance élevée —,
+// et dont le moteur MySQL porte les bases et les comptes donnés.
+func serveurAvecBases(t *testing.T, sites map[string]string, bases, comptes []string) *Scanner {
+	t.Helper()
+	prefix := t.TempDir()
+	paths := config.NewPaths(prefix)
+	eng, err := web.NewEngine("apache", prefix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	write := func(path, content string) {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.MkdirAll(eng.EnabledDir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write(paths.PHPBin("8.1"), "#!/bin/sh\n")
+	write(paths.PHPFpmBin("8.1"), "#!/bin/sh\n")
+	hosts := make([]string, 0, len(sites))
+	for host := range sites {
+		hosts = append(hosts, host)
+	}
+	sort.Strings(hosts)
+	var passwd []string
+	for i, host := range hosts {
+		user := sites[host]
+		socket := "/run/php/php8.1-fpm-" + user + ".sock"
+		write(filepath.Join(eng.AvailableDir(), host+".conf"), fmt.Sprintf(
+			"<VirtualHost *:80>\n    ServerName %s\n    DocumentRoot /var/www/%s/public\n"+
+				"    <FilesMatch \\.php$>\n        SetHandler \"proxy:unix:%s|fcgi://localhost\"\n"+
+				"    </FilesMatch>\n</VirtualHost>\n", host, user, socket))
+		write(paths.PHPPoolFile("8.1", user), fmt.Sprintf("[%s]\nuser = %s\nlisten = %s\n", user, user, socket))
+		passwd = append(passwd, fmt.Sprintf("%s:x:%d:%d::/var/www/%s:/bin/bash", user, 1001+i, 1001+i, user))
+	}
+	write(filepath.Join(prefix, "etc", "passwd"), strings.Join(passwd, "\n")+"\n")
+	return &Scanner{Paths: paths, Engine: eng, HomeRoots: []string{"/var/www"},
+		DBClients: map[string]db.Client{"mysql": &clientFige{bases: bases, comptes: comptes}}}
+}
+
+// inspecter enchaîne le scan et la corrélation, comme « ogs import ».
+func inspecter(t *testing.T, scanner *Scanner) ([]Candidate, []Resource) {
+	t.Helper()
+	resources, err := scanner.Scan(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return Correlate(resources, "/home", "preprod-pp.net")
+}
+
+func candidat(t *testing.T, candidates []Candidate, id string) Candidate {
+	t.Helper()
+	for _, c := range candidates {
+		if c.ID == id {
+			return c
+		}
+	}
+	t.Fatalf("candidat %s absent : %+v", id, candidates)
+	return Candidate{}
+}
+
+func basesDe(c Candidate) []string {
+	var out []string
+	for _, r := range c.Resources {
+		if r.Kind == KindDatabase {
+			out = append(out, r.Name)
+		}
+	}
+	return out
+}
+
+func nonGeree(unmanaged []Resource, kind Kind, name string) bool {
+	for _, r := range unmanaged {
+		if r.Kind == kind && r.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+func TestScanNeRattacheQueLesComptesDeMemeNom(t *testing.T) {
+	// Un préfixe suffisait : le compte de shop.com était rapproché de la base de
+	// shop.fr, et de la base shop_old d'un tout autre site. Le même nom,
+	// séparateurs mis à part, et chaque hôte compté pour un compte.
+	scanner := serveurAvecBases(t, nil,
+		[]string{"mysql", "shop", "shopfr", "shop_old", "boutique_fr"},
+		[]string{"root@localhost", "shop@localhost", "shop@%", "shopfr@localhost", "boutiquefr@%"})
+	resources, err := scanner.Scan(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	attendus := map[string]string{
+		"shop":        "shop@%,shop@localhost",
+		"shopfr":      "shopfr@localhost",
+		"shop_old":    "",
+		"boutique_fr": "boutiquefr@%",
+	}
+	vues := 0
+	for _, r := range resources {
+		if r.Kind != KindDatabase {
+			continue
+		}
+		vues++
+		if want, ok := attendus[r.Name]; !ok {
+			t.Errorf("base système relevée : %s", r.Name)
+		} else if r.Attr("users") != want {
+			t.Errorf("base %s : comptes %q, %q attendus", r.Name, r.Attr("users"), want)
+		}
+	}
+	if vues != len(attendus) {
+		t.Errorf("%d bases relevées, %d attendues", vues, len(attendus))
+	}
+}
+
+func TestCorrelateRattacheChaqueBaseAuSeulProjetQuiLaDesigne(t *testing.T) {
+	// shop.fr (pool shop) et shopping.fr (pool shopping) : le premier candidat
+	// revendiquait aussi la base shopping, sous le compte shop, et le second n'en
+	// recevait aucune. L'apply de shopfr accordait shopping à shop, et
+	// « project delete shopfr » la supprimait.
+	scanner := serveurAvecBases(t,
+		map[string]string{"shop.fr": "shop", "shopping.fr": "shopping"},
+		[]string{"shop", "shopping"},
+		[]string{"shop@localhost", "shopping@localhost"})
+	candidates, _ := inspecter(t, scanner)
+	for id, want := range map[string]string{"shopfr": "shop", "shoppingfr": "shopping"} {
+		c := candidat(t, candidates, id)
+		if got := basesDe(c); len(got) != 1 || got[0] != want {
+			t.Errorf("%s : bases %v, [%s] attendue", id, got, want)
+		}
+		p, _, err := Adopt(c, "/home", "preprod-pp.net")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(p.Spec.Databases) != 1 || p.Spec.Databases[0].Name != want ||
+			p.Spec.Databases[0].User != want {
+			t.Errorf("%s : déclaration %+v, base et compte %s attendus", id, p.Spec.Databases, want)
+		}
+	}
+}
+
+func TestAdoptNeRetientPasLeCompteDUnVoisin(t *testing.T) {
+	// shop.com (base shop, compte shop) et shop.fr (base shopfr, compte shopfr).
+	// Le compte de shop.com, plus court, passait premier dans l'ordre
+	// alphabétique : la base de shop.fr était déclarée sous le compte shop, que
+	// « project delete shopfr » supprimait — shop.com, resté hors d'ogs, perdait
+	// l'accès à sa base.
+	scanner := serveurAvecBases(t,
+		map[string]string{"shop.com": "shopcom", "shop.fr": "shopfr"},
+		[]string{"shop", "shopfr"},
+		[]string{"shop@localhost", "shopfr@localhost"})
+	candidates, unmanaged := inspecter(t, scanner)
+	for _, c := range candidates {
+		p, _, err := Adopt(c, "/home", "preprod-pp.net")
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, d := range p.Spec.Databases {
+			if d.Name == "shop" || d.User == "shop" {
+				t.Errorf("%s déclare la base ou le compte de shop.com : %+v", c.ID, d)
+			}
+		}
+		if c.ID == "shopfr" && (len(p.Spec.Databases) != 1 || p.Spec.Databases[0].Name != "shopfr" ||
+			p.Spec.Databases[0].User != "shopfr" || p.Spec.Databases[0].Host != "localhost") {
+			t.Errorf("shopfr : déclaration %+v, shopfr sous shopfr@localhost attendue", p.Spec.Databases)
+		}
+	}
+	// La base que rien ne désigne reste non gérée : elle ne sera jamais touchée.
+	if !nonGeree(unmanaged, KindDatabase, "shop") {
+		t.Errorf("la base shop doit rester non gérée : %v", unmanaged)
+	}
+}
+
+func TestCorrelateLaisseHorsGestionUneBaseAmbigue(t *testing.T) {
+	// Un pool servant deux sites donne le même compte à deux candidats : la base
+	// de ce nom les désigne tous deux. Le premier dans l'ordre alphabétique la
+	// prenait ; aucun ne doit l'avoir, et chacun doit dire pourquoi.
+	socket := "/run/php/php8.1-fpm-shop.sock"
+	resources := []Resource{
+		{Kind: KindVHost, Name: "shop.com", Attributes: map[string]string{
+			"domains": "shop.com", "docroot": "/var/www/shop/public", "fpm": socket}},
+		{Kind: KindVHost, Name: "shop.fr", Attributes: map[string]string{
+			"domains": "shop.fr", "docroot": "/var/www/shop/public", "fpm": socket}},
+		{Kind: KindPool, Name: "shop", Attributes: map[string]string{
+			"version": "8.1", "user": "shop", "listen": socket}},
+		{Kind: KindDatabase, Name: "shop", Attributes: map[string]string{
+			"engine": "mysql", "users": "shop@localhost"}},
+	}
+	candidates, unmanaged := Correlate(resources, "/home", "preprod-pp.net")
+	if len(candidates) != 2 {
+		t.Fatalf("%d candidats, 2 attendus : %+v", len(candidates), candidates)
+	}
+	for _, c := range candidates {
+		if got := basesDe(c); len(got) > 0 {
+			t.Errorf("%s revendique %v, que son voisin désigne aussi", c.ID, got)
+		}
+		if !containsSubstring(c.Uncertain, "base shop laissée hors gestion : son nom désigne aussi") {
+			t.Errorf("%s doit dire pourquoi la base est écartée : %v", c.ID, c.Uncertain)
+		}
+	}
+	if !nonGeree(unmanaged, KindDatabase, "shop") {
+		t.Errorf("la base ambiguë doit rester non gérée : %v", unmanaged)
+	}
+
+	// Deux vhosts d'un même site — certbot double le vhost d'un « -le-ssl » au
+	// même ServerName — ne sont pas deux prétendants : la base leur revient.
+	resources = []Resource{
+		{Kind: KindVHost, Name: "shop.fr", Attributes: map[string]string{
+			"domains": "shop.fr", "docroot": "/var/www/shop/public", "fpm": socket}},
+		{Kind: KindVHost, Name: "shop.fr-le-ssl", Attributes: map[string]string{
+			"domains": "shop.fr", "docroot": "/var/www/shop/public", "fpm": socket}},
+		{Kind: KindPool, Name: "shop", Attributes: map[string]string{
+			"version": "8.1", "user": "shop", "listen": socket}},
+		{Kind: KindDatabase, Name: "shopfr", Attributes: map[string]string{
+			"engine": "mysql", "users": "shopfr@localhost"}},
+	}
+	candidates, _ = Correlate(resources, "/home", "preprod-pp.net")
+	for _, c := range candidates {
+		if got := basesDe(c); len(got) != 1 || got[0] != "shopfr" {
+			t.Errorf("%s (%s) : bases %v, [shopfr] attendue", c.ID, c.Resources[0].Name, got)
+		}
+		if containsSubstring(c.Uncertain, "désigne aussi") {
+			t.Errorf("un site n'est pas en concurrence avec lui-même : %v", c.Uncertain)
+		}
+	}
+}
+
+func TestCorrelateLaisseHorsGestionUneBaseSansCompteSur(t *testing.T) {
+	// Deux comptes du même nom sous deux hôtes sont deux comptes, et aucun compte
+	// n'en désigne aucun : déclarer la base ferait créer, accorder, puis supprimer
+	// avec le projet un compte que rien ne lui relie. Elle reste non gérée.
+	resources := []Resource{
+		{Kind: KindVHost, Name: "shop.fr", Attributes: map[string]string{
+			"domains": "shop.fr", "docroot": "/var/www/shop/public"}},
+		{Kind: KindVHost, Name: "vitrine.fr", Attributes: map[string]string{
+			"domains": "vitrine.fr", "docroot": "/var/www/vitrine"}},
+		{Kind: KindDatabase, Name: "shop_fr", Attributes: map[string]string{
+			"engine": "mysql", "users": "shopfr@%,shopfr@localhost"}},
+		{Kind: KindDatabase, Name: "vitrinefr", Attributes: map[string]string{
+			"engine": "mysql"}},
+	}
+	candidates, unmanaged := Correlate(resources, "/home", "preprod-pp.net")
+	for id, motif := range map[string]string{
+		"shopfr": "base shop_fr laissée hors gestion : plusieurs comptes portent son nom " +
+			"(shopfr@%, shopfr@localhost)",
+		"vitrinefr": "base vitrinefr laissée hors gestion : aucun compte ne porte son nom",
+	} {
+		c := candidat(t, candidates, id)
+		if got := basesDe(c); len(got) > 0 {
+			t.Errorf("%s revendique %v sans compte sûr", id, got)
+		}
+		if !containsSubstring(c.Uncertain, motif) {
+			t.Errorf("%s doit dire %q : %v", id, motif, c.Uncertain)
+		}
+		p, _, err := Adopt(c, "/home", "preprod-pp.net")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(p.Spec.Databases) > 0 {
+			t.Errorf("%s déclare %+v sans compte sûr", id, p.Spec.Databases)
+		}
+	}
+	for _, base := range []string{"shop_fr", "vitrinefr"} {
+		if !nonGeree(unmanaged, KindDatabase, base) {
+			t.Errorf("la base %s doit rester non gérée : %v", base, unmanaged)
+		}
+	}
+}
+
+func TestAdoptNeDeclarePasUneBaseSansCompteSur(t *testing.T) {
+	// La garde d'Adopt tient pour un candidat composé ailleurs que par Correlate :
+	// le premier compte de la liste n'est jamais retenu d'office.
+	c := Candidate{ID: "shopfr", Host: "shop.fr", Domains: []string{"shop.fr"},
+		Resources: []Resource{{Kind: KindDatabase, Name: "shop", Attributes: map[string]string{
+			"engine": "mysql", "users": "shop@%,shop@localhost"}}}}
+	p, notes, err := Adopt(c, "/home", "preprod-pp.net")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(p.Spec.Databases) > 0 {
+		t.Errorf("aucune base ne doit être déclarée sans compte sûr : %+v", p.Spec.Databases)
+	}
+	if !containsSubstring(notes, "base shop non déclarée : plusieurs comptes portent son nom") {
+		t.Errorf("la base écartée doit être annoncée : %v", notes)
+	}
+}
+
+func TestAdoptGardeLHoteReelDuCompteMySQL(t *testing.T) {
+	// Un compte 'shop'@'%' était déclaré 'shop'@'localhost' : l'observation ne le
+	// trouvait pas, et l'apply créait à côté un compte au mot de passe tiré que
+	// MySQL préfère pour toute connexion locale — l'application perdait l'accès à
+	// sa base au premier apply suivant l'import.
+	scanner := serveurAvecBases(t, map[string]string{"shop.fr": "shop"},
+		[]string{"shop"}, []string{"root@localhost", "shop@%"})
+	candidates, _ := inspecter(t, scanner)
+	p, notes, err := Adopt(candidat(t, candidates, "shopfr"), "/home", "preprod-pp.net")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(p.Spec.Databases) != 1 {
+		t.Fatalf("une base attendue : %+v", p.Spec.Databases)
+	}
+	d := p.Spec.Databases[0]
+	if d.Name != "shop" || d.User != "shop" || d.Host != "%" {
+		t.Errorf("déclaration %s sous %s@%s, shop sous shop@%% attendue", d.Name, d.User, d.Host)
+	}
+	if !containsSubstring(notes, "le mot de passe de shop@% est inconnu d'ogs") {
+		t.Errorf("la note doit nommer le compte réel : %v", notes)
+	}
+	// L'hôte survit à l'écriture de la déclaration : c'est elle que l'apply relit.
+	data, err := spec.Encode(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	relu, err := spec.Decode(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := relu.Spec.Databases[0].Host; got != "%" {
+		t.Errorf("hôte relu %q, %% attendu :\n%s", got, data)
 	}
 }

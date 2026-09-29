@@ -421,12 +421,14 @@ func (s *Scanner) scanDatabases(ctx context.Context) ([]Resource, error) {
 			}
 			attrs := map[string]string{"engine": engine}
 			// La propriété d'une base n'est pas déductible : on rapproche par nom,
-			// et l'incertitude est signalée plutôt que tranchée.
+			// et l'incertitude est signalée plutôt que tranchée. Le même nom, aux
+			// séparateurs près, jamais un préfixe : « shop » rapprochait de la base
+			// shopfr le compte de shop.com, que l'adoption retenait puis que
+			// « project delete » supprimait. Tous les comptes de ce nom sont
+			// énumérés, hôte compris : c'est à compteSur de dire s'il en est un seul.
 			var candidates []string
 			for user := range users {
-				account := strings.SplitN(user, "@", 2)[0]
-				if account == name || strings.HasPrefix(account, name) ||
-					strings.HasPrefix(name, account) {
+				if account, _ := splitAccount(engine, user); similar(account, name) {
 					candidates = append(candidates, user)
 				}
 			}

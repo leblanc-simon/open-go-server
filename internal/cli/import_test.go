@@ -65,3 +65,25 @@ func TestAdoptionSansConflitResteEcrite(t *testing.T) {
 		t.Errorf("un projet ne doit pas être mis en conflit avec lui-même :\n%s", out)
 	}
 }
+
+func TestAdoptionAfficheCeQuiResteAConfirmer(t *testing.T) {
+	// La confirmation portait sur une déclaration dont l'exploitant ne voyait ni
+	// les bases retenues ni ce qui restait à confirmer : seul le scan le disait,
+	// et une base écartée faute de compte sûr — ou prise au voisin — passait sans
+	// un mot au moment d'écrire.
+	h := newHarness(t)
+	h.mustRun("init")
+	h.legacyServer(t)
+	if err := os.MkdirAll(h.path("var", "www", "vitrine"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(h.path("etc", "apache2", "sites-available", "vitrine.conf"),
+		[]byte("<VirtualHost *:80>\n    ServerName vitrine.fr\n    DocumentRoot /var/www/vitrine\n</VirtualHost>\n"),
+		0o644); err != nil {
+		t.Fatal(err)
+	}
+	out := h.mustRun("import", "adopt", "vitrinefr", "--yes")
+	if !strings.Contains(out, "⚠ aucun utilisateur système repéré") {
+		t.Errorf("les incertitudes du candidat doivent être affichées avant d'écrire :\n%s", out)
+	}
+}

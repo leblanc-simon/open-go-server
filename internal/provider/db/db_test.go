@@ -368,6 +368,153 @@ func TestPlanJugeAussiLesPrivilegesDesComptesAdditionnels(t *testing.T) {
 	}
 }
 
+// stubJournal retient ce que le provider exécute et les comptes, hôte compris,
+// dont il relit les privilèges : c'est l'hôte réel d'un compte qui le désigne.
+type stubJournal struct {
+	stubClient
+	exécutées []string
+	relus     []string
+}
+
+func (c *stubJournal) Exec(_ context.Context, stmt string) error {
+	c.exécutées = append(c.exécutées, stmt)
+	return nil
+}
+
+func (c *stubJournal) Grants(ctx context.Context, user, host string) (map[string]string, error) {
+	c.relus = append(c.relus, user+"@"+host)
+	return c.stubClient.Grants(ctx, user, host)
+}
+
+func TestObserveRelitLeCompteSousSonHoteReel(t *testing.T) {
+	// Un projet adopté déclare son compte sous l'hôte réel, 'shop'@'%'.
+	// L'observation doit l'y retrouver — existence et privilèges —, et une
+	// correction de privilèges viser ce compte-là, jamais un homonyme sous
+	// l'hôte par défaut.
+	prov, proj := fixture(t)
+	decl := DefaultDatabase(proj, "mysql")
+	decl.Name, decl.User, decl.Host = "shop", "shop", "%"
+	proj.Spec.Databases = []model.Database{decl}
+	stub := &stubJournal{stubClient: stubClient{
+		databases: map[string]bool{"shop": true},
+		users:     map[string]bool{"shop@%": true, "root@localhost": true},
+		grants:    map[string]string{"shop": "ALTER,CREATE,DELETE,DROP,INDEX,INSERT,SELECT,UPDATE"},
+	}}
+	withStub(prov, stub)
+
+	obs, err := prov.Observe(context.Background(), proj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st := obs.States[0]; !st.UserExists || len(st.OtherHosts) > 0 {
+		t.Errorf("le compte 'shop'@'%%' doit être reconnu : %+v", st)
+	}
+	if len(stub.relus) != 1 || stub.relus[0] != "shop@%" {
+		t.Errorf("privilèges relus pour %v, shop@%% attendu", stub.relus)
+	}
+	steps, err := prov.Plan(context.Background(), proj, obs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(steps) != 1 || steps[0].Action != engine.NoOp {
+		t.Fatalf("aucun changement attendu : %+v", steps)
+	}
+
+	stub.grants = map[string]string{"shop": "SELECT"}
+	if obs, err = prov.Observe(context.Background(), proj); err != nil {
+		t.Fatal(err)
+	}
+	if steps, err = prov.Plan(context.Background(), proj, obs); err != nil {
+		t.Fatal(err)
+	}
+	if err := steps[0].Apply(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	accordé := false
+	for _, q := range stub.exécutées {
+		if strings.Contains(q, "'localhost'") {
+			t.Errorf("requête visant un homonyme sous l'hôte par défaut : %s", q)
+		}
+		accordé = accordé || q == "GRANT ALL PRIVILEGES ON `shop`.* TO 'shop'@'%'"
+	}
+	if !accordé {
+		t.Errorf("le GRANT doit viser 'shop'@'%%' : %v", stub.exécutées)
+	}
+}
+
+func TestPlanNeMasquePasUnCompteSousUnAutreHote(t *testing.T) {
+	// Une base adoptée avant que l'import ne garde l'hôte réel est déclarée sous
+	// 'localhost', alors que son compte est 'shop'@'%'. L'apply créait
+	// 'shop'@'localhost' au mot de passe tiré, que MySQL préfère pour toute
+	// connexion locale : l'application perdait l'accès à sa base.
+	prov, proj := fixture(t)
+	decl := DefaultDatabase(proj, "mysql")
+	decl.Name, decl.User = "shop", "shop"
+	proj.Spec.Databases = []model.Database{decl}
+	stub := &stubJournal{stubClient: stubClient{
+		databases: map[string]bool{"shop": true},
+		users:     map[string]bool{"shop@%": true, "root@localhost": true},
+	}}
+	withStub(prov, stub)
+
+	obs, err := prov.Observe(context.Background(), proj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	steps, err := prov.Plan(context.Background(), proj, obs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(steps) != 1 || steps[0].Critical {
+		t.Fatalf("une étape non critique attendue : %+v", steps)
+	}
+	err = steps[0].Apply(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "'shop'@'%'") ||
+		!strings.Contains(err.Error(), "host") {
+		t.Errorf("le refus doit nommer le compte existant et la porte de sortie : %v", err)
+	}
+	if len(stub.exécutées) > 0 {
+		t.Errorf("rien ne doit être exécuté : %v", stub.exécutées)
+	}
+	if _, err := prov.Password(proj.ID(), "mysql", "shop"); err == nil {
+		t.Error("aucun mot de passe ne doit être scellé pour un compte qu'on refuse de créer")
+	}
+
+	// Un compte additionnel suit la même règle.
+	decl = DefaultDatabase(proj, "mysql")
+	decl.ExtraUsers = []model.DBUser{{User: "lecteur", Privileges: "readonly"}}
+	proj.Spec.Databases = []model.Database{decl}
+	withStub(prov, &stubJournal{stubClient: stubClient{
+		databases: map[string]bool{"shopfr": true},
+		users:     map[string]bool{"shopfr@localhost": true, "lecteur@%": true},
+		grants:    map[string]string{"shopfr": "ALTER,CREATE,DELETE,DROP,INDEX,INSERT,SELECT,UPDATE"},
+	}})
+	if obs, err = prov.Observe(context.Background(), proj); err != nil {
+		t.Fatal(err)
+	}
+	if steps, err = prov.Plan(context.Background(), proj, obs); err != nil {
+		t.Fatal(err)
+	}
+	if err := steps[0].Apply(context.Background()); err == nil ||
+		!strings.Contains(err.Error(), "'lecteur'@'%'") {
+		t.Errorf("le compte additionnel masquerait 'lecteur'@'%%' : %v", err)
+	}
+
+	// Sans homonyme, le compte d'un projet neuf se crée comme avant.
+	withStub(prov, &stubJournal{stubClient: stubClient{
+		users: map[string]bool{"root@localhost": true},
+	}})
+	if obs, err = prov.Observe(context.Background(), proj); err != nil {
+		t.Fatal(err)
+	}
+	if steps, err = prov.Plan(context.Background(), proj, obs); err != nil {
+		t.Fatal(err)
+	}
+	if len(steps) != 1 || steps[0].Action != engine.Create || !steps[0].Critical {
+		t.Errorf("une création critique attendue : %+v", steps)
+	}
+}
+
 func TestStatementsForMySQLDeclaration(t *testing.T) {
 	prov, proj := fixture(t)
 	decl := DefaultDatabase(proj, "mysql")
