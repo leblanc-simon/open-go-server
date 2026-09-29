@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"slices"
 	"syscall"
 	"testing"
 
@@ -37,6 +38,52 @@ func dumpFixture(t *testing.T) (*Provider, *model.Project, model.Database) {
 }
 
 const dumpContent = "-- sauvegarde de shopfr\n"
+
+func TestLesOutilsPostgreSQLSePresententSousLeRoleDuClient(t *testing.T) {
+	// Avec OGS_PG_ADMIN, le client d'administration se connecte sous ce rôle ;
+	// pg_dump et psql, laissés au rôle du compte système, échouaient là où lui
+	// joignait la base — et la suppression la supprimait sans sauvegarde.
+	t.Setenv("OGS_PG_ADMIN", "postgres")
+	prov, proj := fixture(t)
+	prefix := prov.Paths.Prefix()
+	conf := filepath.Join(prefix, "etc", "postgresql", "16", "main", "postgresql.conf")
+	for path, content := range map[string]string{
+		conf: "port = 5433\n",
+		filepath.Join(prefix, "usr", "bin", "pg_dump"): "",
+		filepath.Join(prefix, "usr", "bin", "psql"):    "",
+	} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	decl := model.Database{Engine: "postgres", Name: "shopfr"}
+	dump := filepath.Join(t.TempDir(), "shopfr.sql")
+	if _, err := prov.Dump(context.Background(), proj, decl, dump); err != nil {
+		t.Fatal(err)
+	}
+	if err := prov.Restore(context.Background(), proj, decl, dump); err != nil {
+		t.Fatal(err)
+	}
+	rec := prov.Exec.(*exec.Recorder)
+	for _, tool := range []string{"pg_dump", "psql"} {
+		found := false
+		for _, c := range rec.Calls() {
+			if filepath.Base(c.Name) != tool {
+				continue
+			}
+			found = true
+			if !slices.Contains(c.Args, "--username=postgres") {
+				t.Errorf("%s doit se présenter sous le rôle du client : %q", tool, c.Args)
+			}
+		}
+		if !found {
+			t.Errorf("%s n'a pas été lancé : %v", tool, rec.Calls())
+		}
+	}
+}
 
 func TestSauvegardeVersUnFichierOrdinaireCreeUnInodeNeuf(t *testing.T) {
 	// Écrire dans un fichier posé d'avance lui laisserait son propriétaire et son

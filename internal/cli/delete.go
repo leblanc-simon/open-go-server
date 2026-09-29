@@ -5,9 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/user"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"text/tabwriter"
 	"time"
 
@@ -16,6 +19,7 @@ import (
 	"leblanc.io/open-go-server/internal/archive"
 	"leblanc.io/open-go-server/internal/engine"
 	"leblanc.io/open-go-server/internal/exec"
+	"leblanc.io/open-go-server/internal/fs"
 	"leblanc.io/open-go-server/internal/hook"
 	"leblanc.io/open-go-server/internal/model"
 	appprov "leblanc.io/open-go-server/internal/provider/app"
@@ -24,13 +28,27 @@ import (
 	"leblanc.io/open-go-server/internal/provider/unit"
 	"leblanc.io/open-go-server/internal/spec"
 	"leblanc.io/open-go-server/internal/store"
+	"leblanc.io/open-go-server/internal/validate"
 	"leblanc.io/open-go-server/internal/version"
 )
 
 // ArchiveSizeThreshold est la taille au-delà de laquelle l'archivage demande une
 // confirmation supplémentaire : une archive de plusieurs gigaoctets prend du
-// temps et de la place, et l'exploitant doit le savoir avant de commencer.
-const ArchiveSizeThreshold = 5 << 30 // 5 Gio
+// temps et de la place, et l'exploitant doit le savoir avant de commencer. C'est
+// une variable pour que les tests puissent l'abaisser.
+var ArchiveSizeThreshold int64 = 5 << 30 // 5 Gio
+
+// deleteOptions porte les options de « project delete » que les gardes
+// consultent : ce qui sera effacé décide de ce qu'il faut vérifier.
+type deleteOptions struct {
+	purge, keepData, noDump bool
+}
+
+// dumpsRequired dit si les sauvegardes conditionnent la suppression : une
+// archive est faite, elle doit porter les données, et les bases vont être
+// supprimées. Sous --keep-data les bases restent, et une sauvegarde manquée ne
+// coûte qu'un avertissement.
+func (o deleteOptions) dumpsRequired() bool { return !o.purge && !o.noDump && !o.keepData }
 
 func newDeleteCommand(app *App) *cobra.Command {
 	var (
@@ -43,39 +61,27 @@ func newDeleteCommand(app *App) *cobra.Command {
 		Short: "Supprimer un projet, en l'archivant au préalable",
 		Long: "Par défaut, tout est archivé avant suppression : déclaration, configurations\n" +
 			"générées, dumps de bases, secrets chiffrés et arborescence, avec un manifeste\n" +
-			"décrivant ce qui a été retiré. L'ordre suit l'inverse des dépendances.",
+			"décrivant ce qui a été retiré. L'ordre suit l'inverse des dépendances.\n\n" +
+			"Avant tout geste, la suppression refuse une racine qu'un autre projet partage ou\n" +
+			"englobe, un point de montage sous l'arborescence, une base qu'elle ne peut pas\n" +
+			"sauvegarder (sauf --no-dump), un fichier de configuration qu'ogs n'a pas écrit et\n" +
+			"qui désigne peut-être le compte ou l'arborescence, et, sans --force, le compte ou\n" +
+			"les bases d'un projet qu'ogs n'a pas créés. Ces refus sont énumérés ensemble, chacun\n" +
+			"avec ce qui le lève. Seuls partent les fichiers qu'ogs a écrits pour ce projet ;\n" +
+			"sous --keep-data, l'archive ne recopie pas une arborescence qui n'est pas au seul\n" +
+			"projet.\n\n" +
+			"Une interruption reçue avant le premier retrait abandonne la suppression et relance\n" +
+			"les services arrêtés ; reçue après, elle laisse la suppression aller à son terme.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			p, err := app.loadProject(args[0])
 			if err != nil {
 				return err
 			}
-			// Le dernier rempart est éprouvé AVANT tout le reste : la suppression
-			// franchit très vite le point de non-retour — archive, fichiers générés,
-			// bases, vhosts, compte système —, si bien qu'un refus prononcé au moment
-			// d'effacer l'arborescence ne sauvait plus que celle-ci et conseillait de
-			// corriger une déclaration qui venait de partir aux archives. Une racine
-			// que l'on ne peut pas effacer sans emporter les voisins arrête donc le
-			// geste, pas seulement sa dernière étape ; « --keep-data », qui ne touche
-			// ni au compte ni à l'arborescence, reste ouvert.
-			if !keepData {
-				if err := app.checkRemovableRoot(p); err != nil {
-					return wrap(CodeValidation, err)
-				}
-			}
-			if purge {
-				// La purge ne laisse aucun recours : la confirmation exige de saisir
-				// l'identifiant, ce qui rend l'erreur de frappe improbable.
-				if err := app.confirmExact(p.ID(),
-					fmt.Sprintf("SUPPRESSION DÉFINITIVE de %s, sans archive. Saisir l'identifiant pour confirmer",
-						p.ID())); err != nil {
-					return err
-				}
-			} else if err := app.confirm(fmt.Sprintf(
-				"supprimer %s ? (une archive sera créée avant toute suppression)", p.ID())); err != nil {
-				return err
-			}
+			opts := deleteOptions{purge: purge, keepData: keepData, noDump: noDump}
 
+			// Le verrou est pris d'abord, comme pour apply : ce que les remparts
+			// constatent ne doit pas changer sous eux avant le geste.
 			if err := app.openStore(); err != nil {
 				return err
 			}
@@ -90,6 +96,74 @@ func newDeleteCommand(app *App) *cobra.Command {
 				return err
 			}
 			defer provs.close()
+
+			// Les remparts sont éprouvés AVANT tout le reste, et avant la
+			// confirmation : un « oui » ne doit jamais précéder un refus. La
+			// suppression franchit très vite le point de non-retour — archive,
+			// fichiers générés, bases, vhosts, compte système —, si bien qu'un refus
+			// prononcé au moment d'effacer l'arborescence ne sauvait plus que
+			// celle-ci et conseillait de corriger une déclaration qui venait de
+			// partir aux archives. Le compte non créé par ogs en était le jumeau :
+			// son refus tombait à l'étape 5, tout le reste démonté, et le « --force »
+			// qu'il conseillait échouait faute de déclaration. Tout ce qui peut
+			// refuser le geste le refuse donc ici ; « --keep-data », qui ne touche
+			// ni au compte, ni aux bases, ni à l'arborescence, reste ouvert.
+			//
+			// Et tout est nommé d'un seul coup : un refus qui en masque un autre
+			// fait suivre à l'exploitant un remède qui coûte — retirer le vhost
+			// d'un site adopté, c'est couper le site — avant qu'il n'apprenne que
+			// le compte, les bases ou un partage monté refusent encore. Une base
+			// que l'on ne pourra pas sauvegarder en est.
+			refused := app.deletionRefusals(provs, p, opts)
+			var dumps []model.Database
+			if !purge && !noDump {
+				var r *refusal
+				if dumps, r = app.databasesToDump(cmd, provs, p, opts); r != nil {
+					refused = append(refused, r)
+				}
+			}
+			if err := refused.err(p.ID()); err != nil {
+				return err
+			}
+			// Ce que --force lève est nommé avant la confirmation : sans quoi le
+			// drapeau donné pour le compte emportait aussi, sans un mot, les bases
+			// qu'un import avait rattachées à tort.
+			if app.Force && !keepData {
+				if forced, _ := app.forcedRemovals(p); len(forced) > 0 {
+					app.printf("= --force : la suppression efface aussi ce qu'ogs n'a pas créé — %s\n",
+						strings.Join(forced, " ; "))
+				}
+			}
+			scope := archiveScope{dumps: dumps, strict: opts.dumpsRequired()}
+			if keepData && !purge {
+				scope.skipTree, scope.skipLogs = app.archiveExclusions(p)
+			}
+
+			if purge {
+				// La purge ne laisse aucun recours : la confirmation exige de saisir
+				// l'identifiant, ce qui rend l'erreur de frappe improbable.
+				if err := app.confirmExact(p.ID(),
+					fmt.Sprintf("SUPPRESSION DÉFINITIVE de %s, sans archive. Saisir l'identifiant pour confirmer",
+						p.ID())); err != nil {
+					return err
+				}
+			} else if err := app.confirm(fmt.Sprintf(
+				"supprimer %s ? (une archive sera créée avant toute suppression)", p.ID())); err != nil {
+				return err
+			}
+			// La taille de l'archive passe elle aussi avant l'arrêt des services :
+			// refuser une archive trop grosse, ou manquer de place, laissait derrière
+			// soi des workers arrêtés que rien ne relançait.
+			if !purge {
+				if err := app.checkArchiveSize(p, scope); err != nil {
+					return err
+				}
+			}
+
+			// Une interruption reçue pendant les questions n'a encore rien arrêté.
+			if err := interrupted(cmd.Context()); err != nil {
+				return err
+			}
 
 			// Le hook « preDelete » garde la porte : il peut refuser la suppression,
 			// par exemple si une sauvegarde externe n'a pas abouti.
@@ -110,26 +184,96 @@ func newDeleteCommand(app *App) *cobra.Command {
 			// s'exécuter pendant que l'on démonte le site. Une cible que systemd n'a
 			// pas chargée n'a rien à arrêter : l'annoncer comme un échec ferait
 			// passer pour un défaut le cas d'un projet sans service.
+			stopped := false
 			if app.unitActive(cmd.Context(), unit.TargetName(p.ID())) {
 				app.printf("arrêt des services de %s…\n", p.ID())
+				// Un arrêt en échec a pu en arrêter une partie : la cible était active,
+				// c'est elle qu'un abandon relance.
+				stopped = true
 				if err := provs.Unit.Control(cmd.Context(), p, "stop"); err != nil {
 					warn("arrêt des services : %v", err)
 				}
 			}
+			// Jusqu'au point de non-retour, renoncer doit rendre le système tel
+			// qu'on l'a trouvé : un dump ou une archive en échec laissait les workers
+			// arrêtés — commandes, courriels et files en souffrance, sans un mot —
+			// jusqu'au prochain redémarrage de la machine. Une commande tuée par une
+			// interruption échoue sur « context canceled » : c'est l'annulation
+			// demandée, qui rend le code 9, non une panne.
+			abandon := func(err error) error {
+				if stopped {
+					app.restartServices(cmd.Context(), provs, p)
+				}
+				if cmd.Context().Err() != nil && ExitCode(err) != CodeCancelled {
+					return exitf(CodeCancelled, "interruption reçue : suppression abandonnée avant tout retrait (%v)", err)
+				}
+				return err
+			}
+
+			// Le sort des fichiers générés est tranché avant l'archive : elle ne
+			// recueille, et son manifeste ne déclare retiré, que ce qui part vraiment.
+			files, kept := app.projectFiles(provs, p)
+			scope.files = files
 
 			var removed []string
 			archived := ""
 			if !purge {
-				path, list, err := app.archiveProject(cmd, provs, p, noDump, warn)
+				path, list, err := app.archiveProject(cmd, provs, p, scope, warn)
 				if err != nil {
-					return err
+					return abandon(err)
 				}
 				archived = path
 				removed = list
 			}
+			// Le point de non-retour. Une interruption (Ctrl+C, SIGTERM) reçue
+			// pendant l'archive est un abandon comme un autre : main n'arrête pas le
+			// processus, il annule le contexte, que rien ici ne consultait —
+			// l'archive allait à son terme, puis la suppression continuait, chaque
+			// commande échouant sur « context canceled » : home effacé sous un
+			// compte et des workers FPM toujours vivants, fichiers de parc jamais
+			// recalculés.
+			//
+			// L'archive a pu prendre des minutes, pendant lesquelles un partage a pu
+			// être monté sous la racine, une déclaration voisine ou un vhost posés à
+			// la main : les remparts sont éprouvés une dernière fois, tant qu'y
+			// renoncer ne coûte que l'archive, qui n'a plus d'objet.
+			err = interrupted(cmd.Context())
+			if err == nil {
+				err = app.deletionRefusals(provs, p, opts).err(p.ID())
+			}
+			if err != nil {
+				if archived != "" {
+					_ = os.Remove(archived)
+				}
+				return abandon(err)
+			}
+			// Passé ce point, la suppression va à son terme : y renoncer en chemin
+			// ne rendrait rien, et laisserait le pire des états — un home effacé
+			// sous un compte vivant, une prison fail2ban désignant des journaux
+			// disparus, qui empêche le démon de redémarrer. Une interruption ne
+			// coupe donc plus rien ; elle est seulement signalée, dès qu'une étape
+			// s'achève.
+			interruption := cmd.Context()
+			cmd.SetContext(context.WithoutCancel(interruption))
+			signaled := false
+			signalInterruption := func() {
+				if !signaled && interruption.Err() != nil {
+					signaled = true
+					app.printf("= interruption reçue après le point de non-retour : la suppression va à son terme\n")
+				}
+			}
 
-			// 2. Suppression des fichiers générés, dans l'ordre inverse.
-			for _, file := range app.generatedFiles(provs, p) {
+			// 2. Suppression des fichiers générés, dans l'ordre inverse. Un fichier
+			// qu'ogs n'a pas écrit pour ce projet reste en place : son nom ne prouve
+			// rien — le pool d'un site adopté porte celui de l'identifiant alors qu'il
+			// sert aussi un vhost voisin resté hors d'ogs, qui tombait en 502 sous
+			// « --keep-data » même. Il est nommé, et la suppression rend le code 6 :
+			// ce qu'il configure est toujours actif. Hors --keep-data, seul celui
+			// d'un autre projet arrive jusqu'ici — keptFilesRefusal a refusé les autres.
+			for _, k := range kept {
+				warn("%s conservé : %s", k.path, k.reason)
+			}
+			for _, file := range files {
 				if err := os.Remove(file); err == nil {
 					removed = append(removed, file)
 				} else if !os.IsNotExist(err) {
@@ -143,10 +287,12 @@ func newDeleteCommand(app *App) *cobra.Command {
 			} else if !os.IsNotExist(err) {
 				warn("%s : %v", app.Paths.EnvFile(p.ID()), err)
 			}
-			// Les instances activées disparaissent avec leur répertoire .wants.
-			if err := os.RemoveAll(filepath.Join(app.Paths.SystemdDir(),
-				unit.TargetName(p.ID())+".wants")); err != nil && !os.IsNotExist(err) {
-				warn("instances : %v", err)
+			// Les instances activées disparaissent avec leur répertoire .wants, qui
+			// suit le sort de la cible : une cible conservée garde ses instances.
+			if target := filepath.Join(app.Paths.SystemdDir(), unit.TargetName(p.ID())); !keptPath(kept, target) {
+				if err := os.RemoveAll(target + ".wants"); err != nil && !os.IsNotExist(err) {
+					warn("instances : %v", err)
+				}
 			}
 			// Les répertoires de surcharge des vhosts (D63) partent avec eux, mais
 			// seulement s'ils sont vides : un fichier déposé là porte le travail de
@@ -154,8 +300,8 @@ func newDeleteCommand(app *App) *cobra.Command {
 			// il ne resterait qu'un répertoire orphelin que personne ne relie plus
 			// à un projet disparu.
 			for _, vh := range provs.Web.VHostNames(p) {
-				for _, kept := range provs.Web.RemoveIncludes(vh) {
-					app.printf("= surcharges conservées : %s (non écrites par ogs)\n", kept)
+				for _, dir := range provs.Web.RemoveIncludes(vh) {
+					app.printf("= surcharges conservées : %s (non écrites par ogs)\n", dir)
 				}
 			}
 
@@ -169,8 +315,9 @@ func newDeleteCommand(app *App) *cobra.Command {
 			}
 
 			// 3. Ressources vivantes.
+			signalInterruption()
 			if !keepData {
-				app.dropResources(cmd, provs, p, &removed)
+				app.dropResources(cmd, provs, p, &removed, warn)
 			} else {
 				app.printf("= --keep-data : bases, files et contenu conservés\n")
 			}
@@ -203,6 +350,7 @@ func newDeleteCommand(app *App) *cobra.Command {
 
 			// 5. Compte système et arborescence, une fois que plus rien ne tourne
 			// sous cette identité.
+			signalInterruption()
 			if !keepData {
 				if err := app.removeUser(cmd, provs, p); err != nil {
 					warn("suppression du compte : %v", err)
@@ -238,6 +386,7 @@ func newDeleteCommand(app *App) *cobra.Command {
 			// dont le journal a disparu **empêche le démon de démarrer** — toutes les
 			// autres prisons tombent avec elle —, et le vhost de supervision
 			// proxifierait un socket FPM qui n'existe plus.
+			signalInterruption()
 			if err := app.refreshGlobal(cmd.Context(), provs); err != nil {
 				warn("mise à jour des fichiers de parc : %v", err)
 			}
@@ -255,6 +404,7 @@ func newDeleteCommand(app *App) *cobra.Command {
 
 			_, _ = app.runHook(cmd.Context(), provs.Hooks, p, hook.PostDelete,
 				hook.Context{Resources: removed, Extra: map[string]string{"archive": archived}})
+			signalInterruption()
 			status, mark := "ok", "✓"
 			if warnings > 0 {
 				status, mark = "avertissement", "⚠"
@@ -277,7 +427,7 @@ func newDeleteCommand(app *App) *cobra.Command {
 	f := cmd.Flags()
 	f.BoolVar(&purge, "purge", false, "supprimer sans archiver (irréversible)")
 	f.BoolVar(&keepData, "keep-data", false, "conserver bases, files et contenu")
-	f.BoolVar(&noDump, "no-dump", false, "ne pas inclure de sauvegarde de base dans l'archive")
+	f.BoolVar(&noDump, "no-dump", false, "ne pas sauvegarder les bases dans l'archive (elles sont supprimées quand même)")
 	return cmd
 }
 
@@ -307,8 +457,10 @@ func (a *App) refreshGlobal(ctx context.Context, provs *providers) error {
 	return err
 }
 
-// generatedFiles énumère les fichiers produits par ogs pour un projet, dans
-// l'ordre inverse de leur création.
+// generatedFiles énumère les chemins où ogs écrit les fichiers d'un projet, dans
+// l'ordre inverse de leur création. Ce ne sont que des chemins, calculés depuis
+// l'identifiant : ce qui s'y trouve n'est pas forcément d'ogs, et c'est
+// projectFiles qui en décide.
 func (a *App) generatedFiles(provs *providers, p *model.Project) []string {
 	files := []string{
 		a.Paths.SudoersFile(p.ID()),
@@ -326,10 +478,13 @@ func (a *App) generatedFiles(provs *providers, p *model.Project) []string {
 	if appprov.Applies(p) {
 		files = append(files, provs.App.UnitPath(p))
 	}
-	for _, vh := range provs.Web.VHostNames(p) {
+	// Les noms réels des fichiers : celui d'un vhost adopté ne porte pas toujours
+	// l'extension du moteur (« shop.fr » sur nginx), et le composer depuis le nom
+	// du vhost laissait le fichier et son lien derrière le projet.
+	for _, name := range provs.Web.VHostFiles(p) {
 		files = append(files,
-			filepath.Join(provs.Engine.EnabledDir(), provs.Engine.FileName(vh)),
-			filepath.Join(provs.Engine.AvailableDir(), provs.Engine.FileName(vh)))
+			filepath.Join(provs.Engine.EnabledDir(), name),
+			filepath.Join(provs.Engine.AvailableDir(), name))
 	}
 	for _, pool := range p.Spec.PHP.Pools {
 		name := p.ID()
@@ -341,37 +496,441 @@ func (a *App) generatedFiles(provs *providers, p *model.Project) []string {
 	return files
 }
 
-// dropResources supprime les bases et le vhost AMQP.
-func (a *App) dropResources(cmd *cobra.Command, provs *providers, p *model.Project, removed *[]string) {
-	for _, decl := range p.Spec.Databases {
-		obs, err := provs.DB.Observe(cmd.Context(), p)
-		if err != nil || len(obs.States) == 0 {
+// keptFile est un fichier que la suppression laisse en place, et pourquoi.
+// foreign dit qu'ogs ne sait pas ce qu'il configure : sans en-tête, illisible, ou
+// lien vers un fichier qui n'est pas du projet. Celui qu'ogs a écrit pour un
+// autre projet ne l'est pas — il désigne le compte et la racine de ce projet-là,
+// que le parc interdit de faire recouvrir les nôtres —, ni le lien vers un
+// fichier conservé, dont c'est la cible qui décide.
+type keptFile struct {
+	path, reason string
+	foreign      bool
+}
+
+// keptPath dit si un chemin fait partie des fichiers conservés.
+func keptPath(kept []keptFile, path string) bool {
+	for _, k := range kept {
+		if k.path == path {
+			return true
+		}
+	}
+	return false
+}
+
+// projectFiles partage les chemins de generatedFiles entre ce que la suppression
+// retire et ce qu'elle laisse. Un fichier ne part que si son en-tête le déclare
+// écrit par ogs pour ce projet (fs.ManagedProject) : sans en-tête, c'est celui de
+// l'exploitant — le pool ou le vhost d'un site adopté qu'aucun apply n'a encore
+// réécrit —, et avec l'en-tête d'un autre projet, celui d'un voisin dont le nom
+// prolonge l'identifiant. Un lien n'a pas d'en-tête : il suit le sort de sa
+// cible, qu'il désigne un fichier retiré — ou déjà disparu — parmi ceux du
+// projet ; tout autre lien est laissé, sa cible n'étant pas du projet.
+func (a *App) projectFiles(provs *providers, p *model.Project) (remove []string, kept []keptFile) {
+	candidates := a.generatedFiles(provs, p)
+	known := map[string]bool{}
+	for _, path := range candidates {
+		known[filepath.Clean(path)] = true
+	}
+	removing := map[string]bool{}
+	var links []string
+	for _, path := range candidates {
+		info, err := os.Lstat(path)
+		switch {
+		case os.IsNotExist(err):
 			continue
+		case err != nil:
+			kept = append(kept, keptFile{path, err.Error(), true})
+			continue
+		case info.Mode()&os.ModeSymlink != 0:
+			links = append(links, path)
+			continue
+		}
+		owner, err := fs.ManagedProject(path)
+		switch {
+		case err != nil:
+			kept = append(kept, keptFile{path, err.Error(), true})
+		case owner == p.ID():
+			removing[path] = true
+		case owner == "":
+			kept = append(kept, keptFile{path, "ogs ne l'a pas écrit — il configure peut-être encore " +
+				"autre chose que ce projet ; le retirer à la main s'il n'a plus d'objet", true})
+		default:
+			kept = append(kept, keptFile{path, fmt.Sprintf("ogs l'a écrit pour le projet %s, non pour %s",
+				owner, p.ID()), false})
+		}
+	}
+	for _, path := range links {
+		target, err := os.Readlink(path)
+		if err != nil {
+			kept = append(kept, keptFile{path, err.Error(), true})
+			continue
+		}
+		if !filepath.IsAbs(target) {
+			target = filepath.Join(filepath.Dir(path), target)
+		}
+		target = filepath.Clean(target)
+		_, statErr := os.Lstat(target)
+		switch {
+		case removing[target], known[target] && os.IsNotExist(statErr):
+			removing[path] = true
+		case known[target]:
+			kept = append(kept, keptFile{path, "lien vers " + target + ", conservé avec lui", false})
+		default:
+			kept = append(kept, keptFile{path, "lien vers " + target + ", qui n'est pas un fichier du projet", true})
+		}
+	}
+	for _, path := range candidates {
+		if removing[path] {
+			remove = append(remove, path)
+		}
+	}
+	return remove, kept
+}
+
+// dropResources supprime les bases et le vhost AMQP. Ce qui résiste passe par
+// warn, comme partout dans la suppression : une base injoignable reste en place,
+// et le code 6 doit le dire.
+func (a *App) dropResources(cmd *cobra.Command, provs *providers, p *model.Project, removed *[]string,
+	warn func(format string, args ...any)) {
+	// La garde d'entrée (forcedRemovals) l'a déjà refusé ; elle est
+	// refaite ici pour que le seul appel qui supprime n'en dépende pas.
+	if len(p.Spec.Databases) > 0 && adopted(p) && !a.Force {
+		warn("bases conservées : %s est adopté, et les supprimer exige --force", p.ID())
+	} else if len(p.Spec.Databases) > 0 {
+		obs, err := provs.DB.Observe(cmd.Context(), p)
+		if err != nil {
+			warn("bases : %v", err)
 		}
 		for _, state := range obs.States {
 			if state.Unavailable != nil {
-				a.printf("⚠ base %s : %v\n", decl.Name, state.Unavailable)
+				warn("base %s conservée : %v", state.Declaration.Name, state.Unavailable)
 				continue
 			}
 			if err := provs.DB.Drop(cmd.Context(), state.Declaration, state); err != nil {
-				a.printf("⚠ suppression de la base %s : %v\n", state.Declaration.Name, err)
+				warn("suppression de la base %s : %v", state.Declaration.Name, err)
 				continue
 			}
 			*removed = append(*removed, fmt.Sprintf("base %s %s",
 				state.Declaration.Engine, state.Declaration.Name))
 		}
-		break
 	}
 	if p.Spec.AMQP != nil && provs.AMQP.Client != nil {
 		if err := provs.AMQP.Client.DeleteVhost(cmd.Context(), p.Spec.AMQP.Vhost); err != nil {
-			a.printf("⚠ suppression du vhost amqp : %v\n", err)
+			warn("suppression du vhost amqp : %v", err)
 		} else {
 			*removed = append(*removed, "vhost amqp "+p.Spec.AMQP.Vhost)
 		}
 		if err := provs.AMQP.Client.DeleteUser(cmd.Context(), p.Spec.AMQP.User); err != nil {
-			a.printf("⚠ suppression du compte amqp : %v\n", err)
+			warn("suppression du compte amqp : %v", err)
 		}
 	}
+}
+
+// adopted dit si le projet a été repris d'un serveur existant (« ogs import ») :
+// ses ressources existaient avant ogs, qui n'en a pas la propriété.
+func adopted(p *model.Project) bool { return p.Metadata.Labels["adopted"] == "true" }
+
+// keepDataHint est l'issue que laisse tout refus de toucher au compte, aux bases
+// ou à l'arborescence.
+const keepDataHint = "relancer avec --keep-data, qui retire le projet sans toucher ni au compte, ni aux " +
+	"bases, ni à l'arborescence"
+
+// refusal est un refus d'effacer le compte, les bases ou l'arborescence, en deux
+// pièces : le constat, qui nomme ce qui est en cause, et le geste qui le lève —
+// vide quand seul --keep-data le lève. Sous --keep-data, qui laisse l'arborescence
+// en place, le constat seul dit pourquoi l'archive ne la recopie pas ; au moment
+// d'effacer, quand plus rien ne se relance, il dit ce qui est resté.
+type refusal struct {
+	code   int
+	what   string
+	remedy string
+}
+
+// refusals est l'ensemble des refus d'une suppression. Ils sont toujours
+// rassemblés, jamais rendus au premier : chacun appelle un geste différent, et
+// certains coûtent — retirer le vhost d'un site adopté, c'est couper le site.
+// L'exploitant qui suivait le remède du premier refus apprenait au passage
+// suivant que le compte ou les bases exigeaient encore --force, puis, au
+// troisième, qu'une base était injoignable.
+type refusals []*refusal
+
+// err assemble les refus en un seul message, ou rend nil s'il n'y en a aucun.
+// Le code est celui du premier : l'ordre va de ce que rien ne lève à ce que lève
+// un drapeau (deletionRefusals), et c'est le plus grave qui décide.
+func (rs refusals) err(id string) error {
+	switch len(rs) {
+	case 0:
+		return nil
+	case 1:
+		if rs[0].remedy == "" {
+			return exitf(rs[0].code, "%s — suppression refusée ; %s", rs[0].what, keepDataHint)
+		}
+		return exitf(rs[0].code, "%s — suppression refusée ; %s, ou %s", rs[0].what, rs[0].remedy, keepDataHint)
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "suppression de %s refusée, pour %d raisons, chacune avec ce qui la lève :", id, len(rs))
+	for _, r := range rs {
+		b.WriteString("\n  • " + r.what)
+		if r.remedy != "" {
+			b.WriteString(" — " + r.remedy)
+		}
+	}
+	b.WriteString("\n  ou, pour toutes à la fois, " + keepDataHint)
+	return exitf(rs[0].code, "%s", b.String())
+}
+
+// constat rend les seuls constats, sans remède.
+func (rs refusals) constat() string {
+	whats := make([]string, len(rs))
+	for i, r := range rs {
+		whats[i] = r.what
+	}
+	return strings.Join(whats, " ; ")
+}
+
+// deletionRefusals rassemble les refus qu'une suppression doit prononcer tant
+// qu'elle est encore refusable. Il est appelé à l'entrée, avant la confirmation
+// — où s'y ajoute la base qu'on ne pourra pas sauvegarder (databasesToDump) —,
+// puis au point de non-retour, après l'archive. Viennent d'abord ceux que rien ne
+// lève — la racine, les montages, les fichiers laissés en place —, parce que ce
+// qu'ils protègent n'appartient pas au projet ; puis, en un seul refus, tout ce
+// que --force lève. Sous --keep-data, ni le compte, ni les bases, ni
+// l'arborescence ne sont touchés : seule l'archive s'en garde (archiveExclusions).
+func (a *App) deletionRefusals(provs *providers, p *model.Project, o deleteOptions) refusals {
+	if o.keepData {
+		return nil
+	}
+	// Les journaux partent avec le projet (D71), par le même effacement récursif :
+	// leurs points de montage sont cherchés avec ceux de la racine, et nommés dans
+	// le même refus — un seul passage d'umount.
+	rs := a.rootRefusals(p, p.Spec.Layout.LogDir)
+	if r := a.keptFilesRefusal(provs, p); r != nil {
+		rs = append(rs, r)
+	}
+	forced, r := a.forcedRemovals(p)
+	switch {
+	case r != nil:
+		rs = append(rs, r)
+	case len(forced) > 0 && !a.Force:
+		rs = append(rs, &refusal{code: CodeConflict,
+			what: fmt.Sprintf("projet %s : la suppression effacerait ce qu'ogs n'a pas créé — %s", p.ID(),
+				strings.Join(forced, " ; ")),
+			remedy: "relancer avec --force, qui efface aussi ce qu'ogs n'a pas créé"})
+	}
+	return rs
+}
+
+// forcedRemovals énumère ce que la suppression n'efface que sous --force, parce
+// qu'ogs ne l'a pas créé (§7.1.6) : le compte système qui ne porte pas sa marque —
+// celui d'un projet adopté ne la porte jamais —, et les bases d'un projet adopté,
+// avec leurs comptes. Elles existaient avant ogs, et l'import les rattache sur des
+// indices qu'il ne peut pas toujours vérifier : la base d'un site voisin resté hors
+// d'ogs, un compte dont personne ne connaît plus le mot de passe. Un compte
+// illisible est un refus : rien ne dit alors qu'ogs l'a créé.
+//
+// Tout est nommé d'un coup. Éprouvés l'un après l'autre, le refus du compte
+// masquait celui des bases, et le --force qu'il réclamait les emportait sans
+// qu'elles aient jamais été nommées. removeUser et dropResources portent encore
+// chacun le leur : le seul appel qui supprime ne dépend pas de qui l'appelle.
+func (a *App) forcedRemovals(p *model.Project) ([]string, *refusal) {
+	u, err := a.systemProvider().Identity.LookupUser(p.Spec.User.Name)
+	if err != nil {
+		return nil, &refusal{code: CodeError, what: fmt.Sprintf("compte %s illisible (%v) : impossible de "+
+			"vérifier qu'ogs l'a créé", p.Spec.User.Name, err)}
+	}
+	var out []string
+	if u != nil && !u.Managed {
+		out = append(out, fmt.Sprintf("le compte %s, qui n'a pas été créé par ogs, avec son arborescence %s",
+			p.Spec.User.Name, p.Spec.Layout.Root))
+	}
+	if adopted(p) {
+		for _, d := range p.Spec.Databases {
+			out = append(out, fmt.Sprintf("la base %s, qui existait avant ogs", databaseLabel(d)))
+		}
+	}
+	return out, nil
+}
+
+// databaseLabel nomme une base et les comptes que sa suppression emporte.
+func databaseLabel(d model.Database) string {
+	account := d.User
+	if d.Engine != "postgres" {
+		host := d.Host
+		if host == "" {
+			host = "localhost"
+		}
+		account += "@" + host
+	}
+	for _, u := range d.ExtraUsers {
+		account += ", " + u.User
+	}
+	return fmt.Sprintf("%s %s (compte %s)", d.Engine, d.Name, account)
+}
+
+// keptFilesRefusal refuse d'effacer le compte et l'arborescence tant que la
+// suppression laisse en place un fichier dont ogs ne sait pas ce qu'il configure.
+// Le vhost d'origine d'un projet adopté, qu'aucun apply n'a réécrit, journalise
+// souvent sous la racine, et son pool tourne sous le compte : les effacer quand
+// même rendait la configuration du serveur invalide (« Cannot access directory »),
+// plus aucun rechargement ne passait, et le redémarrage suivant faisait tomber
+// tous les sites. ogs ne retire pas ces fichiers à la place de l'exploitant — ils
+// servent peut-être autre chose, un voisin resté hors d'ogs en tête —, et --force
+// n'y change rien, pour la même raison. Le remède qui ne coupe rien vient en
+// premier : les confier à ogs, qui les réécrit au nom du projet ; les retirer à la
+// main coupe le site sur-le-champ.
+func (a *App) keptFilesRefusal(provs *providers, p *model.Project) *refusal {
+	_, kept := a.projectFiles(provs, p)
+	var foreign []string
+	for _, k := range kept {
+		if k.foreign {
+			foreign = append(foreign, k.path)
+		}
+	}
+	if len(foreign) == 0 {
+		return nil
+	}
+	return &refusal{code: CodeConflict,
+		what: fmt.Sprintf("projet %s : fichier(s) qu'ogs n'a pas écrit(s) pour lui, qu'il laisserait donc "+
+			"en place (%s), et qui désignent peut-être encore son compte ou son arborescence : un vhost qui "+
+			"journalise sous une racine effacée, un pool qui tourne sous un compte disparu rendent la "+
+			"configuration du serveur invalide", p.ID(), strings.Join(foreign, ", ")),
+		remedy: fmt.Sprintf("s'ils ne servent que ce projet, les confier à ogs (ogs apply %s --force, qui les "+
+			"réécrit à son nom et en sauvegarde l'original dans %s) ; sinon, les retirer ou les désactiver "+
+			"d'abord, s'ils n'ont plus d'objet", p.ID(), a.Paths.BackupsDir())}
+}
+
+// restartServices relance ce que l'étape 1 a arrêté, quand la suppression renonce
+// avant le point de non-retour. Le contexte est détaché : une interruption
+// (Ctrl+C) est précisément l'un des abandons à réparer, et un contexte annulé ne
+// relancerait rien.
+func (a *App) restartServices(ctx context.Context, provs *providers, p *model.Project) {
+	a.printf("redémarrage des services de %s : rien n'a été supprimé\n", p.ID())
+	if err := provs.Unit.Control(context.WithoutCancel(ctx), p, "start"); err != nil {
+		a.printf("⚠ redémarrage des services : %v — les relancer : systemctl start %s\n",
+			err, unit.TargetName(p.ID()))
+	}
+}
+
+// interrupted rend l'abandon qu'impose une interruption (Ctrl+C, SIGTERM) reçue
+// avant le point de non-retour, ou nil. main n'arrête pas le processus : il
+// annule le contexte, et c'est à la suppression de le consulter entre deux étapes.
+func interrupted(ctx context.Context) error {
+	if ctx.Err() == nil {
+		return nil
+	}
+	return exitf(CodeCancelled, "interruption reçue : suppression abandonnée avant tout retrait")
+}
+
+// databasesToDump rend les bases à sauvegarder dans l'archive. Quand les bases
+// vont être supprimées, chacune doit pouvoir être sauvegardée : une base
+// injoignable ne l'est pas, et la suppression continuait vers une archive sans
+// ses données. Le refus tombe ici, avant que rien ne s'arrête, nommé avec les
+// autres ; l'échec du dump lui-même, qui ne se sait qu'en le tentant, abandonne
+// dans archiveProject. Une base que le moteur ne connaît pas n'a rien à
+// sauvegarder.
+func (a *App) databasesToDump(cmd *cobra.Command, provs *providers, p *model.Project,
+	o deleteOptions) ([]model.Database, *refusal) {
+	if len(p.Spec.Databases) == 0 {
+		return nil, nil
+	}
+	if !o.dumpsRequired() {
+		// Sous --keep-data, la sauvegarde n'est qu'un complément de l'archive :
+		// chaque base est tentée, et un échec ne coûte qu'un avertissement.
+		return p.Spec.Databases, nil
+	}
+	const remedy = "relancer avec --no-dump pour supprimer le projet sans sauvegarde de ses bases"
+	obs, err := provs.DB.Observe(cmd.Context(), p)
+	if err != nil {
+		return nil, &refusal{code: CodeDependency, what: fmt.Sprintf("bases de %s inobservables (%v) : elles "+
+			"ne peuvent être ni sauvegardées ni supprimées", p.ID(), err), remedy: remedy}
+	}
+	var (
+		dumps       []model.Database
+		unavailable []string
+	)
+	for _, state := range obs.States {
+		decl := state.Declaration
+		switch {
+		case state.Unavailable != nil:
+			unavailable = append(unavailable, fmt.Sprintf("%s %s (%v)", decl.Engine, decl.Name, state.Unavailable))
+		case !state.DBExists:
+			a.printf("= base %s absente du moteur : rien à sauvegarder\n", decl.Name)
+		default:
+			dumps = append(dumps, decl)
+		}
+	}
+	if len(unavailable) > 0 {
+		return nil, &refusal{code: CodeDependency, what: fmt.Sprintf("base(s) inobservable(s), qui ne peuvent "+
+			"être ni sauvegardées ni supprimées : %s", strings.Join(unavailable, ", ")), remedy: remedy}
+	}
+	return dumps, nil
+}
+
+// noDumpHint conclut tout refus lié aux sauvegardes : les deux issues, et ce
+// que chacune coûte.
+const noDumpHint = "suppression abandonnée avant tout retrait. Relancer avec --no-dump pour supprimer " +
+	"le projet sans sauvegarde de ses bases, ou avec --keep-data pour le retirer en les conservant"
+
+// archiveScope dit ce que l'archive d'une suppression recueille. files sont les
+// fichiers générés que la suppression retire (projectFiles), dumps les bases à
+// sauvegarder (databasesToDump). strict dit que les bases vont être supprimées :
+// une sauvegarde en échec abandonne alors l'archive et la suppression. skipTree et
+// skipLogs écartent, sous --keep-data, ce qui n'est pas au seul projet
+// (archiveExclusions).
+type archiveScope struct {
+	files              []string
+	dumps              []model.Database
+	strict             bool
+	skipTree, skipLogs bool
+}
+
+// archiveExclusions décide, sous --keep-data, de ce que l'archive ne recopie pas.
+// Rien n'est effacé, mais l'archive recopiait tout ce qui se trouvait sous la
+// racine : le home d'un voisin que déclarait un clone raté, rangé sous le nom du
+// clone, un partage de médias monté dessous, /var/www tout entier pour une racine
+// adoptée trop large. L'arborescence n'est archivée que si la suppression aurait
+// pu l'effacer — les mêmes remparts en décident — ; sinon, elle reste en place, et
+// l'exploitant apprend pourquoi l'archive ne la porte pas. Refuser le geste, comme
+// sans --keep-data, n'aurait rien protégé de plus, et aurait fermé la seule issue
+// à qui retire un site en laissant le partage monté pour les autres.
+func (a *App) archiveExclusions(p *model.Project) (skipTree, skipLogs bool) {
+	if rs := a.rootRefusals(p); len(rs) > 0 {
+		a.printf("= arborescence non archivée, laissée en place : %s\n", rs.constat())
+		skipTree = true
+	}
+	if r := mountRefusal(p, p.Spec.Layout.LogDir); r != nil {
+		a.printf("= journaux non archivés, laissés en place : %s\n", r.what)
+		skipLogs = true
+	}
+	return skipTree, skipLogs
+}
+
+// checkArchiveSize vérifie l'espace disponible et demande confirmation au-delà du
+// seuil (§13, garde-fous), avant que rien ne soit arrêté : un refus ici laissait
+// jusque-là les services du projet à l'arrêt, sans rien pour les relancer. Une
+// arborescence que l'archive ne recopie pas ne compte pas : un partage monté
+// dessous faisait refuser l'archive « faute de place ».
+func (a *App) checkArchiveSize(p *model.Project, scope archiveScope) error {
+	var size int64
+	if !scope.skipTree {
+		var err error
+		if size, err = treeSize(p.Spec.Layout.Root); err != nil {
+			return wrap(CodeError, err)
+		}
+	}
+	free, err := archive.Available(a.Paths.ArchivesDir())
+	if err == nil && uint64(size) > free {
+		return exitf(CodeError,
+			"espace insuffisant : %s à archiver, %s disponible sous %s",
+			humanBytes(size), humanBytes(int64(free)), a.Paths.ArchivesDir())
+	}
+	if size > ArchiveSizeThreshold {
+		if err := a.confirm(fmt.Sprintf(
+			"l'archive contiendra environ %s : continuer ?", humanBytes(size))); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // removeUser supprime le compte système et l'arborescence.
@@ -384,6 +943,11 @@ func (a *App) removeUser(cmd *cobra.Command, provs *providers, p *model.Project)
 		return fmt.Errorf("l'utilisateur %s n'a pas été créé par ogs : le supprimer exige --force",
 			p.Spec.User.Name)
 	}
+	// Le rempart de l'arborescence est éprouvé avant userdel, et non après : il
+	// compare le propriétaire de la racine au compte du projet, qui n'existera
+	// plus ensuite — un home orphelin et celui d'un voisin ne se distingueraient
+	// alors plus.
+	treeErr := a.checkRemovableRoot(p)
 	// L'échec du userdel n'interrompt plus la suppression : l'arborescence part
 	// quand même. Laisser le home d'un projet dont la suppression vient d'être
 	// annoncée — définitive, qui plus est — serait le pire des deux états.
@@ -422,16 +986,22 @@ func (a *App) removeUser(cmd *cobra.Command, provs *providers, p *model.Project)
 		}
 	}
 	// L'arborescence part en dernier : tout ce qui précède a pu avoir besoin de la lire.
-	treeErr := a.checkRemovableRoot(p)
 	if treeErr == nil {
 		treeErr = os.RemoveAll(p.Spec.Layout.Root)
 	}
 	// Les journaux vivent sous logs.root (D71), que la validation impose : ils
 	// partent avec le projet, après l'archive qui les a recueillis. Le contrôle est
-	// refait ici, la suppression étant récursive.
+	// refait ici, la suppression étant récursive — et os.RemoveAll ne s'arrête pas
+	// plus à un point de montage sous les journaux que sous la racine. Comme pour
+	// l'arborescence, seul le constat est rendu : la déclaration part aux archives
+	// juste après, et aucun remède ne se relance plus.
 	var logsErr error
 	if dir := filepath.Clean(p.Spec.Layout.LogDir); strings.HasPrefix(dir, a.logsRoot()+string(filepath.Separator)) {
-		logsErr = os.RemoveAll(dir)
+		if r := mountRefusal(p, dir); r != nil {
+			logsErr = fmt.Errorf("%s — journaux laissés en place", r.what)
+		} else {
+			logsErr = os.RemoveAll(dir)
+		}
 	}
 	// Le répertoire d'exécution est dérivé du préfixe et de l'identifiant, non du
 	// fichier de projet : il part quoi qu'il arrive à l'arborescence.
@@ -447,10 +1017,13 @@ func (a *App) removeUser(cmd *cobra.Command, provs *providers, p *model.Project)
 // disque, et os.RemoveAll ne demande rien à personne. Le contrôle est donc refait
 // ici, en nommant le chemin : l'exploitant corrige layout.root puis recommence.
 //
-// Il est appelé deux fois, et les deux comptent : à l'entrée de « project
-// delete », où il refuse le geste tant qu'il est encore refusable, et juste avant
-// os.RemoveAll, où il garde le seul appel qui efface — removeUser ne doit pas
-// dépendre de qui l'appelle.
+// Ses refus (rootRefusals) sont prononcés à l'entrée de « project delete », tant
+// que le geste est encore refusable, et de nouveau au point de non-retour,
+// l'archive faite (deletionRefusals). checkRemovableRoot les rend une dernière
+// fois juste avant os.RemoveAll, où il garde le seul appel qui efface — removeUser
+// ne doit pas dépendre de qui l'appelle. Là, seul le constat est rendu : la
+// déclaration part aux archives juste après, et un « corriger puis relancer »
+// n'aurait plus d'objet.
 //
 // Un projet adopté échappe à la racine des homes, et c'est voulu : l'import
 // reprend le home réel d'un compte du système (/var/www/boutique, par exemple).
@@ -458,31 +1031,327 @@ func (a *App) removeUser(cmd *cobra.Command, provs *providers, p *model.Project)
 // est celle de la validation, recopiée — le rempart doit valoir même quand l'amont
 // n'a rien vu — et élargie aux racines que plusieurs sites se partagent : un
 // /etc/passwd dont le home vaut /var/www ferait effacer les voisins.
+//
+// La forme du chemin ne suffit pas : un clone de préproduction reprenant le home
+// de son homologue, deux docroots imbriqués adoptés tels quels, un home de compte
+// englobant le site d'un autre, et la suppression effaçait un voisin avec une
+// racine d'apparence irréprochable. Sont donc éprouvés le parc (aucun autre
+// projet ne déclare la même racine, ni une racine au-dessus ou au-dessous), puis
+// ce qui est sur le disque : un vrai répertoire, sans point de montage dessous,
+// au propriétaire attendu. Aucun de ces refus ne cède à --force : ce qu'ils
+// protègent n'appartient pas au projet.
 func (a *App) checkRemovableRoot(p *model.Project) error {
+	if rs := a.rootRefusals(p); len(rs) > 0 {
+		return fmt.Errorf("%s — arborescence laissée en place", rs.constat())
+	}
+	return nil
+}
+
+// rootRefusals rend, en pièces, les refus d'effacer la racine — aucun si rien ne
+// s'y oppose. archiveExclusions en tire le seul constat. alsoMounts sont des
+// chemins effacés avec elle, dont les points de montage sont cherchés dans le
+// même passage.
+//
+// Tous sont rassemblés — le voisin qui partage la racine ne masque pas le partage
+// monté dessous —, sauf quand la forme même du chemin est refusée : l'exploitant
+// en désignera un autre, et le parc ou le disque vus à celui-ci n'apprendraient
+// rien — pour « / », tous les projets et tous les montages de la machine.
+func (a *App) rootRefusals(p *model.Project, alsoMounts ...string) refusals {
 	clean := filepath.Clean(p.Spec.Layout.Root)
 	home := filepath.Clean(a.homeRoot())
-	refus := func(raison string) error {
-		return fmt.Errorf("racine de projet %q : %s — suppression refusée ; corriger "+
-			"spec.layout.root dans la déclaration du projet, ou relancer avec --keep-data, "+
-			"qui retire le projet sans toucher ni aux bases ni à l'arborescence",
-			p.Spec.Layout.Root, raison)
-	}
+	var raison string
 	switch {
 	// filepath.Clean rend « . » pour une racine vide : un chemin relatif
 	// effacerait le répertoire de travail de qui a lancé la commande.
-	case clean == "/" || clean == ".":
-		return refus("ni la racine du système ni un chemin relatif ne sont effaçables")
+	case clean == "/" || !filepath.IsAbs(clean):
+		raison = "ni la racine du système ni un chemin relatif ne sont effaçables"
 	case systemRoot(clean):
-		return refus("emplacement système")
+		raison = "emplacement système"
 	// L'égalité est refusée au même titre que le débordement : effacer la racine
 	// des homes emporterait tous les autres projets du parc (D60).
 	case clean == home:
-		return refus("c'est la racine des homes elle-même, partagée par tout le parc")
-	case !strings.HasPrefix(clean, home+string(filepath.Separator)) &&
-		p.Metadata.Labels["adopted"] != "true":
-		return refus("hors de " + home + ", alors que le projet n'est pas adopté")
+		raison = "c'est la racine des homes elle-même, partagée par tout le parc"
+	case !strings.HasPrefix(clean, home+string(filepath.Separator)) && !adopted(p):
+		raison = "hors de " + home + ", alors que le projet n'est pas adopté"
+	}
+	if raison != "" {
+		rs := refusals{{code: CodeValidation, what: fmt.Sprintf("racine de projet %q : %s", p.Spec.Layout.Root,
+			raison), remedy: "corriger spec.layout.root dans la déclaration du projet"}}
+		if r := mountRefusal(p, alsoMounts...); r != nil {
+			rs = append(rs, r)
+		}
+		return rs
+	}
+	return append(a.fleetRefusals(p, clean), a.diskRefusals(p, clean, alsoMounts...)...)
+}
+
+// fleetRefusals refuse une racine qu'un autre projet du parc déclare aussi, ou
+// dont il déclare un sous-répertoire ou un ancêtre : l'effacer emporterait tout
+// ou partie du voisin, toujours déclaré et servi — un clone de préproduction
+// raté qui reprenait le home de son homologue, deux docroots imbriqués adoptés
+// tels quels. Chaque voisin est nommé. Chaque déclaration est relue ici, et non
+// tirée de loadProjects : une seule déclaration invalide y ferait échouer tout le
+// parc, alors qu'il suffit ici d'en connaître la racine. Une déclaration dont on
+// ne tire pas de racine fait refuser, en la nommant : dans le doute, rien n'est
+// effacé. projects/archived/ n'est pas lu : un projet supprimé puis recréé au
+// même home y laisse une racine qui ne protège plus rien.
+func (a *App) fleetRefusals(p *model.Project, root string) refusals {
+	dir := a.Paths.ProjectsDir()
+	entries, err := os.ReadDir(dir)
+	if err != nil && !os.IsNotExist(err) {
+		return refusals{{code: CodeError, what: fmt.Sprintf("racine de projet %q : inventaire du parc "+
+			"illisible (%v), impossible de vérifier qu'aucun autre projet ne la partage", root, err)}}
+	}
+	var rs refusals
+	own := filepath.Clean(a.Paths.ProjectFile(p.ID()))
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".yaml") {
+			continue
+		}
+		path := filepath.Join(dir, e.Name())
+		if path == own {
+			continue
+		}
+		other, err := spec.Load(path)
+		if err == nil {
+			err = other.Normalize(a.homeRoot(), a.Cfg.PrepDomain(), model.WithLogsRoot(a.logsRoot()))
+		}
+		if err == nil && !filepath.IsAbs(other.Spec.Layout.Root) {
+			err = fmt.Errorf("spec.layout.root %q n'est pas un chemin absolu", other.Spec.Layout.Root)
+		}
+		if err != nil {
+			rs = append(rs, &refusal{code: CodeConflict, what: fmt.Sprintf("racine de projet %q : la "+
+				"déclaration %s est illisible (%v), impossible de vérifier qu'elle ne partage pas cette racine",
+				root, path, err), remedy: "la corriger"})
+			continue
+		}
+		for _, decl := range []struct{ what, path string }{
+			{"la racine", other.Spec.Layout.Root}, {"le docroot", other.Spec.Layout.Docroot},
+		} {
+			theirs := filepath.Clean(decl.path)
+			if decl.path == "" || !validate.Overlap(root, theirs) {
+				continue
+			}
+			relation := "est aussi " + decl.what
+			switch {
+			case theirs == root:
+			case strings.HasPrefix(theirs, root+string(filepath.Separator)):
+				relation = "contient " + decl.what + " " + theirs
+			default:
+				relation = "est sous " + decl.what + " " + theirs
+			}
+			rs = append(rs, &refusal{code: CodeConflict, what: fmt.Sprintf("racine de projet %q : elle %s "+
+				"du projet %s (%s), et effacer l'une emporterait l'autre", root, relation, other.ID(), path),
+				remedy: "corriger spec.layout.root de l'une des deux déclarations"})
+			// Un voisin se nomme une fois : son docroot est d'ordinaire sous sa racine.
+			break
+		}
+	}
+	return rs
+}
+
+// diskRefusals éprouve ce que la déclaration ne dit pas : ce qui se trouve
+// réellement à l'emplacement de la racine. Une racine absente n'a rien à effacer,
+// mais les chemins de alsoMounts, eux, restent à éprouver — quoi qu'on trouve à
+// l'emplacement de la racine. Sous un vrai répertoire, points de montage et
+// propriétaire sont éprouvés l'un et l'autre, et nommés ensemble.
+func (a *App) diskRefusals(p *model.Project, root string, alsoMounts ...string) refusals {
+	var rs refusals
+	add := func(r *refusal) {
+		if r != nil {
+			rs = append(rs, r)
+		}
+	}
+	info, err := os.Lstat(root)
+	switch {
+	case os.IsNotExist(err):
+	case err != nil:
+		add(&refusal{code: CodeError, what: fmt.Sprintf("racine de projet %q : %v", root, err)})
+	case info.Mode()&os.ModeSymlink != 0:
+		// os.RemoveAll n'effacerait que le lien, mais tout ce qui le précède —
+		// l'archive, la mesure de l'espace, le propriétaire — lirait le lien ou sa
+		// cible selon qu'il le suit ou non : ogs n'efface pas ce qu'il ne voit pas
+		// en entier.
+		target, _ := os.Readlink(root)
+		add(&refusal{code: CodeConflict, what: fmt.Sprintf("racine de projet %q : c'est un lien "+
+			"symbolique (vers %s), non un répertoire", root, target), remedy: "retirer le lien à la main"})
+	case !info.IsDir():
+		add(&refusal{code: CodeConflict, what: fmt.Sprintf("racine de projet %q : ce n'est pas un "+
+			"répertoire", root)})
+	default:
+		add(mountRefusal(p, append([]string{root}, alsoMounts...)...))
+		add(a.rootOwnerRefusal(p, root, info))
+		return rs
+	}
+	add(mountRefusal(p, alsoMounts...))
+	return rs
+}
+
+// rootOwnerRefusal compare le propriétaire de la racine au compte du projet. Le
+// compte existe : la racine doit être à lui. Il n'existe pas — un clone qui n'a
+// jamais été appliqué, un compte déjà supprimé à la main — : la racine ne doit
+// alors appartenir à aucun autre compte existant, sans quoi c'est le home de
+// quelqu'un d'autre que la déclaration désigne. Un UID orphelin, lui, est
+// précisément ce que laisse un compte supprimé.
+//
+// En mode préfixé, le contrôle n'a pas d'objet : les comptes sont simulés, et
+// tout ce que l'essai crée appartient à qui l'a lancé — comme pour les
+// répertoires du projet, dont le provider système ne compare pas non plus le
+// propriétaire sous préfixe.
+func (a *App) rootOwnerRefusal(p *model.Project, root string, info os.FileInfo) *refusal {
+	if a.Exec.Simulated() {
+		return nil
+	}
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return nil
+	}
+	u, err := a.systemProvider().Identity.LookupUser(p.Spec.User.Name)
+	if err != nil {
+		return &refusal{code: CodeError, what: fmt.Sprintf("racine de projet %q : compte %s illisible (%v)",
+			root, p.Spec.User.Name, err)}
+	}
+	reason, err := ownerRefusal(st.Uid, p.Spec.User.Name, u, accountOfUID)
+	if err != nil {
+		return &refusal{code: CodeError, what: fmt.Sprintf("racine de projet %q : propriétaire illisible (%v)",
+			root, err)}
+	}
+	if reason != "" {
+		return &refusal{code: CodeConflict, what: fmt.Sprintf("racine de projet %q : %s", root, reason),
+			remedy: "corriger spec.layout.root ou le propriétaire"}
 	}
 	return nil
+}
+
+// ownerRefusal rend la raison de refuser l'effacement d'une racine appartenant à
+// l'UID owner, ou "" si rien ne s'y oppose. account est le compte du projet, nil
+// s'il n'existe pas ; nameOf nomme le compte d'un UID, "" s'il n'en a aucun.
+func ownerRefusal(owner uint32, user string, account *system.UserInfo,
+	nameOf func(uid uint32) (string, error)) (string, error) {
+	if account != nil && uint32(account.UID) == owner {
+		return "", nil
+	}
+	name, err := nameOf(owner)
+	if err != nil {
+		return "", err
+	}
+	if account != nil {
+		if name == "" {
+			name = "un UID sans compte"
+		}
+		return fmt.Sprintf("elle appartient à %s (UID %d), non à l'utilisateur du projet %s (UID %d)",
+			name, owner, user, account.UID), nil
+	}
+	if name != "" {
+		return fmt.Sprintf("elle appartient au compte %s (UID %d), alors que l'utilisateur du projet %s "+
+			"n'existe pas : c'est le home de quelqu'un d'autre", name, owner, user), nil
+	}
+	return "", nil
+}
+
+// accountOfUID nomme le compte système d'un UID, ou "" s'il n'en a aucun.
+func accountOfUID(uid uint32) (string, error) {
+	u, err := user.LookupId(strconv.FormatUint(uint64(uid), 10))
+	if err != nil {
+		var unknown user.UnknownUserIdError
+		if errors.As(err, &unknown) {
+			return "", nil
+		}
+		return "", err
+	}
+	return u.Username, nil
+}
+
+// mountInfoPath est la table des montages du processus. C'est elle qui fait foi,
+// non la comparaison des st_dev : un bind mount issu du même système de fichiers
+// garde le périphérique de sa source, et ne se distingue de l'arborescence qui
+// l'accueille que par cette table. Une variable, pour que les tests en posent une.
+var mountInfoPath = "/proc/self/mountinfo"
+
+// mountRefusal refuse d'effacer — ou d'archiver — une arborescence sous laquelle
+// un système de fichiers est monté : os.RemoveAll y descend comme ailleurs, et un
+// partage de médias monté sous le home — bind mount, NFS commun à deux frontaux —
+// était vidé pour tous ceux qui s'en servent, seul le rmdir final du point de
+// montage échouant, après coup. L'archive, elle, le recopiait tout entier. ogs ne
+// démonte rien : l'exploitant sait ce que le montage sert encore, et
+// « --keep-data » lui laisse retirer le site sans y toucher.
+func mountRefusal(p *model.Project, paths ...string) *refusal {
+	var found []string
+	for _, path := range paths {
+		if path == "" {
+			continue
+		}
+		points, err := mountPointsUnder(path)
+		if err != nil {
+			return &refusal{code: CodeError, what: fmt.Sprintf("projet %s : table des montages illisible "+
+				"(%v), impossible de vérifier qu'aucun partage n'est monté sous %s", p.ID(), err, path)}
+		}
+		found = append(found, points...)
+	}
+	if len(found) == 0 {
+		return nil
+	}
+	return &refusal{code: CodeConflict, what: fmt.Sprintf("projet %s : système de fichiers monté sous "+
+		"l'arborescence (%s), qui sert peut-être encore d'autres sites ou d'autres serveurs", p.ID(),
+		strings.Join(found, ", ")),
+		remedy: "la suppression ne franchit jamais un point de montage : le démonter d'abord (umount)"}
+}
+
+// mountPointsUnder énumère les points de montage situés sous path, path compris :
+// une racine qui est elle-même un point de montage verrait vider le système de
+// fichiers qu'elle accueille. Le chemin est aussi comparé résolu, la table
+// portant des chemins sans lien (un /home lié à /data/home y figure en
+// /data/home).
+func mountPointsUnder(path string) ([]string, error) {
+	data, err := os.ReadFile(mountInfoPath)
+	if err != nil {
+		return nil, err
+	}
+	roots := []string{filepath.Clean(path)}
+	if resolved, err := filepath.EvalSymlinks(path); err == nil && resolved != roots[0] {
+		roots = append(roots, resolved)
+	}
+	var out []string
+	seen := map[string]bool{}
+	for _, line := range strings.Split(string(data), "\n") {
+		// « 36 35 98:0 /racine /point options… - type source options » : le
+		// point de montage est le cinquième champ.
+		fields := strings.Fields(line)
+		if len(fields) < 5 {
+			continue
+		}
+		point := unescapeMountPath(fields[4])
+		for _, root := range roots {
+			if (point == root || strings.HasPrefix(point, root+"/")) && !seen[point] {
+				seen[point] = true
+				out = append(out, point)
+			}
+		}
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+// unescapeMountPath décode les séquences octales dont le noyau protège les
+// blancs et la barre oblique inverse dans la table des montages (« \040 » pour
+// une espace) : sans quoi un point de montage au nom espacé ne serait jamais
+// reconnu.
+func unescapeMountPath(s string) string {
+	if !strings.Contains(s, `\`) {
+		return s
+	}
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' && i+4 <= len(s) {
+			if v, err := strconv.ParseUint(s[i+1:i+4], 8, 8); err == nil {
+				b.WriteByte(byte(v))
+				i += 3
+				continue
+			}
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
 }
 
 // systemRoot énumère les emplacements qu'aucune racine de projet ne peut valoir,
@@ -582,7 +1451,7 @@ func uidMatches(status string, uid int) bool {
 // quel — le mode 0600 du dump ne vaut qu'à la création —, et un attaquant
 // n'aurait même pas à le lire pour nuire : sur les plateformes visées le noyau
 // refuse l'ouverture (fs.protected_regular), la sauvegarde échoue, et la
-// suppression continue vers une archive sans données. Sous /var/lib/ogs, que
+// suppression continuait alors vers une archive sans données. Sous /var/lib/ogs, que
 // seul root traverse, aucun utilisateur de projet n'y crée de nom.
 func (a *App) dumpWorkDir() (string, error) {
 	root := a.Paths.DumpsDir()
@@ -598,27 +1467,15 @@ func (a *App) dumpWorkDir() (string, error) {
 // archive à laquelle il manque un dump n'est pas une archive dont on peut
 // restaurer le site, et rendre 0 après l'avoir produite ferait croire le
 // contraire à qui enchaîne sur la suppression.
-func (a *App) archiveProject(cmd *cobra.Command, provs *providers, p *model.Project, noDump bool,
+//
+// scope dit ce qu'elle recueille (archiveScope). Quand scope.strict est vrai,
+// les bases vont être supprimées : une sauvegarde en échec abandonne alors
+// l'archive et la suppression, avant tout retrait — elle partait sinon sans que
+// l'archive en garde rien, au mode par défaut qui promet l'inverse. L'espace et
+// le seuil de taille ont été vérifiés avant l'arrêt des services
+// (checkArchiveSize).
+func (a *App) archiveProject(cmd *cobra.Command, provs *providers, p *model.Project, scope archiveScope,
 	warn func(format string, args ...any)) (string, []string, error) {
-	// L'espace disponible est vérifié avant de commencer : échouer au milieu
-	// d'une suppression laisserait le système à moitié démonté.
-	size, err := treeSize(p.Spec.Layout.Root)
-	if err != nil {
-		return "", nil, wrap(CodeError, err)
-	}
-	free, err := archive.Available(a.Paths.ArchivesDir())
-	if err == nil && uint64(size) > free {
-		return "", nil, exitf(CodeError,
-			"espace insuffisant : %s à archiver, %s disponible sous %s",
-			humanBytes(size), humanBytes(int64(free)), a.Paths.ArchivesDir())
-	}
-	if size > ArchiveSizeThreshold {
-		if err := a.confirm(fmt.Sprintf(
-			"l'archive contiendra environ %s : continuer ?", humanBytes(size))); err != nil {
-			return "", nil, err
-		}
-	}
-
 	path := filepath.Join(a.Paths.ArchivesDir(), archive.FileName(p.ID(), time.Now()))
 	w, err := archive.Create(path, archive.Manifest{
 		Project: p.ID(), Host: p.Metadata.Host, Env: p.Metadata.Env,
@@ -638,27 +1495,43 @@ func (a *App) archiveProject(cmd *cobra.Command, provs *providers, p *model.Proj
 	if err := w.AddFile("spec", "project.yaml", a.Paths.ProjectFile(p.ID())); err != nil {
 		return "", nil, wrap(CodeError, err)
 	}
-	// Les configurations générées, pour comparaison ultérieure.
+	// Les configurations générées, pour comparaison ultérieure. Un lien n'a pas
+	// de contenu propre : il est noté parmi les retraits, sa cible est recueillie
+	// pour elle-même.
 	var removed []string
-	for _, file := range a.generatedFiles(provs, p) {
-		if _, err := os.Stat(file); err != nil {
+	for _, file := range scope.files {
+		info, err := os.Lstat(file)
+		if err != nil {
 			continue
 		}
-		if err := w.AddFile("config", "config/"+filepath.Base(file), file); err != nil {
-			return "", nil, wrap(CodeError, err)
+		if info.Mode().IsRegular() {
+			if err := w.AddFile("config", "config/"+filepath.Base(file), file); err != nil {
+				return "", nil, wrap(CodeError, err)
+			}
 		}
 		removed = append(removed, file)
 	}
+	// Une interruption abandonne l'archive entre deux phases : les dumps et les
+	// arborescences peuvent prendre des minutes, qu'il serait vain de passer à
+	// recueillir ce qu'on ne supprimera pas. Pendant une phase, elle attend que
+	// celle-ci s'achève, et le point de non-retour la voit de toute façon.
+	if err := interrupted(cmd.Context()); err != nil {
+		return "", nil, err
+	}
 	// Les dumps : sans eux, l'archive serait inexploitable pour une restauration.
-	if !noDump && len(p.Spec.Databases) > 0 {
+	if len(scope.dumps) > 0 {
 		dir, err := a.dumpWorkDir()
 		if err != nil {
 			return "", nil, wrap(CodeError, err)
 		}
 		defer os.RemoveAll(dir)
-		for _, decl := range p.Spec.Databases {
+		for _, decl := range scope.dumps {
 			tmp := filepath.Join(dir, decl.Name+".sql")
 			if _, err := provs.DB.Dump(cmd.Context(), p, decl, tmp); err != nil {
+				if scope.strict {
+					return "", nil, exitf(CodeError, "sauvegarde de %s impossible : %v — sans elle, la "+
+						"base serait supprimée sans recours ; %s", decl.Name, err, noDumpHint)
+				}
 				warn("sauvegarde de %s impossible : %v — l'archive ne contiendra pas ses données, "+
 					"et « ogs project restore » ne les rendra pas", decl.Name, err)
 				continue
@@ -700,13 +1573,21 @@ func (a *App) archiveProject(cmd *cobra.Command, provs *providers, p *model.Proj
 	} else if !os.IsNotExist(err) {
 		return "", nil, wrap(CodeError, err)
 	}
-	// L'arborescence complète.
-	if err := w.AddTree("tree", "tree", p.Spec.Layout.Root); err != nil {
-		return "", nil, wrap(CodeError, err)
+	// L'arborescence complète, quand elle est au seul projet.
+	if err := interrupted(cmd.Context()); err != nil {
+		return "", nil, err
+	}
+	if !scope.skipTree {
+		if err := w.AddTree("tree", "tree", p.Spec.Layout.Root); err != nil {
+			return "", nil, wrap(CodeError, err)
+		}
 	}
 	// Les journaux, qui ne vivent plus dans le home (D71) : ils partent avec le
 	// projet, comme lorsqu'ils étaient dans son arborescence.
-	if info, err := os.Stat(p.Spec.Layout.LogDir); err == nil && info.IsDir() {
+	if err := interrupted(cmd.Context()); err != nil {
+		return "", nil, err
+	}
+	if info, err := os.Stat(p.Spec.Layout.LogDir); err == nil && info.IsDir() && !scope.skipLogs {
 		if err := w.AddTree("logs", "logs", p.Spec.Layout.LogDir); err != nil {
 			return "", nil, wrap(CodeError, err)
 		}

@@ -763,7 +763,47 @@ func Uniqueness(projects []*model.Project, prepDomain string) error {
 			}
 		}
 	}
+	// L'égalité des homes ne suffit pas : un home imbriqué dans celui d'un autre
+	// projet est effacé avec lui, et « ogs project delete » du premier emportait
+	// le second, toujours déclaré et servi. L'import en produit sans y penser : un
+	// docroot /var/www/boutique devient un home, celui de blog.boutique.fr
+	// (/var/www/boutique/blog) un autre, dessous. L'égalité reste signalée par la
+	// clé « home » ci-dessus, une seule fois.
+	//
+	// Un parc écrit avant ce contrôle peut déjà porter deux homes imbriqués : le
+	// refus vaut alors pour toute commande qui éprouve l'unicité, même au sujet
+	// d'un troisième projet. Le message le dit, sans quoi l'exploitant chercherait
+	// le conflit dans le projet qu'il est en train de créer.
+	for i := range projects {
+		for j := i + 1; j < len(projects); j++ {
+			ri := filepath.Clean(projects[i].Spec.Layout.Root)
+			rj := filepath.Clean(projects[j].Spec.Layout.Root)
+			if ri == rj || !Overlap(ri, rj) {
+				continue
+			}
+			outer, inner := projects[i], projects[j]
+			if isUnder(ri, rj) {
+				outer, inner = inner, outer
+			}
+			errs = append(errs, Error{
+				Field: "home",
+				Message: fmt.Sprintf("%q, home du projet %q, contient %q, celui du projet %q : "+
+					"supprimer le premier effacerait le second — corriger spec.layout.root de l'un des deux, "+
+					"le conflit pouvant précéder la commande en cours (une version antérieure d'ogs l'acceptait)",
+					filepath.Clean(outer.Spec.Layout.Root), outer.Metadata.Name,
+					filepath.Clean(inner.Spec.Layout.Root), inner.Metadata.Name),
+			})
+		}
+	}
 	return errs.OrNil()
+}
+
+// Overlap dit si deux chemins se recouvrent — égaux, ou l'un sous l'autre —, au
+// sens des composants et non des caractères : /var/www/boutique-old n'est pas
+// sous /var/www/boutique. Effacer l'un emporterait alors tout ou partie de
+// l'autre.
+func Overlap(a, b string) bool {
+	return isUnder(a, b) || isUnder(b, a)
 }
 
 // poolRole traduit le nom logique d'un pool en suffixe de rôle : le pool

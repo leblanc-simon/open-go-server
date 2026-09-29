@@ -139,11 +139,20 @@ func (p *Provider) dumpCommand(decl model.Database) (string, []string, error) {
 		return filepath.Join(p.Paths.Prefix(), "/usr/bin/pg_dump"), []string{
 			"--host=" + socketDir,
 			fmt.Sprintf("--port=%d", cluster.Port),
+			adminRoleFlag(),
 			"--no-password",
 			decl.Name,
 		}, nil
 	}
 	return "", nil, fmt.Errorf("moteur %q inconnu", decl.Engine)
+}
+
+// adminRoleFlag présente pg_dump et psql sous le rôle du client d'administration
+// (OGS_PG_ADMIN). Laissés au rôle par défaut — celui du compte système —, ils
+// échouaient là où le client, lui, joignait la base : la suppression d'un projet
+// sauvegardait sans succès une base qu'elle supprimait ensuite sans peine.
+func adminRoleFlag() string {
+	return "--username=" + PostgresAdminRole(os.Getenv("OGS_PG_ADMIN"))
 }
 
 // Restore recharge une sauvegarde. L'opération est destructrice pour le contenu
@@ -182,7 +191,7 @@ func (p *Provider) Restore(ctx context.Context, proj *model.Project, decl model.
 			socketDir = filepath.Join(p.Paths.Prefix(), "/var/run/postgresql")
 		}
 		tool = filepath.Join(p.Paths.Prefix(), "/usr/bin/psql")
-		args = []string{"--host=" + socketDir, fmt.Sprintf("--port=%d", cluster.Port),
+		args = []string{"--host=" + socketDir, fmt.Sprintf("--port=%d", cluster.Port), adminRoleFlag(),
 			"--no-password", "--set=ON_ERROR_STOP=1", "--dbname=" + decl.Name}
 	default:
 		return fmt.Errorf("moteur %q inconnu", decl.Engine)

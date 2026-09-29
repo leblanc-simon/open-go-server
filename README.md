@@ -312,6 +312,15 @@ d'une suppression laisserait le système à moitié démonté.
 suffit pas pour une opération sans recours. `--keep-data` ne retire que les
 configurations.
 
+Avant tout geste, et avant même la confirmation, la suppression énumère **ensemble**
+tout ce qui la refuse, chaque refus avec son remède : une racine qu'un autre projet
+partage ou englobe, un point de montage sous l'arborescence ou les journaux, un fichier
+de configuration qu'ogs n'a pas écrit pour ce projet, une base qu'elle ne pourrait pas
+sauvegarder (`--no-dump` lève ce refus) et, sans `--force`, le compte ou les bases d'un
+projet adopté. Une interruption reçue avant le premier retrait abandonne la suppression
+et relance les services arrêtés ; reçue après, elle laisse la suppression aller à son
+terme.
+
 ### Superviser
 
 ```sh

@@ -150,6 +150,54 @@ func TestUniquenessDetectsHomeCollision(t *testing.T) {
 	}
 }
 
+func TestUnicitéRefuseDesHomesImbriqués(t *testing.T) {
+	// Les deux formes que produit l'import : un home englobant (le compte « web »
+	// porte /home/web, dont site2.fr occupe un sous-répertoire) et deux docroots
+	// imbriqués devenus homes. Chaque fois, supprimer le premier projet effaçait le
+	// second, que l'égalité stricte des homes laissait passer.
+	adopter := func(host, root string) *model.Project {
+		p := newProject(t, host, naming.EnvProd, model.KindStatic)
+		p.Metadata.Labels = map[string]string{"adopted": "true"}
+		p.Spec.Layout.Root, p.Spec.User.Home = root, root
+		p.Spec.Layout.Docroot = root + "/public"
+		return p
+	}
+	for _, c := range []struct{ englobant, imbriqué string }{
+		{"/home/web", "/home/web/site2"},
+		{"/var/www/boutique", "/var/www/boutique/blog"},
+	} {
+		// L'ordre du parc ne change rien : le projet englobant est nommé dans
+		// les deux cas.
+		for _, parc := range [][]*model.Project{
+			{adopter("site1.fr", c.englobant), adopter("site2.fr", c.imbriqué)},
+			{adopter("site2.fr", c.imbriqué), adopter("site1.fr", c.englobant)},
+		} {
+			err := Uniqueness(parc, "preprod-pp.net")
+			if err == nil {
+				t.Errorf("%s et %s : des homes imbriqués doivent être refusés", c.englobant, c.imbriqué)
+				continue
+			}
+			if !strings.Contains(err.Error(), `"`+c.englobant+`", home du projet "site1fr"`) {
+				t.Errorf("le refus doit nommer le home englobant et son projet : %v", err)
+			}
+			// Un parc écrit par une version antérieure peut déjà porter le
+			// conflit : le refus le dit, sans quoi l'exploitant le chercherait dans
+			// le projet qu'il crée.
+			if !strings.Contains(err.Error(), "version antérieure") {
+				t.Errorf("le refus doit dire que le conflit peut précéder la commande : %v", err)
+			}
+		}
+	}
+
+	// Un nom qui en prolonge un autre n'est pas imbriqué : la comparaison porte
+	// sur les composants du chemin, non sur les caractères.
+	parc := []*model.Project{adopter("boutique.fr", "/var/www/boutique"),
+		adopter("ancienne.fr", "/var/www/boutique-old")}
+	if err := Uniqueness(parc, "preprod-pp.net"); err != nil {
+		t.Errorf("deux homes voisins doivent cohabiter : %v", err)
+	}
+}
+
 func TestUniquenessDetectsIdentifierCollision(t *testing.T) {
 	// mon-shop.fr et monshop.fr convergent vers le même identifiant.
 	a := newProject(t, "mon-shop.fr", naming.EnvProd, model.KindStatic)
