@@ -131,11 +131,8 @@ func (p *Provider) unitContext(proj *model.Project, svc model.Service) (map[stri
 		return nil, err
 	}
 	if at.EnvVar != "" {
-		value := "prod"
-		if proj.IsPrep() {
-			value = "dev"
-		}
-		env[at.EnvVar] = value
+		// « prod » en préproduction aussi (D96), comme le pool PHP.
+		env[at.EnvVar] = "prod"
 	}
 	for k, v := range svc.Params {
 		if strings.HasPrefix(k, "env.") {

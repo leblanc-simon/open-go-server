@@ -298,10 +298,9 @@ func (p *Provider) Build(proj *model.Project, pool model.Pool) (*PoolPlan, error
 
 	env := map[string]string{}
 	if at.EnvVar != "" {
+		// « prod » en préproduction aussi (D96) : le site y est public, et un code
+		// installé sans les dépendances de dev ne démarre pas en « dev ».
 		env[at.EnvVar] = "prod"
-		if proj.IsPrep() {
-			env[at.EnvVar] = "dev"
-		}
 	}
 	for k, v := range pool.Env {
 		env[k] = v

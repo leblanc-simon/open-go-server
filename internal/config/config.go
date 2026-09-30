@@ -376,7 +376,6 @@ func Default() *Config {
 				IDSuffix:        naming.SuffixPrep,
 				Certificate:     "@wildcard-prep",
 				RobotsNoindex:   true,
-				PHPEnv:          map[string]string{"APP_ENV": "dev"},
 				PresetDowngrade: true,
 			},
 		},

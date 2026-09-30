@@ -97,6 +97,24 @@ func TestBuildMessengerUnit(t *testing.T) {
 	}
 }
 
+func TestBuildPrepResteEnProd(t *testing.T) {
+	// D96 : une préproduction tourne en APP_ENV=prod, comme son pool PHP.
+	prov, _ := fixture(t)
+	proj := model.New("shop.fr", naming.EnvPrep, model.KindSymfony)
+	proj.Spec.App.Version = "6.4"
+	if err := proj.Normalize(filepath.Join(t.TempDir(), "home"), "preprod-pp.net"); err != nil {
+		t.Fatal(err)
+	}
+	svc := model.Service{Name: "messenger-async", Template: TemplateMessenger, Instances: 1}
+	content, err := prov.Build(proj, svc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if text := string(content); !strings.Contains(text, "Environment=APP_ENV=prod") || strings.Contains(text, "APP_ENV=dev") {
+		t.Errorf("la préproduction doit tourner en APP_ENV=prod :\n%s", text)
+	}
+}
+
 func TestBuildAddsBrokerDependencyWhenDeclared(t *testing.T) {
 	prov, proj := fixture(t)
 	proj.Spec.AMQP = &model.AMQP{Vhost: "shopfr", User: "shopfr"}

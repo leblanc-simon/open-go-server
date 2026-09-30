@@ -235,6 +235,25 @@ func TestBuildSetsEnvVarPerVariant(t *testing.T) {
 	}
 }
 
+func TestBuildPrepResteEnProd(t *testing.T) {
+	// D96 : la préproduction est publique, et un code installé sans les
+	// dépendances de dev ne démarre pas en « dev ».
+	prov, _, _ := fixture(t, "8.5")
+	p := model.New("shop.fr", naming.EnvPrep, model.KindSymfony)
+	p.Spec.App.Version = "6.4"
+	if err := p.Normalize(filepath.Join(t.TempDir(), "home"), "preprod-pp.net"); err != nil {
+		t.Fatal(err)
+	}
+	p.Spec.PHP.Pools[0].Version = "8.5"
+	bp, err := prov.Build(p, p.Spec.PHP.Pools[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(bp.Content), "env[APP_ENV] = prod") || strings.Contains(string(bp.Content), "= dev") {
+		t.Errorf("la préproduction doit tourner en APP_ENV=prod :\n%s", bp.Content)
+	}
+}
+
 func TestBuildIsDeterministic(t *testing.T) {
 	// Deux rendus successifs doivent être identiques, sans quoi chaque apply
 	// réécrirait le fichier et rechargerait FPM pour rien.

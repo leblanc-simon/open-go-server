@@ -137,7 +137,7 @@ func TestFusionConserveLesDefautsDesTables(t *testing.T) {
 	if prep.HostTemplate != "{{.PrepLabel}}.{{.Domain}}" || prep.IDSuffix != "prep" {
 		t.Errorf("champ tu écrasé : %+v", prep)
 	}
-	if !prep.RobotsNoindex || !prep.PresetDowngrade || prep.PHPEnv["APP_ENV"] != "dev" {
+	if !prep.RobotsNoindex || !prep.PresetDowngrade {
 		t.Errorf("champ tu écrasé : %+v", prep)
 	}
 	if _, ok := c.Environments["prod"]; !ok {
