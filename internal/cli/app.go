@@ -337,8 +337,7 @@ func (a *App) buildProviders() (*providers, error) {
 		Force: a.Force,
 		Issuer: &tlsprov.ACME{
 			Paths: a.Paths, Store: certStore, Email: a.Cfg.ACME.Email,
-			Directory:      a.Cfg.ACME.Directory,
-			DNSCredentials: a.dnsCredentials,
+			Directory: a.Cfg.ACME.Directory,
 		},
 		// En mode simulé, l'émetteur de repli évite tout appel réseau : le mode
 		// d'essai doit produire un site complet, certificat compris.
@@ -447,30 +446,6 @@ func (a *App) amqpCredentials() (amqp.Credentials, error) {
 	var creds amqp.Credentials
 	if err := yaml.Unmarshal(data, &creds); err != nil {
 		return amqp.Credentials{}, fmt.Errorf("%s : %w", path, err)
-	}
-	return creds, nil
-}
-
-// dnsCredentials lit les identifiants d'un provider DNS. Ils vivent hors de la
-// base d'état, dans un fichier à permissions restreintes : ils donnent un droit
-// d'écriture sur une zone DNS entière.
-func (a *App) dnsCredentials(provider string) (map[string]string, error) {
-	path := filepath.Join(a.Paths.DNSCredsDir(), provider+".yaml")
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("identifiants %s absents : les enregistrer avec "+
-				"« ogs cert dns-provider set %s » (%s)", provider, provider, path)
-		}
-		return nil, err
-	}
-	if info, err := os.Stat(path); err == nil && info.Mode().Perm()&0o077 != 0 {
-		return nil, fmt.Errorf("%s est lisible au-delà de son propriétaire (mode %04o) : "+
-			"corriger avec chmod 0600", path, info.Mode().Perm())
-	}
-	creds := map[string]string{}
-	if err := yaml.Unmarshal(data, &creds); err != nil {
-		return nil, fmt.Errorf("%s : %w", path, err)
 	}
 	return creds, nil
 }

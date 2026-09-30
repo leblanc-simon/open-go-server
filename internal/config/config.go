@@ -360,7 +360,10 @@ type SharedCert struct {
 	Domains     []string `yaml:"domains"`
 	Challenge   string   `yaml:"challenge"`
 	DNSProvider string   `yaml:"dnsProvider"`
-	KeyType     string   `yaml:"keyType"`
+	// DNSCredentials désigne le jeu d'identifiants DNS du challenge dns-01 ; vide,
+	// chaque nom reçoit celui de sa zone (D97).
+	DNSCredentials string `yaml:"dnsCredentials"`
+	KeyType        string `yaml:"keyType"`
 }
 
 // Default renvoie la configuration par défaut, telle que décrite au cahier des charges.

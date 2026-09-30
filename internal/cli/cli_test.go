@@ -1398,6 +1398,75 @@ func TestCertDNSProviderSet(t *testing.T) {
 	}
 }
 
+func TestCertDNSProviderPlusieursJeux(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	h.stdin = "as\nck\n"
+	out := h.mustRun("cert", "dns-provider", "set", "client-a", "--zone", "Client-A.fr", "--zone", "client-a.com",
+		"--application-key", "ak")
+	if !strings.Contains(out, "zones : client-a.fr, client-a.com") {
+		t.Errorf("zones annoncées :\n%s", out)
+	}
+	content := h.read(t, filepath.Join("etc", "ogs", "credentials", "dns", "client-a.yaml"))
+	if !strings.Contains(content, "provider: ovh") || !strings.Contains(content, "- client-a.fr") {
+		t.Errorf("contenu inattendu :\n%s", content)
+	}
+	// Une zone déjà déclarée par un autre jeu rendrait le choix indéterminé.
+	h.stdin = "cs\n"
+	if out, code := h.run("cert", "dns-provider", "set", "client-b", "--zone", "client-a.fr",
+		"--client-id", "ci"); code != CodeConflict || !strings.Contains(out, "déjà déclarée par le jeu client-a") {
+		t.Errorf("zone en double : code %d attendu %d :\n%s", code, CodeConflict, out)
+	}
+	// Renouveler une clé sans --zone garde les zones : sans quoi les certificats
+	// du jeu repasseraient en http-01 sans un mot.
+	h.stdin = "cs\n"
+	h.mustRun("cert", "dns-provider", "set", "client-a", "--client-id", "ci")
+	content = h.read(t, filepath.Join("etc", "ogs", "credentials", "dns", "client-a.yaml"))
+	if !strings.Contains(content, "- client-a.com") || strings.Contains(content, "applicationKey") {
+		t.Errorf("zones conservées, clés remplacées :\n%s", content)
+	}
+	if out, code := h.run("cert", "dns-provider", "set", "../x", "--client-id", "ci"); code != CodeUsage {
+		t.Errorf("nom qui sort du répertoire : code %d :\n%s", code, out)
+	}
+	h.stdin = "as\nck\n"
+	h.mustRun("cert", "dns-provider", "set", "ovh", "--application-key", "ak")
+	out = h.mustRun("cert", "dns-provider", "list")
+	if !strings.Contains(out, "client-a") || !strings.Contains(out, "client-a.com client-a.fr") ||
+		!strings.Contains(out, "dns-01 demandé seulement") {
+		t.Errorf("liste :\n%s", out)
+	}
+	// La liste ne montre jamais un identifiant.
+	json := h.mustRun("cert", "dns-provider", "list", "-o", "json")
+	if strings.Contains(json, "clientSecret") || strings.Contains(json, "applicationKey") ||
+		!strings.Contains(json, `"zones"`) {
+		t.Errorf("identifiant affiché :\n%s", json)
+	}
+	// Un jeu lisible de tous est écarté, nommé, et rend le code 6.
+	if err := os.Chmod(h.path("etc", "ogs", "credentials", "dns", "ovh.yaml"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if out, code := h.run("cert", "dns-provider", "list"); code != CodePartial ||
+		!strings.Contains(out, "lisible au-delà de son propriétaire") {
+		t.Errorf("jeu lisible de tous : code %d :\n%s", code, out)
+	}
+}
+
+func TestUneZoneDeclareeFaitEmettreParDNS01(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	h.stdin = "cs\n"
+	h.mustRun("cert", "dns-provider", "set", "client-a", "--zone", "client-a.fr", "--client-id", "ci")
+	h.mustRun("project", "create", "client-a.fr", "--kind", "static")
+	out, _ := h.run("plan", "clientafr")
+	if !strings.Contains(out, "dns-01 par la zone déclarée, repli http-01") {
+		t.Errorf("le plan doit annoncer le challenge dns-01 de la zone :\n%s", out)
+	}
+	out, _ = h.run("cert", "issue", "clientafr", "--challenge", "http-01", "--dry-run")
+	if !strings.Contains(out, "(http-01)") {
+		t.Errorf("un challenge imposé l'emporte :\n%s", out)
+	}
+}
+
 func TestRenewTimerIsInstalled(t *testing.T) {
 	h := newHarness(t)
 	h.mustRun("init")

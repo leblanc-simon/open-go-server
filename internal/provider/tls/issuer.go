@@ -43,9 +43,16 @@ type Request struct {
 	Domains     []string
 	Challenge   Challenge
 	DNSProvider string
-	KeyType     string
-	Staging     bool
-	Email       string
+	// DNSCredentials désigne le jeu d'identifiants DNS à employer pour tous les
+	// noms ; vide, chaque nom reçoit celui de sa zone (D97).
+	DNSCredentials string
+	// AutoDNS signale un challenge DNS-01 que la demande n'a pas choisi : tous ses
+	// noms relèvent d'une zone déclarée. Il se replie sur HTTP-01 en cas d'échec,
+	// ce que le challenge par défaut aurait tenté.
+	AutoDNS bool
+	KeyType string
+	Staging bool
+	Email   string
 	// Essential porte les noms dont l'émission ne doit dépendre d'aucun autre :
 	// ceux du vhost principal. Quand la demande complète échoue, l'émission se
 	// replie par paliers qui écartent d'abord les redirections, puis les noms que
@@ -82,10 +89,35 @@ func (r Request) Validate() error {
 		return fmt.Errorf("certificat %s : un joker impose le challenge dns-01 "+
 			"(aucune requête HTTP ne peut valider *.domaine)", r.Name)
 	}
-	if r.Challenge == ChallengeDNS01 && r.DNSProvider == "" {
+	if r.Challenge == ChallengeDNS01 && r.DNSProvider == "" && r.DNSCredentials == "" {
 		return fmt.Errorf("certificat %s : le challenge dns-01 exige un provider DNS", r.Name)
 	}
+	if r.DNSCredentials != "" {
+		if err := CheckDNSCredentialsName(r.DNSCredentials); err != nil {
+			return fmt.Errorf("certificat %s : %w", r.Name, err)
+		}
+		if r.Challenge == ChallengeHTTP01 {
+			return fmt.Errorf("certificat %s : « dnsCredentials » n'a de sens qu'avec le challenge dns-01", r.Name)
+		}
+	}
 	return nil
+}
+
+// Method décrit la méthode de validation, pour le plan et les messages.
+func (r Request) Method() string {
+	switch {
+	case r.AutoDNS:
+		return "dns-01 par la zone déclarée, repli http-01"
+	case r.Challenge == ChallengeDNS01 && r.DNSCredentials != "":
+		return "dns-01, identifiants " + r.DNSCredentials
+	}
+	return string(r.Challenge)
+}
+
+// servesChallenge dit si l'émission peut passer par le vhost — HTTP-01, ou son
+// repli : le vhost doit alors être chargé, non seulement écrit.
+func (r Request) servesChallenge() bool {
+	return r.Challenge == ChallengeHTTP01 || r.AutoDNS
 }
 
 // validateDomain vérifie un nom, joker compris. Un joker ne couvre qu'un seul

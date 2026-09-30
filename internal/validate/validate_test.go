@@ -741,6 +741,23 @@ func TestNomDeCertificatRefuseCeQuiSortDeSonEspace(t *testing.T) {
 	}
 }
 
+// Le jeu d'identifiants DNS désigné est un fichier de /etc/ogs/credentials/dns
+// (D97) : un nom qui en sort est refusé au projet visé, jamais au chargement.
+func TestJeuDIdentifiantsDNSDesigneParUnCertificat(t *testing.T) {
+	p := newProject(t, "shop.fr", naming.EnvProd, model.KindStatic)
+	p.Spec.Certificates = []model.Certificate{{Domains: []string{"shop.fr"}, DNSCredentials: "../master"}}
+	if err := CertificateNames(p); err == nil || !strings.Contains(err.Error(), "dnsCredentials") {
+		t.Errorf("le jeu « ../master » doit être refusé : %v", err)
+	}
+	if err := Project(p, "/home"); err != nil {
+		t.Errorf("le chargement ne doit pas le refuser : %v", err)
+	}
+	p.Spec.Certificates[0].DNSCredentials = "client-a"
+	if err := CertificateNames(p); err != nil {
+		t.Errorf("le jeu « client-a » doit être accepté : %v", err)
+	}
+}
+
 // Deux certificats d'un même projet sous un même nom se partagent un
 // répertoire : chaque apply réémettait l'un sur l'autre, et sous ACME le quota
 // de l'autorité s'épuisait. Refusé aux projets visés ; le chargement du parc,

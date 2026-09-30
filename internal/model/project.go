@@ -253,8 +253,11 @@ type Certificate struct {
 	Domains     []string `yaml:"domains"`
 	Challenge   string   `yaml:"challenge,omitempty"`
 	DNSProvider string   `yaml:"dnsProvider,omitempty"`
-	KeyType     string   `yaml:"keyType,omitempty"`
-	Staging     bool     `yaml:"staging,omitempty"`
+	// DNSCredentials désigne le jeu d'identifiants DNS du challenge dns-01 ; vide,
+	// chaque nom reçoit celui de sa zone (D97).
+	DNSCredentials string `yaml:"dnsCredentials,omitempty"`
+	KeyType        string `yaml:"keyType,omitempty"`
+	Staging        bool   `yaml:"staging,omitempty"`
 }
 
 // CronJob est une tâche planifiée.

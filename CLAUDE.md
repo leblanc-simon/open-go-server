@@ -259,6 +259,16 @@ reprennent entière — et l'écrit pour OpenDKIM ; le plan global écrit la `Ke
 ni à `opendkim.conf`, ni au DNS ; la rotation (`rotate` puis `activate`) ne bascule qu'une fois
 l'enregistrement publié, vérifié par le résolveur.
 
+### Certificats : des jeux d'identifiants DNS choisis par zone
+
+`internal/provider/tls/dns.go` (D97) : un fichier de `/etc/ogs/credentials/dns` par jeu, avec ses `zones`.
+Le challenge de chaque nom prend le jeu désigné (`dnsCredentials`), sinon celui de la zone la plus longue,
+sinon le jeu sans zone s'il est seul, et `routeDNS` aiguille nom à nom. Une demande **sans challenge
+déclaré** dont chaque nom relève d'une zone déclarée passe à DNS-01 (`Request.AutoDNS`) et se replie sur
+HTTP-01 (`DNSFallbackError`, code 6) — d'où `FlushReloads` sur ces étapes aussi. **Un jeu sans zone ne
+déclenche jamais DNS-01 de lui-même** : l'`ovh.yaml` du wildcard de préproduction ferait tenter DNS-01 à
+tout le parc. Un jeu illisible est écarté, jamais bloquant.
+
 ### Pare-feu : ufw.yaml, des profils à soi, des règles marquées
 
 `internal/provider/firewall` (D72) réconcilie ufw avec `/etc/ogs/ufw.yaml`, **dont l'absence vaut « ne

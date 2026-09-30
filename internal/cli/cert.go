@@ -4,7 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
+	"slices"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -25,7 +25,7 @@ func newCertCommand(app *App) *cobra.Command {
 		Short:   "Gérer les certificats TLS",
 	}
 	dns := &cobra.Command{Use: "dns-provider", Short: "Gérer les identifiants DNS"}
-	dns.AddCommand(newCertDNSSetCommand(app))
+	dns.AddCommand(newCertDNSSetCommand(app), newCertDNSListCommand(app))
 	cmd.AddCommand(
 		newCertListCommand(app),
 		newCertIssueCommand(app),
@@ -131,10 +131,16 @@ func newCertIssueCommand(app *App) *cobra.Command {
 				if err != nil {
 					return exitf(CodeUsage, "%s", err)
 				}
-				req.Challenge = ch
+				// Un challenge imposé n'a plus de repli : l'exploitant a choisi.
+				req.Challenge, req.AutoDNS = ch, false
+				if ch != tlsprov.ChallengeDNS01 {
+					req.DNSCredentials = ""
+				} else if req.DNSProvider == "" && req.DNSCredentials == "" {
+					req.DNSProvider = tlsprov.DNSProviderOVH
+				}
 			}
 			if selfSign {
-				req.Challenge = tlsprov.ChallengeSelfSigned
+				req.Challenge, req.AutoDNS, req.DNSCredentials = tlsprov.ChallengeSelfSigned, false, ""
 			}
 			req.Staging = staging || app.Cfg.ACME.Staging
 			if err := req.Validate(); err != nil {
@@ -142,17 +148,19 @@ func newCertIssueCommand(app *App) *cobra.Command {
 			}
 			if app.DryRun {
 				app.printf("--dry-run : certificat %s pour %s (%s%s)\n",
-					req.Name, strings.Join(req.Domains, ", "), req.Challenge, stagingSuffix(req.Staging))
+					req.Name, strings.Join(req.Domains, ", "), req.Method(), stagingSuffix(req.Staging))
 				return nil
 			}
 			app.printf("émission du certificat %s pour %s (%s%s)…\n",
-				req.Name, strings.Join(req.Domains, ", "), req.Challenge, stagingSuffix(req.Staging))
+				req.Name, strings.Join(req.Domains, ", "), req.Method(), stagingSuffix(req.Staging))
 			// Un repli — la demande complète refusée, le certificat émis pour les
 			// seuls noms du vhost principal — a écrit un matériel neuf : il se
 			// recharge comme une émission, et se signale comme un succès partiel.
 			issueErr := provs.TLS.Issue(cmd.Context(), req)
 			partial := (*tlsprov.PartialError)(nil)
-			if issueErr != nil && !errors.As(issueErr, &partial) {
+			fallback := (*tlsprov.DNSFallbackError)(nil)
+			errors.As(issueErr, &fallback)
+			if issueErr != nil && !errors.As(issueErr, &partial) && fallback == nil {
 				_ = app.Audit.Record("", "tls/certificate/"+req.Name, "cert.issue", "échec", issueErr.Error())
 				return wrap(CodeError, issueErr)
 			}
@@ -163,6 +171,12 @@ func newCertIssueCommand(app *App) *cobra.Command {
 				app.printf("⚠ %v\n", issueErr)
 				app.printf("✓ certificat %s émis pour %s, valable jusqu'au %s\n",
 					req.Name, strings.Join(partial.Covered, ", "), info.NotAfter.Format("02/01/2006"))
+			} else if fallback != nil {
+				_ = app.Audit.Record("", "tls/certificate/"+req.Name, "cert.issue", "avertissement",
+					issueErr.Error())
+				app.printf("⚠ %v\n", issueErr)
+				app.printf("✓ certificat %s émis, valable jusqu'au %s\n",
+					req.Name, info.NotAfter.Format("02/01/2006"))
 			} else {
 				_ = app.Audit.Record("", "tls/certificate/"+req.Name, "cert.issue", "ok",
 					strings.Join(req.Domains, ","))
@@ -184,6 +198,10 @@ func newCertIssueCommand(app *App) *cobra.Command {
 			if partial != nil {
 				return exitf(CodePartial, "certificat %s émis sans %s",
 					req.Name, strings.Join(partial.Missing, ", "))
+			}
+			if fallback != nil {
+				return exitf(CodePartial, "certificat %s émis par http-01 : le challenge dns-01 de sa zone a échoué",
+					req.Name)
 			}
 			return nil
 		},
@@ -383,6 +401,8 @@ func newCertDeleteCommand(app *App) *cobra.Command {
 
 func newCertDNSSetCommand(app *App) *cobra.Command {
 	var (
+		provider          string
+		zones             []string
 		endpoint          string
 		applicationKey    string
 		applicationSecret string
@@ -391,27 +411,64 @@ func newCertDNSSetCommand(app *App) *cobra.Command {
 		clientSecret      string
 	)
 	cmd := &cobra.Command{
-		Use:   "set <provider>",
-		Short: "Enregistrer les identifiants d'un provider DNS",
-		Long: "Les identifiants sont écrits en 0600 sous /etc/ogs/credentials/dns/. Ils\n" +
-			"donnent un droit d'écriture sur la zone entière : les traiter comme un secret\n" +
+		Use:   "set <nom>",
+		Short: "Enregistrer un jeu d'identifiants DNS",
+		Long: "Les identifiants sont écrits en 0600 sous /etc/ogs/credentials/dns/<nom>.yaml. Ils\n" +
+			"donnent un droit d'écriture sur des zones entières : les traiter comme un secret\n" +
 			"de premier rang. OVH accepte deux modes, clés applicatives (--application-key)\n" +
 			"ou OAuth2 (--client-id).\n\n" +
+			"Plusieurs jeux d'un même provider coexistent, un par compte ou par jeton : --zone\n" +
+			"déclare les zones dont un jeu répond (répétable). Le challenge dns-01 de chaque\n" +
+			"nom emploie le jeu de sa zone, la plus longue l'emportant, et un certificat dont\n" +
+			"tous les noms relèvent d'une zone déclarée passe de lui-même au challenge dns-01,\n" +
+			"avec repli sur http-01 (D97). Un jeu sans zone — l'ancien « ovh » — ne sert\n" +
+			"qu'un certificat qui demande dns-01 ou le désigne par « dnsCredentials ». Sans\n" +
+			"--zone, les zones d'un jeu existant sont conservées : renouveler une clé ne\n" +
+			"doit pas faire repasser ses certificats en http-01.\n\n" +
 			"Les secrets sont demandés sans écho sur un terminal, et lus sur l'entrée\n" +
 			"standard sinon, une ligne chacun : le secret applicatif puis la clé de\n" +
 			"consommateur, ou le secret client. Les options qui les portent, déconseillées,\n" +
 			"les laissent dans le journal de sudo et l'historique du shell.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			provider := args[0]
+			name := args[0]
+			if err := tlsprov.CheckDNSCredentialsName(name); err != nil {
+				return exitf(CodeUsage, "%s", err)
+			}
 			if provider != tlsprov.DNSProviderOVH {
 				return exitf(CodeUsage, "provider %q non géré : ogs ne gère qu'%q",
 					provider, tlsprov.DNSProviderOVH)
 			}
-			creds := map[string]string{}
-			if endpoint != "" {
-				creds["endpoint"] = endpoint
+			dir := app.Paths.DNSCredsDir()
+			var declared []string
+			for _, z := range zones {
+				n, err := tlsprov.NormalizeZone(z)
+				if err != nil {
+					return exitf(CodeUsage, "%s", err)
+				}
+				if !slices.Contains(declared, n) {
+					declared = append(declared, n)
+				}
 			}
+			sets, _ := tlsprov.LoadDNSCredentials(dir)
+			if len(zones) == 0 {
+				if previous, err := tlsprov.ReadDNSCredentials(dir, name); err == nil {
+					declared = previous.Zones
+				}
+			}
+			// Deux jeux d'une même zone rendraient le choix indéterminé : le premier
+			// renouvellement de chaque certificat de la zone échouerait.
+			for _, s := range sets {
+				if s.Name == name {
+					continue
+				}
+				for _, z := range declared {
+					if slices.Contains(s.Zones, z) {
+						return exitf(CodeConflict, "la zone %s est déjà déclarée par le jeu %s", z, s.Name)
+					}
+				}
+			}
+			creds := dnsCredentialsFile{Provider: provider, Zones: declared, Endpoint: endpoint}
 			saisie := app.saisieSecrets(cmd)
 			var err error
 			switch {
@@ -419,8 +476,7 @@ func newCertDNSSetCommand(app *App) *cobra.Command {
 				if clientSecret, err = saisie.valeur("client-secret", clientSecret, "secret client OAuth2"); err != nil {
 					return err
 				}
-				creds["clientId"] = clientID
-				creds["clientSecret"] = clientSecret
+				creds.ClientID, creds.ClientSecret = clientID, clientSecret
 			case applicationKey != "":
 				applicationSecret, err = saisie.valeur("application-secret", applicationSecret, "secret applicatif")
 				if err != nil {
@@ -429,9 +485,8 @@ func newCertDNSSetCommand(app *App) *cobra.Command {
 				if consumerKey, err = saisie.valeur("consumer-key", consumerKey, "clé de consommateur"); err != nil {
 					return err
 				}
-				creds["applicationKey"] = applicationKey
-				creds["applicationSecret"] = applicationSecret
-				creds["consumerKey"] = consumerKey
+				creds.ApplicationKey, creds.ApplicationSecret, creds.ConsumerKey =
+					applicationKey, applicationSecret, consumerKey
 			default:
 				return exitf(CodeUsage, "fournir soit --client-id (OAuth2), soit --application-key "+
 					"(clés applicatives) ; les secrets sont ensuite demandés")
@@ -440,8 +495,8 @@ func newCertDNSSetCommand(app *App) *cobra.Command {
 			if err != nil {
 				return wrap(CodeError, err)
 			}
-			path := filepath.Join(app.Paths.DNSCredsDir(), provider+".yaml")
-			if err := fs.EnsureDir(filepath.Dir(path), 0o700, fs.KeepOwner); err != nil {
+			path := tlsprov.DNSCredentialsFile(dir, name)
+			if err := fs.EnsureDir(dir, 0o700, fs.KeepOwner); err != nil {
 				return wrap(CodeError, err)
 			}
 			header := []byte("# Identifiants DNS pour le challenge dns-01. Droit d'écriture sur la zone.\n")
@@ -449,14 +504,23 @@ func newCertDNSSetCommand(app *App) *cobra.Command {
 				return wrap(CodeError, err)
 			}
 			if err := app.openStore(); err == nil {
-				_ = app.Audit.Record("", "tls/dns-provider/"+provider, "cert.dns-provider.set", "ok", "")
+				_ = app.Audit.Record("", "tls/dns-provider/"+name, "cert.dns-provider.set", "ok",
+					strings.Join(declared, ","))
 			}
-			app.printf("✓ identifiants %s enregistrés : %s (mode 0600)\n", provider, path)
-			app.printf("  ils seront employés pour les challenges dns-01, donc pour les wildcards.\n")
+			app.printf("✓ identifiants %s (%s) enregistrés : %s (mode 0600)\n", name, provider, path)
+			if len(declared) > 0 {
+				app.printf("  zones : %s — leurs certificats passent au challenge dns-01, "+
+					"repli http-01, au prochain apply ou renouvellement.\n", strings.Join(declared, ", "))
+			} else {
+				app.printf("  aucune zone : employés par un certificat qui demande dns-01 "+
+					"sans zone déclarée, ou les désigne par « dnsCredentials: %s ».\n", name)
+			}
 			return nil
 		},
 	}
 	f := cmd.Flags()
+	f.StringVar(&provider, "provider", tlsprov.DNSProviderOVH, "provider DNS du jeu")
+	f.StringSliceVar(&zones, "zone", nil, "zone dont le jeu répond (répétable)")
 	f.StringVar(&endpoint, "endpoint", "ovh-eu", "point d'accès de l'API (ovh-eu, ovh-ca…)")
 	f.StringVar(&applicationKey, "application-key", "", "clé applicative")
 	f.StringVar(&applicationSecret, "application-secret", "",
@@ -467,6 +531,71 @@ func newCertDNSSetCommand(app *App) *cobra.Command {
 	f.StringVar(&clientSecret, "client-secret", "",
 		"secret client OAuth2 (déconseillé : visible dans le journal de sudo ; l'omettre pour le saisir)")
 	return cmd
+}
+
+// dnsCredentialsFile est le fichier d'un jeu d'identifiants DNS, tel qu'écrit.
+type dnsCredentialsFile struct {
+	Provider          string   `yaml:"provider"`
+	Zones             []string `yaml:"zones,omitempty"`
+	Endpoint          string   `yaml:"endpoint,omitempty"`
+	ApplicationKey    string   `yaml:"applicationKey,omitempty"`
+	ApplicationSecret string   `yaml:"applicationSecret,omitempty"`
+	ConsumerKey       string   `yaml:"consumerKey,omitempty"`
+	ClientID          string   `yaml:"clientId,omitempty"`
+	ClientSecret      string   `yaml:"clientSecret,omitempty"`
+}
+
+// dnsCredentialsView est ce que « dns-provider list » montre d'un jeu : jamais
+// ses identifiants.
+type dnsCredentialsView struct {
+	Name     string   `json:"name" yaml:"name"`
+	Provider string   `json:"provider" yaml:"provider"`
+	Zones    []string `json:"zones" yaml:"zones"`
+	File     string   `json:"file" yaml:"file"`
+}
+
+func newCertDNSListCommand(app *App) *cobra.Command {
+	return &cobra.Command{
+		Use:     "list",
+		Aliases: []string{"ls"},
+		Short:   "Lister les jeux d'identifiants DNS et leurs zones",
+		Args:    cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			dir := app.Paths.DNSCredsDir()
+			sets, errs := tlsprov.LoadDNSCredentials(dir)
+			views := make([]dnsCredentialsView, 0, len(sets))
+			for _, s := range sets {
+				views = append(views, dnsCredentialsView{Name: s.Name, Provider: s.Provider,
+					Zones: orEmpty(s.Zones), File: tlsprov.DNSCredentialsFile(dir, s.Name)})
+			}
+			var warnings []string
+			for _, e := range errs {
+				warnings = append(warnings, e.Error())
+			}
+			warnings = append(warnings, tlsprov.DNSZoneConflicts(sets)...)
+			err := app.emit("DNSCredentialsList", views, warnings, func(tw *tabwriter.Writer) {
+				if len(views) == 0 {
+					fmt.Fprintln(app.Out, "aucun jeu d'identifiants DNS")
+				} else {
+					fmt.Fprintln(tw, "NOM\tPROVIDER\tZONES")
+					for _, v := range views {
+						zones := strings.Join(v.Zones, " ")
+						if zones == "" {
+							zones = "(aucune : dns-01 demandé seulement)"
+						}
+						fmt.Fprintf(tw, "%s\t%s\t%s\n", v.Name, v.Provider, zones)
+					}
+				}
+			})
+			if err != nil {
+				return wrap(CodeError, err)
+			}
+			if len(warnings) > 0 {
+				return exitf(CodePartial, "%d jeu(x) d'identifiants DNS à corriger", len(warnings))
+			}
+			return nil
+		},
+	}
 }
 
 // étatDuCertificat qualifie, pour « status » et l'interface, un certificat qui

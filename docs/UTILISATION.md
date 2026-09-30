@@ -478,7 +478,8 @@ n'avertit que d'un domaine qui n'a encore aucune adresse.
 
 - **Déclarer** dépose la déclaration **crons et services désactivés** : une tâche ne doit jamais tourner sur
   les deux serveurs à la fois. Le certificat échoue tant que le DNS désigne l'ancien serveur — code 6,
-  attendu. Une zone chez OVH peut l'obtenir d'avance par `challenge: dns-01`.
+  attendu. Une zone chez OVH l'obtient d'avance dès que ses identifiants la déclarent
+  (`ogs cert dns-provider set <jeu> --zone <zone>`, voir plus bas).
 - **Synchroniser** ne coupe rien : l'ancien serveur continue de servir. La rejouer la veille de la bascule
   réduit la dernière copie à presque rien. Une fois la bascule engagée, elle est **refusée** : la cible fait
   foi, et une nouvelle copie écraserait ce que les visiteurs y ont écrit.
@@ -517,6 +518,23 @@ sudo ogs                                    # interface en mode texte
 ```
 
 Toutes les commandes acceptent `-o json` ou `-o yaml`, et `man ogs-<commande>` détaille chacune.
+
+### Certificats par le DNS
+
+Un certificat passe par le challenge DNS-01, sans rien changer à la déclaration du projet, dès que **tous**
+ses noms relèvent d'une zone dont ogs a les identifiants. Il s'obtient alors avant que le DNS ne désigne la
+machine, et se replie sur HTTP-01 si l'API du provider échoue (code 6, pour le signaler). Un jeu
+d'identifiants par compte OVH, ou par jeton restreint à une zone :
+
+```sh
+sudo ogs cert dns-provider set client-a --zone client-a.fr --zone client-a.com --application-key AK
+sudo ogs cert dns-provider set client-b --zone client-b.fr --client-id CI
+sudo ogs cert dns-provider list             # jeux et zones, jamais les identifiants
+```
+
+Les secrets sont demandés ensuite. Relancer `set` sans `--zone` renouvelle les clés et garde les zones. Un
+jeu sans zone — l'ancien `ovh` du wildcard de préproduction — ne sert qu'un certificat qui demande
+`challenge: dns-01`, ou le désigne par `dnsCredentials: <jeu>` dans `spec.certificates`.
 
 `ogs db dump -O <fichier>` et `ogs db restore -i <fichier>` n'écrivent ni ne lisent à travers un lien qu'un
 autre compte que root aurait pu poser — celui d'un home, par exemple —, ni dans un tube nommé ou un

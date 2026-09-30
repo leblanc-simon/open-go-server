@@ -41,6 +41,43 @@ type Provider struct {
 	// pas l'alias ajouté, ou qui expire —, et le vhost, dont le rendu n'a pas
 	// changé, ne déclenche rien de lui-même.
 	WebReload string
+	// DNSSets fournit les jeux d'identifiants DNS dont les zones font passer une
+	// demande au challenge DNS-01 d'elle-même (D97) ; à défaut, ceux de
+	// /etc/ogs/credentials/dns, lus une fois.
+	DNSSets   func() []DNSCredentials
+	dnsSets   []DNSCredentials
+	dnsLoaded bool
+}
+
+// dnsCredentialSets rend les jeux d'identifiants DNS. Un fichier illisible est
+// écarté : la demande qu'il aurait servie reste en HTTP-01, comme avant qu'il
+// n'existe, et « doctor » le nomme.
+func (p *Provider) dnsCredentialSets() []DNSCredentials {
+	if p.DNSSets != nil {
+		return p.DNSSets()
+	}
+	if !p.dnsLoaded {
+		p.dnsSets, _ = LoadDNSCredentials(p.Paths.DNSCredsDir())
+		p.dnsLoaded = true
+	}
+	return p.dnsSets
+}
+
+// chooseChallenge fixe le challenge d'une demande qui n'en déclare pas : DNS-01
+// si des identifiants sont nommés, ou si chacun de ses noms relève d'une zone
+// déclarée (D97) — le certificat s'obtient alors avant que le DNS ne désigne la
+// machine, et un joker sans rien déclarer de plus ; HTTP-01 sinon.
+func (p *Provider) chooseChallenge(req *Request, declared string) {
+	if declared != "" {
+		return
+	}
+	if req.DNSCredentials != "" {
+		req.Challenge = ChallengeDNS01
+		return
+	}
+	if provider, ok := AutoDNS(p.dnsCredentialSets(), req.Domains); ok {
+		req.Challenge, req.DNSProvider, req.AutoDNS = ChallengeDNS01, provider, true
+	}
 }
 
 // refusStep produit l'étape qui refuse d'écraser un fichier qu'ogs n'a pas
@@ -88,7 +125,7 @@ func (p *Provider) Requests(proj *model.Project) ([]Request, error) {
 		}
 		req := Request{
 			Name: c.Name, Domains: c.Domains, Challenge: ch,
-			DNSProvider: c.DNSProvider, KeyType: c.KeyType, Staging: c.Staging,
+			DNSProvider: c.DNSProvider, DNSCredentials: c.DNSCredentials, KeyType: c.KeyType, Staging: c.Staging,
 		}
 		if req.Name == "" {
 			req.Name = proj.ID()
@@ -103,6 +140,7 @@ func (p *Provider) Requests(proj *model.Project) ([]Request, error) {
 		// comparer nom à nom l'écartait du repli, et www.shop.fr, qu'il couvrait,
 		// perdait sa couverture au premier repli réussi.
 		req.Essential = covering(req.Domains, servedDomains(proj))
+		p.chooseChallenge(&req, c.Challenge)
 		if err := req.Validate(); err != nil {
 			return nil, err
 		}
@@ -123,6 +161,7 @@ func (p *Provider) Requests(proj *model.Project) ([]Request, error) {
 	}
 	req := Request{Name: proj.ID(), Domains: domains, Challenge: ChallengeHTTP01,
 		Essential: servedDomains(proj)}
+	p.chooseChallenge(&req, "")
 	if err := req.Validate(); err != nil {
 		return nil, err
 	}
@@ -169,10 +208,12 @@ func (p *Provider) SharedRequest(ref string) (Request, bool) {
 	if err != nil {
 		return Request{}, false
 	}
-	return Request{
+	req := Request{
 		Name: SharedPrefix + name, Domains: decl.Domains, Challenge: ch,
-		DNSProvider: decl.DNSProvider, KeyType: decl.KeyType,
-	}, true
+		DNSProvider: decl.DNSProvider, DNSCredentials: decl.DNSCredentials, KeyType: decl.KeyType,
+	}
+	p.chooseChallenge(&req, decl.Challenge)
+	return req, true
 }
 
 // SharedRequests énumère tous les certificats de portée serveur configurés.
@@ -397,7 +438,7 @@ func (p *Provider) certificateStep(req Request) (*engine.Step, error) {
 		s.Apply = func(ctx context.Context) error { return stepError(p.issueOrFallback(ctx, req, urgent)) }
 		// Le vidage recharge un vhost qui garde son bloc 443 sur le certificat en
 		// place : il n'expose que les nouveaux noms au challenge du port 80.
-		s.FlushReloads = req.Challenge == "http-01"
+		s.FlushReloads = req.servesChallenge()
 		s.Reload = reload
 		return s, nil
 	case present:
@@ -406,19 +447,19 @@ func (p *Provider) certificateStep(req Request) (*engine.Step, error) {
 				req.Name, info.DaysLeft(now)))
 		s.Critical = false
 		s.Apply = func(ctx context.Context) error { return stepError(p.issueOrFallback(ctx, req, true)) }
-		s.FlushReloads = req.Challenge == "http-01"
+		s.FlushReloads = req.servesChallenge()
 		s.Reload = reload
 		return s, nil
 	}
 	s := engine.NewStep(resource, engine.Create,
-		fmt.Sprintf("certificat %s pour %s (%s)", req.Name, strings.Join(req.Domains, ", "), req.Challenge))
+		fmt.Sprintf("certificat %s pour %s (%s)", req.Name, strings.Join(req.Domains, ", "), req.Method()))
 	s.Critical = false
 	s.Apply = func(ctx context.Context) error { return stepError(p.issueOrFallback(ctx, req, true)) }
 	s.Reload = reload
 	// Le challenge HTTP-01 se fait servir par le vhost : il doit être chargé, non
 	// seulement écrit. Sans ce vidage, la première émission d'un site neuf échoue
 	// en 404, le serveur n'ayant pas encore relu sa configuration.
-	s.FlushReloads = req.Challenge == "http-01"
+	s.FlushReloads = req.servesChallenge()
 	// La compensation ne retire que ce que cette exécution a créé.
 	s.Compensate = func(context.Context) error { return p.Store.Remove(req.Name) }
 	return s, nil
@@ -428,11 +469,34 @@ func (p *Provider) certificateStep(req Request) (*engine.Step, error) {
 // un aboutissement partiel, qui garde le rechargement de l'étape — le certificat
 // a changé sur le disque, et le serveur présenterait sinon l'ancien.
 func stepError(err error) error {
-	if partial := (*PartialError)(nil); errors.As(err, &partial) {
+	if Written(err) {
 		return engine.Partial(err)
 	}
 	return err
 }
+
+// Written dit si une émission en échec a tout de même écrit un certificat : un
+// repli par paliers (PartialError), ou par HTTP-01 (DNSFallbackError).
+func Written(err error) bool {
+	partial, fallback := (*PartialError)(nil), (*DNSFallbackError)(nil)
+	return errors.As(err, &partial) || errors.As(err, &fallback)
+}
+
+// DNSFallbackError signale un certificat émis par HTTP-01 alors que sa zone
+// déclarée le destinait à DNS-01 (D97) : le certificat est complet, mais les
+// identifiants de la zone ont échoué, et l'émission suivante qui ne pourra pas
+// passer par le vhost — avant une bascule DNS — échouera aussi.
+type DNSFallbackError struct {
+	Name  string
+	Cause error
+}
+
+func (e *DNSFallbackError) Error() string {
+	return fmt.Sprintf("certificat %s émis par http-01, le challenge dns-01 de sa zone ayant échoué : %v "+
+		"(vérifier les identifiants avec « ogs cert dns-provider list »)", e.Name, e.Cause)
+}
+
+func (e *DNSFallbackError) Unwrap() error { return e.Cause }
 
 // PartialError signale une émission repliée : la demande complète a échoué, et le
 // certificat n'a été émis que pour les noms essentiels (Request.Essential).
@@ -557,8 +621,8 @@ func keep(names []string, ok func(string) bool) []string {
 // Près de l'échéance, le site passe avant tout le reste.
 func (p *Provider) issueOrFallback(ctx context.Context, req Request, urgent bool) error {
 	err := p.issue(ctx, req)
-	if err == nil {
-		return nil
+	if fallback := (*DNSFallbackError)(nil); err == nil || errors.As(err, &fallback) {
+		return err
 	}
 	var inPlace *Info
 	if info, ok, rerr := p.Store.Read(req.Name); rerr == nil && ok {
@@ -582,7 +646,9 @@ func (p *Provider) issueOrFallback(ctx context.Context, req Request, urgent bool
 				continue
 			}
 		}
-		if ferr := p.issue(ctx, fb); ferr != nil {
+		// Un palier émis par le repli HTTP-01 d'un challenge DNS-01 venu de la zone
+		// est un palier abouti.
+		if ferr := p.issue(ctx, fb); ferr != nil && !Written(ferr) {
 			échecs = fmt.Errorf("%w ; repli sur %s en échec : %v", échecs, strings.Join(fb.Domains, ", "), ferr)
 			continue
 		}
@@ -629,6 +695,20 @@ func (p *Provider) issue(ctx context.Context, req Request) error {
 		return fmt.Errorf("aucun émetteur disponible pour %s", req.Name)
 	}
 	material, err := issuer.Issue(ctx, req)
+	var dnsErr error
+	if err != nil && req.AutoDNS {
+		// Le challenge DNS-01 venait de la zone, non de la demande : HTTP-01, que la
+		// demande aurait reçu sans elle, garde le site couvert si l'API du provider
+		// est indisponible ou ses identifiants révoqués.
+		http := req
+		http.Challenge, http.AutoDNS, http.DNSProvider = ChallengeHTTP01, false, ""
+		var herr error
+		if material, herr = issuer.Issue(ctx, http); herr == nil {
+			dnsErr, err = err, nil
+		} else {
+			err = fmt.Errorf("dns-01 : %v ; repli http-01 : %w", err, herr)
+		}
+	}
 	if err != nil {
 		if p.DB != nil && req.Challenge != ChallengeSelfSigned {
 			count, until, rerr := p.DB.RecordACMEFailure(key, err.Error())
@@ -644,6 +724,9 @@ func (p *Provider) issue(ctx context.Context, req Request) error {
 	}
 	if p.DB != nil {
 		_ = p.DB.ClearACMEFailures(key)
+	}
+	if dnsErr != nil {
+		return &DNSFallbackError{Name: req.Name, Cause: dnsErr}
 	}
 	return nil
 }
@@ -695,7 +778,7 @@ func (p *Provider) Renew(ctx context.Context, requests []Request, force bool) ([
 			continue
 		}
 		err = p.issueOrFallback(ctx, req, due || force)
-		if partial := (*PartialError)(nil); errors.As(err, &partial) {
+		if Written(err) {
 			done = append(done, req.Name)
 		}
 		if err != nil {
@@ -761,11 +844,6 @@ func (p *Provider) Warnings() ([]string, error) {
 		}
 	}
 	return out, nil
-}
-
-// DNSCredentialsFile renvoie le chemin des identifiants d'un provider DNS.
-func (p *Provider) DNSCredentialsFile(provider string) string {
-	return p.Paths.DNSCredsDir() + string(os.PathSeparator) + provider + ".yaml"
 }
 
 // RenewUnitPlan produit les étapes d'installation de l'unité et du timer de

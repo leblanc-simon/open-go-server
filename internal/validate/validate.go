@@ -12,6 +12,7 @@ import (
 
 	"leblanc.io/open-go-server/internal/model"
 	"leblanc.io/open-go-server/internal/naming"
+	"leblanc.io/open-go-server/internal/provider/tls"
 )
 
 // Error est une erreur de validation localisée dans le document.
@@ -320,6 +321,14 @@ func certificateNames(p *model.Project) []string {
 func CertificateNames(p *model.Project) error {
 	var errs Errors
 	for i, c := range p.Spec.Certificates {
+		// Le jeu d'identifiants désigné est un nom de fichier sous
+		// /etc/ogs/credentials/dns (D97) : il ne doit pas en sortir.
+		if c.DNSCredentials != "" {
+			if err := tls.CheckDNSCredentialsName(c.DNSCredentials); err != nil {
+				errs = append(errs, Error{Field: fmt.Sprintf("spec.certificates[%d].dnsCredentials", i),
+					Message: err.Error()})
+			}
+		}
 		if c.Name == "" {
 			continue
 		}

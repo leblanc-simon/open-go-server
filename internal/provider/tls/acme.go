@@ -44,9 +44,12 @@ type ACME struct {
 	Email string
 	// Directory permet de pointer une autre autorité (test, ACME privé).
 	Directory string
-	// DNSCredentials fournit les identifiants d'un provider DNS.
-	DNSCredentials func(provider string) (map[string]string, error)
-	Now            func() time.Time
+	// DNSSets fournit les jeux d'identifiants DNS (D97) ; à défaut, ceux de
+	// /etc/ogs/credentials/dns.
+	DNSSets func() ([]DNSCredentials, []error)
+	// buildDNS construit le provider d'un jeu ; les tests le remplacent.
+	buildDNS func(DNSCredentials) (challenge.Provider, error)
+	Now      func() time.Time
 }
 
 // Name identifie l'émetteur.
@@ -222,7 +225,7 @@ func (a *ACME) setupChallenge(client *lego.Client, req Request) error {
 		}
 		return client.Challenge.SetHTTP01Provider(provider)
 	case ChallengeDNS01:
-		provider, err := a.dnsProvider(req.DNSProvider)
+		provider, err := a.dnsProvider(req)
 		if err != nil {
 			return err
 		}
@@ -231,22 +234,42 @@ func (a *ACME) setupChallenge(client *lego.Client, req Request) error {
 	return fmt.Errorf("challenge %q non pris en charge par l'émetteur ACME", req.Challenge)
 }
 
-// dnsProvider construit le provider DNS. OVH est le seul géré (D27) : la zone de
-// préproduction y est hébergée, et un provider non éprouvé donnerait une émission
-// qui échoue au moment le moins opportun.
-func (a *ACME) dnsProvider(name string) (challenge.Provider, error) {
-	if name != DNSProviderOVH {
+// dnsProvider construit le provider DNS de la demande : chaque nom reçoit le jeu
+// d'identifiants de sa zone (D97), et une demande qui en couvre plusieurs voit
+// ses challenges aiguillés nom à nom.
+func (a *ACME) dnsProvider(req Request) (challenge.Provider, error) {
+	load := a.DNSSets
+	if load == nil {
+		load = func() ([]DNSCredentials, []error) { return LoadDNSCredentials(a.Paths.DNSCredsDir()) }
+	}
+	sets, loadErrs := load()
+	build := a.buildDNS
+	if build == nil {
+		build = ovhProvider
+	}
+	provider, err := routeDNS(sets, req, build)
+	if err != nil && len(loadErrs) > 0 {
+		// Le jeu attendu est peut-être celui qui n'a pas pu être lu : le taire
+		// renverrait l'exploitant vers une commande qui ne réglerait rien.
+		msgs := make([]string, len(loadErrs))
+		for i, e := range loadErrs {
+			msgs[i] = e.Error()
+		}
+		return nil, fmt.Errorf("%w (jeu(x) écarté(s) : %s)", err, strings.Join(msgs, " ; "))
+	}
+	return provider, err
+}
+
+// ovhProvider construit le provider OVH d'un jeu. OVH est le seul géré (D27) : un
+// provider non éprouvé donnerait une émission qui échoue au moment le moins
+// opportun.
+func ovhProvider(set DNSCredentials) (challenge.Provider, error) {
+	if set.Provider != DNSProviderOVH {
 		return nil, fmt.Errorf("provider DNS %q non géré : ogs ne gère qu'%q. "+
 			"Un autre provider demande d'ajouter sa configuration et de l'éprouver",
-			name, DNSProviderOVH)
+			set.Provider, DNSProviderOVH)
 	}
-	if a.DNSCredentials == nil {
-		return nil, fmt.Errorf("aucune source d'identifiants DNS configurée")
-	}
-	creds, err := a.DNSCredentials(name)
-	if err != nil {
-		return nil, err
-	}
+	creds := set.Values
 	cfg := ovh.NewDefaultConfig()
 	cfg.APIEndpoint = orDefault(creds["endpoint"], "ovh-eu")
 	// Deux modes d'authentification coexistent chez OVH : les clés applicatives

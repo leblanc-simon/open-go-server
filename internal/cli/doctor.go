@@ -24,6 +24,7 @@ import (
 	"leblanc.io/open-go-server/internal/provider/hardening"
 	"leblanc.io/open-go-server/internal/provider/monitoring"
 	"leblanc.io/open-go-server/internal/provider/system"
+	tlsprov "leblanc.io/open-go-server/internal/provider/tls"
 	"leblanc.io/open-go-server/internal/validate"
 )
 
@@ -489,6 +490,25 @@ func (a *App) runChecks(ctx context.Context) []check {
 		if list, err := provs.TLS.Store.List(); err == nil && len(list) > 0 {
 			add("certificats", "ok", fmt.Sprintf("%d présent(s)", len(list)), "")
 		}
+	}
+	// Identifiants DNS (D97) : un jeu illisible, ou une zone que deux jeux
+	// revendiquent, ne se voient qu'au challenge — au renouvellement, des semaines
+	// plus tard. Un jeu écarté laisse ses certificats en http-01, sans un mot.
+	dnsSets, dnsErrs := tlsprov.LoadDNSCredentials(a.Paths.DNSCredsDir())
+	for _, e := range dnsErrs {
+		add("identifiants dns", "échec", e.Error(),
+			"corriger le fichier, ou le réenregistrer avec « ogs cert dns-provider set »")
+	}
+	conflicts := tlsprov.DNSZoneConflicts(dnsSets)
+	for _, c := range conflicts {
+		add("identifiants dns", "échec", c, "ne déclarer chaque zone que dans un seul jeu")
+	}
+	if len(dnsSets) > 0 && len(dnsErrs) == 0 && len(conflicts) == 0 {
+		zones := 0
+		for _, s := range dnsSets {
+			zones += len(s.Zones)
+		}
+		add("identifiants dns", "ok", fmt.Sprintf("%d jeu(x), %d zone(s) déclarée(s)", len(dnsSets), zones), "")
 	}
 	for _, p := range projects {
 		for _, pool := range p.Spec.PHP.Pools {
