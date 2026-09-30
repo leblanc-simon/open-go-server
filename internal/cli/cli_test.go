@@ -1103,6 +1103,20 @@ func TestUnCompteReserveDejaDeclareNArretePasLeParc(t *testing.T) {
 	}
 }
 
+func TestDbAddRefuseUnJeuBorneSurLeProprietairePostgreSQL(t *testing.T) {
+	// Le compte principal d'une base PostgreSQL en est propriétaire : « readonly »
+	// n'y a aucun effet (D92). Le jeu borné se déclare sur un compte additionnel.
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("project", "create", "shop.fr", "--kind", "static")
+	out, code := h.run("db", "add", "shopfr", "--engine", "postgres", "--privileges", "readonly")
+	if code != CodeUsage || !strings.Contains(out, "db user add") {
+		t.Errorf("code %d attendu %d, et la porte de sortie nommée :\n%s", code, CodeUsage, out)
+	}
+	// MySQL applique le jeu borné au compte principal : il reste admis.
+	h.mustRun("db", "add", "shopfr", "--engine", "mysql", "--privileges", "readonly")
+}
+
 func TestDatabaseRemoveKeepsData(t *testing.T) {
 	h := newHarness(t)
 	h.mustRun("init")

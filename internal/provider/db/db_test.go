@@ -1183,3 +1183,275 @@ func TestDropRetireLeMotDePasseAuFilDesSuppressions(t *testing.T) {
 		t.Error("le mot de passe du compte resté en place doit être gardé")
 	}
 }
+
+// poserSocket crée un faux socket — un fichier suffit, seul l'emplacement et
+// les droits sont jugés — dans un répertoire au mode donné.
+func poserSocket(t *testing.T, path string, dirMode os.FileMode) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(filepath.Dir(path), dirMode); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, nil, 0o777); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func postgresConf(t *testing.T, prefix string) {
+	t.Helper()
+	dir := filepath.Join(prefix, "etc", "postgresql", "16", "main")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "postgresql.conf"), []byte("port = 5432\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestUnSocketDansTmpNEstJamaisRetenu(t *testing.T) {
+	// Tout compte local pose un socket dans /tmp au nom qu'ogs cherchait : le
+	// moteur arrêté, root s'y connectait et lui livrait les mots de passe du
+	// parc (S1R-02).
+	// Le répertoire est ici en 0755, à l'identité courante : checkSocket
+	// l'admettrait. Seule l'absence de /tmp des emplacements cherchés protège.
+	prefix := t.TempDir()
+	poserSocket(t, filepath.Join(prefix, "tmp", "mysql.sock"), 0o755)
+	poserSocket(t, filepath.Join(prefix, "tmp", ".s.PGSQL.5432"), 0o755)
+	postgresConf(t, prefix)
+	if socket, ok := FindMySQLSocket(prefix); ok {
+		t.Errorf("DÉFAUT : socket MySQL retenu dans /tmp : %s", socket)
+	}
+	clusters := DetectClusters(prefix)
+	if len(clusters) != 1 || clusters[0].Socket != "" {
+		t.Errorf("DÉFAUT : socket PostgreSQL retenu dans /tmp : %+v", clusters)
+	}
+}
+
+func TestUnSocketDansUnRepertoireOuvertATousEstRefuse(t *testing.T) {
+	prov, proj := fixture(t)
+	prefix := prov.Paths.Prefix()
+	poserSocket(t, filepath.Join(prefix, "run", "mysqld", "mysqld.sock"), 0o777)
+	poserSocket(t, filepath.Join(prefix, "var", "run", "postgresql", ".s.PGSQL.5432"), 0o1777)
+	postgresConf(t, prefix)
+	if socket, ok := FindMySQLSocket(prefix); ok {
+		t.Errorf("socket retenu dans un répertoire inscriptible par tous : %s", socket)
+	}
+	_, err := prov.clientFor(DefaultDatabase(proj, "mysql"))
+	if !errors.Is(err, ErrUnavailable) || !strings.Contains(err.Error(), "inscriptible par tous") {
+		t.Errorf("l'indisponibilité doit nommer le refus : %v", err)
+	}
+	clusters := DetectClusters(prefix)
+	if len(clusters) != 1 || clusters[0].Socket != "" {
+		t.Fatalf("socket PostgreSQL retenu : %+v", clusters)
+	}
+	// Sans socket admis, ne pas retomber sur le répertoire par défaut : ce serait
+	// s'y connecter quand même.
+	if _, err := clusters[0].SocketDir(prefix); !errors.Is(err, ErrUnavailable) {
+		t.Errorf("repli sur le répertoire du socket refusé : %v", err)
+	}
+	if _, err := prov.clientFor(DefaultDatabase(proj, "postgres")); !errors.Is(err, ErrUnavailable) {
+		t.Errorf("client PostgreSQL ouvert sur un socket refusé : %v", err)
+	}
+}
+
+func TestUnSocketDUnAutreCompteQueLeMoteurEstRefuse(t *testing.T) {
+	prefix := t.TempDir()
+	socket := filepath.Join(prefix, "run", "mysqld", "mysqld.sock")
+	poserSocket(t, socket, 0o755)
+	if _, ok := FindMySQLSocket(prefix); !ok {
+		t.Fatal("un socket de l'identité courante doit être admis")
+	}
+	// L'identité courante n'est plus de confiance : le fichier est alors celui
+	// d'un compte quelconque.
+	orig := trustedIDs
+	t.Cleanup(func() { trustedIDs = orig })
+	trustedIDs = func(string) (map[uint32]bool, map[uint32]bool) {
+		return map[uint32]bool{0: true}, map[uint32]bool{0: true}
+	}
+	if os.Getuid() == 0 {
+		t.Skip("sous root, le fichier appartient à root")
+	}
+	if _, ok := FindMySQLSocket(prefix); ok {
+		t.Error("DÉFAUT : socket d'un compte quelconque admis")
+	}
+}
+
+func TestJugementDUnSocket(t *testing.T) {
+	// Chaque motif de refus, sans changer de propriétaire : 111 est le moteur,
+	// 1000 un compte de projet.
+	uids := map[uint32]bool{0: true, 111: true}
+	gids := map[uint32]bool{0: true, 111: true}
+	sain := socketFacts{path: "/run/mysqld/mysqld.sock", dir: "/run/mysqld", uid: 111,
+		dirUID: 111, dirGID: 111, dirPerm: 0o755}
+	for _, c := range []struct {
+		nom    string
+		modif  func(*socketFacts)
+		refuse string
+	}{
+		{"socket et répertoire du moteur", func(*socketFacts) {}, ""},
+		{"répertoire Debian de PostgreSQL, 2775 au groupe du moteur", func(f *socketFacts) { f.dirPerm = 0o775 }, ""},
+		{"répertoire de root", func(f *socketFacts) { f.dirUID, f.dirGID = 0, 0 }, ""},
+		{"lien symbolique", func(f *socketFacts) { f.link = true }, "lien symbolique"},
+		{"socket d'un compte de projet", func(f *socketFacts) { f.uid = 1000 }, "appartient à l'uid 1000"},
+		{"répertoire d'un compte de projet", func(f *socketFacts) { f.dirUID = 1000 }, "répertoire /run/mysqld appartient"},
+		{"répertoire inscriptible par tous", func(f *socketFacts) { f.dirPerm = 0o777 }, "inscriptible par tous"},
+		{"sticky bit, comme /tmp", func(f *socketFacts) { f.dirPerm = 0o777 | os.ModeSticky }, "inscriptible par tous"},
+		{"groupe étranger inscriptible", func(f *socketFacts) { f.dirPerm, f.dirGID = 0o775, 1000 }, "groupe 1000"},
+		{"groupe étranger en lecture seule", func(f *socketFacts) { f.dirGID = 1000 }, ""},
+	} {
+		f := sain
+		c.modif(&f)
+		err := judgeSocket(f, "mysql", uids, gids)
+		switch {
+		case c.refuse == "" && err != nil:
+			t.Errorf("%s : refusé à tort : %v", c.nom, err)
+		case c.refuse != "" && (err == nil || !strings.Contains(err.Error(), c.refuse)):
+			t.Errorf("%s : refus « %s » attendu, obtenu %v", c.nom, c.refuse, err)
+		}
+	}
+}
+
+func TestUnLienALaPlaceDuSocketEstRefuse(t *testing.T) {
+	prefix := t.TempDir()
+	vrai := filepath.Join(prefix, "ailleurs", "mysqld.sock")
+	poserSocket(t, vrai, 0o755)
+	lien := filepath.Join(prefix, "run", "mysqld", "mysqld.sock")
+	if err := os.MkdirAll(filepath.Dir(lien), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(vrai, lien); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := MySQLSocket(prefix); err == nil || !strings.Contains(err.Error(), "lien symbolique") {
+		t.Errorf("un lien à la place du socket doit être refusé, et dit : %v", err)
+	}
+}
+
+func TestLEcouteTCPDoitAppartenirAuMoteur(t *testing.T) {
+	// Moteur arrêté, ou n'écoutant que sur son socket : son port est à qui s'y
+	// lie, et le mot de passe présenté par la restauration avec lui.
+	dir := t.TempDir()
+	orig := procNet
+	t.Cleanup(func() { procNet = orig })
+	procNet = dir
+	origIDs := trustedIDs
+	t.Cleanup(func() { trustedIDs = origIDs })
+	trustedIDs = func(string) (map[uint32]bool, map[uint32]bool) {
+		return map[uint32]bool{0: true, 111: true}, map[uint32]bool{0: true}
+	}
+	const head = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n"
+	ecrire := func(tcp, tcp6 string) {
+		t.Helper()
+		for name, body := range map[string]string{"tcp": head + tcp, "tcp6": head + tcp6} {
+			if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	// 5432 = 0x1538.
+	ecrire("   0: 0100007F:1538 00000000:0000 0A 00000000:00000000 00:00000000 00000000   111        0 1 1\n", "")
+	if err := checkTCPListener(5432, "postgres", "127.0.0.1"); err != nil {
+		t.Errorf("écoute du moteur refusée : %v", err)
+	}
+	ecrire("   0: 0100007F:1538 00000000:0000 0A 00000000:00000000 00:00000000 00000000 65534        0 1 1\n", "")
+	if err := checkTCPListener(5432, "postgres", "127.0.0.1"); !errors.Is(err, ErrUnavailable) {
+		t.Errorf("DÉFAUT : écoute d'un compte quelconque admise : %v", err)
+	}
+	ecrire("", "   0: 00000000000000000000000000000000:1538 00000000000000000000000000000000:0000 0A "+
+		"00000000:00000000 00:00000000 00000000  1000        0 1 1\n")
+	if err := checkTCPListener(5432, "postgres", "127.0.0.1"); !errors.Is(err, ErrUnavailable) {
+		t.Errorf("DÉFAUT : écoute IPv6 joker d'un compte quelconque admise : %v", err)
+	}
+	// Une connexion établie n'est pas une écoute, et un autre port ne compte pas.
+	ecrire("   0: 0100007F:1538 0100007F:9C40 01 00000000:00000000 00:00000000 00000000  1000        0 1 1\n"+
+		"   1: 0100007F:0CEA 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 1 1\n", "")
+	if err := checkTCPListener(5432, "postgres", "127.0.0.1"); !errors.Is(err, ErrUnavailable) {
+		t.Errorf("port libre : refus attendu, obtenu %v", err)
+	}
+}
+
+func TestLEcouteTCPEstJugeeSelonLaFamilleDeLaConnexion(t *testing.T) {
+	// Une écoute du moteur sur ::1 ne reçoit pas 127.0.0.1 : ce port reste à qui
+	// s'y lie entre le contrôle et la connexion.
+	dir := t.TempDir()
+	orig, origIDs, origV6 := procNet, trustedIDs, bindV6Only
+	t.Cleanup(func() { procNet, trustedIDs, bindV6Only = orig, origIDs, origV6 })
+	procNet = dir
+	trustedIDs = func(string) (map[uint32]bool, map[uint32]bool) {
+		return map[uint32]bool{0: true, 111: true}, map[uint32]bool{0: true}
+	}
+	bindV6Only = func() string { return "0" }
+	const head = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n"
+	v6 := func(addr, uid string) string {
+		return "   0: " + addr + ":0CEA 00000000000000000000000000000000:0000 0A 00000000:00000000 " +
+			"00:00000000 00000000 " + uid + " 0 1 1\n"
+	}
+	for _, c := range []struct {
+		nom, tcp6, user, target string
+		admis                   bool
+	}{
+		{"::1 seul, connexion vers 127.0.0.1", v6(hexV6Loopback, "111"), "mysql", "127.0.0.1", false},
+		{"::1 seul, connexion vers ::1", v6(hexV6Loopback, "111"), "mysql", "::1", true},
+		{":: de MySQL, double pile", v6(hexV6Any, "111"), "mysql", "127.0.0.1", true},
+		{":: de PostgreSQL, toujours V6ONLY", v6(hexV6Any, "111"), "postgres", "127.0.0.1", false},
+		{":: étranger", v6(hexV6Any, "1000"), "mysql", "::1", false},
+	} {
+		for name, body := range map[string]string{"tcp": head, "tcp6": head + c.tcp6} {
+			if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		// 3306 = 0x0CEA.
+		err := checkTCPListener(3306, c.user, c.target)
+		if (err == nil) != c.admis {
+			t.Errorf("%s : admis attendu %v, obtenu %v", c.nom, c.admis, err)
+		}
+	}
+	bindV6Only = func() string { return "1" }
+	if err := os.WriteFile(filepath.Join(dir, "tcp6"), []byte(head+v6(hexV6Any, "111")), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := checkTCPListener(3306, "mysql", "127.0.0.1"); err == nil {
+		t.Error("bindv6only=1 : « :: » ne reçoit pas l'IPv4")
+	}
+}
+
+func TestPostgresRefuseUnJeuBorneSurLeComptePrincipal(t *testing.T) {
+	// Le compte principal est propriétaire de la base : « readonly » y était
+	// annoncé par le plan et sans effet — le compte supprimait les tables
+	// (S1R-13). Le plan le refuse, sans rien changer à la base en place.
+	prov, proj := fixture(t)
+	decl := DefaultDatabase(proj, "postgres")
+	decl.Privileges = "readonly"
+	proj.Spec.Databases = []model.Database{decl}
+	// Base et rôle créés par ogs (D91) : seul le jeu déclaré est en cause.
+	obs := Observed{States: []DBState{{Declaration: decl, DBExists: true, UserExists: true,
+		UserOwned: true, DBOwned: true,
+		Grants: map[string]string{decl.Name: "OWNER"}, Extensions: map[string]bool{},
+		ExtraUsers: map[string]bool{}, ExtraOwned: map[string]bool{}}}}
+	steps, err := prov.Plan(context.Background(), proj, obs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(steps) != 1 {
+		t.Fatalf("%d étapes", len(steps))
+	}
+	s := steps[0]
+	if s.Action == engine.NoOp || s.Critical {
+		t.Fatalf("DÉFAUT : un jeu borné sur le propriétaire doit être refusé, sans être critique : %+v", s)
+	}
+	if strings.Contains(s.Summary, "privilèges readonly") {
+		t.Errorf("le plan annonce un jeu qu'il n'applique pas : %s", s.Summary)
+	}
+	if err := s.Apply(context.Background()); err == nil || !strings.Contains(err.Error(), "compte additionnel") {
+		t.Errorf("le refus doit nommer la porte de sortie : %v", err)
+	}
+	// « all » reste conforme : rien ne change pour un site en place.
+	decl.Privileges = "all"
+	obs.States[0].Declaration = decl
+	if steps, err = prov.Plan(context.Background(), proj, obs); err != nil || steps[0].Action != engine.NoOp {
+		t.Errorf("base conforme en « all » : %v, %+v", err, steps)
+	}
+}

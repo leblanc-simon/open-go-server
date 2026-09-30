@@ -72,10 +72,9 @@ func (p *Provider) clientFor(db model.Database) (Client, error) {
 	)
 	switch db.Engine {
 	case "mysql", "mariadb":
-		socket, ok := FindMySQLSocket(p.Paths.Prefix())
-		if !ok {
-			return nil, fmt.Errorf("%w : aucun socket MySQL trouvé (%s) — le serveur est-il installé et démarré ?",
-				ErrUnavailable, strings.Join(mysqlSockets, ", "))
+		socket, refused := findMySQLSocket(p.Paths.Prefix())
+		if socket == "" {
+			return nil, mysqlUnavailable(refused)
 		}
 		c, err = NewMySQLClient(socket)
 	case "postgres":
@@ -299,6 +298,20 @@ func (p *Provider) Plan(ctx context.Context, proj *model.Project, obs Observed) 
 		priv, err := ParsePrivilege(decl.Privileges)
 		if err != nil {
 			return nil, err
+		}
+		// Refus non critique, comme un compte masqué plus bas : la base en place
+		// continue de servir, rien n'y est changé (D92).
+		if reason := CheckPostgresPrivilege(decl.Engine, priv); reason != nil {
+			action := engine.Update
+			if !state.DBExists {
+				action = engine.Create
+			}
+			s := engine.NewStep(resource, action, fmt.Sprintf(
+				"base %s %s — jeu %s refusé sur le compte principal", decl.Engine, decl.Name, priv))
+			s.Critical = false
+			s.Apply = func(context.Context) error { return reason }
+			steps = append(steps, s)
+			continue
 		}
 		host := decl.Host
 		if host == "" {

@@ -34,7 +34,11 @@ func (a *App) scanner() (*importer.Scanner, error) {
 		eng = nil
 	}
 	clients := map[string]db.Client{}
-	if socket, ok := db.FindMySQLSocket(a.Paths.Prefix()); ok {
+	// Un socket refusé (D92) n'est pas une absence : les bases du moteur ne sont
+	// pas inventoriées, et il faut le dire.
+	if socket, err := db.MySQLSocket(a.Paths.Prefix()); err != nil {
+		a.printf("⚠ bases MySQL non inventoriées : %v\n", err)
+	} else if socket != "" {
 		if client, err := db.NewMySQLClient(socket); err == nil {
 			clients["mysql"] = client
 		}
@@ -42,6 +46,8 @@ func (a *App) scanner() (*importer.Scanner, error) {
 	if clusters := db.DetectClusters(a.Paths.Prefix()); len(clusters) > 0 {
 		if client, err := db.NewPostgresClient(clusters[0], os.Getenv("OGS_PG_ADMIN")); err == nil {
 			clients["postgres"] = client
+		} else {
+			a.printf("⚠ bases PostgreSQL non inventoriées : %v\n", err)
 		}
 	}
 	return &importer.Scanner{

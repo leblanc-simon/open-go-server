@@ -130,17 +130,21 @@ var engineClient = func(p *db.Provider, engine, cluster string) (db.Client, erro
 
 // planMySQLAccount crée ou met à jour le compte de métriques MySQL. Le moteur
 // est réputé absent lorsqu'aucun socket n'existe — et alors ogs se tait : une
-// machine sans MySQL n'a pas à voir un avertissement à chaque apply.
+// machine sans MySQL n'a pas à voir un avertissement à chaque apply. Un socket
+// vu puis refusé (D92) n'est pas une absence : l'étape le dit.
 func (p *Provider) planMySQLAccount(ctx context.Context) (*engine.Step, *MySQLAccess) {
 	if p.DB == nil {
 		return nil, nil
 	}
-	socket, ok := db.FindMySQLSocket(p.Paths.Prefix())
-	if !ok {
+	resource := "monitoring/account/mysql"
+	socket, err := db.MySQLSocket(p.Paths.Prefix())
+	if err != nil {
+		return unavailableStep(resource, "compte de supervision MySQL", err), nil
+	}
+	if socket == "" {
 		return nil, nil
 	}
 	account := p.Cfg.Monitoring.TelegrafAccount()
-	resource := "monitoring/account/mysql"
 
 	client, err := engineClient(p.DB, "mysql", "")
 	if err != nil {

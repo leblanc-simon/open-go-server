@@ -609,6 +609,30 @@ Ils ont tous coûté un défaut réel ; les tests unitaires ne les voyaient pas.
 - MySQL : le nom de base après `ON` est un motif où `_` est un joker, donc échappé — **et déséchappé à la
   relecture**, sans quoi toute base contenant un souligné reste éternellement « en écart ». Le nom
   d'utilisateur, lui, est un littéral.
+- **Root ne se connecte qu'au socket du vrai moteur** (D92). `/tmp` figurait parmi les emplacements
+  cherchés : tout compte local y pose `mysql.sock` ou `.s.PGSQL.5432`, et le jour où le moteur est arrêté,
+  root s'y connectait — mots de passe du parc en clair dans les `CREATE USER`, contenu des bases d'un clone.
+  `checkSocket` exige un socket et un répertoire à root ou au compte du moteur, inscriptible par nul autre ;
+  un cluster dont le socket est refusé ne retombe **jamais** sur `/var/run/postgresql` (`Cluster.SocketDir`).
+- **Une restauration est un script, et le client l'exécute** (D92) : `\!` lance une commande shell sous
+  mysql comme sous psql. `db restore`, `site clone` et `project restore` chargent donc sous le **compte de
+  la base**, par un client lancé **sous l'utilisateur Linux du projet** (`AsUser`), environnement construit
+  de toutes pièces — `su` sans `-l` garde `MYSQL_PWD` et `PGPASSWORD`. Deux conséquences : une clause
+  `DEFINER` nommant un autre compte exige `SET_USER_ID`, d'où son retrait ; et
+  `COMMENT ON EXTENSION` exige d'être propriétaire de l'extension, créée sous le rôle d'administration,
+  d'où le retrait de la seule instruction que pg_dump pose sous son en-tête — sous `ON_ERROR_STOP`, la
+  restauration s'y arrêtait. Ces retraits ne touchent que la **tête d'une ligne de définition** :
+  mariadb-dump écrit chaque tuple sur sa propre ligne, et un retrait « hors des lignes `INSERT` »
+  corrompait les données d'un clone en silence. Le mot de passe ne va qu'au vrai moteur : socket admis
+  exigé, et toute écoute TCP de la boucle locale sur le port au compte du moteur (`/proc/net/tcp*`) — le
+  port d'un moteur arrêté est à quiconque s'y lie ; une écoute sur `::1` ne reçoit pas `127.0.0.1`, et
+  PostgreSQL pose `V6ONLY` sur ses écoutes IPv6. Un compte additionnel `all` ne restaure **jamais sous
+  l'utilisateur du projet**, qui lirait son mot de passe dans l'environnement du client : `systemd-run -p
+  DynamicUser=yes`, qui exige D-Bus — absent de l'image d'intégration, où `systemd-run` échoue sur le bus.
+- **PostgreSQL : le compte principal est propriétaire de sa base**, et la propriété emporte tous les droits.
+  `crud` ou `readonly` sur lui étaient annoncés par le plan et sans effet : ils sont refusés (D92), le jeu
+  borné allant sur un compte additionnel. Ne pas le déplacer dans `validate` : `loadProjects` rejette le
+  premier projet invalide, et une déclaration ancienne bloquerait tout le parc.
 - PostgreSQL : l'authentification `peer` exige un rôle au nom de l'utilisateur système (`root`), et
   `CONNECT` doit être révoqué à `PUBLIC` — il est accordé par défaut sur toute base nouvelle. Créer depuis
   `template0`, jamais `template1`.

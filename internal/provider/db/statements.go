@@ -372,6 +372,23 @@ func (s *PostgresSpec) normalize() error {
 	return nil
 }
 
+// CheckPostgresPrivilege refuse un jeu borné sur le compte principal d'une base
+// PostgreSQL (D92). Ce compte est propriétaire de la base et de son schéma
+// public : c'est lui que l'application emploie pour ses migrations, et la
+// propriété emporte tous les droits, qu'aucun GRANT ne retire. « crud » ou
+// « readonly » y étaient acceptés, annoncés par le plan, et sans effet — un
+// compte « readonly » supprimait les tables. Le jeu borné se déclare sur un
+// compte additionnel (extraUsers), qui l'applique réellement, objets à venir
+// compris.
+func CheckPostgresPrivilege(engine string, priv Privilege) error {
+	if engine != "postgres" || priv == "" || priv == PrivAll {
+		return nil
+	}
+	return fmt.Errorf("le jeu %q ne s'applique pas au compte principal d'une base PostgreSQL, qui en est "+
+		"propriétaire : déclarer « all », et le jeu borné sur un compte additionnel (ogs db user add "+
+		"<id> <nom> --privileges %s)", priv, priv)
+}
+
 // PostgresStatements sépare les requêtes selon leur contexte d'exécution :
 // CREATE DATABASE n'est pas transactionnel et les extensions exigent une
 // connexion à la base cible.

@@ -505,7 +505,11 @@ func newSiteCloneCommand(app *App) *cobra.Command {
 
 			dataCopied := false
 			if withData {
-				if err := app.cloneData(cmd, source, target); err != nil {
+				if err := app.cloneData(cmd, source, target); ExitCode(err) == CodeCancelled {
+					_ = app.Audit.Record(target.ID(), "site", "site.clone", "interrompu",
+						"depuis "+source.ID()+" : copie des données interrompue à la demande")
+					return err
+				} else if err != nil {
 					app.printf("⚠ copie des données : %v\n", err)
 				} else {
 					dataCopied = true
@@ -685,11 +689,15 @@ func (a *App) cloneData(cmd *cobra.Command, source, target *model.Project) error
 	}
 	defer os.RemoveAll(dir)
 	tmp := filepath.Join(dir, source.Spec.Databases[0].Name+".sql")
-	if _, err := provs.DB.Dump(cmd.Context(), source, source.Spec.Databases[0], tmp); err != nil {
-		return fmt.Errorf("sauvegarde de la source : %w", err)
-	}
-	if err := provs.DB.Restore(cmd.Context(), target, target.Spec.Databases[0], tmp); err != nil {
-		return fmt.Errorf("restauration dans la cible : %w", err)
+	if err := provs.DB.CloneData(cmd.Context(), source, source.Spec.Databases[0],
+		target, target.Spec.Databases[0], tmp); err != nil {
+		// Une interruption demandée n'est pas un succès partiel, comme pour la
+		// copie des fichiers.
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return exitf(CodeCancelled, "copie des données interrompue à la demande — la base %s n'en porte "+
+				"qu'une partie : %v", target.Spec.Databases[0].Name, err)
+		}
+		return err
 	}
 	a.printf("✓ données copiées : %s → %s\n", source.Spec.Databases[0].Name, target.Spec.Databases[0].Name)
 	return nil

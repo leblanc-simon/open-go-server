@@ -28,9 +28,9 @@ func PostgresAdminRole(override string) string {
 // évite tout mot de passe pour l'accès d'administration.
 func NewPostgresClient(cluster Cluster, adminUser string) (Client, error) {
 	adminUser = PostgresAdminRole(adminUser)
-	socketDir := cluster.Socket
-	if socketDir == "" {
-		socketDir = "/var/run/postgresql"
+	socketDir, err := cluster.SocketDir("")
+	if err != nil {
+		return nil, err
 	}
 	dsn := func(database string) string {
 		if database == "" {

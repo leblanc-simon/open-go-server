@@ -206,6 +206,57 @@ fi
 echo "le dump contient bien la table, en 0600"
 
 echo
+echo "--- restauration : sous le compte du projet, jamais sous root (D92) ---"
+# Une vue posée par root : sa clause DEFINER nomme un compte que le projet ne
+# peut pas désigner. La restauration la retire, et la vue revient au compte qui
+# restaure.
+mariadb shopfr -e "CREATE DEFINER='root'@'localhost' VIEW vue_essai AS SELECT id FROM essai"
+# Une donnée qui ressemble à une clause DEFINER : mariadb-dump écrit chaque
+# tuple sur sa ligne, et la restauration ne doit pas y toucher.
+mariadb shopfr -e "CREATE TABLE notes (t TEXT); INSERT INTO notes VALUES (CONCAT('ligne1', CHAR(10), 'DEFINER=\`root\`@\`localhost\` x'))"
+note_avant=$(mariadb -N shopfr -e "SELECT HEX(t) FROM notes")
+ogs db dump shopfr shopfr -O /root/shopfr-vue.sql >/dev/null 2>&1 || { echo "ÉCHEC : dump"; exit 1; }
+mariadb shopfr -e "DROP VIEW vue_essai; DROP TABLE essai; DROP TABLE notes"
+if ! ogs db restore shopfr shopfr --input /root/shopfr-vue.sql --yes >/tmp/restore.log 2>&1; then
+    cat /tmp/restore.log
+    echo "ÉCHEC : la restauration sous le compte du projet a échoué"
+    exit 1
+fi
+if [ "$(mariadb -N shopfr -e 'SELECT COUNT(*) FROM essai')" != "1" ]; then
+    echo "ÉCHEC : la restauration n'a pas rétabli la table"
+    exit 1
+fi
+if [ "$(mariadb -N shopfr -e 'SELECT HEX(t) FROM notes')" != "$note_avant" ]; then
+    echo "ÉCHEC : la restauration a altéré une donnée qui contenait « DEFINER= »"
+    mariadb -N shopfr -e 'SELECT t FROM notes'
+    exit 1
+fi
+echo "la donnée qui contient « DEFINER= » est restaurée intacte"
+definisseur=$(mariadb -N -e "SELECT DEFINER FROM information_schema.VIEWS WHERE TABLE_SCHEMA='shopfr' AND TABLE_NAME='vue_essai'")
+echo "définisseur de la vue restaurée : $definisseur"
+if [ "$definisseur" != "shopfr@localhost" ]; then
+    echo "ÉCHEC : la vue restaurée doit revenir au compte du projet"
+    exit 1
+fi
+# Un script hostile : une commande shell, et une base hors du projet.
+rm -f /tmp/restore-identite
+printf '%s\n' '\! id -un > /tmp/restore-identite' 'CREATE DATABASE pirate;' > /root/hostile.sql
+if ogs db restore shopfr shopfr --input /root/hostile.sql --yes >/tmp/restore.log 2>&1; then
+    echo "ÉCHEC : une restauration qui crée une base hors du projet doit échouer"
+    exit 1
+fi
+if mariadb -N -e "SHOW DATABASES LIKE 'pirate'" | grep -q pirate; then
+    echo "ÉCHEC : la restauration a créé une base hors du projet"
+    exit 1
+fi
+if [ -e /tmp/restore-identite ] && [ "$(cat /tmp/restore-identite)" != "shopfr" ]; then
+    echo "ÉCHEC : « \\! » s'exécute sous $(cat /tmp/restore-identite), non sous l'utilisateur du projet"
+    exit 1
+fi
+echo "restauration confinée : base hors projet refusée, commande shell sous $(cat /tmp/restore-identite 2>/dev/null || echo personne)"
+rm -f /root/hostile.sql /root/shopfr-vue.sql /tmp/restore-identite
+
+echo
 echo "--- suppression : les bases partent avec le projet ---"
 ogs project delete shopfr --yes >/dev/null 2>&1
 restantes=$(mariadb -N -e "SELECT schema_name FROM information_schema.schemata WHERE schema_name IN ('shopfr','shopfr_stats')")

@@ -205,6 +205,110 @@ if [ "${lignes:-0}" != "1" ]; then
 fi
 
 echo
+echo "--- restauration : sous le rôle du projet, jamais sous root (D92) ---"
+rm -f /tmp/restore-identite
+printf '%s\n' '\! id -un > /tmp/restore-identite' 'CREATE ROLE pirate SUPERUSER;' > /root/hostile.sql
+if ogs db restore shopfr shopfr --input /root/hostile.sql --yes >/tmp/restore.log 2>&1; then
+    echo "ÉCHEC : une restauration qui crée un rôle superutilisateur doit échouer"
+    exit 1
+fi
+if pg "SELECT rolname FROM pg_roles WHERE rolname='pirate'" | grep -q pirate; then
+    echo "ÉCHEC : la restauration a créé un rôle superutilisateur"
+    exit 1
+fi
+identite=$(cat /tmp/restore-identite 2>/dev/null)
+if [ "$identite" != "shopfr" ]; then
+    echo "ÉCHEC : « \\! » s'exécute sous « $identite », non sous l'utilisateur du projet"
+    exit 1
+fi
+echo "rôle superutilisateur refusé, commande shell sous $identite"
+rm -f /root/hostile.sql /tmp/restore-identite
+# Une base à extension, sous un rôle qui n'est pas l'utilisateur Linux : le
+# commentaire de l'extension, qu'un non-propriétaire ne peut poser, est écarté.
+ogs db dump shopfr shopfr_stats -O /root/stats.sql >/dev/null 2>&1 || { echo "ÉCHEC : dump de shopfr_stats"; exit 1; }
+grep -c "COMMENT ON EXTENSION" /root/stats.sql | sed 's/^/commentaires d’extension dans la sauvegarde : /'
+if ! ogs db restore shopfr shopfr_stats --input /root/stats.sql --yes >/tmp/restore.log 2>&1; then
+    cat /tmp/restore.log
+    echo "ÉCHEC : la restauration d'une base à extension échoue sous son rôle"
+    exit 1
+fi
+rm -f /root/stats.sql
+echo "base à extension restaurée sous le rôle shopfr_stats"
+
+echo
+echo "--- mot de passe haché en md5 : la restauration renvoie vers la rotation (D92) ---"
+# Un cluster mis à niveau : pg_hba en md5, mot de passe haché en md5. Le serveur
+# demande alors un échange md5, que PGREQUIREAUTH refuse ; la rotation repose le
+# mot de passe en SCRAM, que le serveur mène même sous « md5 ».
+hba=$(ls /etc/postgresql/"$version"/main/pg_hba.conf)
+cp "$hba" /root/pg_hba.orig
+sed -i 's/scram-sha-256$/md5/' "$hba"
+pg_ctlcluster "$version" main reload
+actuel=$(ogs secrets show shopfr postgres/shopfr | tail -1)
+su - postgres -c "psql -q -c \"SET password_encryption = 'md5'; ALTER ROLE shopfr PASSWORD '$actuel'\"" 2>/dev/null
+if ogs db restore shopfr shopfr --input "$dump" --yes >/tmp/restore.log 2>&1; then
+    echo "ÉCHEC : un échange md5 ne doit pas recevoir le mot de passe"
+    exit 1
+fi
+if ! grep -q "encore haché en md5.*ogs db user rotate shopfr shopfr" /tmp/restore.log; then
+    cat /tmp/restore.log
+    echo "ÉCHEC : le refus doit nommer la rotation"
+    exit 1
+fi
+ogs db user rotate shopfr shopfr --yes >/dev/null 2>&1
+hachage=$(pg "SELECT left(rolpassword, 13) FROM pg_authid WHERE rolname='shopfr'")
+echo "hachage après rotation : $hachage"
+PGPASSWORD="$(ogs secrets show shopfr postgres/shopfr | tail -1)" psql -h 127.0.0.1 -U shopfr -d shopfr \
+    -c "DROP TABLE IF EXISTS essai; DROP TABLE IF EXISTS apres" >/dev/null 2>&1
+if ! ogs db restore shopfr shopfr --input "$dump" --yes >/tmp/restore.log 2>&1; then
+    cat /tmp/restore.log
+    echo "ÉCHEC : après rotation, la restauration doit passer"
+    exit 1
+fi
+cp /root/pg_hba.orig "$hba"
+pg_ctlcluster "$version" main reload
+echo "md5 refusé avec la sortie nommée ; après rotation ($hachage), restauration réussie"
+
+echo
+echo "--- cluster arrêté : son port n'obtient aucun mot de passe (D92) ---"
+# Le port d'un cluster arrêté est à quiconque s'y lie. Un faux serveur, sous
+# nobody, note toute connexion : la restauration ne doit pas lui parler.
+pg_ctlcluster "$version" main stop
+rm -f /tmp/faux-pg
+cat > /tmp/faux-pg.py <<'PY'
+import socket
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", 5432))
+s.listen(1)
+s.settimeout(20)
+try:
+    c, _ = s.accept()
+    open("/tmp/faux-pg", "w").write("connexion\n")
+    c.close()
+except socket.timeout:
+    pass
+PY
+su -s /bin/sh nobody -c "python3 /tmp/faux-pg.py" >/dev/null 2>&1 &
+faux=$!
+sleep 1
+if ogs db restore shopfr shopfr --input "$dump" --yes >/tmp/restore.log 2>&1; then
+    cat /tmp/restore.log
+    echo "ÉCHEC : une restauration vers un cluster arrêté doit être refusée"
+    exit 1
+fi
+tail -1 /tmp/restore.log
+if [ -e /tmp/faux-pg ]; then
+    echo "ÉCHEC : la restauration s'est connectée au faux serveur"
+    exit 1
+fi
+kill "$faux" 2>/dev/null; wait "$faux" 2>/dev/null
+rm -f /tmp/faux-pg.py
+pg_ctlcluster "$version" main start
+sleep 2
+echo "cluster arrêté : restauration refusée, le faux serveur n'a rien reçu"
+
+echo
 echo "--- dump et restauration : aucun lien posé par le projet n'est suivi ---"
 # Le home appartient à l'utilisateur (D51). Un lien à la place de la destination
 # faisait tronquer puis réécrire par root le fichier de son choix ; un lien à la

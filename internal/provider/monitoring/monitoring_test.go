@@ -979,3 +979,35 @@ func TestCompteDeSupervisionRabbitMQInterrompuResteAOgs(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestUnSocketMySQLRefuseNEstPasUneAbsence(t *testing.T) {
+	// Un socket posé dans un répertoire ouvert à tous est refusé (D92) : le
+	// moteur n'est pas pour autant absent, et l'étape doit le dire au lieu de
+	// retirer en silence le compte et les entrées de Telegraf.
+	p, paths := fixture(t)
+	p.DB = &db.Provider{Paths: paths, Exec: p.Exec, Store: p.Store, Keys: p.Keys}
+	dir := filepath.Join(paths.Prefix(), "run", "mysqld")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "mysqld.sock"), nil, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	step, access := p.planMySQLAccount(context.Background())
+	if step == nil || access != nil {
+		t.Fatalf("une étape d'indisponibilité est attendue : %v, %v", step, access)
+	}
+	if err := step.Apply(context.Background()); err == nil || !strings.Contains(err.Error(), "inscriptible par tous") {
+		t.Errorf("l'étape doit nommer le refus : %v", err)
+	}
+	// Sans aucun socket, le moteur est absent : silence.
+	if err := os.Remove(filepath.Join(dir, "mysqld.sock")); err != nil {
+		t.Fatal(err)
+	}
+	if step, _ := p.planMySQLAccount(context.Background()); step != nil {
+		t.Errorf("moteur absent : aucune étape attendue, obtenu %v", step)
+	}
+}

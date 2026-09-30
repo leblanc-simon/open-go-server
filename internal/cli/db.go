@@ -1,6 +1,8 @@
 package cli
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -131,7 +133,11 @@ func newDBAddCommand(app *App) *cobra.Command {
 			default:
 				return exitf(CodeUsage, "moteur %q inconnu (mysql, mariadb ou postgres)", engine)
 			}
-			if _, err := db.ParsePrivilege(privileges); err != nil {
+			priv, err := db.ParsePrivilege(privileges)
+			if err != nil {
+				return exitf(CodeUsage, "%s", err)
+			}
+			if err := db.CheckPostgresPrivilege(engine, priv); err != nil {
 				return exitf(CodeUsage, "%s", err)
 			}
 			decl := db.DefaultDatabase(p, engine)
@@ -297,6 +303,9 @@ func newDBRestoreCommand(app *App) *cobra.Command {
 			}
 			defer provs.close()
 			if err := provs.DB.Restore(cmd.Context(), p, decl, input); err != nil {
+				if errors.Is(err, context.Canceled) {
+					return wrap(CodeCancelled, err)
+				}
 				return wrap(CodeError, err)
 			}
 			app.printf("✓ base %s restaurée depuis %s\n", decl.Name, input)

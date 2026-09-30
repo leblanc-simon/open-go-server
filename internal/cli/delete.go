@@ -1830,11 +1830,23 @@ func newRestoreCommand(app *App) *cobra.Command {
 					partial = exitf(CodePartial, "l'arborescence n'a pas été entièrement restaurée")
 				}
 			}
+			// Une base non rechargée est un succès partiel : le projet est en place,
+			// sa base vide (D92).
 			if withData {
-				app.restoreDumps(cmd, path, p, manifest)
+				ok, err := app.restoreDumps(cmd, path, p, manifest)
+				if err != nil {
+					return err
+				}
+				if !ok && partial == nil {
+					partial = exitf(CodePartial, "une base au moins n'a pas été restaurée")
+				}
 			}
 			_ = app.Audit.Record(p.ID(), "project", "project.restore", "ok", path)
-			app.printf("\n✓ %s restauré\n", p.ID())
+			if partial != nil {
+				app.printf("\n⚠ %s restauré en partie\n", p.ID())
+			} else {
+				app.printf("\n✓ %s restauré\n", p.ID())
+			}
 			return partial
 		},
 	}
@@ -1901,19 +1913,22 @@ func (a *App) restoreTree(path string, p *model.Project, archived []model.Dir, m
 	return err
 }
 
-// restoreDumps recharge les sauvegardes présentes dans l'archive.
-func (a *App) restoreDumps(cmd *cobra.Command, path string, p *model.Project, manifest archive.Manifest) {
+// restoreDumps recharge les sauvegardes présentes dans l'archive, et rend faux
+// si l'une d'elles n'a pas pu l'être. Une interruption arrête tout et remonte en
+// code 9 : les bases suivantes ne sont pas rechargées.
+func (a *App) restoreDumps(cmd *cobra.Command, path string, p *model.Project, manifest archive.Manifest) (bool, error) {
 	provs, err := a.buildProviders()
 	if err != nil {
 		a.printf("⚠ %v\n", err)
-		return
+		return false, nil
 	}
 	defer provs.close()
 	dir, err := a.dumpWorkDir()
 	if err != nil {
 		a.printf("⚠ %v\n", err)
-		return
+		return false, nil
 	}
+	ok := true
 	defer os.RemoveAll(dir)
 	for _, entry := range manifest.Entries {
 		if entry.Kind != "dump" {
@@ -1922,11 +1937,13 @@ func (a *App) restoreDumps(cmd *cobra.Command, path string, p *model.Project, ma
 		data, err := archive.ReadFile(path, entry.Name)
 		if err != nil {
 			a.printf("⚠ %s : %v\n", entry.Name, err)
+			ok = false
 			continue
 		}
 		tmp := filepath.Join(dir, filepath.Base(entry.Name))
 		if err := os.WriteFile(tmp, data, 0o600); err != nil {
 			a.printf("⚠ %s : %v\n", entry.Name, err)
+			ok = false
 			continue
 		}
 		name := strings.TrimSuffix(filepath.Base(entry.Name), ".sql")
@@ -1939,15 +1956,23 @@ func (a *App) restoreDumps(cmd *cobra.Command, path string, p *model.Project, ma
 		if decl == nil {
 			a.printf("⚠ aucune base %s déclarée : sauvegarde ignorée\n", name)
 			_ = os.Remove(tmp)
+			ok = false
 			continue
 		}
-		if err := provs.DB.Restore(cmd.Context(), p, *decl, tmp); err != nil {
+		if err := provs.DB.Restore(cmd.Context(), p, *decl, tmp); errors.Is(err, context.Canceled) ||
+			errors.Is(err, context.DeadlineExceeded) {
+			_ = os.Remove(tmp)
+			return false, exitf(CodeCancelled, "restauration interrompue à la demande — la base %s n'est que "+
+				"partiellement chargée : %v", name, err)
+		} else if err != nil {
 			a.printf("⚠ restauration de %s : %v\n", name, err)
+			ok = false
 		} else {
 			a.printf("✓ base %s restaurée\n", name)
 		}
 		_ = os.Remove(tmp)
 	}
+	return ok, nil
 }
 
 func newArchiveListCommand(app *App) *cobra.Command {
