@@ -47,6 +47,13 @@ type Provider struct {
 	WebReload string
 	// WebEngine est le moteur retenu, qui nomme les journaux web pré-créés (D71).
 	WebEngine string
+	// AccountOfUID nomme le compte d'un UID, "" s'il n'en a aucun ; nil lit la
+	// base des comptes de la machine. Substituable en test.
+	AccountOfUID func(uid int) (string, error)
+	// KnownHome dit si la base d'état porte déjà ce projet avec cette racine : un
+	// home non vide à un UID orphelin est alors le sien, compte supprimé à la
+	// main (D95). nil : aucun home n'est connu.
+	KnownHome func(proj *model.Project) bool
 }
 
 // Name identifie le provider.
@@ -155,6 +162,11 @@ func (p *Provider) Plan(_ context.Context, proj *model.Project, obs Observed) ([
 	var steps []*engine.Step
 	id := proj.ID()
 	spec := proj.Spec.User
+
+	// 0. Le home d'un compte à créer doit être vierge (§7.1.7, D95).
+	if err := p.PreexistingHome(proj, obs); err != nil {
+		return nil, err
+	}
 
 	// 1. Groupe privé du projet.
 	if obs.Group == nil {
@@ -338,6 +350,12 @@ func (p *Provider) dirSteps(proj *model.Project, obs Observed) ([]*engine.Step, 
 	// le propriétaire en place (fs.KeepOwner) : comparer y ferait osciller le plan
 	// sur un écart qu'aucune étape ne corrigerait.
 	checkOwner := !p.Exec.Simulated() && obs.Group != nil
+	// Un répertoire déjà là quand le compte ou le groupe restent à créer passe au
+	// projet : ensureDir le lui donne. Le plan le dit, faute de pouvoir comparer à
+	// des identifiants qui n'existent pas encore — sans quoi la racine d'un home
+	// repris changeait de propriétaire sous une étape « mode » ou « conforme »
+	// (D95). PreexistingHome a déjà refusé ce qui n'était pas à reprendre.
+	pending := !p.Exec.Simulated() && (obs.User == nil || obs.Group == nil)
 
 	var steps []*engine.Step
 	for _, t := range targets {
@@ -369,6 +387,7 @@ func (p *Provider) dirSteps(proj *model.Project, obs Observed) ([]*engine.Step, 
 		}
 		ownerDrift := state.Exists && !state.Symlink && wantUID >= 0 && state.UID >= 0 &&
 			(state.UID != wantUID || state.GID != wantGID)
+		pendingOwner := pending && state.Exists && !state.Symlink && !state.LinkedParent
 
 		switch {
 		case state.LinkedParent:
@@ -414,16 +433,20 @@ func (p *Provider) dirSteps(proj *model.Project, obs Observed) ([]*engine.Step, 
 				return nil
 			}
 			steps = append(steps, s)
-		case state.Mode != t.mode.Perm() || ownerDrift:
+		case state.Mode != t.mode.Perm() || ownerDrift || pendingOwner:
 			previous := state.Mode
 			prevUID, prevGID := state.UID, state.GID
 			var quoi []string
 			if state.Mode != t.mode.Perm() {
 				quoi = append(quoi, fmt.Sprintf("mode %04o → %04o", previous, t.mode.Perm()))
 			}
-			if ownerDrift {
+			switch {
+			case ownerDrift:
 				quoi = append(quoi, fmt.Sprintf("propriétaire %d:%d → %s (%d:%d)",
 					prevUID, prevGID, ownerLabel, wantUID, wantGID))
+			case pendingOwner:
+				quoi = append(quoi, fmt.Sprintf("existant, repris : propriétaire %d:%d → %s (créé par ce plan)",
+					prevUID, prevGID, ownerLabel))
 			}
 			s := engine.NewStep("system/dir/"+t.path, engine.Update,
 				fmt.Sprintf("répertoire %s : %s", t.path, strings.Join(quoi, ", ")))

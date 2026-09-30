@@ -426,6 +426,21 @@ Ils ont tous coûté un défaut réel ; les tests unitaires ne les voyaient pas.
   remonté en lecture seule après une erreur disque a ainsi tué un serveur entier, configuration valide à
   l'appui. `web.Provider.CheckLogs` éprouve les journaux de tous les vhosts gérés avant le rechargement, et
   `doctor` porte le même contrôle.
+- **`useradd --no-create-home` ne regarde pas ce qui est déjà là** (D95) : l'arborescence posée ensuite
+  donnait au nouveau compte le home qu'un autre avait laissé à cet emplacement, racine chownée sous une
+  étape « mode », et le contrôle du propriétaire de la racine à la suppression (D77) voyait alors le compte
+  du projet — tout partait. Le critère est **le propriétaire, jamais le contenu** : un home non vide à un
+  UID orphelin est ce que laisse un `userdel` à la main ou une saga de création déroulée, et l'apply doit
+  le reprendre — mais c'est aussi celui d'un compte supprimé sans `-r`, dont **useradd redonne l'UID** au
+  compte suivant : le projet héritait de ses fichiers et, par l'`authorized_keys` régulier que D61 ne
+  remplace jamais, de son **accès ssh**. Un home non vide à root ou à un UID orphelin n'est donc repris que
+  connu de la base d'état (`KnownHome`) ou réduit au squelette d'ogs (`notSkeleton`).
+  `system.Provider.PreexistingHome` refuse une racine à un autre compte existant, ou dont une
+  entrée de premier niveau est à un compte ordinaire (`system.ForeignEntries` : plage de `login.defs`, hors
+  `www-data`) ; `site create`, `site clone` et `project create` l'éprouvent avant de déposer la
+  déclaration, et `project delete` applique le même critère. Sous préfixe, le compte n'existe jamais : le
+  contrôle s'y tait. Et **aucun registre ne remplace l'état réel** : les ressources laissées de côté par
+  l'import ne sont pas mémorisées, chaque garde lit le système.
 - `userdel` **refuse un compte dont un processus tourne encore**. À la suppression d'un projet, les
   rechargements de PHP-FPM et du serveur web doivent donc précéder la suppression du compte : ce sont eux
   qui libèrent les workers du pool. L'ordre inverse laissait compte, groupe et home en place — en annonçant

@@ -157,5 +157,118 @@ if [ "$echecs" -ne 0 ]; then
     echo "RÉSULTAT : la suppression a laissé des ressources derrière elle."
     exit 1
 fi
-echo "RÉSULTAT : compte, groupe, home, pool et vhost ont tous disparu."
+echo "compte, groupe, home, pool et vhost ont tous disparu."
+
+# Un home laissé par un autre compte n'est jamais repris (D95, §7.1.7). Le compte
+# du projet est créé sans --create-home : la création donnait la racine d'alice
+# au projet, sans le dire, et « project delete » l'effaçait ensuite en entier.
+# Le refus précède le dépôt de la déclaration, qui arrêterait sinon tout apply.
+useradd -m -d /home/autre.test -s /bin/bash alice
+echo "à alice" > /home/autre.test/notes.txt
+chown alice: /home/autre.test/notes.txt
+if refus=$(ogs site create autre.test --kind static --tls=false --yes 2>&1); then
+    echo "ÉCHEC : la création a repris le home d'alice :"
+    echo "$refus" | tail -20
+    ls -la /home/autre.test
+    exit 1
+fi
+if ! grep -qF "appartient au compte alice" <<<"$refus"; then
+    echo "ÉCHEC : le refus ne nomme pas le compte qui tient le home :"
+    echo "$refus"
+    exit 1
+fi
+if [ -e /etc/ogs/projects/autretest.yaml ]; then
+    echo "ÉCHEC : la déclaration a été déposée malgré le refus"
+    exit 1
+fi
+if getent passwd autretest >/dev/null; then
+    echo "ÉCHEC : le compte autretest a été créé sur le home d'alice"
+    exit 1
+fi
+if [ "$(stat -c %U /home/autre.test)" != alice ] || ! grep -q "à alice" /home/autre.test/notes.txt; then
+    echo "ÉCHEC : le home d'alice a changé de mains ou perdu son contenu"
+    exit 1
+fi
+echo "la création refuse le home d'un autre compte, avant d'en déposer la déclaration"
+
+# Un compte supprimé à la main se recrée : son home ne porte que l'arborescence
+# d'ogs, à un UID devenu orphelin. Refuser tout home non vide l'en empêchait.
+ogs site create relu.test --kind static --tls=false --yes >/dev/null 2>&1
+userdel relutest
+if ! sortie=$(ogs apply relutest --yes 2>&1); then
+    echo "ÉCHEC : l'apply ne recrée pas un compte supprimé à la main :"
+    echo "$sortie" | tail -10
+    exit 1
+fi
+if ! getent passwd relutest >/dev/null || [ "$(stat -c %U /home/relu.test)" != relutest ]; then
+    echo "ÉCHEC : le compte relutest n'a pas été recréé, ou son home ne lui a pas été rendu"
+    exit 1
+fi
+echo "un compte supprimé à la main est recréé, son home repris"
+
+# « project create » et « site clone » éprouvent le home avant de déposer la
+# déclaration, comme « site create ».
+if refus=$(ogs project create autre.test --kind static 2>&1) || [ -e /etc/ogs/projects/autretest.yaml ]; then
+    echo "ÉCHEC : project create a déposé la déclaration d'un home tenu par alice :"
+    echo "$refus" | tail -5
+    exit 1
+fi
+useradd -m -d /home/relu.preprod-pp.net -s /bin/bash carol
+if refus=$(ogs site clone relutest --to prep --yes 2>&1) || [ -e /etc/ogs/projects/relutestprep.yaml ]; then
+    echo "ÉCHEC : site clone a déposé la préproduction sur le home de carol :"
+    echo "$refus" | tail -5
+    exit 1
+fi
+if ! grep -qF "appartient au compte carol" <<<"$refus"; then
+    echo "ÉCHEC : le refus du clone ne nomme pas carol :"
+    echo "$refus" | tail -5
+    exit 1
+fi
+echo "project create et site clone refusent le home d'un autre compte sans rien déposer"
+
+# Le home d'un compte supprimé sans -r reste, à un UID orphelin que useradd
+# redonne au compte suivant : repris, il donnait au projet les fichiers de bob
+# et, par son authorized_keys régulier — jamais remplacé (D61) —, un shell sous
+# le compte du projet à la clé de bob, puis « project delete » l'effaçait.
+useradd -m -d /home/ancien.test -s /bin/bash bob
+mkdir -p /home/ancien.test/.ssh
+echo "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGJvYg bob" > /home/ancien.test/.ssh/authorized_keys
+echo "à bob" > /home/ancien.test/secret.txt
+chown -R bob: /home/ancien.test
+userdel bob
+if refus=$(ogs site create ancien.test --kind static --tls=false --yes 2>&1); then
+    echo "ÉCHEC : la création a repris le home de bob, supprimé :"
+    echo "$refus" | tail -10
+    exit 1
+fi
+if ! grep -qF "authorized_keys" <<<"$refus" || [ -e /etc/ogs/projects/ancientest.yaml ] \
+    || getent passwd ancientest >/dev/null || ! grep -q "à bob" /home/ancien.test/secret.txt; then
+    echo "ÉCHEC : le refus ne nomme pas l'accès ssh de bob, ou quelque chose a été déposé ou touché :"
+    echo "$refus" | tail -10
+    exit 1
+fi
+echo "le home d'un compte supprimé n'est pas repris : ni ses fichiers ni son accès ssh"
+
+# Un home repris avant D95 : la racine est au projet, mais ce qu'alice y avait
+# laissé est toujours à elle. La suppression le voit et s'arrête.
+ogs site create repris.test --kind static --tls=false --yes >/dev/null 2>&1
+home=$(getent passwd repristest | cut -d: -f6)
+if [ -z "$home" ] || [ ! -d "$home" ]; then
+    echo "ÉCHEC : le projet repris.test n'a pas été créé"
+    exit 1
+fi
+echo "à alice" > "$home/.bashrc-alice"
+chown alice: "$home/.bashrc-alice"
+if refus=$(ogs project delete repristest --no-dump --yes --force 2>&1); then
+    echo "ÉCHEC : la suppression a effacé un home dont une entrée est à alice"
+    exit 1
+fi
+if ! grep -qF ".bashrc-alice" <<<"$refus" || [ ! -f "$home/.bashrc-alice" ]; then
+    echo "ÉCHEC : le refus ne nomme pas l'entrée d'alice, ou l'a effacée :"
+    echo "$refus"
+    exit 1
+fi
+echo "la suppression refuse d'effacer un home où un autre compte a laissé des entrées"
+
+echo "RÉSULTAT : compte, groupe, home, pool et vhost ont tous disparu, et aucun home d'un autre compte n'est repris ni effacé."
 exit 0

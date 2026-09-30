@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/user"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -1227,6 +1226,7 @@ func (a *App) diskRefusals(p *model.Project, root string, alsoMounts ...string) 
 	default:
 		add(mountRefusal(p, append([]string{root}, alsoMounts...)...))
 		add(a.rootOwnerRefusal(p, root, info))
+		add(a.foreignEntriesRefusal(p, root))
 		return rs
 	}
 	add(mountRefusal(p, alsoMounts...))
@@ -1257,7 +1257,8 @@ func (a *App) rootOwnerRefusal(p *model.Project, root string, info os.FileInfo) 
 		return &refusal{code: CodeError, what: fmt.Sprintf("racine de projet %q : compte %s illisible (%v)",
 			root, p.Spec.User.Name, err)}
 	}
-	reason, err := ownerRefusal(st.Uid, p.Spec.User.Name, u, accountOfUID)
+	reason, err := ownerRefusal(st.Uid, p.Spec.User.Name, u,
+		func(uid uint32) (string, error) { return accountOfUID(int(uid)) })
 	if err != nil {
 		return &refusal{code: CodeError, what: fmt.Sprintf("racine de projet %q : propriétaire illisible (%v)",
 			root, err)}
@@ -1267,6 +1268,42 @@ func (a *App) rootOwnerRefusal(p *model.Project, root string, info os.FileInfo) 
 			remedy: "corriger spec.layout.root ou le propriétaire"}
 	}
 	return nil
+}
+
+// foreignEntriesRefusal refuse une racine dont une entrée de premier niveau
+// appartient à un compte ordinaire existant autre que celui du projet
+// (system.ForeignEntries : ni root, ni un UID orphelin, ni www-data ou un compte
+// système). C'est la trace d'un home repris : avant D95, la création d'un projet
+// sur le home laissé par un autre compte lui donnait la racine, et
+// rootOwnerRefusal y voyait alors le propriétaire attendu — tout ce que l'autre
+// compte y avait laissé partait avec le projet. Le premier niveau suffit à le
+// voir, et reste bon marché ; au-delà, ce qu'ogs ne pose pas est le contenu du
+// projet. --force ne le lève pas : ce qu'il protège n'est pas au projet.
+func (a *App) foreignEntriesRefusal(p *model.Project, root string) *refusal {
+	if a.Exec.Simulated() {
+		return nil
+	}
+	u, err := a.systemProvider().Identity.LookupUser(p.Spec.User.Name)
+	if err != nil {
+		return &refusal{code: CodeError, what: fmt.Sprintf("racine de projet %q : compte %s illisible (%v)",
+			root, p.Spec.User.Name, err)}
+	}
+	uid := -1
+	if u != nil {
+		uid = u.UID
+	}
+	found, err := system.ForeignEntries(root, uid, accountOfUID)
+	if err != nil {
+		return &refusal{code: CodeError, what: fmt.Sprintf("racine de projet %q : entrées illisibles (%v)",
+			root, err)}
+	}
+	if len(found) == 0 {
+		return nil
+	}
+	return &refusal{code: CodeConflict, what: fmt.Sprintf("racine de projet %q : %s appartien%s à un autre "+
+		"compte que celui du projet — le home a pu être repris d'un autre compte", root,
+		strings.Join(found, ", "), map[bool]string{true: "t", false: "nent"}[len(found) == 1]),
+		remedy: "rendre ces entrées au projet ou les déplacer hors de la racine"}
 }
 
 // ownerRefusal rend la raison de refuser l'effacement d'une racine appartenant à
@@ -1295,18 +1332,9 @@ func ownerRefusal(owner uint32, user string, account *system.UserInfo,
 	return "", nil
 }
 
-// accountOfUID nomme le compte système d'un UID, ou "" s'il n'en a aucun.
-func accountOfUID(uid uint32) (string, error) {
-	u, err := user.LookupId(strconv.FormatUint(uint64(uid), 10))
-	if err != nil {
-		var unknown user.UnknownUserIdError
-		if errors.As(err, &unknown) {
-			return "", nil
-		}
-		return "", err
-	}
-	return u.Username, nil
-}
+// accountOfUID nomme le compte système d'un UID, "" s'il n'en a aucun. Une
+// variable, pour que les tests nomment les comptes sans toucher à la machine.
+var accountOfUID = system.AccountOfUID
 
 // mountInfoPath est la table des montages du processus. C'est elle qui fait foi,
 // non la comparaison des st_dev : un bind mount issu du même système de fichiers

@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"text/tabwriter"
@@ -110,6 +111,11 @@ func newProjectCreateCommand(app *App) *cobra.Command {
 			}
 			if err := validate.Uniqueness(append(existing, p), app.Cfg.PrepDomain()); err != nil {
 				return exitf(CodeConflict, "conflit avec le parc existant :\n%v", err)
+			}
+			// Le home est éprouvé avant que la déclaration ne soit déposée (D95) : le
+			// plan le refuserait, et la déclaration restée arrêterait tout apply du parc.
+			if err := app.preexistingHome(cmd.Context(), p); err != nil {
+				return err
 			}
 			if app.DryRun {
 				data, err := spec.Encode(p)
@@ -292,4 +298,20 @@ func orValue(v, fallback string) string {
 		return fallback
 	}
 	return v
+}
+
+// preexistingHome oppose, avant tout dépôt, le refus que le plan du provider
+// système opposerait au home d'un compte à créer (D95). Sans lui, « site
+// create », « site clone » et « project create » déposaient la déclaration, que
+// le plan refusait ensuite : elle restait, et arrêtait tout « ogs apply » du parc.
+func (a *App) preexistingHome(ctx context.Context, p *model.Project) error {
+	prov := a.systemProvider()
+	obs, err := prov.Observe(ctx, p)
+	if err != nil {
+		return wrap(CodeError, err)
+	}
+	if err := prov.PreexistingHome(p, obs); err != nil {
+		return wrap(CodeConflict, err)
+	}
+	return nil
 }

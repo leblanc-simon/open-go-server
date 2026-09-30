@@ -3,6 +3,7 @@ package cli
 import (
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"text/tabwriter"
 
@@ -252,14 +253,13 @@ func newImportAdoptCommand(app *App) *cobra.Command {
 			if err := spec.Save(path, p); err != nil {
 				return wrap(CodeError, err)
 			}
+			// Rien n'est mémorisé des ressources laissées de côté (D95) : aucune
+			// déclaration ne les porte, donc le moteur ne les planifie pas, et les
+			// conflits se jugent sur le système à chaque plan, non sur un relevé
+			// fait ici — qui ne voyait ni les autres candidats, ni ce qui change
+			// après l'import, et que rien ne relisait.
 			if err := app.openStore(); err == nil {
 				_ = app.Audit.Record(p.ID(), "project", "import.adopt", "ok", path)
-				// Les ressources non rattachées sont mémorisées : le moteur ne les
-				// planifiera jamais, et les détections de conflit les prendront en compte.
-				_, unmanaged := importer.Correlate(resources, app.homeRoot(), app.Cfg.PrepDomain())
-				for _, r := range unmanaged {
-					_ = app.Store.RecordUnmanaged(string(r.Kind), r.Name, r.Path)
-				}
 			}
 			app.printf("\n✓ %s adopté : %s\n", p.ID(), path)
 			app.printf("  vérifier avant d'appliquer :\n    ogs diff %s\n", p.ID())
@@ -270,22 +270,45 @@ func newImportAdoptCommand(app *App) *cobra.Command {
 	return cmd
 }
 
+// unmanagedRow est une ressource que l'inspection n'a rattachée à aucun candidat.
+type unmanagedRow struct {
+	Kind   string `json:"kind" yaml:"kind"`
+	Name   string `json:"name" yaml:"name"`
+	Detail string `json:"detail" yaml:"detail"`
+}
+
 func newImportUnmanagedCommand(app *App) *cobra.Command {
 	return &cobra.Command{
 		Use:   "unmanaged",
 		Short: "Lister les ressources laissées hors gestion",
+		Long: "Lecture seule : inspecte le serveur, comme « import scan », et n'affiche que ce\n" +
+			"qui n'est rattaché à aucun projet candidat. La liste est celle du moment : ogs\n" +
+			"ne tient pas de registre de ce qu'il laisse de côté, les conflits se jugeant\n" +
+			"sur le système à chaque plan.",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			if err := app.openStore(); err != nil {
+			scanner, err := app.scanner()
+			if err != nil {
 				return err
 			}
-			rows, err := app.Store.Unmanaged()
+			resources, err := scanner.Scan(cmd.Context())
 			if err != nil {
 				return wrap(CodeError, err)
 			}
+			_, unmanaged := importer.Correlate(resources, app.homeRoot(), app.Cfg.PrepDomain())
+			rows := make([]unmanagedRow, 0, len(unmanaged))
+			for _, r := range unmanaged {
+				rows = append(rows, unmanagedRow{Kind: string(r.Kind), Name: r.Name, Detail: r.Path})
+			}
+			sort.Slice(rows, func(i, j int) bool {
+				if rows[i].Kind != rows[j].Kind {
+					return rows[i].Kind < rows[j].Kind
+				}
+				return rows[i].Name < rows[j].Name
+			})
 			return wrap(CodeError, app.emit("UnmanagedList", rows, nil, func(tw *tabwriter.Writer) {
 				if len(rows) == 0 {
-					fmt.Fprintln(app.Out, "aucune ressource hors gestion enregistrée "+
-						"(lancer « ogs import scan » pour inspecter le serveur)")
+					fmt.Fprintln(app.Out, "aucune ressource hors gestion : tout ce que l'inspection voit "+
+						"est géré par ogs ou rattaché à un projet candidat (« ogs import scan »)")
 					return
 				}
 				fmt.Fprintln(tw, "NATURE\tNOM\tDÉTAIL")

@@ -494,7 +494,10 @@ func (a *App) systemProvider() *system.Provider {
 		ident.PasswdPath = filepath.Join(a.Prefix, "etc", "passwd")
 		ident.GroupPath = filepath.Join(a.Prefix, "etc", "group")
 	}
-	prov := &system.Provider{Exec: a.Exec, Identity: ident}
+	prov := &system.Provider{Exec: a.Exec, Identity: ident, Paths: a.Paths}
+	// Par la variable du paquet, que les essais substituent.
+	prov.AccountOfUID = func(uid int) (string, error) { return accountOfUID(uid) }
+	prov.KnownHome = a.knownHome
 	if a.Prefix != "" {
 		prov.SkipWebUser = true
 	} else if u, err := ident.LookupUser(system.WebUser); err == nil && u == nil {
@@ -511,4 +514,18 @@ func parseEnv(v string) (naming.Env, error) {
 		return "", exitf(CodeUsage, "%s", err)
 	}
 	return env, nil
+}
+
+// knownHome dit si la base d'état porte ce projet, **actif**, avec cette racine :
+// son home est alors le sien, et un compte supprimé à la main se recrée dessus
+// (D95). Une ligne archivée ne vaut rien : « project delete » sans --purge la
+// garde, home compris, et le home a pu passer depuis à un autre compte — une
+// restauration, un clone ou une déclaration redéposée le reprenaient.
+func (a *App) knownHome(p *model.Project) bool {
+	if a.Store == nil {
+		return false
+	}
+	row, err := a.Store.Project(p.ID())
+	return err == nil && row.Status == "active" && row.Home != "" &&
+		filepath.Clean(row.Home) == filepath.Clean(p.Spec.Layout.Root)
 }

@@ -87,3 +87,32 @@ func TestAdoptionAfficheCeQuiResteAConfirmer(t *testing.T) {
 		t.Errorf("les incertitudes du candidat doivent être affichées avant d'écrire :\n%s", out)
 	}
 }
+
+func TestImportUnmanagedListeCeQueLeServeurPorteMaintenant(t *testing.T) {
+	// Le registre des ressources non gérées n'était écrit qu'à l'adoption, sans
+	// les autres candidats, et jamais relu : « import unmanaged » répondait
+	// « aucune ressource » sur un serveur jamais adopté, et la promesse que les
+	// conflits en tiendraient compte n'était tenue nulle part (R2-38, D95). La
+	// liste est désormais celle de l'inspection, au moment de la demande.
+	h := newHarness(t)
+	h.mustRun("init")
+	h.legacyServer(t)
+
+	out := h.mustRun("import", "unmanaged")
+	if !strings.Contains(out, "humain") {
+		t.Errorf("le compte « humain », rattaché à aucun candidat, doit être listé :\n%s", out)
+	}
+	if strings.Contains(out, "boutique.fr") {
+		t.Errorf("le vhost d'un candidat n'est pas hors gestion :\n%s", out)
+	}
+
+	// Ce qui disparaît du serveur disparaît de la liste : un relevé figé à
+	// l'import continuait de le nommer.
+	if err := os.WriteFile(h.path("etc", "passwd"),
+		[]byte("boutique:x:1001:1001::/var/www/boutique:/bin/bash\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if out := h.mustRun("import", "unmanaged"); strings.Contains(out, "humain") {
+		t.Errorf("un compte supprimé ne doit plus être listé :\n%s", out)
+	}
+}

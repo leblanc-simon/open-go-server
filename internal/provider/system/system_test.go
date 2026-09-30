@@ -2,6 +2,7 @@ package system
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -1613,5 +1614,327 @@ func TestLaMigrationNeSuitPasUnLienPoseAuLieuDUnJournal(t *testing.T) {
 	}
 	if data, _ := os.ReadFile(filepath.Join(p.Spec.Layout.LogDir, "php-error.log")); strings.Contains(string(data), "secret") {
 		t.Error("root a recopié la cible du lien dans le répertoire des journaux")
+	}
+}
+
+// homePreexistant pose la racine du projet avant tout apply, telle qu'un autre
+// compte l'aurait laissée, avec les entrées données.
+func homePreexistant(t *testing.T, p *model.Project, entries ...string) {
+	t.Helper()
+	// 0711, le mode que le projet déclare : seul le propriétaire est à reprendre,
+	// et l'étape ne peut pas le cacher derrière une correction de mode.
+	if err := os.MkdirAll(p.Spec.Layout.Root, 0o711); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(p.Spec.Layout.Root, 0o711); err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if err := os.WriteFile(filepath.Join(p.Spec.Layout.Root, e), []byte("à alice\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// planReel calcule le plan sous l'exécuteur réel, sans rien appliquer : sous
+// préfixe, le contrôle du home n'a pas d'objet.
+func planReel(t *testing.T, prov *Provider, p *model.Project, compte string) ([]*engine.Step, error) {
+	t.Helper()
+	if compte != "" && os.Getuid() == 0 {
+		t.Skip("la racine de l'essai est à root, qui ne tient aucun home")
+	}
+	prov.Exec = &exec.Local{}
+	prov.AccountOfUID = func(int) (string, error) { return compte, nil }
+	obs, err := prov.Observe(context.Background(), p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return prov.Plan(context.Background(), p, obs)
+}
+
+func TestLaCreationRefuseUnHomeTenuParUnAutreCompte(t *testing.T) {
+	// Le compte est créé sans --create-home et l'arborescence reçoit le
+	// propriétaire du projet : le home qu'alice avait laissé à cet emplacement
+	// passait au nouveau compte, sa racine chownée sous une étape « mode », et
+	// « project delete » l'effaçait ensuite en entier (R2-42, §7.1.7).
+	p, prov, _, _ := fixture(t)
+	homePreexistant(t, p, ".bashrc", "notes.txt")
+	_, err := planReel(t, prov, p, "alice")
+	if err == nil {
+		t.Fatal("le home d'un autre compte doit être refusé à la création du compte")
+	}
+	for _, want := range []string{p.Spec.Layout.Root, "appartient au compte alice", "ogs import"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("le refus doit contenir %q : %v", want, err)
+		}
+	}
+}
+
+// PlageDeLEssai fait de l'UID du lanceur un compte ordinaire, quelle que soit la
+// machine : sans cela, un essai lancé hors de 1000–60000 ne verrait jamais
+// alice. En root, l'UID 0 est toujours ignoré : l'essai n'a pas d'objet.
+func plageDeLEssai(t *testing.T) {
+	t.Helper()
+	moi := os.Getuid()
+	if moi == 0 {
+		t.Skip("l'UID 0 est toujours ignoré : alice ne peut pas être jouée par root")
+	}
+	defs := filepath.Join(t.TempDir(), "login.defs")
+	if err := os.WriteFile(defs, []byte(fmt.Sprintf("UID_MIN %d\nUID_MAX %d\n", moi, moi)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	precedent := LoginDefsPath
+	t.Cleanup(func() { LoginDefsPath = precedent })
+	LoginDefsPath = defs
+}
+
+func TestLaCreationRefuseDesEntreesDUnAutreCompte(t *testing.T) {
+	// La racine rendue à root ne suffit pas : ce qu'alice y a laissé est à elle.
+	p, prov, _, _ := fixture(t)
+	plageDeLEssai(t)
+	homePreexistant(t, p, ".bashrc")
+	moi := os.Getuid()
+	prov.Exec = &exec.Local{}
+	obs, err := prov.Observe(context.Background(), p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := obs.Dirs[p.Spec.Layout.Root]
+	st.UID = 0 // la racine figure à root ; les entrées restent à qui lance l'essai
+	obs.Dirs[p.Spec.Layout.Root] = st
+	prov.AccountOfUID = func(uid int) (string, error) {
+		if uid == moi {
+			return "alice", nil
+		}
+		return "", nil
+	}
+	_, err = prov.Plan(context.Background(), p, obs)
+	if err == nil || !strings.Contains(err.Error(), `".bashrc" (alice)`) {
+		t.Fatalf("les entrées d'alice doivent faire refuser, obtenu : %v", err)
+	}
+	if strings.Contains(err.Error(), "n'a pas créé") {
+		t.Errorf("le refus ne doit pas affirmer ce qu'ogs ne sait pas : %v", err)
+	}
+}
+
+func TestLaCreationRepareUnCompteSupprimeALaMain(t *testing.T) {
+	// « userdel » à la main, une saga de création déroulée, une suppression qui a
+	// retiré le compte sans le home : la racine reste, pleine de l'arborescence
+	// d'ogs, à un UID devenu orphelin. L'apply recréait le compte ; refuser tout
+	// home non vide l'en empêchait (relecture du lot R).
+	p, prov, _, ident := fixture(t)
+	identiteDeLEssai(ident)
+	apply(t, prov, p)
+	delete(ident.Users, "shopfr")
+	delete(ident.Groups, "shopfr")
+	steps, err := planReel(t, prov, p, "")
+	if err != nil {
+		t.Fatalf("un home au seul UID orphelin doit être repris : %v", err)
+	}
+	var recree bool
+	for _, s := range steps {
+		if s.Resource == "system/user/shopfr" && s.Action == engine.Create {
+			recree = true
+		}
+	}
+	if !recree {
+		t.Error("le compte doit être recréé")
+	}
+}
+
+func TestLesEntreesDesComptesSystemeNeRetiennentRien(t *testing.T) {
+	// www-data, nobody, un compte de service : un site adopté servi par mod_php
+	// n'est pas le home de quelqu'un d'autre.
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "upload.jpg"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	moi := os.Getuid()
+	defs := filepath.Join(t.TempDir(), "login.defs")
+	precedent := LoginDefsPath
+	t.Cleanup(func() { LoginDefsPath = precedent })
+	LoginDefsPath = defs
+	nomme := func(nom string) func(int) (string, error) {
+		return func(int) (string, error) { return nom, nil }
+	}
+	cas := []struct {
+		nom, defs string
+		retenu    bool
+	}{
+		{"alice", fmt.Sprintf("UID_MIN %d\nUID_MAX %d\n", moi, moi), moi != 0},
+		{WebUser, "", false},
+		{"service", fmt.Sprintf("UID_MIN %d\n", moi+1), false},
+		{"nobody", fmt.Sprintf("UID_MAX %d\n", moi-1), false},
+	}
+	for _, c := range cas {
+		if err := os.WriteFile(defs, []byte(c.defs), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		found, err := ForeignEntries(root, -1, nomme(c.nom))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if (len(found) > 0) != c.retenu {
+			t.Errorf("%s : retenu attendu %v, obtenu %v", c.nom, c.retenu, found)
+		}
+	}
+	if found, _ := ForeignEntries(root, moi, nomme("alice")); len(found) != 0 {
+		t.Errorf("les entrées du compte du projet ne retiennent rien : %v", found)
+	}
+}
+
+func TestLaCreationRefuseLeHomeVideDUnAutreCompte(t *testing.T) {
+	// Vide, il reste le home d'alice : le donner au projet le lui retire.
+	p, prov, _, _ := fixture(t)
+	homePreexistant(t, p)
+	_, err := planReel(t, prov, p, "alice")
+	if err == nil || !strings.Contains(err.Error(), "appartient au compte alice") {
+		t.Fatalf("le home vide d'un compte existant doit être refusé, obtenu : %v", err)
+	}
+}
+
+func TestLaCreationAnnonceLaRepriseDUnRepertoireVide(t *testing.T) {
+	// Un répertoire vide sans compte — préparé par l'exploitant, laissé par une
+	// compensation — est repris ; le changement de propriétaire est annoncé, là
+	// où il se glissait sous l'étape du mode.
+	p, prov, _, _ := fixture(t)
+	homePreexistant(t, p)
+	steps, err := planReel(t, prov, p, "")
+	if err != nil {
+		t.Fatalf("un répertoire vide sans compte doit être repris : %v", err)
+	}
+	res := "system/dir/" + p.Spec.Layout.Root
+	for _, s := range steps {
+		if s.Resource != res {
+			continue
+		}
+		if !s.Mutates() || !strings.Contains(s.Summary, "repris : propriétaire") {
+			t.Errorf("la reprise de la racine doit être annoncée : %s", s)
+		}
+		return
+	}
+	t.Fatalf("aucune étape pour la racine %s", res)
+}
+
+func TestLeHomeExistantNeBloqueNiLAdoptionNiUnCompteExistant(t *testing.T) {
+	// Un projet adopté reprend légitimement ce qui existe ; un compte déjà là a
+	// déjà son home — c'est le cas de tout apply après le premier.
+	p, prov, _, ident := fixture(t)
+	homePreexistant(t, p, "index.html")
+	p.Metadata.Labels = map[string]string{"adopted": "true"}
+	if _, err := planReel(t, prov, p, "alice"); err != nil {
+		t.Errorf("un projet adopté ne doit pas être refusé : %v", err)
+	}
+	delete(p.Metadata.Labels, "adopted")
+	identiteDeLEssai(ident)
+	if _, err := planReel(t, prov, p, "alice"); err != nil {
+		t.Errorf("un compte existant ne doit pas voir son home refusé : %v", err)
+	}
+}
+
+// orphelin observe le projet comme si sa racine était à l'UID uid, sans compte,
+// et calcule le plan sous l'exécuteur réel.
+func orphelin(t *testing.T, prov *Provider, p *model.Project, uid int) error {
+	t.Helper()
+	prov.Exec = &exec.Local{}
+	prov.AccountOfUID = func(int) (string, error) { return "", nil }
+	obs, err := prov.Observe(context.Background(), p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := obs.Dirs[p.Spec.Layout.Root]
+	st.UID = uid
+	obs.Dirs[p.Spec.Layout.Root] = st
+	_, err = prov.Plan(context.Background(), p, obs)
+	return err
+}
+
+func TestLaCreationRefuseLeHomeDUnCompteSupprime(t *testing.T) {
+	// « useradd -m bob », une clé dans .ssh/authorized_keys, « userdel bob » sans
+	// -r : le home reste, à l'UID 1004 devenu orphelin, que useradd redonne au
+	// compte du projet. Repris, il lui donnait les fichiers de bob et, par
+	// l'authorized_keys régulier que D61 ne remplace jamais, un shell sous le
+	// compte du projet à la clé de bob ; « project delete » l'effaçait ensuite.
+	p, prov, _, _ := fixture(t)
+	homePreexistant(t, p, ".bashrc", "secret.txt")
+	if err := os.MkdirAll(filepath.Join(p.Spec.Layout.Root, ".ssh"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(AuthorizedKeysPath(p.Spec.Layout.Root), []byte("ssh-ed25519 AAAA bob\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := orphelin(t, prov, p, 1004)
+	if err == nil {
+		t.Fatal("le home d'un compte supprimé ne doit pas être repris")
+	}
+	for _, want := range []string{"l'UID 1004, sans compte", `"secret.txt"`, `".ssh/authorized_keys" (l'accès ssh`} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("le refus doit contenir %q : %v", want, err)
+		}
+	}
+	// À root, le même contenu n'est pas davantage à ogs.
+	if err := orphelin(t, prov, p, 0); err == nil || !strings.Contains(err.Error(), "à root") {
+		t.Errorf("un home à root au contenu étranger doit être refusé, obtenu : %v", err)
+	}
+	// Connu de la base d'état à ce chemin, c'est le home du projet : son compte
+	// a été supprimé à la main.
+	prov.KnownHome = func(*model.Project) bool { return true }
+	if err := orphelin(t, prov, p, 1004); err != nil {
+		t.Errorf("un home connu de la base d'état doit être repris : %v", err)
+	}
+}
+
+func TestLaCreationRepriseLeSqueletteDOgs(t *testing.T) {
+	// Une saga de création déroulée laisse l'arborescence, le gestionnaire de
+	// runtime, la clé de déploiement et le lien du trousseau commun : c'est à
+	// ogs, et l'apply suivant doit recréer le compte.
+	p, prov, _, _ := fixture(t)
+	root := p.Spec.Layout.Root
+	homePreexistant(t, p)
+	for _, d := range []string{"www/public", "var/sessions", ".local/bin", ".ssh", ".nvm/versions"} {
+		if err := os.MkdirAll(filepath.Join(root, d), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, f := range []string{KeyName, KeyName + ".pub"} {
+		if err := os.WriteFile(filepath.Join(root, ".ssh", f), []byte("clé\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(root, "www", "public", "index.html"), []byte("site\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(prov.Paths.DefaultAuthorizedKeys(), AuthorizedKeysPath(root)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("/var/log/ogs-projects/shopfr", filepath.Join(root, model.LogLink)); err != nil {
+		t.Fatal(err)
+	}
+	if err := orphelin(t, prov, p, 1004); err != nil {
+		t.Errorf("le squelette d'ogs doit être repris : %v", err)
+	}
+	// ogs ne pose que des liens dans .local/bin : un exécutable laissé là par
+	// l'ancien titulaire serait dans le PATH du projet.
+	composer := filepath.Join(root, model.LinkDir, "composer")
+	if err := os.WriteFile(composer, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := orphelin(t, prov, p, 1004); err == nil || !strings.Contains(err.Error(), `".local/bin/composer"`) {
+		t.Errorf("un fichier régulier dans .local/bin doit être refusé, obtenu : %v", err)
+	}
+	_ = os.Remove(composer)
+	if err := os.Symlink("/usr/bin/php8.3", filepath.Join(root, model.LinkDir, "php")); err != nil {
+		t.Fatal(err)
+	}
+	if err := orphelin(t, prov, p, 1004); err != nil {
+		t.Errorf("un lien dans .local/bin est ce qu'ogs y pose : %v", err)
+	}
+	// Un lien du trousseau qui mène ailleurs n'est plus celui d'ogs.
+	_ = os.Remove(AuthorizedKeysPath(root))
+	if err := os.Symlink("/home/bob/cles", AuthorizedKeysPath(root)); err != nil {
+		t.Fatal(err)
+	}
+	if err := orphelin(t, prov, p, 1004); err == nil {
+		t.Error("un authorized_keys qui ne désigne pas le trousseau commun doit être refusé")
 	}
 }

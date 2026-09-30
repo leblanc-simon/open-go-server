@@ -19,6 +19,7 @@ import (
 	ogsfs "leblanc.io/open-go-server/internal/fs"
 	"leblanc.io/open-go-server/internal/model"
 	"leblanc.io/open-go-server/internal/provider/system"
+	"leblanc.io/open-go-server/internal/store"
 )
 
 // projetDeRacine fabrique le strict nécessaire au dernier rempart : une racine et
@@ -1162,4 +1163,156 @@ func (m *mysqlFactice) répondre(c net.Conn, q string) {
 		envoyer(chaîneMySQL(l))
 	}
 	envoyer(eof)
+}
+
+func TestLesEntreesDUnAutreCompteRetiennentLaRacine(t *testing.T) {
+	// Avant D95, la création d'un projet sur le home laissé par alice donnait la
+	// racine au projet : le contrôle de son propriétaire passait, et tout ce
+	// qu'alice y avait laissé partait avec lui (R2-42). Ses entrées de premier
+	// niveau, restées à elle, le trahissent — et --force n'y change rien : le
+	// refus est de ceux que rien ne lève, prononcés par rootRefusals.
+	a := appDeRempart(t)
+	a.Exec = &exec.Local{}
+	a.Force = true
+	plageDuLanceur(t)
+	root := filepath.Join(t.TempDir(), "shop.fr")
+	if err := os.MkdirAll(filepath.Join(root, "www"), 0o711); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, ".bashrc"), []byte("à alice\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p := projetDeRacine(root, true)
+	p.Spec.User.Name = "ogs-compte-absent-de-l-essai"
+	moi := os.Getuid()
+	precedent := accountOfUID
+	t.Cleanup(func() { accountOfUID = precedent })
+	accountOfUID = func(uid int) (string, error) {
+		if uid == moi {
+			return "alice", nil
+		}
+		return "", nil
+	}
+	rs := a.rootRefusals(p)
+	var trouve *refusal
+	for _, r := range rs {
+		if strings.Contains(r.what, `".bashrc" (alice)`) {
+			trouve = r
+		}
+	}
+	if trouve == nil {
+		t.Fatalf("l'entrée d'alice doit être nommée dans un refus : %v", rs.constat())
+	}
+	if trouve.code != CodeConflict {
+		t.Errorf("le refus doit rendre %d, obtenu %d", CodeConflict, trouve.code)
+	}
+	if code := ExitCode(rs.err(p.ID())); code != CodeConflict {
+		t.Errorf("la suppression doit rendre %d sous --force, obtenu %d", CodeConflict, code)
+	}
+
+	// Un UID orphelin, www-data ou un compte système ne retiennent rien : c'est
+	// ce que laisse un compte supprimé, ou un site adopté servi par mod_php.
+	accountOfUID = func(int) (string, error) { return "", nil }
+	for _, r := range a.rootRefusals(p) {
+		if strings.Contains(r.what, ".bashrc") {
+			t.Errorf("un UID orphelin ne doit rien retenir : %s", r.what)
+		}
+	}
+}
+
+// plageDuLanceur fait de l'UID du lanceur un compte ordinaire (login.defs de
+// substitution), pour qu'il puisse jouer alice quelle que soit la machine. En
+// root, l'UID 0 est toujours ignoré : l'essai est sauté.
+func plageDuLanceur(t *testing.T) {
+	t.Helper()
+	moi := os.Getuid()
+	if moi == 0 {
+		t.Skip("l'UID 0 est toujours ignoré : alice ne peut pas être jouée par root")
+	}
+	defs := filepath.Join(t.TempDir(), "login.defs")
+	if err := os.WriteFile(defs, []byte(fmt.Sprintf("UID_MIN %d\nUID_MAX %d\n", moi, moi)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	precedent := system.LoginDefsPath
+	t.Cleanup(func() { system.LoginDefsPath = precedent })
+	system.LoginDefsPath = defs
+}
+
+func TestLaCreationEprouveLeHomeAvantDeDeposer(t *testing.T) {
+	// « site create », « site clone » et « project create » déposaient la
+	// déclaration, que le plan refusait ensuite : restée, elle arrêtait tout
+	// « ogs apply » du parc. Le contrôle qu'ils appellent avant spec.Save rend
+	// le code 4 sur le home d'un autre compte.
+	a := appDeRempart(t)
+	a.Exec = &exec.Local{}
+	root := filepath.Join(t.TempDir(), "shop.fr")
+	if err := os.MkdirAll(root, 0o711); err != nil {
+		t.Fatal(err)
+	}
+	p := projetDeRacine(root, false)
+	p.Spec.User.Name = "ogs-compte-absent-de-l-essai"
+	moi := os.Getuid()
+	precedent := accountOfUID
+	t.Cleanup(func() { accountOfUID = precedent })
+	accountOfUID = func(uid int) (string, error) {
+		if uid == moi && moi != 0 {
+			return "alice", nil
+		}
+		return "", nil
+	}
+	if moi == 0 {
+		t.Skip("la racine de l'essai est à root, qui ne tient aucun home")
+	}
+	err := a.preexistingHome(context.Background(), p)
+	if code := ExitCode(err); code != CodeConflict || !strings.Contains(err.Error(), "alice") {
+		t.Fatalf("le home d'alice doit être refusé en %d, obtenu %d : %v", CodeConflict, code, err)
+	}
+	accountOfUID = func(int) (string, error) { return "", nil }
+	if err := a.preexistingHome(context.Background(), p); err != nil {
+		t.Errorf("un répertoire vide sans compte doit passer : %v", err)
+	}
+}
+
+func TestUnHomeConnuNeVautQuePourUnProjetActif(t *testing.T) {
+	// La base d'état reconnaît le home d'un projet dont on a supprimé le compte
+	// à la main (D95). « project delete » sans --purge garde la ligne, archivée,
+	// home compris : une restauration reprenait alors le home qu'un autre compte
+	// avait posé depuis à ce chemin, fichiers et authorized_keys compris.
+	a := appDeRempart(t)
+	a.Exec = &exec.Local{}
+	if err := a.openStore(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = a.Store.Close() })
+	root := filepath.Join(t.TempDir(), "shop.fr")
+	if err := os.MkdirAll(filepath.Join(root, "www"), 0o711); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, ".bash_history"), []byte("ls\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p := model.New("shop.fr", "prod", model.KindStatic)
+	p.Spec.Layout.Root = root
+	p.Spec.Layout.Dirs = []model.Dir{{Path: "www", Mode: "0710"}}
+	p.Spec.User.Name = "ogs-compte-absent-de-l-essai"
+	precedent := accountOfUID
+	t.Cleanup(func() { accountOfUID = precedent })
+	accountOfUID = func(int) (string, error) { return "", nil } // racine à un UID orphelin
+
+	if err := a.preexistingHome(context.Background(), p); err == nil {
+		t.Fatal("un home inconnu portant .bash_history doit être refusé")
+	}
+	if err := a.Store.UpsertProject(store.ProjectRow{ID: p.ID(), Host: "shop.fr", Env: "prod",
+		Home: root, Status: "active"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.preexistingHome(context.Background(), p); err != nil {
+		t.Errorf("le home d'un projet actif, compte supprimé à la main, doit être repris : %v", err)
+	}
+	if err := a.Store.SetProjectStatus(p.ID(), "archived"); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.preexistingHome(context.Background(), p); ExitCode(err) != CodeConflict {
+		t.Errorf("une ligne archivée ne reconnaît plus le home : code %d (%v)", ExitCode(err), err)
+	}
 }

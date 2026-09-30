@@ -487,51 +487,6 @@ func (s *Store) ACMEPause(key string) (until time.Time, paused bool, err error) 
 	return until, time.Now().Before(until), nil
 }
 
-// UnmanagedRow est une ressource laissée hors gestion.
-type UnmanagedRow struct {
-	Kind   string `json:"kind" yaml:"kind"`
-	Name   string `json:"name" yaml:"name"`
-	Detail string `json:"detail" yaml:"detail"`
-	SeenAt string `json:"seenAt" yaml:"seenAt"`
-}
-
-// RecordUnmanaged mémorise une ressource que le moteur ne doit jamais planifier.
-func (s *Store) RecordUnmanaged(kind, name, detail string) error {
-	_, err := s.db.Exec(`
-		INSERT INTO unmanaged (kind, name, detail, seen_at) VALUES (?, ?, ?, ?)
-		ON CONFLICT(kind, name) DO UPDATE SET detail = excluded.detail, seen_at = excluded.seen_at`,
-		kind, name, detail, now())
-	return err
-}
-
-// Unmanaged liste les ressources hors gestion.
-func (s *Store) Unmanaged() ([]UnmanagedRow, error) {
-	rows, err := s.db.Query(`SELECT kind, name, detail, seen_at FROM unmanaged ORDER BY kind, name`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []UnmanagedRow
-	for rows.Next() {
-		var r UnmanagedRow
-		if err := rows.Scan(&r.Kind, &r.Name, &r.Detail, &r.SeenAt); err != nil {
-			return nil, err
-		}
-		out = append(out, r)
-	}
-	return out, rows.Err()
-}
-
-// IsUnmanaged indique si une ressource a été explicitement laissée hors gestion.
-func (s *Store) IsUnmanaged(kind, name string) bool {
-	var count int
-	if err := s.db.QueryRow(`SELECT COUNT(*) FROM unmanaged WHERE kind = ? AND name = ?`,
-		kind, name).Scan(&count); err != nil {
-		return false
-	}
-	return count > 0
-}
-
 // AuditEntry est une ligne du journal d'audit.
 type AuditEntry struct {
 	RunID    string

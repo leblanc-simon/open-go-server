@@ -88,6 +88,11 @@ func newSiteCreateCommand(app *App) *cobra.Command {
 
 			app.printf("site %s\n", p.ID())
 			app.summarizeSite(p)
+			// Le home est éprouvé avant que la déclaration ne soit déposée (D95) : le
+			// plan le refuserait, et la déclaration restée arrêterait tout apply du parc.
+			if err := app.preexistingHome(cmd.Context(), p); err != nil {
+				return err
+			}
 			if app.DryRun {
 				data, err := spec.Encode(p)
 				if err != nil {
@@ -399,6 +404,11 @@ func newSiteCloneCommand(app *App) *cobra.Command {
 			guard := app.cloneGuard(source)
 			declared := reviewDeclared(target, source, guard.Values)
 			withData = withData && len(source.Spec.Databases) > 0 && len(target.Spec.Databases) > 0
+			// Le home est éprouvé avant que la déclaration ne soit déposée (D95) : le
+			// plan le refuserait, et la déclaration restée arrêterait tout apply du parc.
+			if err := app.preexistingHome(cmd.Context(), target); err != nil {
+				return err
+			}
 			if app.DryRun {
 				app.describeCloneGuard(guard, declared, withData)
 				app.printf("\n--dry-run : rien n'a été écrit.\n")
