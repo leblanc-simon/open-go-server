@@ -665,3 +665,47 @@ func TestCommandAndEnvFileReservedToTheirKinds(t *testing.T) {
 		t.Fatalf("envFile sur un site statique doit être refusé, obtenu : %v", err)
 	}
 }
+
+func TestDBAccountsRefuseLesComptesSGBDReserves(t *testing.T) {
+	// Un projet pouvait déclarer root, postgres ou le compte de supervision :
+	// il en recevait des droits sur sa base, et « db user rotate » changeait le
+	// mot de passe du compte d'administration du moteur (D91).
+	for _, c := range []struct {
+		engine, user string
+		extra        bool
+	}{
+		{"mariadb", "root", false}, {"mysql", "mysql", false}, {"mysql", "telegraf", true},
+		{"postgres", "postgres", false}, {"postgres", "root", true}, {"postgres", "pg_monitor", false},
+		{"postgres", "telegraf", false}, {"mysql", "Root", false},
+	} {
+		p := newProject(t, "shop.fr", naming.EnvProd, model.KindStatic)
+		d := model.Database{Engine: c.engine, Name: "shopfr", User: "shopfr", Privileges: "all"}
+		if c.extra {
+			d.ExtraUsers = []model.DBUser{{User: c.user, Privileges: "readonly"}}
+		} else {
+			d.User = c.user
+		}
+		p.Spec.Databases = []model.Database{d}
+		err := DBAccounts(p)
+		if err == nil || !strings.Contains(err.Error(), "réservé") {
+			t.Errorf("%s %s : le compte doit être refusé : %v", c.engine, c.user, err)
+		}
+		// Project, qui juge tout projet chargé, ne le refuse pas : un seul projet
+		// d'avant D91 aurait arrêté les commandes de tout le parc.
+		if err := Project(p, "/home"); err != nil {
+			t.Errorf("%s %s : Project ne doit pas refuser un projet déjà déclaré : %v", c.engine, c.user, err)
+		}
+	}
+	// Les noms que la configuration désigne s'y ajoutent.
+	p := newProject(t, "shop.fr", naming.EnvProd, model.KindStatic)
+	p.Spec.Databases = []model.Database{{Engine: "mysql", Name: "shopfr", User: "metriques", Privileges: "all"}}
+	if err := Project(p, "/home"); err != nil {
+		t.Fatalf("un nom ordinaire doit passer : %v", err)
+	}
+	if err := DBAccounts(p, "metriques"); err == nil || !strings.Contains(err.Error(), "configuration") {
+		t.Errorf("le compte de supervision configuré doit être refusé : %v", err)
+	}
+	if err := DBAccounts(p, "autre"); err != nil {
+		t.Errorf("aucun refus attendu : %v", err)
+	}
+}

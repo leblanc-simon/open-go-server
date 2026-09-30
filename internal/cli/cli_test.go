@@ -1024,6 +1024,81 @@ func TestDatabaseAddRejectsDuplicateAndUnknownEngine(t *testing.T) {
 	}
 }
 
+func TestDatabaseUserRefuseLesComptesReserves(t *testing.T) {
+	// « db user add shopfr root » était accepté, et « db user rotate shopfr root »
+	// partait vers le moteur changer le mot de passe du compte d'administration
+	// (D91). Le compte de supervision configuré est réservé au même titre.
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("project", "create", "shop.fr", "--kind", "static", "--db", "mariadb")
+	for _, name := range []string{"root", "mysql", "telegraf"} {
+		if out, code := h.run("db", "user", "add", "shopfr", name); code != CodeValidation ||
+			!strings.Contains(out, "réservé") {
+			t.Errorf("%s : code %d attendu %d :\n%s", name, code, CodeValidation, out)
+		}
+	}
+	path := h.path("etc", "ogs", "projects", "shopfr.yaml")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "extraUsers") {
+		t.Errorf("le compte refusé ne doit pas être écrit :\n%s", data)
+	}
+	// Un projet déclaré à la main avec root est refusé, et la rotation avec lui :
+	// elle ne l'atteint jamais.
+	patched := strings.Replace(string(data), "      user: shopfr\n",
+		"      user: shopfr\n      extraUsers:\n        - user: root\n          privileges: all\n", 1)
+	if patched == string(data) {
+		t.Fatalf("déclaration inattendue :\n%s", data)
+	}
+	if err := os.WriteFile(path, []byte(patched), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if out, code := h.run("db", "user", "rotate", "shopfr", "root", "--yes"); code != CodeValidation ||
+		!strings.Contains(out, "réservé") {
+		t.Errorf("rotation de root : code %d attendu %d :\n%s", code, CodeValidation, out)
+	}
+}
+
+func TestUnCompteReserveDejaDeclareNArretePasLeParc(t *testing.T) {
+	// Refusé au chargement, un seul projet d'avant D91 déclarant root rendait le
+	// code 3 à tout le parc : plan et apply d'un projet sain, « cert renew » du
+	// timer, et la suppression du fautif comme d'un voisin (D91).
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRunPartial("project", "create", "shop.fr", "--kind", "static", "--db", "mariadb")
+	h.mustRun("project", "create", "voisin.fr", "--kind", "static")
+	path := h.path("etc", "ogs", "projects", "shopfr.yaml")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	patched := strings.Replace(string(data), "      user: shopfr\n", "      user: root\n", 1)
+	if patched == string(data) {
+		t.Fatalf("déclaration inattendue :\n%s", data)
+	}
+	if err := os.WriteFile(path, []byte(patched), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{
+		{"plan", "voisinfr"}, {"apply", "voisinfr", "--yes"}, {"plan"}, {"cert", "renew", "--all"},
+	} {
+		if out, code := h.run(args...); code == CodeValidation || code == CodeError {
+			t.Errorf("%v : code %d :\n%s", args, code, out)
+		}
+	}
+	// Le projet fautif voit sa base refusée, sans que rien ne soit exécuté.
+	if out, code := h.run("plan", "shopfr"); code == CodeValidation || !strings.Contains(out, "réservé") {
+		t.Errorf("la base au compte réservé doit être refusée dans le plan, code %d :\n%s", code, out)
+	}
+	for _, id := range []string{"voisinfr", "shopfr"} {
+		if out, code := h.run("project", "delete", id, "--yes", "--no-dump"); code != CodeOK && code != CodePartial {
+			t.Errorf("suppression de %s : code %d :\n%s", id, code, out)
+		}
+	}
+}
+
 func TestDatabaseRemoveKeepsData(t *testing.T) {
 	h := newHarness(t)
 	h.mustRun("init")

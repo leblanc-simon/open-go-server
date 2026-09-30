@@ -249,6 +249,19 @@ func (a *App) prepare(p *model.Project) error {
 	return nil
 }
 
+// reservedDBAccounts énumère les comptes SGBD que la configuration désigne et
+// qu'aucun projet ne doit déclarer (D91) : ceux de la supervision — le compte
+// MySQL et le rôle PostgreSQL, qui porte le nom de l'utilisateur système de
+// l'agent (D67) — et le rôle d'administration PostgreSQL (D44). Les noms fixes,
+// root et postgres en tête, sont ceux de validate.ReservedDBAccount.
+func (a *App) reservedDBAccounts() []string {
+	return []string{
+		a.Cfg.Monitoring.TelegrafAccount(),
+		a.Cfg.Monitoring.TelegrafUser(),
+		db.PostgresAdminRole(os.Getenv("OGS_PG_ADMIN")),
+	}
+}
+
 // logsRoot renvoie la racine des journaux des projets, préfixe appliqué.
 func (a *App) logsRoot() string { return filepath.Clean(a.Paths.LogsRoot(a.Cfg)) }
 
@@ -313,7 +326,8 @@ func (a *App) buildProviders() (*providers, error) {
 		Owner: func(proj *model.Project) (int, int, error) { return sys.ResolveOwner(proj, "") }}
 	amqpProv := a.amqpProvider()
 	amqpPort := amqpProv.Port
-	dbProv := &db.Provider{Paths: a.Paths, Exec: a.Exec, Store: a.Store, Keys: a.Keys, AMQPPort: amqpPort}
+	dbProv := &db.Provider{Paths: a.Paths, Exec: a.Exec, Store: a.Store, Keys: a.Keys, AMQPPort: amqpPort,
+		Reserved: a.reservedDBAccounts()}
 	certStore := tlsprov.Store{Paths: a.Paths}
 	certs := &tlsprov.Provider{
 		Paths: a.Paths, Cfg: a.Cfg, Store: certStore, DB: a.Store,

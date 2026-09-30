@@ -117,6 +117,9 @@ func newProjectCreateCommand(app *App) *cobra.Command {
 			if err := app.preexistingHome(cmd.Context(), p); err != nil {
 				return err
 			}
+			if err := app.refuseReservedDBAccounts(p); err != nil {
+				return err
+			}
 			if app.DryRun {
 				data, err := spec.Encode(p)
 				if err != nil {

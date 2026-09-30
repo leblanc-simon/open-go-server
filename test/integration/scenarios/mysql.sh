@@ -224,6 +224,63 @@ echo "bases et utilisateur supprimés ; le leurre, qui n'appartenait pas au proj
 mariadb -N -e "SELECT schema_name FROM information_schema.schemata WHERE schema_name='shopfrXstats'"
 
 echo
+echo "--- une base et un compte homonymes préexistants ne sont ni repris ni supprimés (D91) ---"
+# Le site resté hors d'ogs porte les noms qu'ogs dérive du host : la création les
+# reprenait sans un mot — GRANT au compte trouvé, mot de passe scellé qu'il
+# n'avait jamais posé —, et « project delete » les emportait, DROP DATABASE et
+# DROP USER compris.
+mariadb -e "CREATE DATABASE blogfr; CREATE USER 'blogfr'@'localhost' IDENTIFIED BY 'ancien';
+            GRANT SELECT ON blogfr.* TO 'blogfr'@'localhost';
+            CREATE TABLE blogfr.billets (id INT); INSERT INTO blogfr.billets VALUES (1)"
+ogs site create blog.fr --kind static --db mysql --tls=false --yes >/tmp/blog.log 2>&1
+code=$?
+if [ "$code" != 6 ] || ! grep -q "sans qu'ogs l'ait créé" /tmp/blog.log || ! grep -q "renommer" /tmp/blog.log; then
+    echo "ÉCHEC : la reprise de l'homonyme n'est pas refusée (code $code)"
+    tail -8 /tmp/blog.log | sed 's/^/  /'
+    exit 1
+fi
+if mariadb -N -e "SHOW GRANTS FOR 'blogfr'@'localhost'" | grep -q "ALL PRIVILEGES"; then
+    echo "ÉCHEC : le compte préexistant a reçu les droits du projet"
+    exit 1
+fi
+if ogs secrets list blogfr 2>/dev/null | grep -q "mysql/blogfr"; then
+    echo "ÉCHEC : un mot de passe a été scellé pour un compte qu'ogs n'a pas créé"
+    exit 1
+fi
+ogs project delete blogfr --yes >/tmp/blog.log 2>&1
+if [ "$(mariadb -N -e "SELECT COUNT(*) FROM blogfr.billets" 2>/dev/null)" != 1 ] || \
+    ! mariadb -h 127.0.0.1 -u blogfr -pancien blogfr -e 'SELECT 1' >/dev/null 2>&1; then
+    echo "ÉCHEC : la suppression du projet a emporté la base ou le compte d'un autre"
+    tail -8 /tmp/blog.log | sed 's/^/  /'
+    exit 1
+fi
+if ! grep -q "conservé" /tmp/blog.log; then
+    echo "ÉCHEC : la suppression ne dit pas ce qu'elle laisse"
+    tail -8 /tmp/blog.log | sed 's/^/  /'
+    exit 1
+fi
+echo "l'homonyme est refusé à la création, laissé intact à la suppression, et nommé"
+
+echo
+echo "--- les comptes d'administration ne sont pas déclarables (D91) ---"
+ogs site create admin.fr --kind static --db mysql --tls=false --yes >/dev/null 2>&1
+for compte in root mysql telegraf; do
+    ogs db user add adminfr "$compte" >/tmp/admin.log 2>&1
+    code=$?
+    if [ "$code" != 3 ]; then
+        echo "ÉCHEC : « db user add adminfr $compte » accepté (code $code)"
+        tail -3 /tmp/admin.log | sed 's/^/  /'
+        exit 1
+    fi
+done
+ogs project delete adminfr --yes >/dev/null 2>&1
+if ! mariadb -e 'SELECT 1' >/dev/null 2>&1; then
+    echo "ÉCHEC : root n'administre plus MariaDB par le socket"
+    exit 1
+fi
+echo "root, mysql et telegraf sont refusés ; root administre toujours le moteur par le socket"
+
+echo
 echo "--- un compte existant sous un autre hôte n'est pas masqué ---"
 # Le cas d'un serveur repris : 'vitrinefr'@'%', dont l'application connaît le mot
 # de passe. MySQL retient pour chaque connexion le compte à l'hôte le plus
@@ -232,6 +289,15 @@ echo "--- un compte existant sous un autre hôte n'est pas masqué ---"
 mariadb -e "CREATE DATABASE vitrinefr; CREATE USER 'vitrinefr'@'%' IDENTIFIED BY 'ancien';
             GRANT ALL PRIVILEGES ON vitrinefr.* TO 'vitrinefr'@'%'"
 ogs site create vitrine.fr --kind static --db mysql --tls=false --yes >/tmp/vitrine.log 2>&1
+# Hors adoption, la base préexistante est refusée (D91) ; un serveur repris l'est
+# par « ogs import », qui marque le projet adopté — ce que la déclaration fait ici.
+if ! grep -q "sans qu'ogs l'ait créé" /tmp/vitrine.log; then
+    echo "ÉCHEC : la base préexistante d'un projet non adopté n'est pas refusée"
+    tail -5 /tmp/vitrine.log
+    exit 1
+fi
+sed -i 's/^metadata:$/metadata:\n  labels:\n    adopted: "true"/' /etc/ogs/projects/vitrinefr.yaml
+ogs apply vitrinefr --yes >/tmp/vitrine.log 2>&1
 if mariadb -N -e "SELECT host FROM mysql.user WHERE user='vitrinefr'" | grep -qx localhost; then
     echo "ÉCHEC : 'vitrinefr'@'localhost' a été créé à côté de 'vitrinefr'@'%'"
     exit 1

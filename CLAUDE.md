@@ -586,6 +586,18 @@ Ils ont tous coûté un défaut réel ; les tests unitaires ne les voyaient pas.
 - Apache a besoin de sept modules (`ssl`, `proxy`, `proxy_fcgi`, `proxy_http`, `rewrite`, `headers`,
   `status`) ; sans eux la configuration est acceptée puis rend une 500 illisible — ou, pour `status`, une
   page vide. `doctor` les énumère.
+- **Une base ou un compte SGBD n'est à ogs que s'il l'a créé** (D91) : un compte, si son mot de passe est
+  scellé dans la portée du projet ; une base, si ce compte y a ses droits. `CREATE … IF NOT EXISTS` ne dit
+  rien de l'appartenance — il reprenait en silence l'homonyme d'un site resté hors d'ogs, que la
+  suppression du projet emportait ensuite. Hors adoption, l'homonyme est refusé à la création et laissé à
+  la suppression ; une compensation ne retire que ce que son étape a créé, jamais le compte qu'une autre
+  base du projet emploie. Sous MySQL, **compte, GRANT, puis base** : le GRANT est accepté sur une base
+  absente, et une base créée d'abord restait, sur un `CREATE USER` refusé, sans droits donc étrangère —
+  une étape en échec n'est jamais compensée. Et **`ALTER USER 'root'@'localhost' IDENTIFIED BY` remplace,
+  sous MariaDB, l'authentification `unix_socket`** par laquelle ogs administre le moteur : d'où les
+  comptes réservés (`validate.ReservedDBAccount`), refusés aux points d'écriture d'une déclaration,
+  **jamais au chargement** — un seul projet fautif rendait le code 3 à tout le parc, `cert renew` du timer
+  compris —, et qu'aucune suppression ne retire.
 - MySQL : le nom de base après `ON` est un motif où `_` est un joker, donc échappé — **et déséchappé à la
   relecture**, sans quoi toute base contenant un souligné reste éternellement « en écart ». Le nom
   d'utilisateur, lui, est un littéral.

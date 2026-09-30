@@ -12,6 +12,7 @@ import (
 	"leblanc.io/open-go-server/internal/model"
 	"leblanc.io/open-go-server/internal/provider/db"
 	"leblanc.io/open-go-server/internal/spec"
+	"leblanc.io/open-go-server/internal/validate"
 )
 
 func newDBCommand(app *App) *cobra.Command {
@@ -146,6 +147,9 @@ func newDBAddCommand(app *App) *cobra.Command {
 				}
 			}
 			p.Spec.Databases = append(p.Spec.Databases, decl)
+			if err := app.checkDBAccounts(p); err != nil {
+				return err
+			}
 			if app.DryRun {
 				app.printf("--dry-run : la base %s %s serait déclarée\n", decl.Engine, decl.Name)
 				return nil
@@ -323,6 +327,11 @@ func newDBUserAddCommand(app *App) *cobra.Command {
 			}
 			p.Spec.Databases[0].ExtraUsers = append(p.Spec.Databases[0].ExtraUsers,
 				model.DBUser{User: name, Privileges: privileges})
+			// Le fichier n'est relu et validé qu'à la commande suivante : un compte
+			// réservé y serait écrit, et le projet refusé partout ensuite (D91).
+			if err := app.checkDBAccounts(p); err != nil {
+				return err
+			}
 			if err := spec.Save(app.Paths.ProjectFile(p.ID()), p); err != nil {
 				return wrap(CodeError, err)
 			}
@@ -362,6 +371,12 @@ func newDBUserRotateCommand(app *App) *cobra.Command {
 			if decl == nil {
 				return exitf(CodeUsage, "aucun utilisateur %q déclaré dans %s", user, p.ID())
 			}
+			// Avant la confirmation : le provider refuse aussi, mais sans connaître
+			// les comptes que la configuration désigne.
+			if why := validate.ReservedDBAccount(decl.Engine, user, app.reservedDBAccounts()...); why != "" {
+				return exitf(CodeValidation, "compte %q réservé (%s) : ogs n'en change pas le mot de passe",
+					user, why)
+			}
 			if err := app.confirm(fmt.Sprintf("régénérer le mot de passe de %s ?", user)); err != nil {
 				return err
 			}
@@ -382,6 +397,26 @@ func newDBUserRotateCommand(app *App) *cobra.Command {
 			return nil
 		},
 	}
+}
+
+// checkDBAccounts refuse, avant toute écriture, les comptes SGBD réservés d'une
+// déclaration (D91).
+func (a *App) checkDBAccounts(p *model.Project) error {
+	if err := validate.Project(p, a.homeRoot()); err != nil {
+		return exitf(CodeValidation, "projet %s :\n%v", p.ID(), err)
+	}
+	return a.refuseReservedDBAccounts(p)
+}
+
+// refuseReservedDBAccounts refuse, en code 3, une déclaration qui nomme un compte
+// SGBD réservé (D91). Il vaut aux points d'écriture d'une déclaration — db add,
+// db user add, project et site create, import, restore — et jamais au chargement :
+// un seul projet d'avant D91 aurait arrêté toutes les commandes du parc.
+func (a *App) refuseReservedDBAccounts(p *model.Project) error {
+	if err := validate.DBAccounts(p, a.reservedDBAccounts()...); err != nil {
+		return exitf(CodeValidation, "projet %s :\n%v", p.ID(), err)
+	}
+	return nil
 }
 
 // pickDatabase retrouve la base visée : celle nommée, ou l'unique déclarée.

@@ -4,6 +4,9 @@ import (
 	"os"
 	"strings"
 	"testing"
+
+	"leblanc.io/open-go-server/internal/model"
+	"leblanc.io/open-go-server/internal/naming"
 )
 
 func TestAdoptionRefuseUnConflitAvecLeParc(t *testing.T) {
@@ -114,5 +117,37 @@ func TestImportUnmanagedListeCeQueLeServeurPorteMaintenant(t *testing.T) {
 	}
 	if out := h.mustRun("import", "unmanaged"); strings.Contains(out, "humain") {
 		t.Errorf("un compte supprimé ne doit plus être listé :\n%s", out)
+	}
+}
+
+func TestAdoptionEcarteLesBasesAuCompteReserve(t *testing.T) {
+	// Une application ancienne qui se connecte en root faisait adopter root :
+	// l'import conseillait ensuite « db user rotate », qui changeait le mot de
+	// passe d'administration du moteur (D91).
+	p := model.New("shop.fr", naming.EnvProd, model.KindStatic)
+	if err := p.Normalize(t.TempDir(), "preprod-pp.net"); err != nil {
+		t.Fatal(err)
+	}
+	p.Spec.Databases = []model.Database{
+		{Engine: "mariadb", Name: "shop", User: "root"},
+		{Engine: "mariadb", Name: "shop_api", User: "shop_api"},
+		{Engine: "postgres", Name: "stats", User: "metriques"},
+	}
+	notes := []string{
+		"le mot de passe de root@localhost est inconnu d'ogs : Employer « ogs db user rotate shopfr root » pour en reprendre la main",
+		"le mot de passe de shop_api@localhost est inconnu d'ogs : Employer « ogs db user rotate shopfr shop_api » pour en reprendre la main",
+	}
+	notes = withoutReservedDatabases(p, notes, []string{"metriques"})
+	if len(p.Spec.Databases) != 1 || p.Spec.Databases[0].Name != "shop_api" {
+		t.Fatalf("seule shop_api doit rester déclarée : %+v", p.Spec.Databases)
+	}
+	joined := strings.Join(notes, "\n")
+	if strings.Contains(joined, "rotate shopfr root") {
+		t.Errorf("le conseil de rotation de root doit tomber :\n%s", joined)
+	}
+	for _, want := range []string{"rotate shopfr shop_api", "base shop non déclarée", "base stats non déclarée"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("note absente : %s\n%s", want, joined)
+		}
 	}
 }

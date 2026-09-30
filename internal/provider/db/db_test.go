@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -221,6 +222,7 @@ func TestPlanDetecteUneReductionDePrivileges(t *testing.T) {
 	decl := DefaultDatabase(proj, "mysql")
 	decl.Privileges = string(PrivReadOnly)
 	proj.Spec.Databases = []model.Database{decl}
+	sceller(t, prov, proj, "mysql", "shopfr")
 	withStub(prov, &stubClient{
 		databases: map[string]bool{"shopfr": true},
 		users:     map[string]bool{"shopfr@localhost": true},
@@ -256,6 +258,7 @@ func TestPlanNoscillePasSurUnJeuAllDejaAccorde(t *testing.T) {
 	prov, proj := fixture(t)
 	decl := DefaultDatabase(proj, "mysql")
 	proj.Spec.Databases = []model.Database{decl}
+	sceller(t, prov, proj, "mysql", "shopfr")
 	withStub(prov, &stubClient{
 		databases: map[string]bool{"shopfr": true},
 		users:     map[string]bool{"shopfr@localhost": true},
@@ -282,6 +285,7 @@ func TestPlanDetecteUnElargissementDePrivileges(t *testing.T) {
 	prov, proj := fixture(t)
 	decl := DefaultDatabase(proj, "mysql")
 	proj.Spec.Databases = []model.Database{decl}
+	sceller(t, prov, proj, "mysql", "shopfr")
 	withStub(prov, &stubClient{
 		databases: map[string]bool{"shopfr": true},
 		users:     map[string]bool{"shopfr@localhost": true},
@@ -319,6 +323,8 @@ func TestPlanJugeAussiLesPrivilegesDesComptesAdditionnels(t *testing.T) {
 	decl := DefaultDatabase(proj, "mysql")
 	decl.ExtraUsers = []model.DBUser{{User: "shopfr_ro", Privileges: "readonly"}}
 	proj.Spec.Databases = []model.Database{decl}
+	sceller(t, prov, proj, "mysql", "shopfr")
+	sceller(t, prov, proj, "mysql", "shopfr_ro")
 	stub := &stubClient{
 		databases: map[string]bool{"shopfr": true},
 		users:     map[string]bool{"shopfr@localhost": true, "shopfr_ro@localhost": true},
@@ -395,6 +401,7 @@ func TestObserveRelitLeCompteSousSonHoteReel(t *testing.T) {
 	decl := DefaultDatabase(proj, "mysql")
 	decl.Name, decl.User, decl.Host = "shop", "shop", "%"
 	proj.Spec.Databases = []model.Database{decl}
+	adopter(proj)
 	stub := &stubJournal{stubClient: stubClient{
 		databases: map[string]bool{"shop": true},
 		users:     map[string]bool{"shop@%": true, "root@localhost": true},
@@ -451,6 +458,7 @@ func TestPlanNeMasquePasUnCompteSousUnAutreHote(t *testing.T) {
 	decl := DefaultDatabase(proj, "mysql")
 	decl.Name, decl.User = "shop", "shop"
 	proj.Spec.Databases = []model.Database{decl}
+	adopter(proj)
 	stub := &stubJournal{stubClient: stubClient{
 		databases: map[string]bool{"shop": true},
 		users:     map[string]bool{"shop@%": true, "root@localhost": true},
@@ -661,5 +669,517 @@ func TestDescribeMasksPassword(t *testing.T) {
 	}
 	if !strings.Contains(out, "mot de passe généré") {
 		t.Errorf("le plan doit signaler la présence d'un secret sans le révéler :\n%s", out)
+	}
+}
+
+// --- Appartenance des bases et des comptes (D91) ---
+
+// sceller simule un compte créé par ogs : son mot de passe est scellé dans la
+// portée du projet, comme le fait l'application de toute création.
+func sceller(t *testing.T, prov *Provider, proj *model.Project, engine, user string) {
+	t.Helper()
+	if _, err := prov.ensurePassword(proj.ID(), engine, user); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// adopter marque le projet comme repris d'un serveur existant (« ogs import »).
+func adopter(proj *model.Project) {
+	if proj.Metadata.Labels == nil {
+		proj.Metadata.Labels = map[string]string{}
+	}
+	proj.Metadata.Labels["adopted"] = "true"
+}
+
+func TestCompensationNeSupprimePasUnCompteQuiExistaitDeja(t *testing.T) {
+	// Deux bases du même projet partagent un compte : la seconde, neuve, échoue
+	// plus loin dans la saga. Sa compensation supprimait aussi le compte — celui
+	// dont vit la première base, en production.
+	for _, engineName := range []string{"mysql", "postgres"} {
+		prov, proj := fixture(t)
+		decl := RoleDatabase(proj, engineName, "api")
+		decl.User = proj.ID()
+		decl.ExtraUsers = []model.DBUser{{User: "lecteur", Privileges: "readonly"}, {User: "neuf", Privileges: "readonly"}}
+		proj.Spec.Databases = []model.Database{decl}
+		sceller(t, prov, proj, engineName, proj.ID())
+		sceller(t, prov, proj, engineName, "lecteur")
+		users := map[string]bool{"shopfr@localhost": true, "lecteur@localhost": true}
+		if engineName == "postgres" {
+			users = map[string]bool{"shopfr": true, "lecteur": true}
+		}
+		stub := &stubJournal{stubClient: stubClient{
+			databases: map[string]bool{"shopfr": true}, users: users,
+			grants: map[string]string{"shopfr": "ALTER,CREATE,DELETE,DROP,INDEX,INSERT,SELECT,UPDATE"},
+		}}
+		prov.clients = map[string]Client{engineName: stub}
+
+		obs, err := prov.Observe(context.Background(), proj)
+		if err != nil {
+			t.Fatal(err)
+		}
+		steps, err := prov.Plan(context.Background(), proj, obs)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(steps) != 1 || steps[0].Action != engine.Create || steps[0].Compensate == nil {
+			t.Fatalf("%s : une création compensable attendue : %+v", engineName, steps)
+		}
+		if err := steps[0].Compensate(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		joined := strings.Join(stub.exécutées, "\n")
+		if !strings.Contains(joined, "DROP DATABASE IF EXISTS") || !strings.Contains(joined, "shopfr_api") {
+			t.Errorf("%s : la base créée doit être retirée :\n%s", engineName, joined)
+		}
+		for _, compte := range []string{"'shopfr'", `"shopfr"`, "'lecteur'", `"lecteur"`} {
+			if strings.Contains(joined, "DROP USER IF EXISTS "+compte) || strings.Contains(joined, "DROP ROLE IF EXISTS "+compte) {
+				t.Errorf("%s : la compensation supprime %s, qui existait avant l'étape :\n%s", engineName, compte, joined)
+			}
+		}
+		if !strings.Contains(joined, "'neuf'") && !strings.Contains(joined, `"neuf"`) {
+			t.Errorf("%s : le compte créé par l'étape doit être retiré :\n%s", engineName, joined)
+		}
+	}
+}
+
+func TestPlanRefuseUneBaseOuUnCompteQuOgsNAPasCrees(t *testing.T) {
+	// Une base ou un compte homonyme préexistant était repris sans un mot — et
+	// supprimé avec le projet. Il ne devient pas celui d'ogs en silence.
+	cas := []struct {
+		nom, engine string
+		stub        stubClient
+		attendu     string
+	}{
+		{"base mysql préexistante", "mysql", stubClient{databases: map[string]bool{"shopfr": true},
+			users: map[string]bool{"root@localhost": true}}, "base shopfr"},
+		{"compte mysql préexistant", "mysql", stubClient{databases: map[string]bool{},
+			users: map[string]bool{"shopfr@localhost": true}}, "compte 'shopfr'@'localhost'"},
+		{"base et compte mysql préexistants", "mysql", stubClient{databases: map[string]bool{"shopfr": true},
+			users:  map[string]bool{"shopfr@localhost": true},
+			grants: map[string]string{"shopfr": "ALTER,CREATE,DELETE,DROP,INDEX,INSERT,SELECT,UPDATE"}}, "base shopfr"},
+		{"rôle postgres préexistant", "postgres", stubClient{databases: map[string]bool{},
+			users: map[string]bool{"shopfr": true}}, `rôle shopfr`},
+		{"base postgres préexistante", "postgres", stubClient{databases: map[string]bool{"shopfr": true},
+			users: map[string]bool{}}, "base shopfr"},
+	}
+	for _, c := range cas {
+		prov, proj := fixture(t)
+		proj.Spec.Databases = []model.Database{DefaultDatabase(proj, c.engine)}
+		stub := &stubJournal{stubClient: c.stub}
+		prov.clients = map[string]Client{c.engine: stub}
+		obs, err := prov.Observe(context.Background(), proj)
+		if err != nil {
+			t.Fatal(err)
+		}
+		steps, err := prov.Plan(context.Background(), proj, obs)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(steps) != 1 || steps[0].Critical || steps[0].Action == engine.NoOp {
+			t.Fatalf("%s : une étape non critique en échec attendue : %+v", c.nom, steps)
+		}
+		err = steps[0].Apply(context.Background())
+		// L'import n'est pas une issue : il refuse un projet déjà déclaré.
+		if err == nil || !strings.Contains(err.Error(), c.attendu) || !strings.Contains(err.Error(), "renommer") ||
+			strings.Contains(err.Error(), "ogs import") {
+			t.Errorf("%s : le refus doit nommer %s et les issues réelles : %v", c.nom, c.attendu, err)
+		}
+		if len(stub.exécutées) > 0 {
+			t.Errorf("%s : rien ne doit être exécuté : %v", c.nom, stub.exécutées)
+		}
+		if _, err := prov.Password(proj.ID(), c.engine, "shopfr"); err == nil {
+			t.Errorf("%s : aucun mot de passe ne doit être scellé", c.nom)
+		}
+
+		// Adopté, le projet reprend ses ressources : c'est l'adoption explicite.
+		adopter(proj)
+		if obs, err = prov.Observe(context.Background(), proj); err != nil {
+			t.Fatal(err)
+		}
+		if steps, err = prov.Plan(context.Background(), proj, obs); err != nil {
+			t.Fatal(err)
+		}
+		if len(steps) != 1 || (steps[0].Action != engine.NoOp && !steps[0].Critical) {
+			t.Errorf("%s : un projet adopté ne doit pas être refusé : %+v", c.nom, steps)
+		}
+	}
+}
+
+func TestPlanReconnaitLesBasesQuOgsACreeesAvantD91(t *testing.T) {
+	// Un parc existant ne porte aucune marque : ce qu'ogs y a créé se reconnaît
+	// au mot de passe scellé du compte et aux droits que ce compte a sur la base.
+	// Il doit passer « plan » sans écart.
+	for _, engineName := range []string{"mysql", "postgres"} {
+		prov, proj := fixture(t)
+		decl := DefaultDatabase(proj, engineName)
+		decl.ExtraUsers = []model.DBUser{{User: "lecteur", Privileges: "all"}}
+		proj.Spec.Databases = []model.Database{decl}
+		sceller(t, prov, proj, engineName, "shopfr")
+		sceller(t, prov, proj, engineName, "lecteur")
+		users := map[string]bool{"shopfr@localhost": true, "lecteur@localhost": true}
+		if engineName == "postgres" {
+			users = map[string]bool{"shopfr": true, "lecteur": true}
+		}
+		prov.clients = map[string]Client{engineName: &stubClient{
+			databases: map[string]bool{"shopfr": true}, users: users,
+			grants: map[string]string{"shopfr": "ALTER,CREATE,DELETE,DROP,INDEX,INSERT,SELECT,UPDATE"},
+		}}
+		obs, err := prov.Observe(context.Background(), proj)
+		if err != nil {
+			t.Fatal(err)
+		}
+		steps, err := prov.Plan(context.Background(), proj, obs)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(steps) != 1 || steps[0].Action != engine.NoOp {
+			t.Errorf("%s : aucun changement attendu : %+v", engineName, steps)
+		}
+	}
+}
+
+func TestDropNeDetruitQueCeQuiEstAOgs(t *testing.T) {
+	// La suppression d'un projet non adopté ne détruit que ce qu'ogs a créé : une
+	// base préexistante et un compte dont il n'a jamais tenu le mot de passe
+	// restent en place, et sont nommés.
+	prov, proj := fixture(t)
+	decl := DefaultDatabase(proj, "mysql")
+	decl.ExtraUsers = []model.DBUser{{User: "lecteur", Privileges: "readonly"}}
+	proj.Spec.Databases = []model.Database{decl}
+	sceller(t, prov, proj, "mysql", "lecteur")
+	stub := &stubJournal{stubClient: stubClient{
+		databases: map[string]bool{"shopfr": true},
+		users:     map[string]bool{"shopfr@localhost": true, "lecteur@localhost": true},
+		grantsPar: map[string]map[string]string{"lecteur": {"shopfr": "SELECT,SHOW VIEW"}},
+	}}
+	withStub(prov, stub)
+	obs, err := prov.Observe(context.Background(), proj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	kept, err := prov.Drop(context.Background(), decl, obs.States[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(stub.exécutées, "\n")
+	if strings.Contains(joined, "DROP DATABASE") || strings.Contains(joined, "'shopfr'@") {
+		t.Errorf("la base et le compte préexistants ne doivent pas être supprimés :\n%s", joined)
+	}
+	if !strings.Contains(joined, "DROP USER IF EXISTS 'lecteur'@'localhost'") {
+		t.Errorf("le compte créé par ogs doit partir :\n%s", joined)
+	}
+	if k := strings.Join(kept, " ; "); !strings.Contains(k, "base shopfr") || !strings.Contains(k, "'shopfr'@'localhost'") {
+		t.Errorf("ce qui reste doit être nommé : %v", kept)
+	}
+
+	// Un projet adopté, lui, emporte tout ce qu'il déclare : c'est ce que
+	// « project delete --force » a confirmé (D77).
+	adopter(proj)
+	stub.exécutées = nil
+	if obs, err = prov.Observe(context.Background(), proj); err != nil {
+		t.Fatal(err)
+	}
+	if kept, err = prov.Drop(context.Background(), decl, obs.States[0]); err != nil || len(kept) > 0 {
+		t.Fatalf("rien ne doit rester : %v, %v", kept, err)
+	}
+	joined = strings.Join(stub.exécutées, "\n")
+	if !strings.Contains(joined, "DROP DATABASE IF EXISTS `shopfr`") || !strings.Contains(joined, "'shopfr'@'localhost'") {
+		t.Errorf("la base adoptée et son compte doivent partir :\n%s", joined)
+	}
+}
+
+func TestRotationRefuseLesComptesDAdministration(t *testing.T) {
+	// « db user rotate » sur root changeait le mot de passe du compte par lequel
+	// ogs administre MariaDB — et le scellait comme un secret du projet.
+	for _, c := range []struct{ engine, user string }{
+		{"mariadb", "root"}, {"mysql", "mysql"}, {"postgres", "postgres"}, {"postgres", "pg_monitor"},
+		{"mysql", "telegraf"},
+	} {
+		prov, proj := fixture(t)
+		decl := DefaultDatabase(proj, c.engine)
+		decl.ExtraUsers = []model.DBUser{{User: c.user, Privileges: "all"}}
+		proj.Spec.Databases = []model.Database{decl}
+		adopter(proj)
+		stub := &stubJournal{}
+		prov.clients = map[string]Client{c.engine: stub}
+		if _, err := prov.RotatePassword(context.Background(), proj, decl, c.user); err == nil ||
+			!strings.Contains(err.Error(), "réservé") {
+			t.Errorf("%s %s : la rotation doit être refusée : %v", c.engine, c.user, err)
+		}
+		if len(stub.exécutées) > 0 {
+			t.Errorf("%s %s : rien ne doit être exécuté : %v", c.engine, c.user, stub.exécutées)
+		}
+		if _, err := prov.Password(proj.ID(), c.engine, c.user); err == nil {
+			t.Errorf("%s %s : aucun secret ne doit être scellé", c.engine, c.user)
+		}
+	}
+}
+
+func TestRotationNeReprendPasUnCompteEtranger(t *testing.T) {
+	// Sur un projet non adopté, la rotation d'un compte dont ogs n'a jamais tenu
+	// le mot de passe en ferait le sien sans adoption.
+	prov, proj := fixture(t)
+	decl := DefaultDatabase(proj, "mysql")
+	proj.Spec.Databases = []model.Database{decl}
+	stub := &stubJournal{}
+	withStub(prov, stub)
+	if _, err := prov.RotatePassword(context.Background(), proj, decl, "shopfr"); err == nil {
+		t.Error("la rotation d'un compte étranger doit être refusée")
+	}
+	if len(stub.exécutées) > 0 {
+		t.Errorf("rien ne doit être exécuté : %v", stub.exécutées)
+	}
+	sceller(t, prov, proj, "mysql", "shopfr")
+	if _, err := prov.RotatePassword(context.Background(), proj, decl, "shopfr"); err != nil {
+		t.Errorf("le compte d'ogs doit pouvoir changer de mot de passe : %v", err)
+	}
+}
+
+// stubMoteur est un moteur MySQL qui tient l'état de ce qu'on lui fait créer, et
+// qui refuse la première requête commençant par echoue — de quoi éprouver une
+// création interrompue, puis le plan suivant.
+type stubMoteur struct {
+	stubJournal
+	echoue string
+}
+
+var (
+	reCreeBase   = regexp.MustCompile("^CREATE DATABASE IF NOT EXISTS `([^`]+)`")
+	reCreeCompte = regexp.MustCompile(`^CREATE USER IF NOT EXISTS '([^']+)'@'([^']+)'`)
+	reAccorde    = regexp.MustCompile("^GRANT .* ON `([^`]+)`\\.\\* TO '([^']+)'@")
+)
+
+func (c *stubMoteur) Exec(_ context.Context, stmt string) error {
+	if c.echoue != "" && strings.HasPrefix(stmt, c.echoue) {
+		c.echoue = ""
+		return errors.New("refusé par le moteur")
+	}
+	c.exécutées = append(c.exécutées, stmt)
+	if m := reCreeBase.FindStringSubmatch(stmt); m != nil {
+		c.databases[m[1]] = true
+	}
+	if m := reCreeCompte.FindStringSubmatch(stmt); m != nil {
+		c.users[m[1]+"@"+m[2]] = true
+	}
+	if m := reAccorde.FindStringSubmatch(stmt); m != nil {
+		if c.grantsPar[m[2]] == nil {
+			c.grantsPar[m[2]] = map[string]string{}
+		}
+		c.grantsPar[m[2]][strings.ReplaceAll(m[1], `\_`, "_")] = "ALTER,CREATE,DELETE,DROP,INDEX,INSERT,SELECT,UPDATE"
+	}
+	return nil
+}
+
+func TestUneCreationMySQLInterrompueSeRepareAuPlanSuivant(t *testing.T) {
+	// La base était créée avant son compte et ses droits : un CREATE USER refusé
+	// (plugin indisponible, politique de mots de passe) ou un GRANT en échec
+	// laissait une base sans droits, qu'ogs tenait ensuite pour étrangère — et une
+	// étape en échec n'est jamais compensée. Plus aucun apply ne réparait.
+	for _, echec := range []string{"CREATE USER", "GRANT", "CREATE DATABASE"} {
+		prov, proj := fixture(t)
+		proj.Spec.Databases = []model.Database{DefaultDatabase(proj, "mysql")}
+		stub := &stubMoteur{stubJournal: stubJournal{stubClient: stubClient{
+			databases: map[string]bool{}, users: map[string]bool{"root@localhost": true},
+			grantsPar: map[string]map[string]string{},
+		}}, echoue: echec}
+		withStub(prov, stub)
+
+		obs, _ := prov.Observe(context.Background(), proj)
+		steps, err := prov.Plan(context.Background(), proj, obs)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := steps[0].Apply(context.Background()); err == nil {
+			t.Fatalf("%s : l'échec simulé n'a pas eu lieu", echec)
+		}
+		obs, _ = prov.Observe(context.Background(), proj)
+		if steps, err = prov.Plan(context.Background(), proj, obs); err != nil {
+			t.Fatal(err)
+		}
+		if len(steps) != 1 || !steps[0].Critical || steps[0].Action == engine.NoOp {
+			t.Fatalf("%s : le plan suivant doit reprendre la création, obtenu %+v", echec, steps)
+		}
+		if err := steps[0].Apply(context.Background()); err != nil {
+			t.Fatalf("%s : la reprise doit réussir : %v", echec, err)
+		}
+		obs, _ = prov.Observe(context.Background(), proj)
+		if st := obs.States[0]; !st.DBOwned || !st.UserOwned {
+			t.Errorf("%s : base et compte doivent être à ogs après la reprise : %+v", echec, st)
+		}
+	}
+}
+
+func TestLesComptesReservesDejaDeclaresSontRefusesSansArreterLePlan(t *testing.T) {
+	// Un projet d'avant D91 qui déclarait root se chargeait jusque-là : le refuser
+	// au chargement arrêtait tout le parc. La base est refusée, rien n'est
+	// exécuté ; un compte additionnel réservé ne fait refuser que lui.
+	prov, proj := fixture(t)
+	prov.Reserved = []string{"metriques"}
+	decl := DefaultDatabase(proj, "mysql")
+	decl.User = "root"
+	proj.Spec.Databases = []model.Database{decl}
+	sceller(t, prov, proj, "mysql", "root")
+	stub := &stubJournal{stubClient: stubClient{
+		databases: map[string]bool{"shopfr": true}, users: map[string]bool{"root@localhost": true},
+		grants: map[string]string{"shopfr": "ALTER,CREATE,DELETE,DROP,INDEX,INSERT,SELECT,UPDATE"},
+	}}
+	withStub(prov, stub)
+	obs, _ := prov.Observe(context.Background(), proj)
+	steps, err := prov.Plan(context.Background(), proj, obs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(steps) != 1 || steps[0].Critical {
+		t.Fatalf("une étape non critique attendue : %+v", steps)
+	}
+	if err := steps[0].Apply(context.Background()); err == nil || !strings.Contains(err.Error(), "réservé") {
+		t.Errorf("le refus doit dire le compte réservé : %v", err)
+	}
+	if len(stub.exécutées) > 0 {
+		t.Errorf("rien ne doit être exécuté : %v", stub.exécutées)
+	}
+
+	// Compte additionnel réservé — celui que la configuration désigne : la base et
+	// son compte principal restent réconciliés.
+	decl = DefaultDatabase(proj, "mysql")
+	decl.ExtraUsers = []model.DBUser{{User: "metriques", Privileges: "readonly"}}
+	proj.Spec.Databases = []model.Database{decl}
+	withStub(prov, &stubJournal{stubClient: stubClient{databases: map[string]bool{},
+		users: map[string]bool{"root@localhost": true}}})
+	obs, _ = prov.Observe(context.Background(), proj)
+	if steps, err = prov.Plan(context.Background(), proj, obs); err != nil {
+		t.Fatal(err)
+	}
+	if len(steps) != 2 || steps[0].Critical || !steps[1].Critical || steps[1].Action != engine.Create {
+		t.Fatalf("un refus pour le compte réservé et la création de la base attendus : %+v", steps)
+	}
+	if diff, _ := steps[1].Diff(); strings.Contains(diff, "metriques") {
+		t.Errorf("la création ne doit pas viser le compte réservé :\n%s", diff)
+	}
+}
+
+func TestDropNeSupprimeJamaisUnCompteReserve(t *testing.T) {
+	// Un projet d'avant D91 qui déclarait root en tient le mot de passe scellé :
+	// le compte passait pour être à ogs, et un projet adopté l'emportait sous
+	// --force. DROP USER 'root'@'localhost' coupe ogs du moteur.
+	for _, adopté := range []bool{false, true} {
+		prov, proj := fixture(t)
+		decl := DefaultDatabase(proj, "mariadb")
+		decl.User = "root"
+		decl.ExtraUsers = []model.DBUser{{User: "mysql", Privileges: "all"}}
+		proj.Spec.Databases = []model.Database{decl}
+		if adopté {
+			adopter(proj)
+		}
+		sceller(t, prov, proj, "mariadb", "root")
+		sceller(t, prov, proj, "mariadb", "mysql")
+		stub := &stubJournal{stubClient: stubClient{
+			databases: map[string]bool{"shopfr": true},
+			users:     map[string]bool{"root@localhost": true, "mysql@localhost": true},
+			grants:    map[string]string{"shopfr": "ALTER,CREATE,DELETE,DROP,INDEX,INSERT,SELECT,UPDATE"},
+		}}
+		prov.clients = map[string]Client{"mariadb": stub}
+		obs, _ := prov.Observe(context.Background(), proj)
+		kept, err := prov.Drop(context.Background(), decl, obs.States[0])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if joined := strings.Join(stub.exécutées, "\n"); strings.Contains(joined, "DROP USER") {
+			t.Errorf("adopté=%v : un compte réservé ne part jamais :\n%s", adopté, joined)
+		}
+		if k := strings.Join(kept, " ; "); !strings.Contains(k, "'root'@'localhost'") || !strings.Contains(k, "'mysql'@'localhost'") {
+			t.Errorf("adopté=%v : les comptes réservés restés doivent être nommés : %v", adopté, kept)
+		}
+	}
+}
+
+func TestDropRetireLesMotsDePasseDesComptesSupprimes(t *testing.T) {
+	// Laissé au keystore, le mot de passe d'un compte supprimé faisait d'un
+	// homonyme recréé plus tard hors d'ogs le compte d'un projet du même nom.
+	prov, proj := fixture(t)
+	decl := DefaultDatabase(proj, "mysql")
+	proj.Spec.Databases = []model.Database{decl}
+	sceller(t, prov, proj, "mysql", "shopfr")
+	withStub(prov, &stubJournal{stubClient: stubClient{
+		databases: map[string]bool{"shopfr": true}, users: map[string]bool{"shopfr@localhost": true},
+		grants: map[string]string{"shopfr": "ALTER,CREATE,DELETE,DROP,INDEX,INSERT,SELECT,UPDATE"},
+	}})
+	obs, _ := prov.Observe(context.Background(), proj)
+	if _, err := prov.Drop(context.Background(), decl, obs.States[0]); err != nil {
+		t.Fatal(err)
+	}
+	if prov.sealed(proj.ID(), "mysql", "shopfr") {
+		t.Error("le mot de passe du compte supprimé doit quitter le keystore")
+	}
+}
+
+func TestUnCompteAdditionnelEtrangerNeBloqueQueLui(t *testing.T) {
+	// Les rôles additionnels PostgreSQL étaient observés sans être créés jusqu'à
+	// leur prise en charge : l'exploitant les a créés à la main. Un seul d'entre
+	// eux faisait refuser toute l'étape, et la dérive du compte principal n'était
+	// plus corrigée.
+	prov, proj := fixture(t)
+	decl := DefaultDatabase(proj, "postgres")
+	decl.Extensions = []string{"pg_trgm"}
+	decl.ExtraUsers = []model.DBUser{{User: "lecteur", Privileges: "readonly"}}
+	proj.Spec.Databases = []model.Database{decl}
+	sceller(t, prov, proj, "postgres", "shopfr")
+	stub := &stubJournal{stubClient: stubClient{
+		databases: map[string]bool{"shopfr": true}, users: map[string]bool{"shopfr": true, "lecteur": true},
+		grants: map[string]string{"shopfr": "OWNER"},
+	}}
+	prov.clients = map[string]Client{"postgres": stub}
+	obs, _ := prov.Observe(context.Background(), proj)
+	steps, err := prov.Plan(context.Background(), proj, obs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(steps) != 2 {
+		t.Fatalf("deux étapes attendues, le refus du compte et la base : %+v", steps)
+	}
+	var refus, base *engine.Step
+	for _, s := range steps {
+		if strings.HasSuffix(s.Resource, "/lecteur") {
+			refus = s
+		} else {
+			base = s
+		}
+	}
+	if refus == nil || refus.Critical || base == nil || base.Action == engine.NoOp {
+		t.Fatalf("le refus doit viser le seul compte, la base rester réconciliée : %+v", steps)
+	}
+	if err := refus.Apply(context.Background()); err == nil || !strings.Contains(err.Error(), "rôle lecteur") {
+		t.Errorf("le refus doit nommer le rôle : %v", err)
+	}
+	if diff, _ := base.Diff(); !strings.Contains(diff, "pg_trgm") || strings.Contains(diff, "lecteur") {
+		t.Errorf("la base doit être réconciliée sans toucher au rôle étranger :\n%s", diff)
+	}
+}
+
+func TestDropRetireLeMotDePasseAuFilDesSuppressions(t *testing.T) {
+	// Une suppression interrompue en route gardait les mots de passe de tous les
+	// comptes, même de ceux déjà supprimés.
+	prov, proj := fixture(t)
+	decl := DefaultDatabase(proj, "mysql")
+	decl.ExtraUsers = []model.DBUser{{User: "lecteur", Privileges: "readonly"}}
+	proj.Spec.Databases = []model.Database{decl}
+	sceller(t, prov, proj, "mysql", "shopfr")
+	sceller(t, prov, proj, "mysql", "lecteur")
+	stub := &stubMoteur{stubJournal: stubJournal{stubClient: stubClient{
+		databases: map[string]bool{"shopfr": true},
+		users:     map[string]bool{"shopfr@localhost": true, "lecteur@localhost": true},
+		grants:    map[string]string{"shopfr": "ALTER,CREATE,DELETE,DROP,INDEX,INSERT,SELECT,UPDATE"},
+		grantsPar: map[string]map[string]string{},
+	}}, echoue: "DROP USER IF EXISTS 'lecteur'"}
+	withStub(prov, stub)
+	obs, _ := prov.Observe(context.Background(), proj)
+	if _, err := prov.Drop(context.Background(), decl, obs.States[0]); err == nil {
+		t.Fatal("l'échec simulé n'a pas eu lieu")
+	}
+	if prov.sealed(proj.ID(), "mysql", "shopfr") {
+		t.Error("le mot de passe du compte supprimé doit quitter le keystore")
+	}
+	if !prov.sealed(proj.ID(), "mysql", "lecteur") {
+		t.Error("le mot de passe du compte resté en place doit être gardé")
 	}
 }

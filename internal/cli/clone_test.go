@@ -628,3 +628,25 @@ func TestLeCloneSimuleAnnonceSaGarde(t *testing.T) {
 		t.Errorf("--dry-run ne doit rien écrire : %v", err)
 	}
 }
+
+func TestLeCloneDUnProjetAdopteNEstPasAdopte(t *testing.T) {
+	// La préproduction héritait de l'étiquette adopted : elle échappait au refus
+	// des bases et comptes homonymes, et sa suppression sous --force les emportait
+	// (D91). Elle est créée par ogs, pas reprise.
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("project", "create", "shop.fr", "--kind", "static")
+	h.modifierDeclaration(t, "shopfr", adopter)
+	h.mustRunPartial("site", "clone", "shopfr", "--to", "prep", "--yes")
+	data, err := os.ReadFile(h.path("etc", "ogs", "projects", "shopfrprep.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "adopted") {
+		t.Errorf("la préproduction ne doit pas être adoptée :\n%s", data)
+	}
+	source, err := os.ReadFile(h.path("etc", "ogs", "projects", "shopfr.yaml"))
+	if err != nil || !strings.Contains(string(source), "adopted") {
+		t.Errorf("la source doit rester adoptée : %v\n%s", err, source)
+	}
+}

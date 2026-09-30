@@ -85,6 +85,9 @@ func newSiteCreateCommand(app *App) *cobra.Command {
 			if err := validate.Uniqueness(append(existing, p), app.Cfg.PrepDomain()); err != nil {
 				return exitf(CodeConflict, "conflit avec le parc existant :\n%v", err)
 			}
+			if err := app.refuseReservedDBAccounts(p); err != nil {
+				return err
+			}
 
 			app.printf("site %s\n", p.ID())
 			app.summarizeSite(p)
@@ -539,6 +542,11 @@ func (a *App) cloneProject(source *model.Project, env naming.Env) (*model.Projec
 	clone.Metadata.Name = ""
 	clone.Metadata.Env = string(env)
 	clone.Metadata.Description = source.Metadata.Description
+	// La préproduction est créée par ogs, jamais adoptée : l'étiquette héritée la
+	// faisait échapper au refus des homonymes, et sa suppression sous --force les
+	// emportait (D91). Les étiquettes sont dupliquées, pas partagées avec la source.
+	clone.Metadata.Labels = maps.Clone(source.Metadata.Labels)
+	delete(clone.Metadata.Labels, "adopted")
 	// Tout ce qui porte l'identifiant doit être recalculé : l'oublier ferait
 	// pointer la préproduction sur les ressources de la production.
 	clone.Spec.User = model.User{}

@@ -159,12 +159,19 @@ type MySQLStatements struct {
 	Grants   []string
 }
 
-// All renvoie les requêtes dans l'ordre d'exécution.
+// All renvoie les requêtes dans l'ordre d'exécution : le compte, ses privilèges,
+// puis la base. MySQL accepte un GRANT sur une base qui n'existe pas encore — il
+// porte sur un motif, et la ligne de mysql.db vaut dès la création —, et cet ordre
+// est celui qui laisse toujours ogs reprendre la main (D91) : une base n'est à
+// lui que si son compte y a des privilèges, et la créer d'abord laissait, sur un
+// CREATE USER refusé (plugin indisponible, politique de mots de passe) ou un
+// GRANT en échec, une base sans droits qu'aucun apply ne reconnaissait plus. Une
+// étape en échec n'étant pas compensée, rien ne l'aurait retirée.
 func (s MySQLStatements) All() []string {
 	out := make([]string, 0, len(s.Database)+len(s.User)+len(s.Grants)+1)
-	out = append(out, s.Database...)
 	out = append(out, s.User...)
 	out = append(out, s.Grants...)
+	out = append(out, s.Database...)
 	return out
 }
 
@@ -309,12 +316,17 @@ func SetMySQLPassword(user, host, password, plugin string) (string, error) {
 		quoteLiteral(user), quoteLiteral(host), quoteLiteral(password)), nil
 }
 
-// DropMySQL produit les requêtes de suppression, base puis utilisateur.
+// DropMySQL produit les requêtes de suppression, base puis utilisateur. Une base
+// vide ne produit que la suppression des comptes : une compensation ne retire que
+// ce que son étape a créé, et la base peut lui préexister (D91).
 func DropMySQL(database, user, host string, extra []string) ([]string, error) {
-	if err := checkIdentifier("nom de base", database); err != nil {
-		return nil, err
+	var out []string
+	if database != "" {
+		if err := checkIdentifier("nom de base", database); err != nil {
+			return nil, err
+		}
+		out = append(out, fmt.Sprintf("DROP DATABASE IF EXISTS %s", quoteMySQLIdent(database)))
 	}
-	out := []string{fmt.Sprintf("DROP DATABASE IF EXISTS %s", quoteMySQLIdent(database))}
 	if host == "" {
 		host = "localhost"
 	}
@@ -494,16 +506,20 @@ func SetPostgresPassword(role, password string) (string, error) {
 }
 
 // DropPostgres produit les requêtes de suppression. WITH (FORCE) termine les
-// connexions restantes ; il n'existe qu'à partir de PostgreSQL 13.
+// connexions restantes ; il n'existe qu'à partir de PostgreSQL 13. Une base vide
+// ne produit que la suppression des rôles, comme pour DropMySQL.
 func DropPostgres(database, role string, extra []string, supportsForce bool) ([]string, error) {
-	if err := checkIdentifier("nom de base", database); err != nil {
-		return nil, err
+	var out []string
+	if database != "" {
+		if err := checkIdentifier("nom de base", database); err != nil {
+			return nil, err
+		}
+		drop := fmt.Sprintf("DROP DATABASE IF EXISTS %s", quotePGIdent(database))
+		if supportsForce {
+			drop += " WITH (FORCE)"
+		}
+		out = append(out, drop)
 	}
-	drop := fmt.Sprintf("DROP DATABASE IF EXISTS %s", quotePGIdent(database))
-	if supportsForce {
-		drop += " WITH (FORCE)"
-	}
-	out := []string{drop}
 	// La base d'abord, les rôles ensuite : leurs privilèges et privilèges par
 	// défaut vivent dans la base, et disparaissent avec elle. Un rôle laissé
 	// derrière conserverait la faculté de se connecter au cluster.

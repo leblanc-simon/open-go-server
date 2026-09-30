@@ -340,6 +340,82 @@ func validateDatabases(p *model.Project, add func(string, string, ...any)) {
 	}
 }
 
+// reservedDBAccounts énumère, par moteur, les comptes qu'aucun projet ne doit
+// déclarer (D91) : ceux du moteur lui-même, celui par lequel ogs l'administre et
+// ceux de la supervision sous leur nom par défaut. Un projet qui les déclarait
+// recevait des droits sur sa base, « db user rotate » changeait le mot de passe
+// du compte d'administration — sous MariaDB, root perd alors l'authentification
+// par socket dont ogs dépend pour tout le parc — et le scellait comme un secret
+// du projet, que « secrets env » remettait à son application. Les noms à point ou
+// à tiret (mysql.sys, mariadb.sys, debian-sys-maint) sont déjà exclus par la
+// liste blanche des identifiants ; ils figurent ici pour que la règle ne dépende
+// pas d'elle.
+var reservedDBAccounts = map[string][]string{
+	"mysql": {"root", "mysql", "mysql.sys", "mysql.session", "mysql.infoschema", "mariadb.sys",
+		"debian-sys-maint", "public", "telegraf"},
+	"postgres": {"postgres", "root", "public", "telegraf"},
+}
+
+// ReservedDBAccount dit pourquoi un nom de compte SGBD est réservé, ou rend une
+// chaîne vide. extra porte les noms que la configuration désigne — les comptes de
+// supervision, le rôle d'administration PostgreSQL — et que la seule déclaration
+// d'un projet ne connaît pas. La comparaison ignore la casse : « Root » est un
+// autre compte pour le moteur, mais il n'a sa place dans aucun projet.
+func ReservedDBAccount(engine, user string, extra ...string) string {
+	if engine == "mariadb" {
+		engine = "mysql"
+	}
+	name := strings.ToLower(user)
+	if engine == "postgres" && strings.HasPrefix(name, "pg_") {
+		// PostgreSQL réserve le préfixe à ses rôles prédéfinis : pg_monitor existe
+		// déjà, et le déclarer en ferait le propriétaire de la base du projet.
+		return "préfixe pg_ réservé aux rôles prédéfinis de PostgreSQL"
+	}
+	for _, r := range reservedDBAccounts[engine] {
+		if name == r {
+			return "compte du moteur, de son administration ou de la supervision"
+		}
+	}
+	for _, r := range extra {
+		if r != "" && name == strings.ToLower(r) {
+			return "compte que la configuration d'ogs désigne pour la supervision ou l'administration"
+		}
+	}
+	return ""
+}
+
+// DBAccounts refuse les comptes SGBD réservés d'un projet, y compris ceux que la
+// configuration désigne (voir ReservedDBAccount).
+//
+// Il ne fait pas partie de Project, et c'est voulu : Project juge tout projet
+// chargé, et un seul projet d'avant D91 déclarant root rendait alors le code 3 à
+// toute commande de parc — apply, cert renew du timer, project delete du fautif
+// comme d'un voisin, dont le plan global ne se recalculait plus. Le contrôle
+// vaut aux points d'écriture d'une déclaration ; ce qui est déjà déclaré est
+// refusé par le provider, base par base, en étape non bloquante.
+func DBAccounts(p *model.Project, extra ...string) error {
+	var errs Errors
+	checkDBAccounts(p, extra, func(field, format string, args ...any) {
+		errs = append(errs, Error{Field: field, Message: fmt.Sprintf(format, args...)})
+	})
+	return errs.OrNil()
+}
+
+func checkDBAccounts(p *model.Project, extra []string, add func(string, string, ...any)) {
+	for i, db := range p.Spec.Databases {
+		f := fmt.Sprintf("spec.databases[%d]", i)
+		if why := ReservedDBAccount(db.Engine, db.User, extra...); why != "" {
+			add(f+".user", "compte %q réservé (%s) : déclarer un compte propre au projet", db.User, why)
+		}
+		for j, u := range db.ExtraUsers {
+			if why := ReservedDBAccount(db.Engine, u.User, extra...); why != "" {
+				add(fmt.Sprintf("%s.extraUsers[%d].user", f, j),
+					"compte %q réservé (%s) : déclarer un compte propre au projet", u.User, why)
+			}
+		}
+	}
+}
+
 // reEnvName est le nom d'une variable d'environnement tel que systemd l'accepte.
 var reEnvName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 

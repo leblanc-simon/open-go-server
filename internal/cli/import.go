@@ -193,6 +193,7 @@ func newImportAdoptCommand(app *App) *cobra.Command {
 			if err != nil {
 				return exitf(CodeValidation, "%v", err)
 			}
+			notes = withoutReservedDatabases(p, notes, app.reservedDBAccounts())
 			path := app.Paths.ProjectFile(p.ID())
 			if _, err := os.Stat(path); err == nil {
 				return exitf(CodeConflict, "le projet %s est déjà déclaré (%s)", p.ID(), path)
@@ -318,4 +319,32 @@ func newImportUnmanagedCommand(app *App) *cobra.Command {
 			}))
 		},
 	}
+}
+
+// withoutReservedDatabases retire de l'adoption les bases dont le compte est
+// réservé — root, celui de la supervision (D91) : le projet en recevrait des
+// droits, « db user rotate », que la note d'Adopt conseille, changerait le mot de
+// passe d'administration du moteur, et la déclaration serait refusée dès la
+// commande suivante. Chaque base écartée est dite, et le conseil de rotation de
+// son compte tombe avec elle.
+func withoutReservedDatabases(p *model.Project, notes, reserved []string) []string {
+	kept := p.Spec.Databases[:0]
+	for _, d := range p.Spec.Databases {
+		why := validate.ReservedDBAccount(d.Engine, d.User, reserved...)
+		if why == "" {
+			kept = append(kept, d)
+			continue
+		}
+		rotate := "« ogs db user rotate " + p.ID() + " " + d.User + " »"
+		filtered := notes[:0]
+		for _, n := range notes {
+			if !strings.Contains(n, rotate) {
+				filtered = append(filtered, n)
+			}
+		}
+		notes = append(filtered, fmt.Sprintf("base %s non déclarée : son compte %s est réservé (%s) — "+
+			"lui donner un compte propre avant de l'adopter", d.Name, d.User, why))
+	}
+	p.Spec.Databases = kept
+	return notes
 }

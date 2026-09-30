@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -606,12 +607,21 @@ func (a *App) dropResources(cmd *cobra.Command, provs *providers, p *model.Proje
 				warn("base %s conservée : %v", state.Declaration.Name, state.Unavailable)
 				continue
 			}
-			if err := provs.DB.Drop(cmd.Context(), state.Declaration, state); err != nil {
+			// Seul part ce qui est à ogs (D91) : un homonyme qu'il n'a pas créé
+			// reste, et le code 6 le dit.
+			kept, err := provs.DB.Drop(cmd.Context(), state.Declaration, state)
+			if len(kept) > 0 {
+				warn("base %s %s : conservé, faute d'avoir été créé par ogs — %s", state.Declaration.Engine,
+					state.Declaration.Name, strings.Join(kept, ", "))
+			}
+			if err != nil {
 				warn("suppression de la base %s : %v", state.Declaration.Name, err)
 				continue
 			}
-			*removed = append(*removed, fmt.Sprintf("base %s %s",
-				state.Declaration.Engine, state.Declaration.Name))
+			if !slices.Contains(kept, "base "+state.Declaration.Name) {
+				*removed = append(*removed, fmt.Sprintf("base %s %s",
+					state.Declaration.Engine, state.Declaration.Name))
+			}
 		}
 	}
 	if p.Spec.AMQP != nil && provs.AMQP.Client != nil {
@@ -790,26 +800,49 @@ func (a *App) forcedRemovals(p *model.Project) ([]string, *refusal) {
 	}
 	if adopted(p) {
 		for _, d := range p.Spec.Databases {
-			out = append(out, fmt.Sprintf("la base %s, qui existait avant ogs", databaseLabel(d)))
+			out = append(out, fmt.Sprintf("la base %s, qui existait avant ogs", databaseLabel(d, a.reservedDBAccounts())))
 		}
 	}
 	return out, nil
 }
 
-// databaseLabel nomme une base et les comptes que sa suppression emporte.
-func databaseLabel(d model.Database) string {
-	account := d.User
-	if d.Engine != "postgres" {
-		host := d.Host
-		if host == "" {
-			host = "localhost"
+// databaseLabel nomme une base et les comptes que sa suppression emporte — et
+// ceux-là seuls : un compte réservé ne part jamais (D91), et la confirmation qui
+// l'annonçait promettait une suppression que Drop ne fait pas. Il n'est appelé
+// que pour un projet adopté, dont Drop retire tout le reste de ce qu'il déclare.
+func databaseLabel(d model.Database, reserved []string) string {
+	host := d.Host
+	if host == "" {
+		host = "localhost"
+	}
+	var removed, kept []string
+	for _, user := range append([]string{d.User}, extraUserNames(d)...) {
+		account := user
+		if d.Engine != "postgres" {
+			account += "@" + host
 		}
-		account += "@" + host
+		if validate.ReservedDBAccount(d.Engine, user, reserved...) != "" {
+			kept = append(kept, account)
+			continue
+		}
+		removed = append(removed, account)
 	}
+	label := fmt.Sprintf("%s %s", d.Engine, d.Name)
+	if len(removed) > 0 {
+		label += " (compte " + strings.Join(removed, ", ") + ")"
+	}
+	if len(kept) > 0 {
+		label += ", sans " + strings.Join(kept, ", ") + ", réservé et conservé"
+	}
+	return label
+}
+
+func extraUserNames(d model.Database) []string {
+	out := make([]string, 0, len(d.ExtraUsers))
 	for _, u := range d.ExtraUsers {
-		account += ", " + u.User
+		out = append(out, u.User)
 	}
-	return fmt.Sprintf("%s %s (compte %s)", d.Engine, d.Name, account)
+	return out
 }
 
 // keptFilesRefusal refuse d'effacer le compte et l'arborescence tant que la
@@ -1722,6 +1755,11 @@ func newRestoreCommand(app *App) *cobra.Command {
 			// étaient à root (RestoredOwner).
 			archived := append([]model.Dir(nil), p.Spec.Layout.Dirs...)
 			if err := app.prepare(p); err != nil {
+				return err
+			}
+			// Une archive d'avant D91 peut déclarer un compte réservé : la restaurer
+			// l'écrirait de nouveau au parc.
+			if err := app.refuseReservedDBAccounts(p); err != nil {
 				return err
 			}
 			if err := spec.Save(target, p); err != nil {

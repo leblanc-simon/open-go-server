@@ -9,6 +9,8 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -583,9 +585,14 @@ func TestSuppressionAbandonneSurUnDumpEnEchec(t *testing.T) {
 	// DEFINER disparu) : la base était supprimée sans que l'archive en garde rien.
 	h := newHarness(t)
 	h.mustRun("init")
+	// Le moteur répond dès la création : c'est ogs qui crée la base et son compte,
+	// et seul ce qu'il a créé part avec le projet (D91).
+	moteur := demarrerMySQLFactice(t, h.path("run", "mysqld", "mysqld.sock"))
 	h.mustRunPartial("site", "create", "shop.fr", "--kind", "php-symfony", "--php", "8.5",
 		"--db", "mysql", "--tls=false", "--yes")
-	moteur := demarrerMySQLFactice(t, h.path("run", "mysqld", "mysqld.sock"), "shopfr")
+	if !moteur.reçu("CREATE DATABASE IF NOT EXISTS `shopfr`") {
+		t.Fatalf("la base doit avoir été créée par ogs : %q", moteur.requêtes())
+	}
 
 	out, code := h.run("project", "delete", "shopfr", "--yes")
 	if code != CodeError || !strings.Contains(out, "sauvegarde de shopfr impossible") ||
@@ -612,6 +619,36 @@ func TestSuppressionAbandonneSurUnDumpEnEchec(t *testing.T) {
 	out = h.mustRunPartial("project", "delete", "shopfr", "--yes")
 	if !strings.Contains(out, "sauvegarde de shopfr incluse") || !moteur.reçu("DROP DATABASE IF EXISTS `shopfr`") {
 		t.Errorf("une base sauvegardée doit être supprimée :\n%s\nrequêtes : %q", out, moteur.requêtes())
+	}
+}
+
+func TestUneBaseHomonymePreexistanteNEstNiRepriseNiSupprimee(t *testing.T) {
+	// La base et le compte d'un site resté hors d'ogs portaient le nom qu'ogs
+	// dérive du host : la création les reprenait sans un mot, et la suppression
+	// du projet les emportait — DROP DATABASE, DROP USER (D91).
+	h := newHarness(t)
+	h.mustRun("init")
+	moteur := demarrerMySQLFactice(t, h.path("run", "mysqld", "mysqld.sock"), "shopfr")
+	out := h.mustRunPartial("site", "create", "shop.fr", "--kind", "php-symfony", "--php", "8.5",
+		"--db", "mysql", "--tls=false", "--yes")
+	for _, motif := range []string{"base shopfr", "'shopfr'@'localhost'", "renommer"} {
+		if !strings.Contains(out, motif) {
+			t.Errorf("le refus doit nommer %q :\n%s", motif, out)
+		}
+	}
+	for _, q := range moteur.requêtes() {
+		if strings.Contains(q, "shopfr") {
+			t.Errorf("rien ne doit viser la base ni le compte préexistants : %s", q)
+		}
+	}
+
+	déposer(t, h.path("usr", "bin", "mysqldump"), "#!/bin/sh\n")
+	out = h.mustRunPartial("project", "delete", "shopfr", "--yes")
+	if moteur.reçu("DROP") {
+		t.Errorf("la base et le compte préexistants ne doivent pas être supprimés : %q", moteur.requêtes())
+	}
+	if !strings.Contains(out, "conservé") || !strings.Contains(out, "base shopfr") {
+		t.Errorf("ce qui reste doit être dit :\n%s", out)
 	}
 }
 
@@ -1026,10 +1063,19 @@ func réponses(t *testing.T, saisies string) {
 // cherche ogs sous le préfixe : c'est le vrai client d'ogs qui s'y adresse, et
 // chaque requête qui n'est pas une lecture est consignée — de quoi prouver
 // qu'une base n'a pas été supprimée.
+//
+// Il garde assez d'état pour qu'un apply y crée ce qu'il déclare : une base
+// créée rejoint la liste, un compte créé celle des comptes, un GRANT les
+// privilèges que l'observation relit — par requête préparée, comme le client
+// d'ogs le fait. De quoi distinguer ce qu'ogs a créé de ce qui préexistait (D91).
 type mysqlFactice struct {
 	mu      sync.Mutex
 	bases   []string
-	journal []string
+	comptes []string
+	// privilèges porte, par compte « 'u'@'h' », les privilèges par base.
+	privilèges map[string]map[string]string
+	requetes   map[uint32]string
+	journal    []string
 }
 
 // demarrerMySQLFactice écoute sur socket et sert les bases données. Le chemin
@@ -1044,7 +1090,12 @@ func demarrerMySQLFactice(t *testing.T, socket string, bases ...string) *mysqlFa
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = ln.Close() })
-	m := &mysqlFactice{bases: append([]string{"information_schema", "mysql"}, bases...)}
+	m := &mysqlFactice{bases: append([]string{"information_schema", "mysql"}, bases...),
+		comptes: []string{"root@localhost"}, privilèges: map[string]map[string]string{},
+		requetes: map[uint32]string{}}
+	for _, b := range bases {
+		m.comptes = append(m.comptes, b+"@localhost")
+	}
 	go func() {
 		for {
 			c, err := ln.Accept()
@@ -1119,6 +1170,11 @@ func (m *mysqlFactice) servir(c net.Conn) {
 			paquetMySQL(c, 1, ok)
 		case 0x03: // COM_QUERY
 			m.répondre(c, string(p[1:]))
+		case 0x16: // COM_STMT_PREPARE
+			m.préparer(c, string(p[1:]))
+		case 0x17: // COM_STMT_EXECUTE
+			m.exécuter(c, p[1:])
+		case 0x19: // COM_STMT_CLOSE, sans réponse
 		default:
 			// Les requêtes préparées sont refusées : ogs tolère un échec de lecture
 			// des privilèges, et c'est tout ce qu'elles servent ici.
@@ -1136,13 +1192,11 @@ func (m *mysqlFactice) répondre(c net.Conn, q string) {
 	case strings.Contains(q, "information_schema.SCHEMATA"):
 		lignes = append(lignes, m.bases...)
 	case strings.Contains(q, "mysql.user"):
-		lignes = []string{"root@localhost"}
-		for _, b := range m.bases[2:] {
-			lignes = append(lignes, b+"@localhost")
-		}
+		lignes = append(lignes, m.comptes...)
 	case strings.HasPrefix(strings.ToUpper(strings.TrimSpace(q)), "SELECT"):
 	default:
 		m.journal = append(m.journal, q)
+		m.appliquer(q)
 		m.mu.Unlock()
 		paquetMySQL(c, 1, []byte{0, 0, 0, 2, 0, 0, 0})
 		return
@@ -1150,19 +1204,149 @@ func (m *mysqlFactice) répondre(c net.Conn, q string) {
 	m.mu.Unlock()
 	seq := byte(1)
 	envoyer := func(p []byte) { paquetMySQL(c, seq, p); seq++ }
-	eof := []byte{0xfe, 0, 0, 2, 0}
 	envoyer([]byte{1})
+	envoyer(colonneMySQL())
+	envoyer(eofMySQL)
+	for _, l := range lignes {
+		envoyer(chaîneMySQL(l))
+	}
+	envoyer(eofMySQL)
+}
+
+var eofMySQL = []byte{0xfe, 0, 0, 2, 0}
+
+// colonneMySQL décrit une colonne de texte.
+func colonneMySQL() []byte {
 	var col []byte
 	for _, s := range []string{"def", "", "", "", "c", "c"} {
 		col = append(col, chaîneMySQL(s)...)
 	}
-	col = append(col, 0x0c, 45, 0, 0, 1, 0, 0, 0xfd, 0, 0, 0, 0, 0)
-	envoyer(col)
-	envoyer(eof)
-	for _, l := range lignes {
-		envoyer(chaîneMySQL(l))
+	return append(col, 0x0c, 45, 0, 0, 1, 0, 0, 0xfd, 0, 0, 0, 0, 0)
+}
+
+// motifMySQL rend le nom entre les premiers délimiteurs qui suivent le mot clé.
+func motifMySQL(q, clé string, délimiteur byte) string {
+	i := strings.Index(q, clé)
+	if i < 0 {
+		return ""
 	}
-	envoyer(eof)
+	reste := q[i+len(clé):]
+	a := strings.IndexByte(reste, délimiteur)
+	if a < 0 {
+		return ""
+	}
+	b := strings.IndexByte(reste[a+1:], délimiteur)
+	if b < 0 {
+		return ""
+	}
+	return reste[a+1 : a+1+b]
+}
+
+// appliquer tient l'état de ce qu'une requête crée ou supprime.
+func (m *mysqlFactice) appliquer(q string) {
+	switch {
+	case strings.HasPrefix(q, "CREATE DATABASE"):
+		if b := motifMySQL(q, "EXISTS", '`'); b != "" && !slices.Contains(m.bases, b) {
+			m.bases = append(m.bases, b)
+		}
+	case strings.HasPrefix(q, "CREATE USER"):
+		if u, h := motifMySQL(q, "EXISTS", '\''), motifMySQL(q, "@", '\''); u != "" &&
+			!slices.Contains(m.comptes, u+"@"+h) {
+			m.comptes = append(m.comptes, u+"@"+h)
+		}
+	case strings.HasPrefix(q, "GRANT ") && strings.Contains(q, ".* TO "):
+		base := strings.ReplaceAll(motifMySQL(q, " ON ", '`'), `\_`, "_")
+		compte := "'" + motifMySQL(q, " TO ", '\'') + "'@'" + motifMySQL(q[strings.Index(q, " TO "):], "@", '\'') + "'"
+		if m.privilèges[compte] == nil {
+			m.privilèges[compte] = map[string]string{}
+		}
+		m.privilèges[compte][base] = "ALTER,CREATE,DELETE,DROP,INDEX,INSERT,SELECT,UPDATE"
+	case strings.HasPrefix(q, "DROP DATABASE"):
+		b := motifMySQL(q, "EXISTS", '`')
+		m.bases = slices.DeleteFunc(m.bases, func(x string) bool { return x == b })
+	case strings.HasPrefix(q, "DROP USER"):
+		compte := motifMySQL(q, "EXISTS", '\'') + "@" + motifMySQL(q, "@", '\'')
+		m.comptes = slices.DeleteFunc(m.comptes, func(x string) bool { return x == compte })
+	}
+}
+
+// préparer répond à COM_STMT_PREPARE : un identifiant, et autant de paramètres
+// que de « ? ». Les colonnes ne sont décrites qu'à l'exécution.
+func (m *mysqlFactice) préparer(c net.Conn, q string) {
+	m.mu.Lock()
+	id := uint32(len(m.requetes) + 1)
+	m.requetes[id] = q
+	m.mu.Unlock()
+	n := strings.Count(q, "?")
+	paquetMySQL(c, 1, []byte{0, byte(id), byte(id >> 8), byte(id >> 16), byte(id >> 24), 0, 0,
+		byte(n), byte(n >> 8), 0, 0, 0})
+	seq := byte(2)
+	for i := 0; i < n; i++ {
+		paquetMySQL(c, seq, colonneMySQL())
+		seq++
+	}
+	if n > 0 {
+		paquetMySQL(c, seq, eofMySQL)
+	}
+}
+
+// exécuter répond à COM_STMT_EXECUTE pour les deux lectures de privilèges : le
+// compte visé est le seul paramètre, une chaîne « 'u'@'h' » retrouvée telle quelle
+// dans le paquet.
+func (m *mysqlFactice) exécuter(c net.Conn, p []byte) {
+	if len(p) < 4 {
+		return
+	}
+	m.mu.Lock()
+	q := m.requetes[uint32(p[0])|uint32(p[1])<<8|uint32(p[2])<<16|uint32(p[3])<<24]
+	var lignes [][]string
+	if a, b := bytes.IndexByte(p, '\''), bytes.LastIndexByte(p, '\''); a >= 0 && b > a &&
+		strings.Contains(q, "SCHEMA_PRIVILEGES") {
+		privs := m.privilèges[string(p[a:b+1])]
+		bases := make([]string, 0, len(privs))
+		for base := range privs {
+			bases = append(bases, base)
+		}
+		sort.Strings(bases)
+		for _, base := range bases {
+			lignes = append(lignes, []string{base, privs[base]})
+		}
+	}
+	m.mu.Unlock()
+	seq := byte(1)
+	envoyer := func(p []byte) { paquetMySQL(c, seq, p); seq++ }
+	colonnes := 1
+	if strings.Contains(q, "SCHEMA_PRIVILEGES") {
+		colonnes = 2
+	}
+	envoyer([]byte{byte(colonnes)})
+	for i := 0; i < colonnes; i++ {
+		envoyer(colonneMySQL())
+	}
+	envoyer(eofMySQL)
+	for _, l := range lignes {
+		ligne := []byte{0, 0}
+		for _, v := range l {
+			ligne = append(ligne, chaîneMySQL(v)...)
+		}
+		envoyer(ligne)
+	}
+	envoyer(eofMySQL)
+}
+
+func TestLaConfirmationNeNommeQueLesComptesQuiPartent(t *testing.T) {
+	// Un compte réservé ne part jamais (D91) : l'annoncer promettait une
+	// suppression que Drop ne fait pas.
+	d := model.Database{Engine: "mariadb", Name: "shop", User: "shop", Host: "%",
+		ExtraUsers: []model.DBUser{{User: "root"}, {User: "metriques"}, {User: "lecture"}}}
+	got := databaseLabel(d, []string{"metriques"})
+	want := "mariadb shop (compte shop@%, lecture@%), sans root@%, metriques@%, réservé et conservé"
+	if got != want {
+		t.Errorf("libellé :\n  %s\nattendu :\n  %s", got, want)
+	}
+	if got := databaseLabel(model.Database{Engine: "mysql", Name: "shopfr", User: "shopfr"}, nil); got != "mysql shopfr (compte shopfr@localhost)" {
+		t.Errorf("libellé ordinaire : %s", got)
+	}
 }
 
 func TestLesEntreesDUnAutreCompteRetiennentLaRacine(t *testing.T) {
