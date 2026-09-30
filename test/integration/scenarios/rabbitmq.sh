@@ -14,8 +14,13 @@ curl -sf -u "$auth" "$api/overview" | grep -o '"management_version":"[^"]*"'
 version=$(ls /etc/php | head -1)
 ogs init --quiet
 choisir_moteur apache
-ogs amqp credentials set --user admin --password motdepasse-essai \
-    --url http://rabbitmq:15672 --amqp-port 5672 >/dev/null
+# Le mot de passe passe par l'entrée standard, jamais par la ligne de commande :
+# il y figurerait dans le journal de sudo et l'historique du shell (D93).
+printf '%s\n' motdepasse-essai | ogs amqp credentials set --user admin \
+    --url http://rabbitmq:15672 --amqp-port 5672 >/dev/null ||
+    { echo "ÉCHEC : identifiants non enregistrés depuis l'entrée standard"; exit 1; }
+grep -q "password: motdepasse-essai" /etc/ogs/credentials/amqp.yaml ||
+    { echo "ÉCHEC : le mot de passe lu sur l'entrée standard n'est pas celui enregistré"; exit 1; }
 
 echo
 echo "--- création d'un site avec deux transports Messenger ---"
@@ -137,6 +142,102 @@ if curl -sf -u "$auth" "$api/users/shopfr" >/dev/null 2>&1; then
     exit 1
 fi
 echo "vhost et utilisateur supprimés"
+
+echo
+echo "--- homonymes créés hors d'ogs : ni repris, ni supprimés (D93) ---"
+# L'administrateur a déjà un vhost et un compte « atelierfr », avec un message
+# en attente. ogs les reprenait sans connaître le mot de passe, puis les
+# détruisait avec leurs files à la suppression du projet.
+curl -sf -u "$auth" -X PUT "$api/vhosts/atelierfr" -H 'content-type: application/json' -d '{}' ||
+    { echo "ÉCHEC : vhost de l'administrateur non créé"; exit 1; }
+curl -sf -u "$auth" -X PUT "$api/users/atelierfr" -H 'content-type: application/json' \
+    -d '{"password":"celui-de-l-administrateur","tags":""}' ||
+    { echo "ÉCHEC : compte de l'administrateur non créé"; exit 1; }
+curl -sf -u "$auth" -X PUT "$api/queues/atelierfr/commandes" -H 'content-type: application/json' \
+    -d '{"durable":true}' || { echo "ÉCHEC : file de l'administrateur non créée"; exit 1; }
+empreinte() { curl -sf -u "$auth" "$api/users/atelierfr" | grep -o '"password_hash":"[^"]*"'; }
+avant=$(empreinte)
+[ -n "$avant" ] || { echo "ÉCHEC : empreinte du compte de l'administrateur illisible"; exit 1; }
+sortie=$(ogs site create atelier.fr --kind php-symfony --app-version 6.4 --php "$version" \
+    --tls=false --messenger async --yes 2>&1)
+code=$?
+echo "$sortie" | grep -i "vhost amqp" | head -2
+if [ "$code" != 6 ] || ! echo "$sortie" | grep -q "sans avoir été créé"; then
+    echo "ÉCHEC : le vhost homonyme devait être refusé en code 6 (code $code)"
+    echo "$sortie" | tail -6
+    exit 1
+fi
+if curl -sf -u "$auth" "$api/queues/atelierfr/async" >/dev/null 2>&1; then
+    echo "ÉCHEC : ogs a déclaré une file dans le vhost de l'administrateur"
+    exit 1
+fi
+if [ "$(empreinte)" != "$avant" ]; then
+    echo "ÉCHEC : le mot de passe du compte de l'administrateur a changé"
+    exit 1
+fi
+ogs project delete atelierfr --yes >/dev/null 2>&1
+if ! curl -sf -u "$auth" "$api/queues/atelierfr/commandes" >/dev/null 2>&1; then
+    echo "ÉCHEC : le vhost de l'administrateur est parti avec le projet"
+    exit 1
+fi
+if ! curl -sf -u "$auth" "$api/users/atelierfr" >/dev/null 2>&1; then
+    echo "ÉCHEC : le compte de l'administrateur est parti avec le projet"
+    exit 1
+fi
+echo "vhost, file et compte de l'administrateur intacts"
+
+echo
+echo "--- port de management local tenu par un autre compte (D93) ---"
+# Broker arrêté, tout compte local peut ouvrir 127.0.0.1:15672 : ogs n'y envoie
+# ses identifiants d'administration que si le port est tenu par root ou par le
+# compte du broker. Le vrai broker vit dans un autre conteneur et n'écoute pas
+# sur la boucle locale de celui-ci : un écouteur factice y tient sa place.
+cat > /tmp/ecoute.py <<'PY'
+import http.server, sys
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        with open(sys.argv[1], "a") as f:
+            f.write("%s %s\n" % (self.path, self.headers.get("Authorization", "-")))
+        self.send_response(404)
+        self.end_headers()
+    def log_message(self, *a):
+        pass
+http.server.HTTPServer(("127.0.0.1", 15672), H).serve_forever()
+PY
+journal=/tmp/ecoute.journal
+: > "$journal" && chmod 666 "$journal"
+ecouter() {  # ecouter <compte>
+    su -s /bin/sh "$1" -c "python3 /tmp/ecoute.py $journal" 2>/dev/null &
+    ecouteur=$!
+    for _ in $(seq 1 20); do
+        ss -tln | grep -q '127.0.0.1:15672 ' && return 0
+        sleep 0.2
+    done
+    echo "ÉCHEC : l'écouteur factice n'a pas démarré"; exit 1
+}
+arreter() { pkill -f /tmp/ecoute.py; wait "$ecouteur" 2>/dev/null; }
+printf '%s\n' motdepasse-essai | ogs amqp credentials set --user admin \
+    --url http://127.0.0.1:15672 --amqp-port 5672 >/dev/null
+ogs project create ecoute.fr --kind php-symfony --app-version 6.4 --php "$version" >/dev/null
+ogs amqp messenger ecoutefr --transport async >/dev/null
+ecouter nobody
+sortie=$(ogs amqp status ecoutefr 2>&1)
+echo "$sortie" | grep -o "tenu par l'uid [0-9]*, ni root ni le compte rabbitmq" | head -1
+if grep -q "Basic" "$journal"; then
+    echo "ÉCHEC : les identifiants sont partis vers un port tenu par nobody"; exit 1
+fi
+echo "$sortie" | grep -q "tenu par l'uid" || { echo "ÉCHEC : refus non expliqué :"; echo "$sortie"; exit 1; }
+arreter
+# Le même port tenu par root reçoit la requête : la garde ne bloque pas un
+# broker légitime.
+ecouter root
+ogs amqp status ecoutefr >/dev/null 2>&1
+arreter
+grep -q "Basic" "$journal" || { echo "ÉCHEC : un port tenu par root doit recevoir la requête"; exit 1; }
+echo "identifiants refusés au port tenu par nobody, envoyés au port tenu par root"
+printf '%s\n' motdepasse-essai | ogs amqp credentials set --user admin \
+    --url http://rabbitmq:15672 --amqp-port 5672 >/dev/null
+ogs project delete ecoutefr --yes >/dev/null 2>&1
 
 echo
 echo "RÉSULTAT : le provider RabbitMQ fonctionne sur un vrai broker — isolation"

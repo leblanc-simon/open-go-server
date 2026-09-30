@@ -36,27 +36,45 @@ func newAMQPCommand(app *App) *cobra.Command {
 
 func newAMQPCredentialsSetCommand(app *App) *cobra.Command {
 	var (
-		url      string
-		user     string
-		password string
-		amqpPort int
+		url           string
+		user          string
+		password      string
+		amqpPort      int
+		brokerAccount string
 	)
 	cmd := &cobra.Command{
-		Use:   "set",
+		Use:   "set --user <compte>",
 		Short: "Enregistrer les identifiants d'administration du broker",
 		Long: "Les identifiants sont écrits en 0600 sous /etc/ogs/credentials/. Ils donnent\n" +
 			"un accès d'administration complet au broker : les traiter comme un secret de\n" +
 			"premier rang. Ne pas employer le compte « guest », restreint à la boucle locale\n" +
-			"et connu de tous.",
+			"et connu de tous.\n\n" +
+			"Le mot de passe est demandé sans écho sur un terminal, et lu sur l'entrée\n" +
+			"standard sinon (une ligne) : « printf '%s\\n' \"$mdp\" | ogs amqp credentials set\n" +
+			"--user ogs-admin ». L'option --password, déconseillée, le laisse dans le journal\n" +
+			"de sudo et l'historique du shell.\n\n" +
+			"Vers cette machine, les identifiants ne partent que vers un port tenu par\n" +
+			"root ou par le compte du broker (--broker-account, nom ou uid) : broker arrêté,\n" +
+			"tout compte local peut ouvrir le port de management. Un broker en conteneur\n" +
+			"publié par DNAT (Docker sans userland-proxy) se désigne par son adresse (--url).",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			if user == "" || password == "" {
-				return exitf(CodeUsage, "--user et --password sont requis")
+			if user == "" {
+				return exitf(CodeUsage, "--user est requis")
+			}
+			password, err := app.saisieSecrets(cmd).valeur("password", password,
+				"mot de passe du compte "+user)
+			if err != nil {
+				return err
 			}
 			if user == "guest" {
 				app.printf("⚠ le compte « guest » est un compte par défaut connu : " +
 					"créer un compte d'administration dédié est préférable.\n")
 			}
-			creds := amqp.Credentials{URL: url, User: user, Password: password, AMQPPort: amqpPort}
+			if brokerAccount == amqp.DefaultBrokerAccount {
+				brokerAccount = ""
+			}
+			creds := amqp.Credentials{URL: url, User: user, Password: password, AMQPPort: amqpPort,
+				BrokerAccount: brokerAccount}
 			data, err := yaml.Marshal(creds)
 			if err != nil {
 				return wrap(CodeError, err)
@@ -79,8 +97,12 @@ func newAMQPCredentialsSetCommand(app *App) *cobra.Command {
 	f := cmd.Flags()
 	f.StringVar(&url, "url", amqp.DefaultManagementURL, "URL de l'API management")
 	f.StringVar(&user, "user", "", "compte d'administration")
-	f.StringVar(&password, "password", "", "mot de passe")
+	f.StringVar(&password, "password", "",
+		"mot de passe (déconseillé : visible dans le journal de sudo ; l'omettre pour le saisir)")
 	f.IntVar(&amqpPort, "amqp-port", 5672, "port du protocole AMQP, pour les chaînes de connexion")
+	f.StringVar(&brokerAccount, "broker-account", amqp.DefaultBrokerAccount,
+		"compte système du broker, par son nom ou son uid : seul admis avec root à tenir le port de management "+
+			"sur cette machine")
 	return cmd
 }
 
@@ -122,6 +144,13 @@ func newAMQPStatusCommand(app *App) *cobra.Command {
 				}
 				if obs.Unavailable != nil {
 					warnings = append(warnings, fmt.Sprintf("%s : %v", p.ID(), obs.Unavailable))
+					continue
+				}
+				// Les files d'un homonyme ne sont pas celles du projet : les
+				// afficher sous son nom le ferait croire (D93).
+				if !obs.Owned() {
+					warnings = append(warnings, fmt.Sprintf("%s : vhost %s non créé par ogs (%s), files non "+
+						"affichées", p.ID(), p.Spec.AMQP.Vhost, amqp.ForeignReason(p.Spec.AMQP, obs)))
 					continue
 				}
 				for _, name := range sortedQueueNames(obs.Queues) {
@@ -315,6 +344,12 @@ func newAMQPQueuePurgeCommand(app *App) *cobra.Command {
 			}
 			if obs.Unavailable != nil {
 				return exitf(CodeDependency, "%v", obs.Unavailable)
+			}
+			// Vider la file d'un vhost qu'ogs n'a pas créé, c'était détruire les
+			// messages de son propriétaire (D93).
+			if !obs.Owned() {
+				return exitf(CodeConflict, "vhost amqp %s : %s — ogs n'y vide aucune file",
+					p.Spec.AMQP.Vhost, amqp.ForeignReason(p.Spec.AMQP, obs))
 			}
 			queue, ok := obs.Queues[args[1]]
 			if !ok {

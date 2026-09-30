@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/user"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -37,6 +38,9 @@ import (
 type harness struct {
 	t      *testing.T
 	prefix string
+	// stdin est l'entrée standard de la prochaine commande, puis vidée : jamais
+	// celle du processus de test, qu'une saisie de secret attendrait.
+	stdin string
 }
 
 func newHarness(t *testing.T) *harness {
@@ -51,6 +55,8 @@ func (h *harness) run(args ...string) (string, int) {
 	root := NewRootCommand()
 	root.SetOut(&out)
 	root.SetErr(&errBuf)
+	root.SetIn(strings.NewReader(h.stdin))
+	h.stdin = ""
 	root.SetArgs(append([]string{"--prefix", h.prefix}, args...))
 	err := root.Execute()
 	// Le message d'erreur est produit par main ; on le joint à la sortie pour que
@@ -1266,8 +1272,12 @@ func TestCertDNSProviderSet(t *testing.T) {
 	if out, code := h.run("cert", "dns-provider", "set", "cloudflare"); code != CodeUsage {
 		t.Errorf("provider non géré : code %d attendu %d :\n%s", code, CodeUsage, out)
 	}
-	h.mustRun("cert", "dns-provider", "set", "ovh",
-		"--application-key", "ak", "--application-secret", "as", "--consumer-key", "ck")
+	// Les secrets passent par l'entrée standard, une ligne chacun (D93).
+	h.stdin = "as\nck\n"
+	out := h.mustRun("cert", "dns-provider", "set", "ovh", "--application-key", "ak")
+	if strings.Contains(out, "déconseillé") || strings.Contains(out, "⚠") {
+		t.Errorf("aucun avertissement attendu sans option porteuse de secret :\n%s", out)
+	}
 	path := h.path("etc", "ogs", "credentials", "dns", "ovh.yaml")
 	info, err := os.Stat(path)
 	if err != nil {
@@ -1278,8 +1288,20 @@ func TestCertDNSProviderSet(t *testing.T) {
 		t.Errorf("mode %04o, attendu 0600", info.Mode().Perm())
 	}
 	content := h.read(t, filepath.Join("etc", "ogs", "credentials", "dns", "ovh.yaml"))
-	if !strings.Contains(content, "applicationKey: ak") || !strings.Contains(content, "endpoint: ovh-eu") {
+	if !strings.Contains(content, "applicationKey: ak") || !strings.Contains(content, "endpoint: ovh-eu") ||
+		!strings.Contains(content, "applicationSecret: as") || !strings.Contains(content, "consumerKey: ck") {
 		t.Errorf("contenu inattendu :\n%s", content)
+	}
+	// Une entrée standard incomplète est une erreur d'usage, pas un secret vide.
+	h.stdin = "as\n"
+	if out, code := h.run("cert", "dns-provider", "set", "ovh", "--application-key", "ak"); code != CodeUsage ||
+		!strings.Contains(out, "clé de consommateur requis") {
+		t.Errorf("secret manquant : code %d attendu %d :\n%s", code, CodeUsage, out)
+	}
+	// L'option porteuse de valeur reste acceptée, mais signalée.
+	out = h.mustRun("cert", "dns-provider", "set", "ovh", "--client-id", "ci", "--client-secret", "cs")
+	if !strings.Contains(out, "--client-secret : la valeur figure dans la ligne de commande") {
+		t.Errorf("l'option porteuse du secret doit être signalée :\n%s", out)
 	}
 }
 
@@ -1798,7 +1820,14 @@ func (h *harness) fakeBroker(t *testing.T, state *brokerState) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	creds := fmt.Sprintf("url: %s\nuser: admin\npassword: s3cr3t\namqpPort: 5672\n", srv.URL)
+	// Le faux broker tourne sous le compte des tests : c'est lui que la garde de
+	// la boucle locale doit tenir pour le compte du broker (D93).
+	moi, err := user.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	creds := fmt.Sprintf("url: %s\nuser: admin\npassword: s3cr3t\namqpPort: 5672\nbrokerAccount: %s\n",
+		srv.URL, moi.Username)
 	if err := os.WriteFile(filepath.Join(dir, "amqp.yaml"), []byte(creds), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -1843,6 +1872,12 @@ func (b *brokerState) serve(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(out)
 	case strings.HasPrefix(path, "/api/users/") && r.Method == http.MethodPut:
 		b.users[strings.TrimPrefix(path, "/api/users/")] = true
+		w.WriteHeader(http.StatusNoContent)
+	case strings.HasPrefix(path, "/api/vhosts/") && r.Method == http.MethodDelete:
+		delete(b.vhosts, strings.TrimPrefix(path, "/api/vhosts/"))
+		w.WriteHeader(http.StatusNoContent)
+	case strings.HasPrefix(path, "/api/users/") && r.Method == http.MethodDelete:
+		delete(b.users, strings.TrimPrefix(path, "/api/users/"))
 		w.WriteHeader(http.StatusNoContent)
 	case path == "/api/permissions":
 		_ = json.NewEncoder(w).Encode([]map[string]any{})
@@ -1893,6 +1928,139 @@ func TestAMQPMessengerPresetAndApply(t *testing.T) {
 	}
 	if args["x-dead-letter-exchange"] != "dlx" {
 		t.Errorf("exchange de rejet absent : %+v", args)
+	}
+}
+
+func TestSuppressionLaisseLeVhostAMQPQuOgsNaPasCree(t *testing.T) {
+	// Un vhost et un compte homonymes, créés hors d'ogs, étaient repris sans
+	// secret par l'apply puis détruits, messages compris, par « project delete »
+	// (R2-40). Ils sont désormais refusés au plan et laissés à la suppression.
+	h := newHarness(t)
+	h.mustRun("init")
+	state := newBrokerState()
+	state.vhosts["shopfr"], state.users["shopfr"] = true, true
+	h.fakeBroker(t, state)
+	h.mustRun("project", "create", "shop.fr", "--kind", "php-symfony", "--app-version", "6.4", "--php", "8.5")
+	h.mustRun("amqp", "messenger", "shopfr", "--transport", "async")
+
+	out, code := h.run("apply", "shopfr", "--yes")
+	if code != CodePartial || !strings.Contains(out, "sans avoir été créé") {
+		t.Errorf("le vhost homonyme doit être refusé en code 6 (code %d) :\n%s", code, out)
+	}
+	for _, w := range state.writes {
+		if strings.Contains(w, "shopfr") && strings.Contains(w, "/api/") {
+			t.Errorf("écriture sur les ressources de l'administrateur : %s", w)
+		}
+	}
+	out = h.mustRunPartial("project", "delete", "shopfr", "--yes")
+	if !strings.Contains(out, "vhost amqp shopfr conservé") || !strings.Contains(out, "compte amqp shopfr conservé") {
+		t.Errorf("la suppression doit dire ce qu'elle laisse :\n%s", out)
+	}
+	for _, w := range state.writes {
+		if strings.HasPrefix(w, "DELETE ") {
+			t.Errorf("suppression d'une ressource qu'ogs n'a pas créée : %s", w)
+		}
+	}
+}
+
+func TestVhostDeLAdministrateurDesigneApresCoupNestPasRepris(t *testing.T) {
+	// Le mot de passe scellé prouve le compte, pas le vhost : un spec.amqp.vhost
+	// changé vers le vhost « legacy » de l'administrateur y ouvrait les
+	// permissions « .* » du compte du projet, y déclarait files et bindings, puis
+	// « project delete » supprimait legacy et ses messages.
+	h := newHarness(t)
+	h.mustRun("init")
+	state := newBrokerState()
+	h.fakeBroker(t, state)
+	h.mustRun("project", "create", "shop.fr", "--kind", "php-symfony", "--app-version", "6.4", "--php", "8.5")
+	h.mustRun("amqp", "messenger", "shopfr", "--transport", "async")
+	h.mustRun("apply", "shopfr", "--yes")
+
+	state.vhosts["legacy"] = true
+	decl := h.path("etc", "ogs", "projects", "shopfr.yaml")
+	data, err := os.ReadFile(decl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "vhost: shopfr") {
+		t.Fatalf("déclaration inattendue :\n%s", data)
+	}
+	if err := os.WriteFile(decl, []byte(strings.ReplaceAll(string(data), "vhost: shopfr", "vhost: legacy")),
+		0o600); err != nil {
+		t.Fatal(err)
+	}
+	state.writes = nil
+	out, code := h.run("apply", "shopfr", "--yes")
+	if code != CodePartial || !strings.Contains(out, "aucune marque scellée pour le vhost legacy") {
+		t.Errorf("le vhost de l'administrateur doit être refusé en code 6 (code %d) :\n%s", code, out)
+	}
+	for _, w := range state.writes {
+		if strings.Contains(w, "legacy") {
+			t.Errorf("écriture sur le vhost de l'administrateur : %s", w)
+		}
+	}
+	out = h.mustRunPartial("project", "delete", "shopfr", "--yes")
+	if slices.Contains(state.writes, "DELETE /api/vhosts/legacy") {
+		t.Errorf("le vhost de l'administrateur est parti avec le projet :\n%s", out)
+	}
+	// Le compte, lui, est celui d'ogs : il part.
+	if !slices.Contains(state.writes, "DELETE /api/users/shopfr") {
+		t.Errorf("le compte d'ogs doit partir : %v", state.writes)
+	}
+}
+
+func TestFilesDUnVhostHomonymeNiVideesNiAffichees(t *testing.T) {
+	// « amqp queue purge » vidait la file d'un vhost qu'ogs n'a pas créé, et
+	// « amqp status » l'affichait sous le nom du projet.
+	h := newHarness(t)
+	h.mustRun("init")
+	state := newBrokerState()
+	state.vhosts["shopfr"] = true
+	state.queueList = []map[string]any{{"name": "async", "vhost": "shopfr", "messages": 12}}
+	h.fakeBroker(t, state)
+	h.mustRun("project", "create", "shop.fr", "--kind", "php-symfony", "--app-version", "6.4", "--php", "8.5")
+	h.mustRun("amqp", "messenger", "shopfr", "--transport", "async")
+	state.writes = nil
+	out, code := h.run("amqp", "queue", "purge", "shopfr", "async", "--yes")
+	if code != CodeConflict || !strings.Contains(out, "aucune marque scellée") {
+		t.Errorf("la purge doit être refusée (code %d) :\n%s", code, out)
+	}
+	for _, w := range state.writes {
+		if strings.HasPrefix(w, "DELETE ") {
+			t.Errorf("file de l'administrateur vidée : %s", w)
+		}
+	}
+	out, _ = h.run("amqp", "status", "shopfr")
+	if !strings.Contains(out, "non créé par ogs") || strings.Contains(out, "async") && strings.Contains(out, "12") {
+		t.Errorf("les files d'un homonyme ne doivent pas être affichées :\n%s", out)
+	}
+}
+
+func TestSuppressionRetireLeVhostAMQPDOgs(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	state := newBrokerState()
+	h.fakeBroker(t, state)
+	h.mustRun("project", "create", "shop.fr", "--kind", "php-symfony", "--app-version", "6.4", "--php", "8.5")
+	h.mustRun("amqp", "messenger", "shopfr", "--transport", "async")
+	h.mustRun("apply", "shopfr", "--yes")
+	h.mustRunPartial("project", "delete", "shopfr", "--yes")
+	if !slices.Contains(state.writes, "DELETE /api/vhosts/shopfr") ||
+		!slices.Contains(state.writes, "DELETE /api/users/shopfr") {
+		t.Errorf("le vhost et le compte d'ogs doivent partir : %v", state.writes)
+	}
+	// Les secrets partent avec eux : un vhost homonyme créé ensuite par un autre
+	// n'est pas tenu pour celui du projet recréé sous le même nom. Le compte est
+	// absent du broker : seule la marque du vhost, restée, le ferait adopter.
+	if state.vhosts["shopfr"] || state.users["shopfr"] {
+		t.Fatalf("le faux broker doit avoir retiré vhost et compte : %v %v", state.vhosts, state.users)
+	}
+	state.vhosts["shopfr"] = true
+	h.mustRun("project", "create", "shop.fr", "--kind", "php-symfony", "--app-version", "6.4", "--php", "8.5")
+	h.mustRun("amqp", "messenger", "shopfr", "--transport", "async")
+	if out, code := h.run("apply", "shopfr", "--yes"); code != CodePartial ||
+		!strings.Contains(out, "aucune marque scellée pour le vhost shopfr") {
+		t.Errorf("le vhost d'un autre doit être refusé au projet recréé (code %d) :\n%s", code, out)
 	}
 }
 
@@ -1957,15 +2125,15 @@ func TestAMQPStatusShowsCounters(t *testing.T) {
 	h := newHarness(t)
 	h.mustRun("init")
 	state := newBrokerState()
-	state.vhosts["shopfr"] = true
-	state.users["shopfr"] = true
+	h.fakeBroker(t, state)
+	h.mustRun("project", "create", "shop.fr", "--kind", "php-symfony", "--app-version", "6.4", "--php", "8.5")
+	h.mustRun("amqp", "messenger", "shopfr")
+	// Le vhost est celui d'ogs : ceux d'un homonyme ne sont pas affichés (D93).
+	h.mustRun("apply", "shopfr", "--yes")
 	state.queueList = []map[string]any{{
 		"name": "async", "vhost": "shopfr", "durable": true, "type": "quorum",
 		"messages": 42, "consumers": 2, "arguments": map[string]any{},
 	}}
-	h.fakeBroker(t, state)
-	h.mustRun("project", "create", "shop.fr", "--kind", "php-symfony", "--app-version", "6.4", "--php", "8.5")
-	h.mustRun("amqp", "messenger", "shopfr")
 	out := h.mustRun("amqp", "status", "shopfr")
 	if !strings.Contains(out, "async") || !strings.Contains(out, "42") {
 		t.Errorf("les compteurs doivent être affichés :\n%s", out)
@@ -2002,6 +2170,16 @@ func TestAMQPCredentialsPermissions(t *testing.T) {
 	out := h.mustRun("amqp", "credentials", "set", "--user", "guest", "--password", "guest")
 	if !strings.Contains(out, "compte par défaut connu") {
 		t.Errorf("l'emploi de guest doit être signalé :\n%s", out)
+	}
+	if !strings.Contains(out, "--password : la valeur figure dans la ligne de commande") {
+		t.Errorf("l'option --password doit être signalée :\n%s", out)
+	}
+	// Hors terminal, le mot de passe se lit sur l'entrée standard (S1R-11).
+	h.stdin = "mot de passe lu\n"
+	h.mustRun("amqp", "credentials", "set", "--user", "admin")
+	if content := h.read(t, filepath.Join("etc", "ogs", "credentials", "amqp.yaml")); !strings.Contains(content,
+		"password: mot de passe lu") {
+		t.Errorf("le mot de passe de l'entrée standard doit être enregistré :\n%s", content)
 	}
 	info, err := os.Stat(h.path("etc", "ogs", "credentials", "amqp.yaml"))
 	if err != nil {

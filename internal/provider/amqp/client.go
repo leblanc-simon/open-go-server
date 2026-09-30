@@ -33,6 +33,10 @@ type Credentials struct {
 	Password string `yaml:"password"`
 	// AMQPPort est le port du protocole AMQP, pour construire les DSN applicatifs.
 	AMQPPort int `yaml:"amqpPort,omitempty"`
+	// BrokerAccount est le compte système sous lequel tourne le broker : sur la
+	// boucle locale, seul lui — ou root — reçoit les identifiants (D93). Vide,
+	// c'est celui du paquet Debian, DefaultBrokerAccount.
+	BrokerAccount string `yaml:"brokerAccount,omitempty"`
 }
 
 // Vhost décrit un vhost observé.
@@ -157,11 +161,27 @@ func NewHTTPClient(creds Credentials) (Client, error) {
 	if _, err := url.Parse(creds.URL); err != nil {
 		return nil, fmt.Errorf("URL de management %q invalide : %w", creds.URL, err)
 	}
+	return newHTTPClient(creds, peerGuard{account: brokerAccount(creds)}), nil
+}
+
+func newHTTPClient(creds Credentials, guard peerGuard) *httpClient {
+	// Chaque connexion passe par la garde : une connexion ouverte avant l'arrêt du
+	// broker n'est jamais réemployée vers un autre, le noyau la fermant avec lui.
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = nil
+	transport.DialContext = guard.dial
 	return &httpClient{
 		base:  strings.TrimRight(creds.URL, "/"),
 		creds: creds,
-		http:  &http.Client{Timeout: 15 * time.Second},
-	}, nil
+		http:  &http.Client{Timeout: 15 * time.Second, Transport: transport},
+	}
+}
+
+func brokerAccount(creds Credentials) string {
+	if creds.BrokerAccount == "" {
+		return DefaultBrokerAccount
+	}
+	return creds.BrokerAccount
 }
 
 // do exécute une requête et décode la réponse éventuelle.
@@ -184,7 +204,7 @@ func (c *httpClient) do(ctx context.Context, method, path string, body, out any)
 	}
 	res, err := c.http.Do(req)
 	if err != nil {
-		return fmt.Errorf("%w : %v", ErrUnavailable, err)
+		return fmt.Errorf("%w : %w", ErrUnavailable, err)
 	}
 	defer res.Body.Close()
 	switch {

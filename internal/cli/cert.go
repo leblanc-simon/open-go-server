@@ -395,7 +395,12 @@ func newCertDNSSetCommand(app *App) *cobra.Command {
 		Short: "Enregistrer les identifiants d'un provider DNS",
 		Long: "Les identifiants sont écrits en 0600 sous /etc/ogs/credentials/dns/. Ils\n" +
 			"donnent un droit d'écriture sur la zone entière : les traiter comme un secret\n" +
-			"de premier rang. OVH accepte deux modes, clés applicatives ou OAuth2.",
+			"de premier rang. OVH accepte deux modes, clés applicatives (--application-key)\n" +
+			"ou OAuth2 (--client-id).\n\n" +
+			"Les secrets sont demandés sans écho sur un terminal, et lus sur l'entrée\n" +
+			"standard sinon, une ligne chacun : le secret applicatif puis la clé de\n" +
+			"consommateur, ou le secret client. Les options qui les portent, déconseillées,\n" +
+			"les laissent dans le journal de sudo et l'historique du shell.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			provider := args[0]
@@ -407,24 +412,29 @@ func newCertDNSSetCommand(app *App) *cobra.Command {
 			if endpoint != "" {
 				creds["endpoint"] = endpoint
 			}
+			saisie := app.saisieSecrets(cmd)
+			var err error
 			switch {
 			case clientID != "":
-				if clientSecret == "" {
-					return exitf(CodeUsage, "--client-secret est requis avec --client-id")
+				if clientSecret, err = saisie.valeur("client-secret", clientSecret, "secret client OAuth2"); err != nil {
+					return err
 				}
 				creds["clientId"] = clientID
 				creds["clientSecret"] = clientSecret
 			case applicationKey != "":
-				if applicationSecret == "" || consumerKey == "" {
-					return exitf(CodeUsage,
-						"--application-secret et --consumer-key sont requis avec --application-key")
+				applicationSecret, err = saisie.valeur("application-secret", applicationSecret, "secret applicatif")
+				if err != nil {
+					return err
+				}
+				if consumerKey, err = saisie.valeur("consumer-key", consumerKey, "clé de consommateur"); err != nil {
+					return err
 				}
 				creds["applicationKey"] = applicationKey
 				creds["applicationSecret"] = applicationSecret
 				creds["consumerKey"] = consumerKey
 			default:
-				return exitf(CodeUsage, "fournir soit --client-id et --client-secret, "+
-					"soit --application-key, --application-secret et --consumer-key")
+				return exitf(CodeUsage, "fournir soit --client-id (OAuth2), soit --application-key "+
+					"(clés applicatives) ; les secrets sont ensuite demandés")
 			}
 			data, err := yaml.Marshal(creds)
 			if err != nil {
@@ -449,10 +459,13 @@ func newCertDNSSetCommand(app *App) *cobra.Command {
 	f := cmd.Flags()
 	f.StringVar(&endpoint, "endpoint", "ovh-eu", "point d'accès de l'API (ovh-eu, ovh-ca…)")
 	f.StringVar(&applicationKey, "application-key", "", "clé applicative")
-	f.StringVar(&applicationSecret, "application-secret", "", "secret applicatif")
-	f.StringVar(&consumerKey, "consumer-key", "", "clé de consommateur")
+	f.StringVar(&applicationSecret, "application-secret", "",
+		"secret applicatif (déconseillé : visible dans le journal de sudo ; l'omettre pour le saisir)")
+	f.StringVar(&consumerKey, "consumer-key", "",
+		"clé de consommateur (déconseillé : visible dans le journal de sudo ; l'omettre pour la saisir)")
 	f.StringVar(&clientID, "client-id", "", "identifiant client OAuth2")
-	f.StringVar(&clientSecret, "client-secret", "", "secret client OAuth2")
+	f.StringVar(&clientSecret, "client-secret", "",
+		"secret client OAuth2 (déconseillé : visible dans le journal de sudo ; l'omettre pour le saisir)")
 	return cmd
 }
 

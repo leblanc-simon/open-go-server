@@ -48,7 +48,50 @@ type Observed struct {
 	Policies    map[string]Policy
 	// Degraded indique que le broker est piloté sans le plugin management.
 	Degraded bool
+	// Sealed dit si le keystore porte le mot de passe du compte pour ce projet :
+	// il est scellé juste avant qu'ogs crée le compte, jamais autrement.
+	Sealed bool
+	// VhostSealed dit si le keystore porte la marque du vhost pour ce projet
+	// (VhostMarker), scellée juste avant qu'ogs crée le vhost.
+	VhostSealed bool
+	// Marked dit si le projet porte au moins une marque de vhost, quel qu'il
+	// soit : il a été planifié depuis D93, et le critère du parc antérieur ne
+	// vaut plus pour lui (VhostOwned).
+	Marked bool
 }
+
+// VhostMarker nomme le secret qui marque un vhost créé par ogs. Sa valeur est le
+// nom du vhost : seul compte qu'il existe, scellé au projet.
+func VhostMarker(vhost string) string { return "amqp-vhost/" + vhost }
+
+// UserOwned dit si le compte observé, s'il existe, est celui qu'ogs a créé pour
+// le projet (D93) : son mot de passe est scellé.
+func (o Observed) UserOwned() bool { return !o.UserExists || o.Sealed }
+
+// VhostOwned dit si le vhost observé, s'il existe, est celui qu'ogs a créé pour
+// le projet (D93). Le secret du compte ne le prouve pas : il prouve le compte, et
+// un spec.amqp.vhost changé vers le vhost d'un autre le laisserait intact. La
+// preuve est la marque du vhost, ou le critère du parc antérieur (Legacy).
+func (o Observed) VhostOwned() bool { return !o.VhostExists || o.VhostSealed || o.Legacy() }
+
+// Legacy dit si le vhost est admis par le seul critère du parc antérieur à D93 :
+// un compte d'ogs qui y a déjà ses permissions, dans un projet qui ne porte
+// encore **aucune** marque de vhost. Sans cette dernière condition, le critère
+// valait pour toujours : il suffisait que l'administrateur accorde au compte du
+// projet une permission, même restreinte, sur son vhost commun, puis que
+// spec.amqp.vhost le désigne, pour que le plan y élargisse les droits à « .* »
+// et que la suppression l'emporte avec ses messages. Le premier plan qui admet un
+// vhost ainsi en scelle la marque (vhostStep) : le critère s'éteint avec lui.
+func (o Observed) Legacy() bool {
+	return o.VhostExists && !o.VhostSealed && !o.Marked && o.Sealed && o.Permission != nil
+}
+
+// Owned dit si le vhost et le compte observés, quand ils existent, sont ceux
+// qu'ogs a créés pour le projet (D93). Le broker ne porte aucune marque : ce sont
+// les secrets scellés au keystore qui font foi. Un vhost ou un compte homonymes
+// sans eux appartiennent à quelqu'un d'autre — l'administrateur, une application
+// restée hors d'ogs.
+func (o Observed) Owned() bool { return o.VhostOwned() && o.UserOwned() }
 
 // Observe inspecte le broker.
 func (p *Provider) Observe(ctx context.Context, proj *model.Project) (Observed, error) {
@@ -70,6 +113,9 @@ func (p *Provider) Observe(ctx context.Context, proj *model.Project) (Observed, 
 		return obs, nil
 	}
 	obs.Version = version
+	obs.Sealed = p.sealed(proj.ID(), "amqp/"+proj.Spec.AMQP.User)
+	obs.VhostSealed = p.sealed(proj.ID(), VhostMarker(proj.Spec.AMQP.Vhost))
+	obs.Marked = obs.VhostSealed || p.marked(proj.ID())
 
 	vhost := proj.Spec.AMQP.Vhost
 	vhosts, err := p.Client.Vhosts(ctx)
@@ -148,9 +194,12 @@ func (p *Provider) Plan(ctx context.Context, proj *model.Project, obs Observed) 
 		s.Apply = func(context.Context) error { return reason }
 		return []*engine.Step{s}, nil
 	}
+	if !obs.Owned() {
+		return []*engine.Step{foreignStep(spec, obs)}, nil
+	}
 
 	var steps []*engine.Step
-	steps = append(steps, p.vhostStep(spec, obs))
+	steps = append(steps, p.vhostStep(proj, spec, obs))
 	userStep, err := p.userStep(proj, spec, obs)
 	if err != nil {
 		return nil, err
@@ -168,14 +217,91 @@ func (p *Provider) Plan(ctx context.Context, proj *model.Project, obs Observed) 
 	return steps, nil
 }
 
-func (p *Provider) vhostStep(spec *model.AMQP, obs Observed) *engine.Step {
+// foreignStep refuse de toucher à un vhost ou à un compte homonymes qu'ogs n'a pas
+// créés. Les reprendre, c'était laisser le projet sans mot de passe — le compte
+// gardait le sien, que personne ne pouvait donner à l'application —, puis les
+// détruire à « project delete » avec les messages en attente de leur véritable
+// propriétaire. Aucune étape n'est planifiée sur eux, pas même les permissions :
+// ouvrir le vhost d'un autre au compte du projet serait pire que de ne rien faire.
+// L'étape n'est pas critique — un site sans broker reste déployable, comme sous
+// l'indisponibilité — et son échec rend le code 6.
+func foreignStep(spec *model.AMQP, obs Observed) *engine.Step {
+	var what []string
+	if !obs.VhostOwned() {
+		what = append(what, "le vhost "+spec.Vhost)
+	}
+	if !obs.UserOwned() {
+		what = append(what, "le compte "+spec.User)
+	}
+	names := strings.Join(what, " et ")
+	exists, created, pronoun := "existe", "créé", "le"
+	if len(what) > 1 {
+		exists, created, pronoun = "existent", "créés", "les"
+	}
+	s := engine.NewStep("amqp/vhost/"+spec.Vhost, engine.Create, fmt.Sprintf(
+		"vhost amqp %s — refusé : %s %s déjà sans avoir été %s par ogs", spec.Vhost, names, exists, created))
+	s.Critical = false
+	reason := fmt.Errorf("%s : ogs ne %s reprend pas, et ne %s supprimera pas. Déclarer d'autres noms "+
+		"(spec.amqp.vhost, spec.amqp.user) qui n'existent pas encore sur le broker, ou retirer l'homonyme "+
+		"du broker s'il n'a plus d'usage", ForeignReason(spec, obs), pronoun, pronoun)
+	s.Apply = func(context.Context) error { return reason }
+	return s
+}
+
+// ForeignReason dit pourquoi le vhost ou le compte d'un projet ne sont pas tenus
+// pour ceux d'ogs.
+func ForeignReason(spec *model.AMQP, obs Observed) string {
+	var parts []string
+	if !obs.VhostOwned() {
+		parts = append(parts, fmt.Sprintf("aucune marque scellée pour le vhost %s", spec.Vhost))
+	}
+	if !obs.UserOwned() {
+		parts = append(parts, fmt.Sprintf("aucun mot de passe scellé pour le compte %s", spec.User))
+	}
+	return strings.Join(parts, ", ")
+}
+
+func (p *Provider) vhostStep(proj *model.Project, spec *model.AMQP, obs Observed) *engine.Step {
 	resource := "amqp/vhost/" + spec.Vhost
+	project := proj.ID()
+	if obs.Legacy() {
+		// Migration du parc antérieur à D93 : la marque est posée une fois, et le
+		// critère des permissions ne sert plus jamais à ce projet.
+		s := engine.NewStep(resource, engine.Update,
+			fmt.Sprintf("vhost amqp %s — marque de propriété (vhost antérieur à D93)", spec.Vhost))
+		s.Apply = func(context.Context) error { return p.sealMarker(project, spec.Vhost) }
+		// Un keystore en échec ne doit pas interrompre l'apply du projet : la
+		// marque sera reposée au passage suivant, comme les autres étapes AMQP.
+		s.Critical = false
+		return s
+	}
 	if obs.VhostExists {
 		return engine.NewStep(resource, engine.NoOp, fmt.Sprintf("vhost amqp %s", spec.Vhost))
 	}
 	s := engine.NewStep(resource, engine.Create, fmt.Sprintf("vhost amqp %s", spec.Vhost))
-	s.Apply = func(ctx context.Context) error { return p.Client.EnsureVhost(ctx, spec.Vhost) }
-	s.Compensate = func(ctx context.Context) error { return p.Client.DeleteVhost(ctx, spec.Vhost) }
+	s.Apply = func(ctx context.Context) error {
+		// La marque précède le vhost : dans l'ordre inverse, une interruption
+		// entre les deux laisserait un vhost d'ogs refusé pour toujours.
+		if err := p.sealMarker(project, spec.Vhost); err != nil {
+			return err
+		}
+		if err := p.Client.EnsureVhost(ctx, spec.Vhost); err != nil {
+			// Restée sans vhost, la marque ferait adopter l'homonyme qu'un autre
+			// créerait ensuite : la compensation ne couvre pas l'étape en échec.
+			// Elle n'est retirée que si cette étape l'a posée.
+			if !obs.VhostSealed {
+				_ = p.Store.DeleteSecret(project, VhostMarker(spec.Vhost))
+			}
+			return err
+		}
+		return nil
+	}
+	s.Compensate = func(ctx context.Context) error {
+		if err := p.Client.DeleteVhost(ctx, spec.Vhost); err != nil {
+			return err
+		}
+		return p.Store.DeleteSecret(project, VhostMarker(spec.Vhost))
+	}
 	return s
 }
 
@@ -508,6 +634,49 @@ func sameDefinition(a, b map[string]any) bool {
 	return true
 }
 
+// sealed dit si le keystore porte le secret nommé pour le projet. Une lecture qui
+// échoue vaut absence : c'est le sens prudent, celui qui refuse de reprendre et de
+// supprimer.
+func (p *Provider) sealed(project, name string) bool {
+	if p.Store == nil {
+		return false
+	}
+	_, _, err := p.Store.GetSecret(project, name)
+	return err == nil
+}
+
+// marked dit si le projet porte au moins une marque de vhost. Une lecture qui
+// échoue vaut présence : c'est le sens prudent, celui qui refuse le critère du
+// parc antérieur.
+func (p *Provider) marked(project string) bool {
+	if p.Store == nil {
+		return true
+	}
+	names, err := p.Store.SecretNames(project)
+	if err != nil {
+		return true
+	}
+	for _, n := range names {
+		if strings.HasPrefix(n, VhostMarker("")) {
+			return true
+		}
+	}
+	return false
+}
+
+// sealMarker scelle la marque d'un vhost qu'ogs s'apprête à créer.
+func (p *Provider) sealMarker(project, vhost string) error {
+	if p.Store == nil || p.Keys == nil {
+		return fmt.Errorf("keystore indisponible : impossible de marquer le vhost %s", vhost)
+	}
+	name := VhostMarker(vhost)
+	nonce, ciphertext, err := p.Keys.Seal(project, name, []byte(vhost))
+	if err != nil {
+		return err
+	}
+	return p.Store.PutSecret(project, name, nonce, ciphertext)
+}
+
 // ensurePassword génère et scelle le mot de passe du compte AMQP, ou le relit.
 func (p *Provider) ensurePassword(project, user string) (string, error) {
 	if p.Store == nil || p.Keys == nil {
@@ -542,6 +711,12 @@ func (p *Provider) RotatePassword(ctx context.Context, proj *model.Project) (str
 		return "", fmt.Errorf("le projet %s ne déclare pas de transport AMQP", proj.ID())
 	}
 	user := proj.Spec.AMQP.User
+	// Un compte dont ogs n'a pas scellé le mot de passe n'est pas le sien (D93) :
+	// le changer couperait l'application de son propriétaire.
+	if !p.sealed(proj.ID(), "amqp/"+user) {
+		return "", fmt.Errorf("le compte amqp %s n'a pas été créé par ogs : son mot de passe n'est pas "+
+			"changé", user)
+	}
 	password, err := secret.Password(0)
 	if err != nil {
 		return "", err

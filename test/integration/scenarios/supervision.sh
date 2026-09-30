@@ -191,6 +191,33 @@ apache2ctl -t >/dev/null 2>&1 || echec "le vhost d'état est invalide après la 
 echo "  fichiers de parc recalculés, configurations toujours valides"
 
 echo
+echo "--- un compte homonyme de l'administrateur est-il laissé tel quel ? (D93) ---"
+# L'administrateur collecte déjà sous « collecte » ; ogs, réglé sur ce nom, lui
+# posait un mot de passe neuf par ALTER USER et cassait sa collecte.
+mariadb -e "CREATE USER 'collecte'@'localhost' IDENTIFIED BY 'celui-de-l-administrateur';
+            GRANT PROCESS ON *.* TO 'collecte'@'localhost'" || echec "compte de l'administrateur non créé"
+cp /etc/ogs/config.yaml /tmp/config.yaml.avant
+python3 - <<'PY'
+chemin = "/etc/ogs/config.yaml"
+s = open(chemin).read()
+assert "  telegraf: {}\n" in s, "réglage telegraf inattendu"
+s = s.replace("  telegraf: {}\n", "  telegraf:\n    account: collecte\n", 1)
+open(chemin, "w").write(s)
+PY
+sortie=$(ogs apply --yes 2>&1)
+code=$?
+echo "$sortie" | grep -i "collecte" | head -2
+[ "$code" = 6 ] || echec "le refus doit rendre le code 6 (code $code)"
+echo "$sortie" | grep -q "sans avoir été créé par ogs" || echec "le refus n'est pas annoncé"
+mariadb -h 127.0.0.1 -u collecte -p'celui-de-l-administrateur' -e "SELECT 1" >/dev/null 2>&1 \
+    || echec "le mot de passe du compte de l'administrateur a changé"
+mariadb -N -e "SHOW GRANTS FOR 'collecte'@'localhost'" | grep -qi performance_schema \
+    && echec "les droits du compte de l'administrateur ont changé"
+grep -q "collecte" "$fragment" && echec "le fragment porte un compte qu'ogs n'a pas posé"
+cp /tmp/config.yaml.avant /etc/ogs/config.yaml
+echo "  mot de passe, droits et fragment intacts"
+
+echo
 echo "RÉSULTAT : la supervision décrit un parc réel — état servi en local, comptes"
 echo "           de métriques bornés, prisons acceptées par fail2ban, et rien qui"
 echo "           survive à la suppression d'un projet."

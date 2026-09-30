@@ -384,7 +384,7 @@ func (b *fakeBroker) Overview(context.Context) (string, error) { return "3.13.7"
 func (b *fakeBroker) Users(context.Context) ([]amqp.User, error) {
 	return b.users, nil
 }
-func (b *fakeBroker) EnsureUser(_ context.Context, name, password string, _ []string) error {
+func (b *fakeBroker) EnsureUser(_ context.Context, name, password string, tags []string) error {
 	if b.refuse != nil {
 		return b.refuse
 	}
@@ -392,6 +392,14 @@ func (b *fakeBroker) EnsureUser(_ context.Context, name, password string, _ []st
 		b.created = map[string]string{}
 	}
 	b.created[name] = password
+	// Le compte posé est relu comme le rendrait le broker.
+	for i := range b.users {
+		if b.users[i].Name == name {
+			b.users[i].Tags = strings.Join(tags, ",")
+			return nil
+		}
+	}
+	b.users = append(b.users, amqp.User{Name: name, Tags: strings.Join(tags, ",")})
 	return nil
 }
 
@@ -432,28 +440,120 @@ func TestPlanNeScellePasDeSecretDeParc(t *testing.T) {
 	}
 }
 
-func TestCompteDeSupervisionPreexistantRecoitSonMotDePasse(t *testing.T) {
-	// Un compte créé par l'administrateur — ou une base d'état restaurée sans ses
-	// secrets — était jugé conforme sur son seul tag : le fragment partait avec un
-	// mot de passe que le broker ignore, et l'agent échouait à chaque collecte
-	// sans que rien — ni le plan, ni l'apply, ni doctor — ne le dise.
+func TestCompteDeSupervisionRabbitMQDeLAdministrateurNestPasRepris(t *testing.T) {
+	// Un compte « telegraf » créé par l'administrateur — ou une base d'état
+	// restaurée sans ses secrets — était « réparé » : mot de passe neuf, tags
+	// remplacés par « monitoring », et la collecte de l'administrateur cassée sans
+	// un mot (R2-41). Il est désormais laissé tel quel, l'étape échoue pour le
+	// dire, et le fragment ne reçoit aucun identifiant que le broker refuserait.
 	p, _ := fixture(t)
 	account := p.Cfg.Monitoring.TelegrafAccount()
-	broker := &fakeBroker{users: []amqp.User{{Name: account, Tags: "monitoring"}}}
+	broker := &fakeBroker{users: []amqp.User{{Name: account, Tags: "administrator"}}}
 	p.AMQP = &amqp.Provider{Client: broker, ManagementURL: amqp.DefaultManagementURL}
 
+	step, access := p.planRabbitAccount(context.Background())
+	if step == nil || step.Apply == nil || step.Critical {
+		t.Fatalf("une étape non critique qui échoue est attendue : %+v", step)
+	}
+	if access != nil {
+		t.Error("aucun identifiant ne doit partir au fragment pour un compte qu'ogs n'a pas posé")
+	}
+	err := step.Apply(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "monitoring.telegraf.account") {
+		t.Errorf("le refus doit nommer le remède : %v", err)
+	}
+	if len(broker.created) != 0 {
+		t.Errorf("le compte de l'administrateur a été modifié : %v", broker.created)
+	}
+	if names, _ := p.Store.SecretNames(SecretScope); len(names) != 0 {
+		t.Errorf("un secret a été scellé pour un compte qu'ogs n'a pas créé : %v", names)
+	}
+}
+
+func TestCompteDeSupervisionRabbitMQAOgsRetrouveSonTag(t *testing.T) {
+	// Le compte d'ogs — son mot de passe est scellé — qui a perdu son tag est
+	// repassé, avec le mot de passe scellé et non un nouveau.
+	p, _ := fixture(t)
+	account := p.Cfg.Monitoring.TelegrafAccount()
+	if err := p.sealSecret("rabbitmq/"+account, "scelle"); err != nil {
+		t.Fatal(err)
+	}
+	broker := &fakeBroker{users: []amqp.User{{Name: account, Tags: ""}}}
+	p.AMQP = &amqp.Provider{Client: broker, ManagementURL: amqp.DefaultManagementURL}
 	step, _ := p.planRabbitAccount(context.Background())
 	if step == nil || step.Apply == nil {
-		t.Fatal("le compte doit être repassé tant que son mot de passe n'est pas scellé")
+		t.Fatal("le compte d'ogs sans son tag doit être repassé")
 	}
 	if err := step.Apply(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	// Une fois posé et scellé, le compte est conforme : le plan ne doit plus rien
-	// annoncer.
-	again, _ := p.planRabbitAccount(context.Background())
-	if again == nil || again.Apply != nil {
-		t.Errorf("second plan non vide : le compte n'est pas idempotent (%+v)", again)
+	if broker.created[account] != "scelle" {
+		t.Errorf("mot de passe posé %q, attendu le mot de passe scellé", broker.created[account])
+	}
+}
+
+// fakeMySQL répond aux seuls appels que la planification du compte de
+// supervision MySQL fait, et note les requêtes.
+type fakeMySQL struct {
+	db.Client
+	users map[string]bool
+	execs []string
+}
+
+func (m *fakeMySQL) Users(context.Context) (map[string]bool, error) { return m.users, nil }
+func (m *fakeMySQL) Grants(context.Context, string, string) (map[string]string, error) {
+	return map[string]string{}, nil
+}
+func (m *fakeMySQL) Exec(_ context.Context, stmt string) error {
+	m.execs = append(m.execs, stmt)
+	return nil
+}
+
+func TestCompteDeSupervisionMySQLDeLAdministrateurNestPasRepris(t *testing.T) {
+	// Même défaut côté MySQL (R2-41) : un ALTER USER au mot de passe neuf sur le
+	// compte « telegraf » de l'administrateur.
+	p, paths := fixture(t)
+	socket := filepath.Join(paths.Prefix(), "run", "mysqld", "mysqld.sock")
+	if err := os.MkdirAll(filepath.Dir(socket), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(socket, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	account := p.Cfg.Monitoring.TelegrafAccount()
+	moteur := &fakeMySQL{users: map[string]bool{account + "@localhost": true}}
+	p.DB = &db.Provider{}
+	previous := engineClient
+	engineClient = func(*db.Provider, string, string) (db.Client, error) { return moteur, nil }
+	t.Cleanup(func() { engineClient = previous })
+
+	step, access := p.planMySQLAccount(context.Background())
+	if step == nil || step.Apply == nil || step.Critical {
+		t.Fatalf("une étape non critique qui échoue est attendue : %+v", step)
+	}
+	if access != nil {
+		t.Error("aucun identifiant ne doit partir au fragment pour un compte qu'ogs n'a pas posé")
+	}
+	if err := step.Apply(context.Background()); err == nil {
+		t.Error("l'étape doit échouer pour dire le refus")
+	}
+	if len(moteur.execs) != 0 {
+		t.Errorf("requêtes envoyées sur le compte de l'administrateur : %v", moteur.execs)
+	}
+
+	// Le compte d'ogs, lui, est repassé quand ses privilèges dérivent.
+	if err := p.sealSecret("mysql/"+account, "scelle"); err != nil {
+		t.Fatal(err)
+	}
+	step, access = p.planMySQLAccount(context.Background())
+	if step == nil || access == nil || step.Apply == nil {
+		t.Fatal("le compte d'ogs aux privilèges incomplets doit être repassé")
+	}
+	if err := step.Apply(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(moteur.execs) == 0 {
+		t.Error("aucune requête pour le compte d'ogs")
 	}
 }
 
@@ -800,5 +900,82 @@ func TestPrisonsRetoucheesALaMainNeSontPasEcrasees(t *testing.T) {
 	}
 	if data, _ := os.ReadFile(copies[0]); string(data) != string(retouche) {
 		t.Error("la sauvegarde ne porte pas le fichier de l'exploitant")
+	}
+}
+
+// fakeMySQLPartiel crée le compte puis échoue au premier GRANT : l'apply
+// interrompu en route, après CREATE USER.
+type fakeMySQLPartiel struct {
+	fakeMySQL
+	refuserGrant bool
+}
+
+func (m *fakeMySQLPartiel) Exec(ctx context.Context, stmt string) error {
+	if strings.HasPrefix(strings.ToUpper(stmt), "CREATE USER") {
+		m.users["telegraf@localhost"] = true
+	}
+	if m.refuserGrant && strings.HasPrefix(strings.ToUpper(stmt), "GRANT") {
+		return errors.New("GRANT refusé")
+	}
+	return m.fakeMySQL.Exec(ctx, stmt)
+}
+
+func TestCompteDeSupervisionMySQLInterrompuResteAOgs(t *testing.T) {
+	// Scellé après le moteur, le secret manquait au compte que CREATE USER venait
+	// de créer quand un GRANT échouait : le plan suivant le tenait pour celui de
+	// l'administrateur, et le refusait pour toujours.
+	p, paths := fixture(t)
+	socket := filepath.Join(paths.Prefix(), "run", "mysqld", "mysqld.sock")
+	if err := os.MkdirAll(filepath.Dir(socket), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(socket, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	moteur := &fakeMySQLPartiel{fakeMySQL: fakeMySQL{users: map[string]bool{}}, refuserGrant: true}
+	p.DB = &db.Provider{}
+	previous := engineClient
+	engineClient = func(*db.Provider, string, string) (db.Client, error) { return moteur, nil }
+	t.Cleanup(func() { engineClient = previous })
+
+	step, _ := p.planMySQLAccount(context.Background())
+	if step == nil || step.Apply == nil {
+		t.Fatal("le compte doit être créé")
+	}
+	if err := step.Apply(context.Background()); err == nil {
+		t.Fatal("le GRANT refusé doit faire échouer l'étape")
+	}
+	if !moteur.users["telegraf@localhost"] {
+		t.Fatal("le compte doit exister après CREATE USER")
+	}
+	moteur.refuserGrant = false
+	step, access := p.planMySQLAccount(context.Background())
+	if step == nil || step.Apply == nil || access == nil || strings.Contains(step.Summary, "refusé") {
+		t.Fatalf("le compte d'ogs interrompu doit être repassé, non refusé : %+v", step)
+	}
+	if err := step.Apply(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCompteDeSupervisionRabbitMQInterrompuResteAOgs(t *testing.T) {
+	// Même défaut côté RabbitMQ : un scellement en échec après EnsureUser.
+	p, _ := fixture(t)
+	account := p.Cfg.Monitoring.TelegrafAccount()
+	broker := &fakeBroker{refuse: errors.New("contexte annulé")}
+	p.AMQP = &amqp.Provider{Client: broker, ManagementURL: amqp.DefaultManagementURL}
+	step, _ := p.planRabbitAccount(context.Background())
+	if err := step.Apply(context.Background()); err == nil {
+		t.Fatal("la pose refusée doit faire échouer l'étape")
+	}
+	// Le broker a pu créer le compte avant de répondre en erreur.
+	broker.users = []amqp.User{{Name: account, Tags: ""}}
+	broker.refuse = nil
+	step, access := p.planRabbitAccount(context.Background())
+	if step == nil || step.Apply == nil || access == nil || strings.Contains(step.Summary, "refusé") {
+		t.Fatalf("le compte d'ogs interrompu doit être repassé, non refusé : %+v", step)
+	}
+	if err := step.Apply(context.Background()); err != nil {
+		t.Fatal(err)
 	}
 }

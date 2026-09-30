@@ -22,6 +22,7 @@ import (
 	"leblanc.io/open-go-server/internal/fs"
 	"leblanc.io/open-go-server/internal/hook"
 	"leblanc.io/open-go-server/internal/model"
+	"leblanc.io/open-go-server/internal/provider/amqp"
 	appprov "leblanc.io/open-go-server/internal/provider/app"
 	"leblanc.io/open-go-server/internal/provider/cron"
 	"leblanc.io/open-go-server/internal/provider/system"
@@ -615,14 +616,59 @@ func (a *App) dropResources(cmd *cobra.Command, provs *providers, p *model.Proje
 		}
 	}
 	if p.Spec.AMQP != nil && provs.AMQP.Client != nil {
-		if err := provs.AMQP.Client.DeleteVhost(cmd.Context(), p.Spec.AMQP.Vhost); err != nil {
-			warn("suppression du vhost amqp : %v", err)
-		} else {
-			*removed = append(*removed, "vhost amqp "+p.Spec.AMQP.Vhost)
+		// Ce qu'ogs n'a pas créé reste en place (D93) : un vhost homonyme de
+		// l'administrateur partait avec ses files et leurs messages. Vhost et
+		// compte se jugent chacun sur sa propre preuve — le mot de passe du compte
+		// ne dit rien du vhost, que spec.amqp.vhost a pu faire désigner après coup.
+		// Broker injoignable, rien n'est tenté : la suppression n'aurait pas mieux
+		// réussi.
+		spec := p.Spec.AMQP
+		obs, err := provs.AMQP.Observe(cmd.Context(), p)
+		if err == nil && obs.Unavailable != nil {
+			err = obs.Unavailable
 		}
-		if err := provs.AMQP.Client.DeleteUser(cmd.Context(), p.Spec.AMQP.User); err != nil {
-			warn("suppression du compte amqp : %v", err)
+		if err != nil {
+			warn("vhost amqp %s et compte %s conservés : %v", spec.Vhost, spec.User, err)
+			return
 		}
+		switch {
+		case !obs.VhostOwned():
+			warn("vhost amqp %s conservé : ogs ne l'a pas créé (aucune marque scellée)", spec.Vhost)
+		case obs.VhostExists:
+			if err := provs.AMQP.Client.DeleteVhost(cmd.Context(), spec.Vhost); err != nil {
+				warn("suppression du vhost amqp : %v", err)
+				break
+			}
+			*removed = append(*removed, "vhost amqp "+spec.Vhost)
+			fallthrough
+		default:
+			// La marque part avec le vhost : restée au keystore, elle ferait tenir
+			// pour sien l'homonyme qu'un autre créerait ensuite, et qu'un projet
+			// recréé sous le même identifiant reprendrait puis supprimerait.
+			a.dropSecret(p.ID(), amqp.VhostMarker(spec.Vhost), warn)
+		}
+		switch {
+		case !obs.UserOwned():
+			warn("compte amqp %s conservé : ogs ne l'a pas créé (aucun mot de passe scellé)", spec.User)
+		case obs.UserExists:
+			if err := provs.AMQP.Client.DeleteUser(cmd.Context(), spec.User); err != nil {
+				warn("suppression du compte amqp : %v", err)
+				break
+			}
+			fallthrough
+		default:
+			a.dropSecret(p.ID(), "amqp/"+spec.User, warn)
+		}
+	}
+}
+
+// dropSecret retire un secret du projet, et signale l'échec.
+func (a *App) dropSecret(project, name string, warn func(format string, args ...any)) {
+	if a.Store == nil {
+		return
+	}
+	if err := a.Store.DeleteSecret(project, name); err != nil {
+		warn("secret %s : %v", name, err)
 	}
 }
 

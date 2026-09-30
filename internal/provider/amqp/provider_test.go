@@ -2,6 +2,7 @@ package amqp
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -32,6 +33,7 @@ type memClient struct {
 	// management dont le tag ne suffit pas à /api/users.
 	failUsers error
 	failPerms error
+	failVhost error
 }
 
 func newMemClient() *memClient {
@@ -57,6 +59,9 @@ func (m *memClient) Vhosts(context.Context) ([]Vhost, error) {
 	return out, nil
 }
 func (m *memClient) EnsureVhost(_ context.Context, name string) error {
+	if m.failVhost != nil {
+		return m.failVhost
+	}
 	m.vhosts[name] = true
 	return nil
 }
@@ -607,5 +612,224 @@ func TestDSNHasNoEncodedSlash(t *testing.T) {
 	}
 	if dsn != "amqp://shopfr:s3cr3t@127.0.0.1:5672/shopfr" {
 		t.Errorf("DSN : %s", dsn)
+	}
+}
+
+func TestVhostHomonymeNonCreeParOgsNestPasRepris(t *testing.T) {
+	// Un vhost et un compte homonymes, créés hors d'ogs, étaient repris en silence
+	// — le compte gardait son mot de passe, qu'ogs ne connaissait pas — puis
+	// détruits par « project delete », messages compris (R2-40).
+	for _, c := range []struct {
+		nom           string
+		vhost, compte bool
+	}{
+		{"vhost seul", true, false},
+		{"compte seul", false, true},
+		{"vhost et compte", true, true},
+	} {
+		t.Run(c.nom, func(t *testing.T) {
+			p, client, proj := fixture(t)
+			if c.vhost {
+				client.vhosts["shopfr"] = true
+			}
+			if c.compte {
+				client.users["shopfr"] = "celui-de-l-administrateur"
+			}
+			obs, err := p.Observe(context.Background(), proj)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if obs.Owned() {
+				t.Fatal("un homonyme sans mot de passe scellé ne doit pas être tenu pour celui d'ogs")
+			}
+			steps, err := p.Plan(context.Background(), proj, obs)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(steps) != 1 || steps[0].Critical || steps[0].Apply == nil {
+				t.Fatalf("une seule étape non critique de refus est attendue : %+v", steps)
+			}
+			if err := steps[0].Apply(context.Background()); err == nil ||
+				!strings.Contains(err.Error(), "spec.amqp.vhost") {
+				t.Errorf("le refus doit nommer le remède : %v", err)
+			}
+			if c.compte && client.users["shopfr"] != "celui-de-l-administrateur" {
+				t.Error("le mot de passe du compte de l'administrateur a changé")
+			}
+			if len(client.permissions) != 0 || len(client.queues) != 0 {
+				t.Error("rien ne doit être déclaré sur des ressources qu'ogs n'a pas créées")
+			}
+			if _, _, err := p.Store.GetSecret(proj.ID(), "amqp/shopfr"); err == nil {
+				t.Error("aucun mot de passe ne doit être scellé pour un compte refusé")
+			}
+		})
+	}
+}
+
+func TestVhostDOgsResteLeSien(t *testing.T) {
+	// Le compte créé par ogs porte son mot de passe scellé : vhost et compte
+	// restent les siens, y compris quand l'un des deux a disparu du broker.
+	p, client, proj := fixture(t)
+	apply(t, p, proj)
+	delete(client.users, "shopfr")
+	obs, err := p.Observe(context.Background(), proj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !obs.Owned() {
+		t.Fatal("le vhost qu'ogs a créé doit rester le sien")
+	}
+	apply(t, p, proj)
+	if client.users["shopfr"] == "" {
+		t.Error("le compte disparu doit être recréé")
+	}
+	if plan := replan(t, p, proj); !plan.Empty() {
+		t.Errorf("le plan doit être vide :\n%s", plan.String())
+	}
+}
+
+func TestRotationRefuseUnCompteNonCreeParOgs(t *testing.T) {
+	p, client, proj := fixture(t)
+	client.users["shopfr"] = "celui-de-l-administrateur"
+	if _, err := p.RotatePassword(context.Background(), proj); err == nil {
+		t.Error("la rotation d'un compte qu'ogs n'a pas créé doit être refusée")
+	}
+	if client.users["shopfr"] != "celui-de-l-administrateur" {
+		t.Error("le mot de passe du compte de l'administrateur a changé")
+	}
+}
+
+func TestVhostDUnAutreDesigneApresCoupEstRefuse(t *testing.T) {
+	// Le mot de passe scellé prouve le compte, pas le vhost : désigner après coup
+	// le vhost « legacy » de l'administrateur y ouvrait les permissions du compte
+	// et y déclarait files et bindings.
+	p, client, proj := fixture(t)
+	apply(t, p, proj)
+	client.vhosts["legacy"] = true
+	proj.Spec.AMQP.Vhost = "legacy"
+	obs, err := p.Observe(context.Background(), proj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if obs.VhostOwned() || !obs.UserOwned() {
+		t.Fatalf("vhost tenu pour celui d'ogs (%v), ou compte refusé (%v)", obs.VhostOwned(), obs.UserOwned())
+	}
+	steps, err := p.Plan(context.Background(), proj, obs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(steps) != 1 || steps[0].Critical {
+		t.Fatalf("une seule étape non critique de refus est attendue : %+v", steps)
+	}
+	if err := steps[0].Apply(context.Background()); err == nil ||
+		!strings.Contains(err.Error(), "aucune marque scellée pour le vhost legacy") {
+		t.Errorf("le refus doit nommer le vhost : %v", err)
+	}
+	if _, ok := client.permissions["legacy/shopfr"]; ok {
+		t.Error("permissions posées sur le vhost de l'administrateur")
+	}
+}
+
+func TestVhostDuParcExistantResteLeSien(t *testing.T) {
+	// Un vhost créé avant la marque (D93) n'en porte pas : le compte d'ogs qui y a
+	// ses permissions suffit, et le parc existant ne voit aucun écart.
+	p, _, proj := fixture(t)
+	apply(t, p, proj)
+	if err := p.Store.DeleteSecret(proj.ID(), VhostMarker("shopfr")); err != nil {
+		t.Fatal(err)
+	}
+	// Le premier plan ne porte que la marque : le critère des permissions s'éteint
+	// avec lui.
+	plan := replan(t, p, proj)
+	if m := plan.Mutating(); len(m) != 1 || !strings.Contains(m[0].Summary, "marque de propriété") {
+		t.Fatalf("seule la marque du vhost doit être posée :\n%s", plan.String())
+	}
+	apply(t, p, proj)
+	if !p.sealed(proj.ID(), VhostMarker("shopfr")) {
+		t.Fatal("la marque du vhost antérieur doit être scellée")
+	}
+	if plan := replan(t, p, proj); !plan.Empty() {
+		t.Errorf("le plan doit être vide après la migration :\n%s", plan.String())
+	}
+}
+
+func TestPermissionAccordeeParLAdministrateurNeFaitPasAdopterSonVhost(t *testing.T) {
+	// Le critère du parc antérieur, sans borne, rouvrait R2-40 : l'administrateur
+	// accorde au compte du projet une permission restreinte sur son vhost commun,
+	// spec.amqp.vhost le désigne, et le plan élargissait les droits à « .* ».
+	p, client, proj := fixture(t)
+	apply(t, p, proj)
+	client.vhosts["legacy"] = true
+	lecture := Permission{Vhost: "legacy", User: "shopfr", Configure: "", Write: "", Read: "^lecture$"}
+	client.permissions["legacy/shopfr"] = lecture
+	proj.Spec.AMQP.Vhost = "legacy"
+	obs, err := p.Observe(context.Background(), proj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if obs.VhostOwned() {
+		t.Fatal("un projet marqué ne doit adopter aucun vhost par ses permissions")
+	}
+	steps, err := p.Plan(context.Background(), proj, obs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(steps) != 1 || steps[0].Critical {
+		t.Fatalf("une seule étape non critique de refus est attendue : %+v", steps)
+	}
+	if client.permissions["legacy/shopfr"] != lecture {
+		t.Error("la permission de l'administrateur a changé")
+	}
+}
+
+func TestMarqueRetireeQuandLeVhostNePeutEtreCree(t *testing.T) {
+	// Restée sans vhost, la marque faisait adopter l'homonyme créé ensuite par un
+	// autre : la compensation ne couvre pas l'étape en échec.
+	p, client, proj := fixture(t)
+	client.failVhost = errors.New("broker refuse")
+	obs, err := p.Observe(context.Background(), proj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	steps, err := p.Plan(context.Background(), proj, obs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := steps[0].Apply(context.Background()); err == nil {
+		t.Fatal("la création refusée doit faire échouer l'étape")
+	}
+	if p.sealed(proj.ID(), VhostMarker("shopfr")) {
+		t.Error("la marque doit être retirée quand le vhost n'a pas été créé")
+	}
+}
+
+func TestMarqueDuVhostPoseeAvantLui(t *testing.T) {
+	// Une interruption entre la création du vhost et celle du compte laissait un
+	// vhost d'ogs que le plan suivant refusait pour toujours.
+	p, client, proj := fixture(t)
+	obs, err := p.Observe(context.Background(), proj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	steps, err := p.Plan(context.Background(), proj, obs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := steps[0].Apply(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !client.vhosts["shopfr"] {
+		t.Fatal("la première étape doit créer le vhost")
+	}
+	obs, err = p.Observe(context.Background(), proj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !obs.Owned() {
+		t.Fatal("le vhost qu'ogs vient de créer doit rester le sien")
+	}
+	apply(t, p, proj)
+	if plan := replan(t, p, proj); !plan.Empty() {
+		t.Errorf("le plan doit être vide :\n%s", plan.String())
 	}
 }

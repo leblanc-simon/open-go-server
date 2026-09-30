@@ -544,6 +544,27 @@ Ils ont tous coûté un défaut réel ; les tests unitaires ne les voyaient pas.
   signe qu'une ligne de journal. La fonction de template `systemdEnv` cite l'affectation **seulement si la
   valeur l'exige** — une valeur simple garde son rendu, et l'unité n'est ni réécrite ni redémarrée. Les `%`
   restent des spécificateurs (`INSTANCE=%i`).
+- **Un port de la machine au-dessus de 1024 est à qui le prend** : broker ou plugin de management
+  arrêté, l'utilisateur d'un projet ouvre `127.0.0.1:15672` et reçoit l'authentification Basic de
+  l'administrateur du broker. Le client vérifie donc **l'autre bout de chaque connexion** (D93) — le socket
+  accepté, cherché dans `/proc/net/tcp{,6}` par ses deux adresses, hérite de l'uid du socket d'écoute —, et
+  n'admet que root et le compte du broker, quelle que soit l'adresse qui désigne la machine. Relire l'écoute
+  avant de se connecter laisserait une fenêtre. Un socket introuvable vers la machine est une redirection
+  DNAT (Docker sans userland-proxy) : refus. `/proc/net/tcp` écrit les adresses par mots de 32 bits
+  **dans l'ordre de la machine**, et une connexion IPv4 vers un serveur en `::` y figure sous sa forme
+  projetée. Les tests tiennent leurs faux brokers sous leur propre compte : ils le déclarent en
+  `brokerAccount`.
+- **Sur un moteur partagé, un secret scellé est la preuve de propriété — une par ressource** (D93) : un
+  vhost, un compte AMQP ou un compte de supervision homonymes sans elle appartiennent à l'administrateur.
+  Les « réparer », c'était leur poser un mot de passe neuf, puis les détruire à la suppression, messages
+  compris. Le mot de passe d'un compte ne prouve pas son vhost : `spec.amqp.vhost` peut désigner après
+  coup celui d'un autre, d'où la marque `amqp-vhost/<vhost>`. Le critère du parc antérieur (permissions du
+  compte sur le vhost) ne vaut que pour un projet **sans aucune marque**, et le premier apply la pose : sans
+  borne, une permission accordée par l'administrateur sur son vhost commun suffisait à le faire adopter.
+  Trois corollaires : la preuve est scellée
+  **avant** la création (une pose interrompue laisserait sinon une ressource d'ogs refusée pour toujours),
+  elle part avec la ressource (sinon elle ferait adopter l'homonyme créé ensuite), et, scellée avant, elle
+  ne dit plus que le moteur a le compte — le fragment de Telegraf attend de l'avoir observé.
 - Telegraf n'a **pas d'équivalent d'`apachectl -t`** : son option de test exécute réellement la collecte.
   Le rechargement se contente d'un constat en aval. Et un fragment que l'agent ne peut pas lire ne produit
   **aucune erreur** — il démarre, ne collecte rien, et se tait ; d'où le contrôle de `doctor`.

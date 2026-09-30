@@ -2,9 +2,14 @@ package amqp
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
+	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/user"
 	"strings"
 	"testing"
 )
@@ -43,7 +48,7 @@ func fakeBroker(t *testing.T, responses map[string]any) (Client, *[]recordedRequ
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	t.Cleanup(srv.Close)
-	client, err := NewHTTPClient(Credentials{URL: srv.URL, User: "admin", Password: "s3cr3t"})
+	client, err := NewHTTPClient(Credentials{URL: srv.URL, User: "admin", Password: "s3cr3t", BrokerAccount: compteDuTest(t)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -233,7 +238,7 @@ func TestPluginMissingIsDistinguished(t *testing.T) {
 		w.WriteHeader(http.StatusNotFound)
 	}))
 	defer srv.Close()
-	client, err := NewHTTPClient(Credentials{URL: srv.URL, User: "admin", Password: "x"})
+	client, err := NewHTTPClient(Credentials{URL: srv.URL, User: "admin", Password: "x", BrokerAccount: compteDuTest(t)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -251,7 +256,7 @@ func TestUnauthorizedIsExplicit(t *testing.T) {
 		w.WriteHeader(http.StatusUnauthorized)
 	}))
 	defer srv.Close()
-	client, _ := NewHTTPClient(Credentials{URL: srv.URL, User: "admin", Password: "mauvais"})
+	client, _ := NewHTTPClient(Credentials{URL: srv.URL, User: "admin", Password: "mauvais", BrokerAccount: compteDuTest(t)})
 	err := client.EnsureVhost(context.Background(), "shopfr")
 	if err == nil || !strings.Contains(err.Error(), "refusés") {
 		t.Errorf("le refus d'authentification doit être explicite : %v", err)
@@ -301,5 +306,162 @@ func TestEnsurePolicyDefaultsToQueues(t *testing.T) {
 	}
 	if body["pattern"] != "^.*" {
 		t.Errorf("motif : %v", body["pattern"])
+	}
+}
+
+// compteDuTest rend le compte qui fait tourner les tests : c'est lui qui tient les
+// serveurs de test, et la garde de la boucle locale doit le reconnaître comme le
+// compte du broker.
+func compteDuTest(t *testing.T) string {
+	t.Helper()
+	u, err := user.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return u.Username
+}
+
+func TestIdentifiantsRefusesAUnPortLocalTenuParUnAutreCompte(t *testing.T) {
+	// Broker arrêté, l'utilisateur d'un projet ouvre 127.0.0.1:15672 : ogs lui
+	// envoyait les identifiants d'administration en Basic, et le mot de passe de
+	// chaque compte de projet dans le corps des requêtes (S1R-07).
+	var reçu []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if user, pass, ok := r.BasicAuth(); ok {
+			reçu = append(reçu, user+":"+pass)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(srv.Close)
+	// Le serveur tourne sous le compte des tests, qui n'est ni root ni rabbitmq
+	// (sauf à lancer les tests en root, où la garde admet légitimement root).
+	if os.Getuid() == 0 {
+		t.Skip("en root, le serveur de test est tenu par root, que la garde admet")
+	}
+	client, err := NewHTTPClient(Credentials{URL: srv.URL, User: "admin", Password: "s3cr3t",
+		BrokerAccount: "compte-absent-ogs"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = client.EnsureUser(context.Background(), "shopfr", "mot-de-passe-du-projet", nil)
+	if !errors.Is(err, ErrUntrustedPeer) || !errors.Is(err, ErrUnavailable) {
+		t.Errorf("refus attendu, rendu comme une indisponibilité : %v", err)
+	}
+	if len(reçu) != 0 {
+		t.Errorf("identifiants envoyés à un port tenu par un autre compte : %v", reçu)
+	}
+	// Le compte du broker, lui, les reçoit.
+	client, _ = NewHTTPClient(Credentials{URL: srv.URL, User: "admin", Password: "s3cr3t",
+		BrokerAccount: compteDuTest(t)})
+	if err := client.EnsureUser(context.Background(), "shopfr", "x", nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(reçu) != 1 {
+		t.Errorf("le broker légitime doit recevoir la requête : %v", reçu)
+	}
+}
+
+func TestAdresseDeProcNetTCP(t *testing.T) {
+	// /proc/net/tcp écrit l'adresse par mots de 32 bits dans l'ordre de la
+	// machine ; une connexion IPv4 vers un serveur qui écoute sur « :: » y figure
+	// sous sa forme projetée.
+	if binary.NativeEndian.Uint16([]byte{1, 0}) != 1 {
+		t.Skip("machine gros-boutiste : les exemples sont ceux d'une machine petit-boutiste")
+	}
+	cases := map[string]string{
+		"0100007F:3D70":                         "127.0.0.1:15728",
+		"0000000000000000FFFF00000100007F:3D70": "127.0.0.1:15728",
+		"00000000000000000000000001000000:0050": "[::1]:80",
+	}
+	for raw, want := range cases {
+		addr, err := parseProcAddr(raw)
+		if err != nil {
+			t.Fatalf("%s : %v", raw, err)
+		}
+		wantAddr, _ := net.ResolveTCPAddr("tcp", want)
+		if !sameAddr(addr, wantAddr) {
+			t.Errorf("%s : %s, attendu %s", raw, addr, want)
+		}
+	}
+}
+
+func TestGardeVautPourToutesLesAdressesDeLaMachine(t *testing.T) {
+	// Une URL qui désigne la machine par l'une de ses adresses, et non par la
+	// boucle locale, aboutit au même port : la garde ne s'en tenait qu'à
+	// 127.0.0.1.
+	if os.Getuid() == 0 {
+		t.Skip("en root, le serveur de test est tenu par root, que la garde admet")
+	}
+	var ip net.IP
+	addrs, _ := net.InterfaceAddrs()
+	for _, a := range addrs {
+		if n, ok := a.(*net.IPNet); ok && !n.IP.IsLoopback() && n.IP.To4() != nil {
+			ip = n.IP
+			break
+		}
+	}
+	if ip == nil {
+		t.Skip("aucune adresse IPv4 hors boucle locale sur cette machine")
+	}
+	ln, err := net.Listen("tcp", net.JoinHostPort(ip.String(), "0"))
+	if err != nil {
+		t.Skip(err)
+	}
+	var reçu int
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reçu++
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	srv.Listener = ln
+	srv.Start()
+	t.Cleanup(srv.Close)
+	client, _ := NewHTTPClient(Credentials{URL: srv.URL, User: "admin", Password: "s3cr3t",
+		BrokerAccount: "compte-absent-ogs"})
+	if err := client.EnsureVhost(context.Background(), "shopfr"); !errors.Is(err, ErrUntrustedPeer) {
+		t.Errorf("refus attendu vers %s : %v", srv.URL, err)
+	}
+	if reçu != 0 {
+		t.Error("identifiants envoyés à un port de la machine tenu par un autre compte")
+	}
+}
+
+// connFictive n'a que des adresses : celles d'une connexion dont aucun socket de
+// cette machine ne tient l'autre bout.
+type connFictive struct {
+	net.Conn
+	local, remote net.Addr
+}
+
+func (c connFictive) LocalAddr() net.Addr  { return c.local }
+func (c connFictive) RemoteAddr() net.Addr { return c.remote }
+
+func TestSocketAbsentVersLaMachineEstRefuseEnNommantLeRemede(t *testing.T) {
+	// Docker sans userland-proxy : 127.0.0.1:15672 est redirigé par DNAT vers un
+	// conteneur, et aucun socket de l'hôte ne répond. Vers un broker distant, au
+	// contraire, l'absence est la règle.
+	conn := connFictive{
+		local:  &net.TCPAddr{IP: net.ParseIP("192.0.2.1"), Port: 40000},
+		remote: &net.TCPAddr{IP: net.ParseIP("192.0.2.10"), Port: 15672},
+	}
+	distant := peerGuard{account: "rabbitmq", local: func(net.IP) bool { return false }}
+	if err := distant.check(conn); err != nil {
+		t.Errorf("un broker distant ne figure pas dans les tables de la machine : %v", err)
+	}
+	redirigé := peerGuard{account: "rabbitmq", local: func(net.IP) bool { return true }}
+	err := redirigé.check(conn)
+	if !errors.Is(err, ErrUntrustedPeer) || !strings.Contains(err.Error(), "--url") {
+		t.Errorf("refus nommant le remède attendu : %v", err)
+	}
+}
+
+func TestCompteDuBrokerParSonUID(t *testing.T) {
+	// Un broker en conteneur, sur le réseau de l'hôte, tourne sous un uid sans nom
+	// dans /etc/passwd.
+	uids, err := trustedUIDs("999")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !uids[999] || !uids[0] || len(uids) != 2 {
+		t.Errorf("uid admis : %v", uids)
 	}
 }

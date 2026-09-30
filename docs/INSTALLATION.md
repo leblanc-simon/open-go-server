@@ -71,13 +71,21 @@ restreint le champ d'action (aucun serveur MySQL détecté, PHP 7.4 non install�
 préproduction, fournisseur DNS, certificats partagés, connexions aux serveurs de bases. Le fichier est
 validé à chaque lecture ; une valeur inconnue est refusée plutôt qu'ignorée.
 
-Les identifiants d'administration ne s'y écrivent pas en clair :
+Les identifiants d'administration n'y figurent pas : ils vivent en 0600 sous `/etc/ogs/credentials/`.
+MySQL et PostgreSQL n'en demandent aucun — ogs s'y connecte en root par le socket local. RabbitMQ et OVH,
+eux, en exigent :
 
 ```sh
-ogs db credentials set mysql        # demande le mot de passe et le chiffre
-ogs amqp credentials set
-ogs cert dns-provider set ovh
+ogs amqp credentials set --user ogs-admin          # demande le mot de passe, sans écho
+ogs cert dns-provider set ovh --client-id <id>     # demande le secret client, sans écho
+printf '%s\n' "$mdp" | ogs amqp credentials set --user ogs-admin   # hors terminal
 ```
+
+Les secrets ne se passent pas en option : ils resteraient dans le journal de sudo et l'historique du
+shell de root. Vers cette machine, ogs n'envoie les identifiants du broker qu'à un port tenu par root ou
+par le compte `rabbitmq` (`--broker-account`, nom ou uid, pour un autre) : broker arrêté, tout compte local
+pourrait ouvrir le port de management. Un broker en conteneur dont le port est publié par DNAT (Docker sans
+userland-proxy) se désigne par l'adresse du conteneur (`--url`).
 
 ### PostgreSQL : un rôle d'administration à créer une fois
 

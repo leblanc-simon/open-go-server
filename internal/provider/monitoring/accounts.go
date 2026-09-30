@@ -25,6 +25,10 @@ type MySQLAccess struct {
 	User     string
 	Password string
 	Socket   string
+	// posed dit que le moteur a ce compte sous le mot de passe scellé : observé
+	// conforme, ou posé par l'étape qui vient de réussir. Le secret est scellé
+	// avant la pose (D93) ; il ne suffit donc plus à le dire.
+	posed bool
 }
 
 // PostgresAccess est un cluster et le rôle sous lequel l'agent s'y connecte. Il
@@ -43,6 +47,8 @@ type RabbitAccess struct {
 	URL      string
 	User     string
 	Password string
+	// posed : voir MySQLAccess.
+	posed bool
 }
 
 // planAccounts réconcilie les comptes de supervision des moteurs installés.
@@ -86,7 +92,8 @@ func secretName(engine, account string) string { return engine + "/" + account }
 // **scellé**, et rend celui du keystore plutôt que celui du plan.
 //
 // C'est l'invariant du fragment : un mot de passe non scellé n'a jamais été posé
-// sur le moteur — l'étape du compte reste à appliquer, ou vient d'échouer. L'y
+// sur le moteur — l'étape du compte reste à appliquer (elle scelle avant de poser,
+// D93), ou son scellement même a échoué. L'y
 // écrire donnerait à l'agent un identifiant que le moteur refuse, et, comme un
 // secret non scellé est tiré au hasard à chaque planification, le fichier
 // changerait à chaque apply sans jamais converger : « diff » resterait en code 6
@@ -98,14 +105,14 @@ func secretName(engine, account string) string { return engine + "/" + account }
 func (p *Provider) sealedCredentials(creds Credentials) Credentials {
 	out := creds
 	out.MySQL, out.RabbitMQ = nil, nil
-	if creds.MySQL != nil {
+	if creds.MySQL != nil && creds.MySQL.posed {
 		if password, sealed, err := p.lookupSecret(secretName("mysql", creds.MySQL.User)); err == nil && sealed {
 			access := *creds.MySQL
 			access.Password = password
 			out.MySQL = &access
 		}
 	}
-	if creds.RabbitMQ != nil {
+	if creds.RabbitMQ != nil && creds.RabbitMQ.posed {
 		if password, sealed, err := p.lookupSecret(secretName("rabbitmq", creds.RabbitMQ.User)); err == nil && sealed {
 			access := *creds.RabbitMQ
 			access.Password = password
@@ -113,6 +120,12 @@ func (p *Provider) sealedCredentials(creds Credentials) Credentials {
 		}
 	}
 	return out
+}
+
+// engineClient ouvre le client d'administration d'un moteur. Substituable en test :
+// un moteur simulé se branche ici, le provider de bases n'en exposant aucun.
+var engineClient = func(p *db.Provider, engine, cluster string) (db.Client, error) {
+	return p.EngineClient(engine, cluster)
 }
 
 // planMySQLAccount crée ou met à jour le compte de métriques MySQL. Le moteur
@@ -129,7 +142,7 @@ func (p *Provider) planMySQLAccount(ctx context.Context) (*engine.Step, *MySQLAc
 	account := p.Cfg.Monitoring.TelegrafAccount()
 	resource := "monitoring/account/mysql"
 
-	client, err := p.DB.EngineClient("mysql", "")
+	client, err := engineClient(p.DB, "mysql", "")
 	if err != nil {
 		return unavailableStep(resource, "compte de supervision MySQL", err), nil
 	}
@@ -138,17 +151,24 @@ func (p *Provider) planMySQLAccount(ctx context.Context) (*engine.Step, *MySQLAc
 	if err != nil {
 		return unavailableStep(resource, "compte de supervision MySQL", err), nil
 	}
-	access := &MySQLAccess{User: account, Password: password, Socket: socket}
+	// Moteur momentanément injoignable, l'entrée d'un compte déjà scellé reste au
+	// fragment : la retirer, puis la remettre, relancerait l'agent deux fois.
+	access := &MySQLAccess{User: account, Password: password, Socket: socket, posed: sealed}
 
 	users, err := client.Users(ctx)
 	if err != nil {
 		return unavailableStep(resource, "compte de supervision MySQL", err), access
 	}
-	// Un secret qui n'est pas encore scellé n'a jamais été posé sur le moteur : le
-	// compte doit être repassé même s'il paraît conforme. Sans cela, un compte
-	// « telegraf » créé par l'administrateur — ou une base d'état restaurée sans
-	// ses secrets — ferait écrire dans le fragment un mot de passe que MySQL
-	// ignore, et l'agent échouerait à chaque collecte sans que rien ne le dise.
+	access.posed = sealed && users[account+"@localhost"]
+	// Un compte qui existe sans que son mot de passe soit scellé n'est pas à ogs
+	// (D93) : l'administrateur l'a créé pour sa propre collecte, ou la base d'état
+	// a été restaurée sans ses secrets. Le reprendre, c'était un ALTER USER au mot
+	// de passe neuf, et la collecte de l'administrateur cassée sans un mot. Aucun
+	// mot de passe n'est scellé, donc aucune entrée MySQL au fragment : l'agent ne
+	// reçoit pas un identifiant que le moteur refuserait.
+	if users[account+"@localhost"] && !sealed {
+		return foreignAccountStep(resource, "MySQL", account+"@localhost"), nil
+	}
 	conforming := users[account+"@localhost"] && sealed
 	if conforming {
 		// Le mot de passe scellé et celui du moteur ne se comparent pas : MySQL ne
@@ -191,6 +211,21 @@ func (p *Provider) planMySQLAccount(ctx context.Context) (*engine.Step, *MySQLAc
 		return strings.Join(stmts, ";\n") + ";", nil
 	}
 	s.Apply = func(ctx context.Context) error {
+		// Le scellement est un acte d'application, pas de calcul — « ogs plan »
+		// n'écrit rien —, et il **précède** le moteur (D93), comme pour le compte
+		// AMQP d'un projet. Le secret scellé est la preuve que le compte est à
+		// ogs : scellé après, un CREATE USER passé suivi d'un GRANT en échec, ou un
+		// contexte annulé entre les deux, laissait un compte d'ogs sans preuve,
+		// tenu pour celui de l'administrateur et refusé pour toujours. Scellé
+		// avant, l'échec se répare de lui-même : le compte absent est recréé, le
+		// compte aux droits incomplets repassé, toujours sous ce mot de passe. Le
+		// prix est un fragment qui peut porter, jusqu'au prochain apply, le mot de
+		// passe d'un compte que le moteur n'a pas encore — l'étape en échec le dit.
+		if !sealed {
+			if err := p.sealSecret(name, password); err != nil {
+				return err
+			}
+		}
 		if legacy != "" {
 			// L'échec de cette seule requête est le cas nominal : MySQL rend
 			// ER_NONEXISTING_GRANT dès qu'aucune ligne ne porte le motif littéral,
@@ -208,12 +243,8 @@ func (p *Provider) planMySQLAccount(ctx context.Context) (*engine.Step, *MySQLAc
 				return err
 			}
 		}
-		// Le scellement vient après : c'est un acte d'application, pas de calcul —
-		// « ogs plan » n'écrit rien. Et il vient **après** le moteur, non avant : un
-		// secret scellé sans avoir été posé rendrait le compte conforme au prochain
-		// plan, avec un fragment que MySQL refuserait. Dans l'ordre inverse, l'échec
-		// se répare de lui-même : le secret reste absent, l'étape repasse.
-		return p.sealSecret(name, password)
+		access.posed = true
+		return nil
 	}
 	return s, access
 }
@@ -306,31 +337,66 @@ func (p *Provider) planRabbitAccount(ctx context.Context) (*engine.Step, *Rabbit
 	if err != nil {
 		return unavailableStep(resource, summary, err), nil
 	}
-	access := &RabbitAccess{URL: p.AMQP.ManagementURL, User: account, Password: password}
+	access := &RabbitAccess{URL: p.AMQP.ManagementURL, User: account, Password: password, posed: sealed}
 
 	users, err := p.AMQP.Client.Users(ctx)
 	if err != nil {
 		return unavailableStep(resource, summary, err), access
 	}
-	// Même piège que côté MySQL : le tag seul est relu, et un compte préexistant
-	// garderait son mot de passe pendant que le fragment porterait le nôtre.
+	access.posed = false
+	// Même règle que côté MySQL (D93) : un compte homonyme sans mot de passe
+	// scellé est celui de l'administrateur. Le « réparer » remplaçait son mot de
+	// passe et ses tags — un compte « administrator » ramené à « monitoring ».
+	action := engine.Create
 	for _, u := range users {
-		if u.Name == account && tagsContain(u.Tags, "monitoring") && sealed {
+		if u.Name != account {
+			continue
+		}
+		if !sealed {
+			return foreignAccountStep(resource, "RabbitMQ", account), nil
+		}
+		access.posed = true
+		if tagsContain(u.Tags, "monitoring") {
 			return engine.NewStep(resource, engine.NoOp, summary), access
 		}
+		action = engine.Update
 	}
-	s := engine.NewStep(resource, engine.Create, summary)
+	s := engine.NewStep(resource, action, summary)
 	s.Critical = false
 	s.Diff = func() (string, error) {
 		return fmt.Sprintf("PUT /api/users/%s {\"tags\": \"monitoring\", \"password\": \"<scellé>\"}", account), nil
 	}
 	s.Apply = func(ctx context.Context) error {
+		// Scellé avant le broker, pour la même raison que côté MySQL : c'est la
+		// preuve que le compte est à ogs, et elle ne doit pas manquer à un compte
+		// créé par une pose interrompue.
+		if !sealed {
+			if err := p.sealSecret(name, password); err != nil {
+				return err
+			}
+		}
 		if err := p.AMQP.Client.EnsureUser(ctx, account, password, []string{"monitoring"}); err != nil {
 			return err
 		}
-		return p.sealSecret(name, password)
+		access.posed = true
+		return nil
 	}
 	return s, access
+}
+
+// foreignAccountStep refuse de reprendre un compte de supervision homonyme qu'ogs
+// n'a pas créé. Non critique, comme toute étape de supervision : elle échoue pour
+// être rapportée (code 6), et le fragment de l'agent reste sans cette entrée.
+func foreignAccountStep(resource, engineName, account string) *engine.Step {
+	s := engine.NewStep(resource, engine.Update, fmt.Sprintf(
+		"compte de supervision %s %s — refusé : il existe sans avoir été créé par ogs", engineName, account))
+	s.Critical = false
+	reason := fmt.Errorf("le compte %s %s existe déjà, et ogs ne l'a pas créé (aucun mot de passe scellé) : "+
+		"ogs ne change ni son mot de passe ni ses droits. Nommer autrement les comptes de supervision "+
+		"(monitoring.telegraf.account dans config.yaml), ou retirer ce compte du moteur s'il n'a plus "+
+		"d'usage", engineName, account)
+	s.Apply = func(context.Context) error { return reason }
+	return s
 }
 
 // unavailableStep produit l'étape d'un moteur installé mais injoignable. Elle

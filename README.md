@@ -118,9 +118,9 @@ ogs db list | add | remove | dump | restore
 ogs db user add | rotate <id> <utilisateur>
 ogs secrets list | show | env <id>
 ogs cert list | issue | renew | revoke | delete
-ogs cert dns-provider set ovh --application-key … 
+ogs cert dns-provider set ovh --application-key … | --client-id …   (secrets demandés)
 ogs amqp status | messenger | queue add | queue purge
-ogs amqp credentials set --user … --password …
+ogs amqp credentials set --user …           (mot de passe demandé)
 ogs cron add | remove | list | enable | disable | run
 ogs firewall init | status | profiles | rules | sources | whois <adresse>
 ogs firewall plan | apply | confirm | ban | unban <adresse|source>
@@ -229,9 +229,13 @@ ne déclenche donc aucun appel à l'autorité. Ce certificat exige le challenge 
 donc des identifiants OVH :
 
 ```sh
-sudo ogs cert dns-provider set ovh --client-id … --client-secret …
+sudo ogs cert dns-provider set ovh --client-id …   # le secret client est demandé sans écho
 sudo ogs cert issue @wildcard-prep
 ```
+
+Les secrets ne passent pas en option : ils resteraient dans le journal de sudo et
+l'historique du shell. Hors terminal, ils se lisent sur l'entrée standard, une ligne
+chacun.
 
 Après cinq échecs consécutifs sur un même jeu de domaines, les tentatives sont
 suspendues une heure : insister ferait perdre le droit d'émettre pour le domaine.
@@ -239,7 +243,7 @@ suspendues une heure : insister ferait perdre le droit d'émettre pour le domain
 ### Files RabbitMQ
 
 ```sh
-sudo ogs amqp credentials set --user ogs-admin --password …
+sudo ogs amqp credentials set --user ogs-admin     # mot de passe demandé sans écho
 sudo ogs amqp messenger shopfr --transport async,priority
 sudo ogs apply shopfr
 sudo ogs secrets env shopfr        # MESSENGER_TRANSPORT_DSN incluse
