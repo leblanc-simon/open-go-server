@@ -4028,11 +4028,18 @@ Limites connues, laissées en l'état :
 - **Majeurs de sécurité non traités** par les lots, reproduits par la revue :
   - `AllowOverride All` sur le docroot Prestashop fait appliquer par `www-data`, identité partagée par
     tous les projets, les directives qu'un `.htaccess` du projet choisit (constat S2R-01 ; D87 borne les
-    `Options`, pas le reste) ;
-  - aucun nom de compte SGBD n'est réservé : un projet peut déclarer `root`, `postgres` ou le compte de
-    supervision (constat S2R-05) ;
-  - les secrets d'un projet restent au keystore après `project delete`, `--purge` et la purge des archives
-    comprises, et un projet recréé sous le même identifiant en hérite (constat R1-21).
+    `Options`, pas le reste). Une liste fermée ne suffit pas — les drapeaux `[H=…]` et `[P]` de
+    `RewriteRule` atteignent `server-status` et le socket FPM d'un voisin — : la correction retenue est
+    `AllowOverride None`, les règles de Prestashop 1.7, 8 et 9 portées par le template, en cours et non
+    livrée ;
+  - les secrets d'un projet autres que les mots de passe SGBD et AMQP (retirés depuis D91 et D93) restent
+    au keystore après `project delete`, `--purge` et la purge des archives comprises, et un projet recréé
+    sous le même identifiant en hérite (constat R1-21).
+- **Prestashop sous nginx n'a pas de back-office** : le vhost n'exécute que le front controller racine
+  (`location ~ ^/index.php … internal;`, puis `location ~ \.php$ { return 404; }`), si bien que
+  `admin…/index.php`, `/api`, les `.php` des modules (`ajax.php`) et `index.php` en accès direct répondent
+  404, là où Apache les sert. Relevé par la revue, non traité : il faut décider quels points d'entrée PHP
+  ouvrir. Le même template ne sert pas les images produit dont l'identifiant a trois chiffres ou plus.
 
 **Points ouverts** (D93) :
 
