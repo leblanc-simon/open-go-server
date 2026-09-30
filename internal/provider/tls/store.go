@@ -28,6 +28,9 @@ const (
 // SharedPrefix marque une référence à un certificat de portée serveur.
 const SharedPrefix = "@"
 
+// sharedDirPrefix préfixe le répertoire d'un certificat partagé.
+const sharedDirPrefix = "_shared-"
+
 // RenewBefore est le délai avant expiration à partir duquel un certificat est
 // renouvelé. Let's Encrypt émet pour 90 jours : 30 jours laissent le temps de
 // diagnostiquer un renouvellement en échec avant la coupure.
@@ -52,9 +55,27 @@ func (s Store) Dir(name string) string {
 // DirName traduit un nom de certificat en nom de répertoire lisible.
 func DirName(name string) string {
 	if strings.HasPrefix(name, SharedPrefix) {
-		return "_shared-" + strings.TrimPrefix(name, SharedPrefix)
+		return sharedDirPrefix + strings.TrimPrefix(name, SharedPrefix)
 	}
 	return name
+}
+
+// CheckProjectName refuse un nom de certificat de projet qui sortirait de
+// l'espace des projets (D94) : « @… » désigne un certificat partagé,
+// « _shared-… » est son répertoire, et « / » ou un « . » en tête mèneraient hors
+// du magasin. Le nom devient un répertoire où l'émission écrit une clé privée,
+// et que la compensation d'une émission ratée supprime en entier. C'est la
+// règle de validate.CertificateNames, reprise ici pour que le magasin ne
+// dépende pas d'une validation faite ailleurs ; tout autre nom, « *.cc.fr »
+// compris, reste accepté.
+func CheckProjectName(name string) error {
+	switch {
+	case name == "", strings.ContainsAny(name, "/\x00"), strings.HasPrefix(name, "."),
+		IsShared(name), strings.HasPrefix(name, sharedDirPrefix):
+		return fmt.Errorf("nom de certificat %q invalide : il sortirait du répertoire des certificats "+
+			"du projet — un projet ne déclare pas de certificat partagé", name)
+	}
+	return nil
 }
 
 // IsShared indique si la référence désigne un certificat de portée serveur.

@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -44,6 +45,12 @@ type Provider struct {
 	// vivent dans un répertoire de l'utilisateur (D70). Nil, ou en mode simulé,
 	// le propriétaire n'est pas changé.
 	Owner func(*model.Project) (uid, gid int, err error)
+	// Listeners énumère les écoutes TCP de la machine, avec leur compte. Nil, le
+	// noyau est lu (/proc/net), sauf en mode simulé où rien ne l'est (D94).
+	Listeners func() ([]Listener, error)
+
+	recovered   sync.Once
+	recoveryErr error
 }
 
 // linkOwner est le propriétaire des liens gérés d'un projet.
@@ -171,7 +178,16 @@ func (p *Provider) port(proj *model.Project, runtime string) (int, error) {
 	if p.Store == nil {
 		return min, nil
 	}
-	return p.Store.Allocate("app-"+runtime, proj.ID(), ServiceName, min, max)
+	// Les ports que portent les unités écrites passent avant toute attribution :
+	// sans quoi le premier projet calculé prendrait, sur une base perdue, le port
+	// en service chez un voisin (D94).
+	p.recovered.Do(func() { p.recoveryErr = p.recoverPorts() })
+	if p.recoveryErr != nil {
+		return 0, fmt.Errorf("reprise des ports des unités applicatives : %w", p.recoveryErr)
+	}
+	inUse := p.PortsInUse()
+	return p.Store.Allocate("app-"+runtime, proj.ID(), ServiceName, min, max,
+		func(n int) bool { return inUse[n] })
 }
 
 // Observed est l'état réel de l'application.
@@ -185,7 +201,10 @@ type Observed struct {
 	RunDirMode  os.FileMode
 	UnitPresent bool
 	Listening   bool
-	Endpoint    Endpoint
+	// Foreign nomme le compte étranger qui tient le port du projet, vide sinon :
+	// une connexion qui aboutit ne dit pas qui répond (D94).
+	Foreign  string
+	Endpoint Endpoint
 	// EnvFile est l'état du fichier d'environnement, observé seulement quand le
 	// projet le demande.
 	EnvFile EnvFileState
@@ -237,6 +256,9 @@ func (p *Provider) Observe(_ context.Context, proj *model.Project) (Observed, er
 		obs.UnitPresent = true
 	}
 	obs.Listening = p.listening(endpoint)
+	if obs.Foreign, err = p.foreignListener(proj, endpoint); err != nil {
+		return obs, err
+	}
 	return obs, nil
 }
 
@@ -729,6 +751,16 @@ func (p *Provider) PlanHealth(_ context.Context, proj *model.Project, obs Observ
 	if err != nil {
 		return nil, err
 	}
+	if obs.Foreign != "" {
+		// Le vhost relaierait vers un autre compte : c'est une étape critique, qui
+		// arrête l'apply avant l'écriture du vhost, et non l'avertissement d'une
+		// application lente à démarrer.
+		foreign := obs.Foreign
+		s := engine.NewStep("app/health/"+proj.ID(), engine.Update,
+			fmt.Sprintf("écoute de %s tenue par un autre compte", describeEndpoint(endpoint)))
+		s.Apply = func(context.Context) error { return foreignError(foreign) }
+		return s, nil
+	}
 	if obs.Listening {
 		return engine.NewStep("app/health/"+proj.ID(), engine.NoOp, "application à l'écoute"), nil
 	}
@@ -757,6 +789,15 @@ func (p *Provider) waitReady(ctx context.Context, proj *model.Project, endpoint 
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		if p.listening(endpoint) {
+			// Le port a pu être pris pendant le redémarrage : l'instance du projet
+			// échoue alors au bind, et c'est l'étranger qui répond.
+			foreign, err := p.foreignListener(proj, endpoint)
+			if err != nil {
+				return err
+			}
+			if foreign != "" {
+				return foreignError(foreign)
+			}
 			return nil
 		}
 		select {
@@ -774,6 +815,12 @@ func (p *Provider) waitReady(ctx context.Context, proj *model.Project, endpoint 
 	}
 	return fmt.Errorf("aucune écoute sur %s après %s : l'application écoute-t-elle sur "+
 		"127.0.0.1 et le port fourni par PORT ?", endpoint.Address, timeout)
+}
+
+// foreignError est le refus d'une écoute tenue par un autre compte.
+func foreignError(foreign string) error {
+	return fmt.Errorf("%s : le vhost lui relaierait le trafic du site — arrêter ce processus, "+
+		"puis relancer l'apply (ogs doctor le signale aussi)", foreign)
 }
 
 func describeEndpoint(e Endpoint) string {

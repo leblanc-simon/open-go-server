@@ -1762,6 +1762,12 @@ func newRestoreCommand(app *App) *cobra.Command {
 			if err := app.refuseReservedDBAccounts(p); err != nil {
 				return err
 			}
+			// L'archive dit ce que le projet tenait à sa suppression, non ce que le
+			// parc a déclaré depuis : un domaine, une base ou un home repris entre-temps
+			// seraient servis deux fois.
+			if err := app.checkFleetUniqueness(p); err != nil {
+				return err
+			}
 			if err := spec.Save(target, p); err != nil {
 				return wrap(CodeError, err)
 			}

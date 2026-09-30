@@ -383,3 +383,48 @@ func TestOuvertureRattrapeUnJournalAbandonne(t *testing.T) {
 		t.Errorf("journal abandonné : mode %04o, 0600 attendu", info.Mode().Perm())
 	}
 }
+
+// Claim reprend dans la base un numéro que le disque atteste — l'unité ou le
+// pool écrits — sans jamais le prendre à une autre ressource : c'est ainsi
+// qu'une base d'état perdue retrouve les ports en service au lieu de les
+// redistribuer dans l'ordre alphabétique (R2-18).
+func TestClaimReprendUnNumeroSansLeVolerAPersonne(t *testing.T) {
+	s := open(t)
+	ok, err := s.Claim("app-go", "bbfr", "app", 21001)
+	if err != nil || !ok {
+		t.Fatalf("un numéro libre doit être repris : %v %v", ok, err)
+	}
+	// Déjà tenu par une autre ressource : refusé, la base reste inchangée.
+	if ok, err := s.Claim("app-go", "aafr", "app", 21001); err != nil || ok {
+		t.Fatalf("un numéro tenu ne doit pas être repris : %v %v", ok, err)
+	}
+	// La ressource a déjà son numéro : il n'est pas remplacé.
+	if ok, err := s.Claim("app-go", "bbfr", "app", 21005); err != nil || ok {
+		t.Fatalf("un numéro attribué ne doit pas être remplacé : %v %v", ok, err)
+	}
+	n, err := s.Allocate("app-go", "aafr", "app", 21001, 21999)
+	if err != nil || n != 21002 {
+		t.Fatalf("l'attribution doit contourner le numéro repris : %d %v", n, err)
+	}
+	if n, err := s.Allocate("app-go", "bbfr", "app", 21001, 21999); err != nil || n != 21001 {
+		t.Fatalf("le numéro repris doit être rendu : %d %v", n, err)
+	}
+}
+
+// Un numéro déjà en écoute sur la machine n'est jamais attribué : le port
+// prévisible d'un projet à venir, pris d'avance par un autre compte, lui
+// aurait livré tout le trafic du site (S2R-02).
+func TestAllocateEviteUnNumeroOccupe(t *testing.T) {
+	s := open(t)
+	occupé := func(n int) bool { return n == 21001 || n == 21002 }
+	n, err := s.Allocate("app-go", "aafr", "app", 21001, 21999, occupé)
+	if err != nil || n != 21003 {
+		t.Fatalf("attribué %d, attendu 21003 : %v", n, err)
+	}
+	// Un numéro déjà attribué reste celui de la ressource, occupé ou non : c'est
+	// sa propre application qui l'écoute.
+	n, err = s.Allocate("app-go", "aafr", "app", 21001, 21999, func(int) bool { return true })
+	if err != nil || n != 21003 {
+		t.Fatalf("attribution instable : %d %v", n, err)
+	}
+}

@@ -709,3 +709,102 @@ func TestDBAccountsRefuseLesComptesSGBDReserves(t *testing.T) {
 		t.Errorf("aucun refus attendu : %v", err)
 	}
 }
+
+// Le nom d'un certificat devient un répertoire de /var/lib/ogs/acme : libre, il
+// visait le wildcard partagé (« @… », rangé sous _shared-…) ou sortait du
+// répertoire par « / » et « .. » — et l'émission y écrivait une clé privée, sa
+// compensation y faisait un RemoveAll (R1-08).
+func TestNomDeCertificatRefuseCeQuiSortDeSonEspace(t *testing.T) {
+	for _, nom := range []string{
+		"@wildcard-prep", "_shared-wildcard-prep", "../../../etc/ssl", "a/b", ".", "..", ".cache",
+	} {
+		p := newProject(t, "shop.fr", naming.EnvProd, model.KindStatic)
+		p.Spec.Certificates = []model.Certificate{{Name: nom, Domains: []string{"shop.fr"}}}
+		err := CertificateNames(p)
+		if err == nil || !strings.Contains(err.Error(), "spec.certificates[0].name") {
+			t.Errorf("le nom de certificat %q doit être refusé : %v", nom, err)
+		}
+		// Le chargement du parc, lui, ne s'arrête pas sur une déclaration fautive :
+		// il arrêterait le renouvellement de tous les certificats.
+		if err := Project(p, "/home"); err != nil {
+			t.Errorf("Project ne doit pas refuser %q, que plan et apply refusent : %v", nom, err)
+		}
+	}
+	// Un nom hérité qui ne sort de rien — un joker, une espace, un nom long —
+	// fonctionnait : il continue de fonctionner.
+	for _, nom := range []string{"", "shopfr", "shop.fr", "*.cc.fr", "shop fr", "Shop_FR", strings.Repeat("a", 80)} {
+		p := newProject(t, "shop.fr", naming.EnvProd, model.KindStatic)
+		p.Spec.Certificates = []model.Certificate{{Name: nom, Domains: []string{"shop.fr"}}}
+		if err := CertificateNames(p); err != nil {
+			t.Errorf("le nom de certificat %q doit être accepté : %v", nom, err)
+		}
+	}
+}
+
+// Deux certificats d'un même projet sous un même nom se partagent un
+// répertoire : chaque apply réémettait l'un sur l'autre, et sous ACME le quota
+// de l'autorité s'épuisait. Refusé aux projets visés ; le chargement du parc,
+// lui, le tolère.
+func TestNomDeCertificatEnDoubleDansLeProjet(t *testing.T) {
+	p := newProject(t, "shop.fr", naming.EnvProd, model.KindStatic)
+	p.Spec.Certificates = []model.Certificate{
+		{Name: "shopfr", Domains: []string{"shop.fr"}},
+		{Domains: []string{"www.shop.fr"}}, // nom implicite : l'identifiant
+	}
+	if got := DuplicateCertificates(p); len(got) != 1 || got[0] != "shopfr" {
+		t.Fatalf("doublon non relevé : %v", got)
+	}
+	if err := CertificateNames(p); err == nil || !strings.Contains(err.Error(), "shopfr") {
+		t.Fatalf("le doublon doit être refusé au projet visé : %v", err)
+	}
+	if err := Project(p, "/home"); err != nil {
+		t.Fatalf("un doublon hérité ne doit pas refuser la déclaration : %v", err)
+	}
+}
+
+// Une collision entre deux voisins n'arrête pas la commande qui vise un
+// troisième projet : elle sera refusée à la leur.
+func TestUniciteRestreinteAuxProjetsVises(t *testing.T) {
+	a := newProject(t, "aa.fr", naming.EnvProd, model.KindStatic)
+	b := newProject(t, "bb.fr", naming.EnvProd, model.KindStatic)
+	c := newProject(t, "cc.fr", naming.EnvProd, model.KindStatic)
+	b.Spec.Certificates = []model.Certificate{{Name: "aafr", Domains: []string{"bb.fr"}}}
+	parc := []*model.Project{a, b, c}
+	if err := UniquenessFor(parc, "preprod-pp.net", "ccfr"); err != nil {
+		t.Errorf("ccfr n'est dans aucun conflit : %v", err)
+	}
+	for _, id := range []string{"aafr", "bbfr"} {
+		if err := UniquenessFor(parc, "preprod-pp.net", id); err == nil {
+			t.Errorf("%s est dans le conflit : il doit être refusé", id)
+		}
+	}
+}
+
+// Un certificat nommé d'après l'identifiant d'un voisin s'écrivait dans le
+// répertoire du certificat implicite de ce voisin : le vhost du voisin
+// présentait alors le certificat d'un autre, et la compensation d'une émission
+// ratée le supprimait.
+func TestUnicitéDesNomsDeCertificat(t *testing.T) {
+	a := newProject(t, "shop.fr", naming.EnvProd, model.KindStatic)
+	b := newProject(t, "autre.fr", naming.EnvProd, model.KindStatic)
+	b.Spec.Certificates = []model.Certificate{{Name: "shopfr", Domains: []string{"autre.fr"}}}
+	err := Uniqueness([]*model.Project{a, b}, "preprod-pp.net")
+	if err == nil || !strings.Contains(err.Error(), "certificat") {
+		t.Fatalf("un certificat au nom du voisin doit être refusé : %v", err)
+	}
+
+	b.Spec.Certificates[0].Name = "commun"
+	a.Spec.Certificates = []model.Certificate{{Name: "commun", Domains: []string{"shop.fr"}}}
+	err = Uniqueness([]*model.Project{a, b}, "preprod-pp.net")
+	if err == nil || !strings.Contains(err.Error(), "commun") {
+		t.Fatalf("deux projets ne partagent pas un nom de certificat : %v", err)
+	}
+
+	// Un projet qui nomme son certificat d'après son propre identifiant ne
+	// rencontre que lui-même.
+	a.Spec.Certificates[0].Name = "shopfr"
+	b.Spec.Certificates[0].Name = "autrefr"
+	if err := Uniqueness([]*model.Project{a, b}, "preprod-pp.net"); err != nil {
+		t.Fatalf("chacun son certificat : %v", err)
+	}
+}

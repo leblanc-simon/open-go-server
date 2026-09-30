@@ -580,8 +580,8 @@ func TestApplyNeRetireJamaisLesFichiersDUnVoisinAuNomProche(t *testing.T) {
 
 // Le sens inverse : le vhost « b2b » ou le pool « api » ajoutés à la déclaration
 // de shop s'écrivent dans shop_b2b.conf et shop_api.conf, les fichiers
-// principaux de deux voisins. « apply shop » ne valide l'unicité que sur sa
-// cible : il réécrivait le fichier du voisin à son compte, avec le code 0 — le
+// principaux de deux voisins. « apply shop » ne validait l'unicité que sur sa
+// cible (R1-07, corrigé par D94) : il réécrivait le fichier du voisin à son compte, avec le code 0 — le
 // pool de shop_api tournait sous l'utilisateur de shop. Le fichier d'un autre
 // projet est un conflit, --force compris.
 func TestApplyCibleNeReecritJamaisLeFichierDUnVoisin(t *testing.T) {
@@ -631,7 +631,11 @@ func TestApplyCibleNeReecritJamaisLeFichierDUnVoisin(t *testing.T) {
 					t.Errorf("« ogs %s » : code %d, attendu %d (conflit) :\n%s",
 						strings.Join(args, " "), code, CodeConflict, out)
 				}
-				if !strings.Contains(out, "est le fichier du projet "+cas.voisin) {
+				// Depuis D94, le contrôle d'unicité, éprouvé contre le parc entier,
+				// arrête la commande avant même le plan ; fs.CheckOwner reste la
+				// seconde ligne. L'un comme l'autre nomme le voisin.
+				if !strings.Contains(out, "est le fichier du projet "+cas.voisin) &&
+					!strings.Contains(out, "(demandé par \""+cas.voisin+"\")") {
 					t.Errorf("« ogs %s » doit nommer le propriétaire du fichier :\n%s", strings.Join(args, " "), out)
 				}
 			}

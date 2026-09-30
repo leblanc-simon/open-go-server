@@ -307,7 +307,11 @@ func (s *Store) ForgetFile(path string) error {
 // Allocate réserve le plus petit numéro libre d'une plage pour une ressource.
 // Les numéros de pool PHP et de port applicatif suivent une norme lisible : la
 // stabilité de l'attribution compte autant que l'unicité.
-func (s *Store) Allocate(scope, projectID, name string, min, max int) (int, error) {
+//
+// busy écarte, pour une attribution nouvelle seulement, les numéros que la
+// machine tient déjà : un port en écoute (D94). Le numéro déjà attribué à la
+// ressource est rendu tel quel — c'est sa propre application qui l'écoute.
+func (s *Store) Allocate(scope, projectID, name string, min, max int, busy ...func(int) bool) (int, error) {
 	var existing int
 	err := s.db.QueryRow(`SELECT number FROM allocations WHERE scope = ? AND project_id = ? AND name = ?`,
 		scope, projectID, name).Scan(&existing)
@@ -335,7 +339,7 @@ func (s *Store) Allocate(scope, projectID, name string, min, max int) (int, erro
 		return 0, err
 	}
 	for n := min; n <= max; n++ {
-		if taken[n] {
+		if taken[n] || anyBusy(busy, n) {
 			continue
 		}
 		if _, err := s.db.Exec(`INSERT INTO allocations (scope, number, project_id, name, created_at)
@@ -345,6 +349,46 @@ func (s *Store) Allocate(scope, projectID, name string, min, max int) (int, erro
 		return n, nil
 	}
 	return 0, fmt.Errorf("plage %s saturée (%d à %d) : aucun numéro disponible", scope, min, max)
+}
+
+func anyBusy(busy []func(int) bool, n int) bool {
+	for _, f := range busy {
+		if f != nil && f(n) {
+			return true
+		}
+	}
+	return false
+}
+
+// Claim inscrit pour une ressource un numéro que le disque atteste — l'unité ou
+// le pool qu'ogs a écrits —, s'il est libre et que la ressource n'en a pas
+// encore (D94). Il rend vrai s'il l'a inscrit.
+//
+// La base d'état n'est pas la seule à savoir quel numéro sert quel projet : le
+// vhost d'un voisin relaie déjà vers le port écrit dans son unité. Une base
+// perdue ou recréée redistribuait les numéros dans l'ordre alphabétique des
+// projets, et le premier servi prenait le port en service chez un autre — dont
+// le vhost relayait alors vers l'application d'un autre client. Le numéro déjà
+// attribué l'emporte sur le disque, et un numéro tenu par une autre ressource
+// n'est jamais repris : la base, quand elle sait, fait foi.
+func (s *Store) Claim(scope, projectID, name string, number int) (bool, error) {
+	var existing int
+	err := s.db.QueryRow(`SELECT number FROM allocations WHERE scope = ? AND project_id = ? AND name = ?`,
+		scope, projectID, name).Scan(&existing)
+	if err == nil {
+		return false, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return false, err
+	}
+	res, err := s.db.Exec(`INSERT INTO allocations (scope, number, project_id, name, created_at)
+		VALUES (?, ?, ?, ?, ?) ON CONFLICT(scope, number) DO NOTHING`,
+		scope, number, projectID, name, now())
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n == 1, err
 }
 
 // Release libère un numéro.

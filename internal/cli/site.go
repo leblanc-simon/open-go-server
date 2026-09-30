@@ -78,12 +78,10 @@ func newSiteCreateCommand(app *App) *cobra.Command {
 			if _, err := os.Stat(path); err == nil {
 				return exitf(CodeConflict, "le projet %s existe déjà (%s)", p.ID(), path)
 			}
-			existing, err := app.loadProjects()
-			if err != nil {
+			// Seuls comptent les conflits qui touchent le nouveau projet : une collision
+			// entre deux voisins ne bloque pas une création sans rapport (D94).
+			if err := app.checkFleetUniqueness(p); err != nil {
 				return err
-			}
-			if err := validate.Uniqueness(append(existing, p), app.Cfg.PrepDomain()); err != nil {
-				return exitf(CodeConflict, "conflit avec le parc existant :\n%v", err)
 			}
 			if err := app.refuseReservedDBAccounts(p); err != nil {
 				return err
@@ -394,6 +392,9 @@ func newSiteCloneCommand(app *App) *cobra.Command {
 			if _, err := os.Stat(path); err == nil {
 				return exitf(CodeConflict, "le projet %s existe déjà (%s)", target.ID(), path)
 			}
+			if err := app.checkFleetUniqueness(target); err != nil {
+				return err
+			}
 			app.printf("clone de %s vers %s (%s)\n", source.ID(), target.ID(), to)
 			app.summarizeSite(target)
 			// Ce que la source tient d'ogs ne passe pas à la destination, ni par sa
@@ -701,6 +702,12 @@ func (a *App) applyProjects(cmd *cobra.Command, projects []*model.Project) error
 		return wrap(CodeLocked, err)
 	}
 	defer lock.Release()
+	// Chaque appelant éprouve déjà l'unicité avant d'écrire la déclaration ; la
+	// reprendre sous le verrou ferme la fenêtre où un autre projet aurait été
+	// déclaré entre-temps.
+	if err := a.checkFleetUniqueness(projects...); err != nil {
+		return err
+	}
 	if err := a.openStore(); err != nil {
 		return err
 	}

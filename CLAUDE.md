@@ -145,7 +145,15 @@ renouvellement des certificats n'était jamais activé.
 `internal/naming` dérive du host un identifiant unique (`shop.fr` → `shopfr`, ≤ 28 caractères + `prep` en
 préproduction) qui nomme l'utilisateur Linux, son groupe, les bases, le vhost AMQP, le pool PHP, le vhost
 web, les unités systemd et le fichier cron. `internal/validate` contrôle la cohérence d'un projet et
-l'unicité dans le parc.
+l'unicité dans le parc — **toujours le parc entier** (`App.checkFleetUniqueness`, D94), jamais les seuls
+projets visés : `apply blogfr` ou `plan -f` comparaient le projet à lui-même, et un domaine ou une base d'un
+voisin entraient sans un mot. Seuls y comptent les conflits qui touchent un projet visé
+(`validate.UniquenessFor`), et **tout chemin d'apply ou de déclaration** l'appelle — la TUI l'oubliait. Le nom
+d'un certificat est un nom de répertoire, unique dans le parc, et l'identifiant de chaque projet y est
+réservé : c'est celui de son certificat implicite. **Ce que `validate.Project` refuse arrête le parc entier**
+— il suit chaque chargement, donc `cert renew --all`, `status` et le recalcul du parc à la suppression d'un
+voisin : une règle neuve qui rendrait invalide une déclaration jusque-là acceptée se porte au plan et à
+l'apply du projet visé (`checkFleetUniqueness`) et à `doctor`, jamais au chargement.
 
 ### Fichiers gérés
 
@@ -719,6 +727,14 @@ Ils ont tous coûté un défaut réel ; les tests unitaires ne les voyaient pas.
   de multiplexage ne vit jamais sous un nom stable de `/tmp` — un compte local y tenait le rôle de connexion
   maître pour les commandes root vers la source —, et un secret ne passe jamais en argument :
   `/proc/<pid>/cmdline` est lisible de tous.
+- **`state.db` ne sait pas seule quel port sert quel projet** (D94) : le vhost d'un voisin relaie déjà vers
+  le port écrit dans son unité, ou vers celui de son pool TCP. Une base perdue redistribuait les numéros
+  dans l'ordre alphabétique, et chaque site était servi par l'application de l'autre. D'où la reprise, avant
+  la première attribution, des numéros que portent les fichiers écrits (`Store.Claim`) — la base l'emporte
+  quand elle sait. Et **une connexion qui aboutit ne dit pas qui répond** : tout compte local peut tenir un
+  port libre. Une écoute se juge à son uid (`/proc/net/tcp`, `app.ReadListeners`), l'attribution écarte les
+  ports en écoute, et une écoute étrangère — ni le projet, ni root — rend l'attente critique. doctor relit le
+  port dans l'unité écrite : il n'attribue rien, sans quoi, sans base, tout projet aurait reçu le premier.
 
 ## Codes de retour
 

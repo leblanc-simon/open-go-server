@@ -223,6 +223,10 @@ func newAMQPMessengerCommand(app *App) *cobra.Command {
 			if err := app.prepare(p); err != nil {
 				return err
 			}
+			// Le vhost AMQP est une clé d'unicité : un voisin a pu le déclarer.
+			if err := app.checkFleetUniqueness(p); err != nil {
+				return err
+			}
 			if app.DryRun {
 				data, err := spec.Encode(p)
 				if err != nil {

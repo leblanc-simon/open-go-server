@@ -587,6 +587,42 @@ func (a *App) reloadFunc(provs *providers) func(context.Context, string) error {
 	}
 }
 
+// checkFleetUniqueness éprouve l'unicité des projets donnés contre le parc
+// entier, jamais contre eux seuls (D94). Une déclaration passée par -f, ou
+// modifiée sur le disque, remplace celle de même identifiant.
+//
+// Éprouver la seule liste visée comparait « apply blogfr » ou « plan -f » à
+// lui-même : un domaine, une base ou un home déjà tenus par un voisin entraient
+// sans un mot, et l'apply suivant réécrivait les droits de la base du voisin ou
+// posait un second vhost pour le même nom. C'est le raisonnement du plan global,
+// qui lit lui aussi le parc entier : un sous-ensemble ne dit rien de ce qu'il
+// laisse de côté.
+//
+// Seuls comptent les conflits qui touchent un projet visé, détenteur ou
+// demandeur : une collision entre deux voisins ne doit pas arrêter l'apply d'un
+// troisième. Les noms de certificat des projets visés s'éprouvent ici, et non
+// au chargement du parc (validate.CertificateNames).
+func (a *App) checkFleetUniqueness(projects ...*model.Project) error {
+	for _, p := range projects {
+		if err := validate.CertificateNames(p); err != nil {
+			return exitf(CodeValidation, "projet %s :\n%v", p.ID(), err)
+		}
+	}
+	fleet, err := a.loadProjects()
+	if err != nil {
+		return err
+	}
+	ids := make([]string, 0, len(projects))
+	for _, p := range projects {
+		fleet = withProject(fleet, p)
+		ids = append(ids, p.ID())
+	}
+	if err := validate.UniquenessFor(fleet, a.Cfg.PrepDomain(), ids...); err != nil {
+		return exitf(CodeConflict, "conflit avec le parc existant :\n%v", err)
+	}
+	return nil
+}
+
 // targets résout les projets visés : ceux nommés, ou tous à défaut.
 func (a *App) targets(args []string, file string) ([]*model.Project, error) {
 	if file != "" {
@@ -632,8 +668,8 @@ func newPlanCommand(app *App) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if err := validate.Uniqueness(projects, app.Cfg.PrepDomain()); err != nil {
-				return exitf(CodeConflict, "%v", err)
+			if err := app.checkFleetUniqueness(projects...); err != nil {
+				return err
 			}
 			if err := app.openStore(); err != nil {
 				return err
@@ -759,8 +795,8 @@ func newApplyCommand(app *App) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if err := validate.Uniqueness(projects, app.Cfg.PrepDomain()); err != nil {
-				return exitf(CodeConflict, "%v", err)
+			if err := app.checkFleetUniqueness(projects...); err != nil {
+				return err
 			}
 
 			// Verrou global : deux applications simultanées ne doivent jamais se

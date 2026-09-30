@@ -13,7 +13,6 @@ import (
 	"leblanc.io/open-go-server/internal/naming"
 	"leblanc.io/open-go-server/internal/provider/db"
 	"leblanc.io/open-go-server/internal/spec"
-	"leblanc.io/open-go-server/internal/validate"
 )
 
 func newProjectCommand(app *App) *cobra.Command {
@@ -105,12 +104,10 @@ func newProjectCreateCommand(app *App) *cobra.Command {
 			if _, err := os.Stat(path); err == nil {
 				return exitf(CodeConflict, "le projet %s existe déjà (%s)", p.ID(), path)
 			}
-			existing, err := app.loadProjects()
-			if err != nil {
+			// Seuls comptent les conflits qui touchent le nouveau projet : une collision
+			// entre deux voisins ne bloque pas une création sans rapport (D94).
+			if err := app.checkFleetUniqueness(p); err != nil {
 				return err
-			}
-			if err := validate.Uniqueness(append(existing, p), app.Cfg.PrepDomain()); err != nil {
-				return exitf(CodeConflict, "conflit avec le parc existant :\n%v", err)
 			}
 			// Le home est éprouvé avant que la déclaration ne soit déposée (D95) : le
 			// plan le refuserait, et la déclaration restée arrêterait tout apply du parc.

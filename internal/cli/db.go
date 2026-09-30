@@ -150,6 +150,11 @@ func newDBAddCommand(app *App) *cobra.Command {
 			if err := app.checkDBAccounts(p); err != nil {
 				return err
 			}
+			// Le nom d'une base de rôle prolonge l'identifiant du projet : la base
+			// « api » de shop s'appelle shop_api, base principale d'un projet shop_api.
+			if err := app.checkFleetUniqueness(p); err != nil {
+				return err
+			}
 			if app.DryRun {
 				app.printf("--dry-run : la base %s %s serait déclarée\n", decl.Engine, decl.Name)
 				return nil

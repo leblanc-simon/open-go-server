@@ -82,6 +82,47 @@ func newDoctorCommand(app *App) *cobra.Command {
 	}
 }
 
+// certificateDeclarationChecks nomme les déclarations de certificat à corriger
+// (D94) : un nom qui sort de l'espace du projet, ou deux certificats d'un projet
+// sous un même nom, que plan et apply refusent au seul projet qui les porte. Le
+// chargement du parc les tolère, pour qu'une seule déclaration n'arrête pas le
+// renouvellement de tous les certificats.
+func certificateDeclarationChecks(projects []*model.Project, add func(name, status, detail, fix string)) {
+	for _, p := range projects {
+		if err := validate.CertificateNames(p); err != nil {
+			add("certificats déclarés", "échec", "projet "+p.ID()+" : "+strings.ReplaceAll(err.Error(), "\n", " ; "),
+				"corriger spec.certificates dans "+p.ID()+".yaml ; plan et apply de ce projet le refusent")
+		}
+	}
+}
+
+// appListenerChecks vérifie qu'aucun autre compte ne tient le port d'un projet :
+// une écoute qui aboutit ne dit pas qui répond, et le vhost relaie tout à qui
+// tient le port (D94). Le port est relu dans l'unité écrite — doctor n'attribue
+// rien et n'écrit pas dans la base d'état —, et un projet sans unité, ou dont
+// l'unité ne porte pas de port, n'est pas éprouvé.
+func appListenerChecks(provs *providers, projects []*model.Project, add func(name, status, detail, fix string)) {
+	foreign := 0
+	for _, p := range projects {
+		if !appprov.Applies(p) {
+			continue
+		}
+		who, err := provs.App.ForeignListenerOnDisk(p)
+		if err != nil {
+			add("écoute applicative", "avertissement", "projet "+p.ID()+" : "+err.Error(), "")
+			continue
+		}
+		if who != "" {
+			foreign++
+			add("écoute applicative", "échec", "projet "+p.ID()+" : "+who,
+				"arrêter ce processus, puis « ogs app restart "+p.ID()+" »")
+		}
+	}
+	if foreign == 0 {
+		add("écoute applicative", "ok", "chaque port applicatif est tenu par son projet", "")
+	}
+}
+
 // listeners énumère les points d'écoute TCP de la machine.
 func (a *App) listeners() ([]string, error) {
 	res, err := a.Exec.Run(context.Background(), exec.Command{
@@ -396,6 +437,7 @@ func (a *App) runChecks(ctx context.Context) []check {
 		return out
 	}
 	add("projets", "ok", fmt.Sprintf("%d déclaré(s)", len(projects)), "")
+	certificateDeclarationChecks(projects, add)
 
 	// Délégation sudo : un fichier au préfixe ogs- non généré par l'outil, ou
 	// élargi à la main, mérite d'être signalé.
@@ -428,6 +470,10 @@ func (a *App) runChecks(ctx context.Context) []check {
 			} else {
 				add("écoute applicative", "ok", "aucun port exposé", "")
 			}
+		}
+		if provs, err := a.buildProviders(); err == nil {
+			appListenerChecks(provs, projects, add)
+			provs.close()
 		}
 	}
 

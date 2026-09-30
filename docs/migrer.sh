@@ -1139,14 +1139,17 @@ declarer_projet() {
 
     brouillon="$(temporaire)"
     py extraire "$MANIFESTE" "$id" "$brouillon" "$desactiver"
-    etape "Validation (ogs plan -f)"
-    "${OGS[@]}" plan -f "$brouillon" >/dev/null </dev/null || fatal "$id : déclaration refusée par ogs plan -f"
-    ok "déclaration valide"
-
+    # La garde d'appartenance passe la première : « plan -f » éprouve aussi
+    # l'unicité contre le parc entier (D94), mais ne nomme que la première
+    # collision, là où la garde les nomme toutes.
     etape "Appartenance (parc de la cible)"
     garde_appartenance "$id"
     de_la_migration "$id" || cible_neuve "$id"
     ok "ni compte, ni home, ni base d'un autre projet"
+
+    etape "Validation (ogs plan -f)"
+    "${OGS[@]}" plan -f "$brouillon" >/dev/null </dev/null || fatal "$id : déclaration refusée par ogs plan -f"
+    ok "déclaration valide"
 
     if [[ -e "$fichier" ]]; then
         # Le fichier a pu être complété par ogs (amqp messenger) : ne pas l'écraser.

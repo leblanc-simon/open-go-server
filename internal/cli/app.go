@@ -324,6 +324,9 @@ func (a *App) buildProviders() (*providers, error) {
 	appProv := &appprov.Provider{Paths: a.Paths, Exec: a.Exec, Templates: tmpl, Store: a.Store,
 		Installer: &appprov.Installer{Exec: a.Exec}, Force: a.Force,
 		Owner: func(proj *model.Project) (int, int, error) { return sys.ResolveOwner(proj, "") }}
+	// Un pool en écoute TCP écarte, comme une application, les ports que la
+	// machine tient déjà (D94).
+	php.PortsInUse = appProv.PortsInUse
 	amqpProv := a.amqpProvider()
 	amqpPort := amqpProv.Port
 	dbProv := &db.Provider{Paths: a.Paths, Exec: a.Exec, Store: a.Store, Keys: a.Keys, AMQPPort: amqpPort,

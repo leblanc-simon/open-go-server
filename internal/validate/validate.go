@@ -289,6 +289,92 @@ func validateMail(p *model.Project, add func(string, string, ...any)) {
 // validateCertificates contrôle les certificats déclarés. Le provider DNS est
 // refusé dès la déclaration : le découvrir au moment de l'émission ferait échouer
 // un apply qui a déjà créé le site.
+// certificateNames rend les noms de certificat qu'un projet revendique : ceux
+// qu'il déclare, l'identifiant pour un certificat sans nom, et l'identifiant
+// toujours — c'est le nom du certificat implicite qu'un vhost TLS obtient sans
+// rien déclarer, et un voisin qui le prendrait écrirait dans son répertoire.
+func certificateNames(p *model.Project) []string {
+	out := []string{p.ID()}
+	for _, c := range p.Spec.Certificates {
+		if c.Name != "" {
+			out = append(out, c.Name)
+		}
+	}
+	return out
+}
+
+// CertificateNames éprouve les noms de certificat d'un projet (D94). Le nom
+// devient un répertoire de /var/lib/ogs/acme/certificates, où l'émission écrit
+// une clé privée et que la compensation d'une émission ratée supprime en
+// entier : un nom qui sort de l'espace des projets — « / », « . » en tête,
+// « @… » qui désigne un certificat partagé, « _shared-… » son répertoire — est
+// refusé, comme deux certificats sous un même nom. La règle du nom est celle de
+// tls.CheckProjectName.
+//
+// Elle n'est pas portée par Project, que suit le chargement de tout le parc :
+// une seule déclaration fautive aurait arrêté le renouvellement de tous les
+// certificats, status, et le recalcul du parc à la suppression d'un voisin
+// (D68). Elle est éprouvée pour les projets visés par plan et apply, et doctor
+// nomme les déclarations à corriger. Tout autre nom — « *.cc.fr » compris —
+// reste accepté : il ne mène nulle part ailleurs.
+func CertificateNames(p *model.Project) error {
+	var errs Errors
+	for i, c := range p.Spec.Certificates {
+		if c.Name == "" {
+			continue
+		}
+		if msg := CertificateNameProblem(c.Name); msg != "" {
+			errs = append(errs, Error{Field: fmt.Sprintf("spec.certificates[%d].name", i), Message: msg})
+		}
+	}
+	// Deux certificats sous un même nom — deux sans nom, qui prennent tous deux
+	// l'identifiant — se partagent un répertoire : chaque apply réémettait l'un
+	// sur l'autre, le plan n'était jamais vide, et sous ACME le quota de
+	// l'autorité s'épuisait jusqu'au refus, laissant un site sans certificat.
+	for _, name := range DuplicateCertificates(p) {
+		errs = append(errs, Error{Field: "spec.certificates", Message: fmt.Sprintf(
+			"deux certificats s'appellent %q (l'identifiant du projet pour un certificat sans nom) : "+
+				"ils s'écriraient dans le même répertoire — donner un nom distinct à chacun", name)})
+	}
+	return errs.OrNil()
+}
+
+// CertificateNameProblem dit pourquoi un nom de certificat sort de l'espace des
+// projets, vide s'il n'en sort pas.
+func CertificateNameProblem(name string) string {
+	switch {
+	case strings.ContainsAny(name, "/\x00"):
+		return fmt.Sprintf("nom de certificat %q invalide : « / » mènerait hors du répertoire des certificats", name)
+	case strings.HasPrefix(name, "."):
+		return fmt.Sprintf("nom de certificat %q invalide : un « . » en tête désigne le répertoire "+
+			"des certificats ou son parent", name)
+	case strings.HasPrefix(name, "@"), strings.HasPrefix(name, "_shared-"):
+		return fmt.Sprintf("nom de certificat %q invalide : « @… » et « _shared-… » désignent un "+
+			"certificat partagé, qu'un projet ne déclare pas", name)
+	}
+	return ""
+}
+
+// DuplicateCertificates nomme les certificats qu'un projet déclare deux fois
+// sous un même nom — l'identifiant pour un certificat sans nom : ils
+// s'écrivent dans le même répertoire, le dernier émis écrasant l'autre.
+// CertificateNames le refuse aux projets visés ; doctor le nomme.
+func DuplicateCertificates(p *model.Project) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, c := range p.Spec.Certificates {
+		name := c.Name
+		if name == "" {
+			name = p.ID()
+		}
+		if seen[name] {
+			out = append(out, name)
+		}
+		seen[name] = true
+	}
+	return out
+}
+
 func validateCertificates(p *model.Project, add func(string, string, ...any)) {
 	for i, c := range p.Spec.Certificates {
 		f := fmt.Sprintf("spec.certificates[%d]", i)
@@ -740,6 +826,38 @@ func cronField(f string, min, max int) error {
 // identifiants distincts peuvent réclamer le même répertoire (§3.3.6).
 func Uniqueness(projects []*model.Project, prepDomain string) error {
 	var errs Errors
+	for _, c := range uniquenessConflicts(projects, prepDomain) {
+		errs = append(errs, c.err)
+	}
+	return errs.OrNil()
+}
+
+// UniquenessFor éprouve l'unicité sur tout le parc, mais ne retient que les
+// conflits où l'un des projets nommés est détenteur ou demandeur (D94). Une
+// collision entre deux autres projets ne doit pas arrêter la commande qui n'en
+// vise aucun : elle sera refusée à la leur.
+func UniquenessFor(projects []*model.Project, prepDomain string, ids ...string) error {
+	visés := map[string]bool{}
+	for _, id := range ids {
+		visés[id] = true
+	}
+	var errs Errors
+	for _, c := range uniquenessConflicts(projects, prepDomain) {
+		if visés[c.a] || visés[c.b] {
+			errs = append(errs, c.err)
+		}
+	}
+	return errs.OrNil()
+}
+
+// conflict est une collision entre deux projets, nommés par identifiant.
+type conflict struct {
+	err  Error
+	a, b string
+}
+
+func uniquenessConflicts(projects []*model.Project, prepDomain string) []conflict {
+	var errs []conflict
 	// Le propriétaire d'une clé est repéré par sa position, et non par son nom :
 	// deux projets distincts peuvent porter le même identifiant, et c'est
 	// précisément la collision à détecter.
@@ -814,6 +932,9 @@ func Uniqueness(projects []*model.Project, prepDomain string) error {
 		// fichier à chaque apply, chacun servant ses domaines à la place de
 		// l'autre.
 		{"fichier de vhost", map[string]int{}, vhostFiles},
+		// Le nom d'un certificat est son répertoire : deux projets sous un même
+		// nom écrasent le certificat l'un de l'autre, clé privée comprise (D94).
+		{"certificat", map[string]int{}, certificateNames},
 	}
 	for index, p := range projects {
 		for _, k := range kinds {
@@ -828,11 +949,11 @@ func Uniqueness(projects []*model.Project, prepDomain string) error {
 					if owner == index {
 						continue
 					}
-					errs = append(errs, Error{
+					errs = append(errs, conflict{Error{
 						Field: k.label,
 						Message: fmt.Sprintf("%q est déjà utilisé par le projet %q (demandé par %q)",
 							key, projects[owner].Metadata.Name, p.Metadata.Name),
-					})
+					}, projects[owner].Metadata.Name, p.Metadata.Name})
 					continue
 				}
 				k.seen[key] = index
@@ -861,17 +982,17 @@ func Uniqueness(projects []*model.Project, prepDomain string) error {
 			if isUnder(ri, rj) {
 				outer, inner = inner, outer
 			}
-			errs = append(errs, Error{
+			errs = append(errs, conflict{Error{
 				Field: "home",
 				Message: fmt.Sprintf("%q, home du projet %q, contient %q, celui du projet %q : "+
 					"supprimer le premier effacerait le second — corriger spec.layout.root de l'un des deux, "+
 					"le conflit pouvant précéder la commande en cours (une version antérieure d'ogs l'acceptait)",
 					filepath.Clean(outer.Spec.Layout.Root), outer.Metadata.Name,
 					filepath.Clean(inner.Spec.Layout.Root), inner.Metadata.Name),
-			})
+			}, outer.Metadata.Name, inner.Metadata.Name})
 		}
 	}
-	return errs.OrNil()
+	return errs
 }
 
 // Overlap dit si deux chemins se recouvrent — égaux, ou l'un sous l'autre —, au

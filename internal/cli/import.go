@@ -203,12 +203,10 @@ func newImportAdoptCommand(app *App) *cobra.Command {
 			// revendiquant le même host, le même home ou la même base sont toutes
 			// deux écrites, et le conflit n'apparaît qu'au premier apply portant sur
 			// tout le parc — bien après que l'exploitant a cru le serveur repris.
-			existing, err := app.loadProjects()
-			if err != nil {
+			// Seuls comptent les conflits qui touchent le nouveau projet : une collision
+			// entre deux voisins ne bloque pas une création sans rapport (D94).
+			if err := app.checkFleetUniqueness(p); err != nil {
 				return err
-			}
-			if err := validate.Uniqueness(append(existing, p), app.Cfg.PrepDomain()); err != nil {
-				return exitf(CodeConflict, "conflit avec le parc existant :\n%v", err)
 			}
 
 			app.printf("adoption de %s\n", p.ID())

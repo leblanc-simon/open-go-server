@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"leblanc.io/open-go-server/internal/config"
@@ -38,6 +40,12 @@ type Provider struct {
 	// sauvegarde horodatée (§6.4). Sans lui, le refus n'aurait aucune porte de
 	// sortie et l'apply du projet resterait bloqué.
 	Force bool
+	// PortsInUse rend les ports TCP en écoute sur la machine ; un pool en écoute
+	// TCP n'en reçoit jamais un (D94). Nil, rien n'est écarté.
+	PortsInUse func() map[int]bool
+
+	recovered   sync.Once
+	recoveryErr error
 }
 
 // refusStep produit l'étape qui refuse d'écraser un fichier qu'ogs n'a pas
@@ -192,7 +200,72 @@ func (p *Provider) number(proj *model.Project, pool model.Pool, name string) (in
 		// lieu à l'application.
 		return min, nil
 	}
-	return p.Store.Allocate("php-"+pool.Version, proj.ID(), name, min, max)
+	// Les numéros des pools écrits passent avant toute attribution : sur une
+	// base perdue, le premier projet calculé prendrait sinon le port d'un voisin
+	// (D94).
+	p.recovered.Do(func() { p.recoveryErr = p.recoverNumbers() })
+	if p.recoveryErr != nil {
+		return 0, fmt.Errorf("reprise des numéros des pools écrits : %w", p.recoveryErr)
+	}
+	var inUse map[int]bool
+	if pool.Listen == "tcp" && p.PortsInUse != nil {
+		inUse = p.PortsInUse()
+	}
+	return p.Store.Allocate("php-"+pool.Version, proj.ID(), name, min, max,
+		func(n int) bool { return inUse[n] })
+}
+
+// reListenLine relit l'écoute d'un pool écrit : le port TCP, ou le numéro que
+// porte le nom du socket (php<v>-fpm-<numéro>-<pool>.sock).
+var reListenLine = regexp.MustCompile(`(?m)^listen\s*=\s*(?:127\.0\.0\.1:([0-9]+)|\S*/php[0-9.]+-fpm-([0-9]+)-[^/\s]+\.sock)\s*$`)
+
+// recoverNumbers inscrit dans la base d'état les numéros que portent les pools
+// écrits par ogs (D94). La base n'est pas seule à savoir quel numéro sert quel
+// pool : en écoute TCP, le vhost d'un voisin relaie déjà vers le port de son
+// pool. Le projet et le pool sont lus sur l'en-tête, jamais sur le nom du
+// fichier (D76).
+func (p *Provider) recoverNumbers() error {
+	for _, version := range Supported {
+		min, err := naming.PoolNumber(version, 1)
+		if err != nil {
+			return err
+		}
+		max, err := naming.PoolNumber(version, 99)
+		if err != nil {
+			return err
+		}
+		matches, err := filepath.Glob(filepath.Join(p.Paths.PHPPoolDir(version), "*.conf"))
+		if err != nil {
+			return err
+		}
+		for _, path := range matches {
+			project, resource, err := fs.ManagedResource(path)
+			name, ok := strings.CutPrefix(resource, "php/pool/")
+			if err != nil || project == "" || !ok || name == "" {
+				continue
+			}
+			data, err := os.ReadFile(path)
+			if err != nil {
+				continue
+			}
+			m := reListenLine.FindSubmatch(data)
+			if m == nil {
+				continue
+			}
+			digits := m[1]
+			if len(digits) == 0 {
+				digits = m[2]
+			}
+			n, err := strconv.Atoi(string(digits))
+			if err != nil || n < min || n > max {
+				continue
+			}
+			if _, err := p.Store.Claim("php-"+version, project, name, n); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // Build calcule le rendu attendu d'un pool.

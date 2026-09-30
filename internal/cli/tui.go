@@ -125,6 +125,11 @@ func (b *tuiBackend) Apply(ctx context.Context, p *model.Project) (string, error
 		return buf.String(), err
 	}
 	defer lock.Release()
+	// Le même contrôle que « ogs apply <id> », sous le même verrou : l'unicité
+	// contre le parc entier, jamais contre le seul projet affiché (D94).
+	if err := b.app.checkFleetUniqueness(p); err != nil {
+		return buf.String(), err
+	}
 	provs, err := b.app.buildProviders()
 	if err != nil {
 		return buf.String(), err
@@ -257,6 +262,9 @@ func (b *tuiBackend) Create(ctx context.Context, answers tui.WizardAnswers) (str
 	path := b.app.Paths.ProjectFile(p.ID())
 	if _, err := os.Stat(path); err == nil {
 		return "", fmt.Errorf("le projet %s existe déjà", p.ID())
+	}
+	if err := b.app.checkFleetUniqueness(p); err != nil {
+		return "", err
 	}
 	if err := spec.Save(path, p); err != nil {
 		return "", err

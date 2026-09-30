@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"leblanc.io/open-go-server/internal/config"
+	"leblanc.io/open-go-server/internal/model"
+	"leblanc.io/open-go-server/internal/naming"
 )
 
 func newStore(t *testing.T) Store {
@@ -210,5 +212,25 @@ func TestRemove(t *testing.T) {
 	}
 	if _, ok, _ := s.Read("shopfr"); ok {
 		t.Error("le certificat devrait avoir été supprimé")
+	}
+}
+
+// Un projet ne nomme jamais le répertoire d'un certificat partagé ni un chemin
+// hors du magasin : Requests le refuse sans supposer la validation faite, parce
+// que l'émission y écrirait une clé privée et que sa compensation y ferait un
+// RemoveAll (R1-08).
+func TestUnProjetNeNommePasUnCertificatHorsDeSonEspace(t *testing.T) {
+	p := newProvider(t)
+	for _, nom := range []string{"@wildcard-prep", "_shared-wildcard-prep", "../../etc/ssl", "a/b", ".."} {
+		proj := newProject(t, "shop.fr", naming.EnvProd)
+		proj.Spec.Certificates = []model.Certificate{{Name: nom, Domains: []string{"shop.fr"}}}
+		if _, err := p.Requests(proj); err == nil {
+			t.Errorf("le nom %q doit être refusé", nom)
+		}
+	}
+	proj := newProject(t, "shop.fr", naming.EnvProd)
+	proj.Spec.Certificates = []model.Certificate{{Name: "shop.fr", Domains: []string{"shop.fr"}}}
+	if _, err := p.Requests(proj); err != nil {
+		t.Errorf("un nom ordinaire doit passer : %v", err)
 	}
 }

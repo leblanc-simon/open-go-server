@@ -93,6 +93,9 @@ func (p *Provider) Requests(proj *model.Project) ([]Request, error) {
 		if req.Name == "" {
 			req.Name = proj.ID()
 		}
+		if err := CheckProjectName(req.Name); err != nil {
+			return nil, fmt.Errorf("projet %s : %w", proj.ID(), err)
+		}
 		if len(req.Domains) == 0 {
 			req.Domains = CertifiedDomains(proj)
 		}
