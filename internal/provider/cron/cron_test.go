@@ -634,3 +634,105 @@ func TestPlanRefuseUnFichierEtranger(t *testing.T) {
 		t.Errorf("le refus doit dire où l'original sera sauvegardé : %v", err)
 	}
 }
+
+func TestCommandSePlaceDansLeRepertoireDeTravail(t *testing.T) {
+	// Le répertoire de travail n'est pas qu'un préfixe de commande : une tâche
+	// qui lit un chemin relatif doit le trouver là, non dans le home où cron la
+	// lance.
+	prov, proj := fixture(t)
+	proj.Spec.Crons = []model.CronJob{{
+		Name: "export", Schedule: "0 4 * * *", Command: "/usr/local/bin/export.sh",
+	}}
+	_, jobs, err := prov.Build(proj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	www := filepath.Join(proj.Spec.Layout.Root, "www")
+	want := "cd '" + www + "' && /usr/bin/flock -n "
+	if !strings.HasPrefix(jobs[0].Command, want) {
+		t.Errorf("la tâche doit commencer par se placer dans www/ :\n%s", jobs[0].Command)
+	}
+
+	// Un répertoire explicite est cité : une espace ou une apostrophe ne doit
+	// pas découper la ligne.
+	proj.Spec.Crons[0].Workdir = "/srv/l'export du jour"
+	_, jobs, err = prov.Build(proj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(jobs[0].Command, `cd '/srv/l'\''export du jour' && `) {
+		t.Errorf("répertoire de travail mal cité :\n%s", jobs[0].Command)
+	}
+}
+
+func TestCommandSansVerrouSePlaceAussiDansLeRepertoire(t *testing.T) {
+	prov, proj := fixture(t)
+	lock := false
+	proj.Spec.Crons = []model.CronJob{{
+		Name: "scheduler", Schedule: "* * * * *", Command: "bin/console schedule:run", Lock: &lock,
+	}}
+	_, jobs, err := prov.Build(proj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	www := filepath.Join(proj.Spec.Layout.Root, "www")
+	want := "cd '" + www + "' && " + filepath.Join(model.BinDir(proj.Spec.Layout.Root), "php") +
+		" " + filepath.Join(www, "bin", "console") + " schedule:run"
+	if jobs[0].Command != want {
+		t.Errorf("commande :\n%s\nattendu :\n%s", jobs[0].Command, want)
+	}
+}
+
+func TestPHPFixeLaVersionDeLaTache(t *testing.T) {
+	prov, proj := fixture(t)
+	bin := prov.Paths.PHPBin("8.2")
+	if err := os.MkdirAll(filepath.Dir(bin), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(bin, nil, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	proj.Spec.Crons = []model.CronJob{
+		{Name: "console", Schedule: "* * * * *", Command: "bin/console app:sync", PHP: "8.2"},
+		{Name: "script", Schedule: "* * * * *", Command: "php scripts/purge.php --vieux", PHP: "8.2"},
+		{Name: "lien", Schedule: "* * * * *", Command: "php scripts/purge.php"},
+	}
+	_, jobs, err := prov.Build(proj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(jobs[0].Command, bin+" "+filepath.Join(proj.Spec.Layout.Root, "www", "bin", "console")+" app:sync") {
+		t.Errorf("bin/console doit passer par PHP 8.2 :\n%s", jobs[0].Command)
+	}
+	if !strings.HasSuffix(jobs[1].Command, bin+" scripts/purge.php --vieux") {
+		t.Errorf("« php … » doit passer par PHP 8.2 :\n%s", jobs[1].Command)
+	}
+	// Sans « php: », « php … » passe par le lien géré (D30), au lieu d'être
+	// pris pour un exécutable de www/.
+	link := filepath.Join(model.BinDir(proj.Spec.Layout.Root), "php")
+	if !strings.HasSuffix(jobs[2].Command, link+" scripts/purge.php") {
+		t.Errorf("« php … » doit passer par le lien géré :\n%s", jobs[2].Command)
+	}
+}
+
+func TestPHPRefuseCeQuIlNePeutAppliquer(t *testing.T) {
+	prov, proj := fixture(t)
+	cas := map[string]model.CronJob{
+		"commande non PHP":  {Name: "x", Schedule: "* * * * *", Command: "/usr/local/bin/x.sh", PHP: "8.2"},
+		"version invalide":  {Name: "x", Schedule: "* * * * *", Command: "bin/console a", PHP: "8"},
+		"version non gérée": {Name: "x", Schedule: "* * * * *", Command: "bin/console a", PHP: "9.0"},
+		"version absente":   {Name: "x", Schedule: "* * * * *", Command: "bin/console a", PHP: "8.3"},
+	}
+	for nom, job := range cas {
+		proj.Spec.Crons = []model.CronJob{job}
+		if _, _, err := prov.Build(proj); err == nil {
+			t.Errorf("%s : refus attendu", nom)
+		}
+	}
+	// En mode simulé, aucun binaire n'est posé : la version n'est pas cherchée.
+	prov.Simulated = true
+	proj.Spec.Crons = []model.CronJob{cas["version absente"]}
+	if _, _, err := prov.Build(proj); err != nil {
+		t.Errorf("mode simulé : %v", err)
+	}
+}

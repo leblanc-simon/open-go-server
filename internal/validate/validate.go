@@ -72,6 +72,17 @@ var phpEOL = map[string]string{
 	"8.1": "2025-12-31",
 }
 
+// PHPVersion contrôle une version PHP : sa forme, puis qu'elle soit gérée.
+func PHPVersion(version string) error {
+	if !rePHPVer.MatchString(version) {
+		return fmt.Errorf("version %q invalide (exemple : 8.3)", version)
+	}
+	if !contains(supportedPHP, version) {
+		return fmt.Errorf("version %q non gérée (gérées : %s)", version, strings.Join(supportedPHP, ", "))
+	}
+	return nil
+}
+
 // EOLDate renvoie la date de fin de support d'une version PHP, si elle est passée.
 func EOLDate(version string) (string, bool) {
 	d, ok := phpEOL[version]

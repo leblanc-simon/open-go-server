@@ -2370,7 +2370,7 @@ func TestCronAndServiceLifecycle(t *testing.T) {
 	// Le fichier cron : verrou, identité, interpréteur par le lien, journal.
 	cronFile := h.read(t, filepath.Join("etc", "cron.d", "ogs-shopfr"))
 	for _, want := range []string{
-		"0 3 * * * shopfr /usr/bin/flock -n",
+		"0 3 * * * shopfr cd '" + filepath.Join(h.prefix, "home", "shop.fr", "www") + "' && /usr/bin/flock -n",
 		filepath.Join("run", "ogs", "shopfr", "scheduler.lock"),
 		filepath.Join(".local", "bin", "php"),
 		filepath.Join("www", "bin", "console"),

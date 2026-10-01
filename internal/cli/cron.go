@@ -38,13 +38,15 @@ func newCronAddCommand(app *App) *cobra.Command {
 		command  string
 		noLock   bool
 		workdir  string
+		php      string
 	)
 	cmd := &cobra.Command{
 		Use:   "add <id> <nom>",
 		Short: "Déclarer une tâche planifiée",
-		Long: "La tâche est enveloppée dans flock, s'exécute sous l'utilisateur du projet et\n" +
-			"journalise sa sortie dans logs/. L'expression est validée et ses prochaines\n" +
-			"occurrences affichées, afin de confirmer qu'elle correspond à l'intention.",
+		Long: "La tâche est enveloppée dans flock, s'exécute sous l'utilisateur du projet,\n" +
+			"depuis son répertoire de travail, et journalise sa sortie dans logs/. L'expression\n" +
+			"est validée et ses prochaines occurrences affichées, afin de confirmer qu'elle\n" +
+			"correspond à l'intention.",
 		Args: cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			p, err := app.loadProject(args[0])
@@ -66,13 +68,18 @@ func newCronAddCommand(app *App) *cobra.Command {
 			if err := validate.CronExpression(schedule); err != nil {
 				return exitf(CodeValidation, "expression %q : %v", schedule, err)
 			}
+			if php != "" {
+				if err := validate.PHPVersion(php); err != nil {
+					return exitf(CodeValidation, "--php : %v", err)
+				}
+			}
 			next, err := cron.NextOccurrences(schedule, time.Now(), 3)
 			if err != nil {
 				return exitf(CodeValidation, "expression %q : %v", schedule, err)
 			}
 			lock := !noLock
 			job := model.CronJob{Name: name, Schedule: schedule, Command: command,
-				Workdir: workdir, Lock: &lock}
+				Workdir: workdir, PHP: php, Lock: &lock}
 			p.Spec.Crons = append(p.Spec.Crons, job)
 			if err := app.prepare(p); err != nil {
 				return err
@@ -97,7 +104,8 @@ func newCronAddCommand(app *App) *cobra.Command {
 	f.StringVar(&schedule, "schedule", "", "expression cron à cinq champs")
 	f.StringVar(&command, "command", "", "commande à exécuter")
 	f.BoolVar(&noLock, "no-lock", false, "ne pas envelopper dans flock")
-	f.StringVar(&workdir, "workdir", "", "répertoire de travail (défaut : racine du projet)")
+	f.StringVar(&workdir, "workdir", "", "répertoire de travail (défaut : www/ du projet)")
+	f.StringVar(&php, "php", "", "version de PHP de la tâche (défaut : celle du projet, par le lien géré)")
 	_ = cmd.MarkFlagRequired("schedule")
 	return cmd
 }

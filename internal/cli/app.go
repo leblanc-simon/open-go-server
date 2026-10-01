@@ -357,7 +357,7 @@ func (a *App) buildProviders() (*providers, error) {
 		DB:     dbProv,
 		AMQP:   amqpProv,
 		App:    appProv,
-		Cron: &cron.Provider{Paths: a.Paths, Templates: tmpl, Force: a.Force,
+		Cron: &cron.Provider{Paths: a.Paths, Templates: tmpl, Force: a.Force, Simulated: a.Exec.Simulated(),
 			Owner: func(proj *model.Project) (int, int, error) { return sys.ResolveOwner(proj, "") }},
 		Unit:    &unit.Provider{Paths: a.Paths, Exec: a.Exec, Templates: tmpl, Force: a.Force},
 		Sudoers: &sudoers.Provider{Paths: a.Paths, Exec: a.Exec, Force: a.Force},

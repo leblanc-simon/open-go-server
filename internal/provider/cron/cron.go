@@ -15,6 +15,7 @@ import (
 	"leblanc.io/open-go-server/internal/model"
 	"leblanc.io/open-go-server/internal/provider/removal"
 	"leblanc.io/open-go-server/internal/template"
+	"leblanc.io/open-go-server/internal/validate"
 )
 
 // Provider réconcilie le fichier cron d'un projet.
@@ -28,6 +29,9 @@ type Provider struct {
 	// sauvegarde horodatée (§6.4). Sans lui, le refus n'aurait aucune porte de
 	// sortie et l'apply du projet resterait bloqué.
 	Force bool
+	// Simulated suspend le contrôle d'installation d'une version PHP fixée par
+	// une tâche : le mode préfixé ne pose aucun binaire.
+	Simulated bool
 }
 
 // refusStep produit l'étape qui refuse d'écraser un fichier qu'ogs n'a pas
@@ -172,12 +176,23 @@ func (p *Provider) jobs(proj *model.Project) ([]job, error) {
 	return out, nil
 }
 
-// command construit la commande complète : verrou, interpréteur, répertoire de
-// travail. Le verrou est posé par défaut — une tâche qui se recouvre est une
+// command construit la commande complète : répertoire de travail, verrou,
+// interpréteur. Le verrou est posé par défaut — une tâche qui se recouvre est une
 // cause fréquente d'incident, et l'oubli est plus probable que le besoin inverse.
+//
+// La ligne commence par un « cd » : cron lance la tâche dans le home, et une
+// commande qui lit un chemin relatif — un fichier de configuration, un
+// répertoire var/ — le chercherait là. Le répertoire de travail ne servait
+// auparavant qu'à compléter une commande relative, ce qui le rendait trompeur.
+// Le « cd » précède le verrou : flock exécute une commande, pas une ligne de
+// shell. S'il échoue, la tâche ne part pas, et le journal dit pourquoi.
 func (p *Provider) command(proj *model.Project, decl model.CronJob) (string, error) {
 	if strings.ContainsAny(decl.Command, "\n\r") {
 		return "", fmt.Errorf("tâche %s : la commande ne peut pas contenir de retour à la ligne", decl.Name)
+	}
+	fields := strings.Fields(decl.Command)
+	if len(fields) == 0 {
+		return "", fmt.Errorf("tâche %s : commande vide", decl.Name)
 	}
 	workdir := decl.Workdir
 	if workdir == "" {
@@ -185,23 +200,62 @@ func (p *Provider) command(proj *model.Project, decl model.CronJob) (string, err
 		// Prendre la racine du projet produirait un chemin inexistant.
 		workdir = filepath.Join(proj.Spec.Layout.Root, "www")
 	}
+	interp, err := p.interpreter(proj, decl)
+	if err != nil {
+		return "", err
+	}
 	command := decl.Command
 	// Une commande relative est résolue depuis le répertoire de travail, et
-	// « bin/console » est réécrit pour passer par le lien d'interpréteur : une
-	// bascule de version PHP ne doit pas exiger de réécrire les crons (D30).
-	if strings.HasPrefix(command, "bin/console") || strings.HasPrefix(command, "./bin/console") {
-		command = filepath.Join(model.BinDir(proj.Spec.Layout.Root), "php") + " " +
-			filepath.Join(workdir, strings.TrimPrefix(strings.TrimPrefix(command, "./"), ""))
-	} else if !filepath.IsAbs(strings.Fields(command)[0]) {
+	// « bin/console » comme « php … » passent par l'interpréteur de la tâche :
+	// le lien géré par défaut, de sorte qu'une bascule de version PHP n'exige pas
+	// de réécrire les crons (D30), ou la version que fixe « php: » (D98).
+	switch {
+	case strings.HasPrefix(command, "bin/console") || strings.HasPrefix(command, "./bin/console"):
+		command = interp + " " + filepath.Join(workdir, strings.TrimPrefix(command, "./"))
+	case fields[0] == "php":
+		command = interp + strings.TrimPrefix(command, "php")
+	case decl.PHP != "":
+		// Ignorer la version demandée ferait tourner la tâche sous une autre
+		// sans un mot : c'était le cas avant D98.
+		return "", fmt.Errorf("tâche %s : « php: %s » ne s'applique qu'à « bin/console … » ou "+
+			"« php … », pas à %q", decl.Name, decl.PHP, fields[0])
+	case !filepath.IsAbs(fields[0]):
 		command = filepath.Join(workdir, command)
 	}
 
 	lock := decl.Lock == nil || *decl.Lock
-	if !lock {
-		return command, nil
+	if lock {
+		lockPath := filepath.Join(p.Paths.ProjectRunDir(proj.ID()), decl.Name+".lock")
+		command = fmt.Sprintf("/usr/bin/flock -n %s %s", lockPath, command)
 	}
-	lockPath := filepath.Join(p.Paths.ProjectRunDir(proj.ID()), decl.Name+".lock")
-	return fmt.Sprintf("/usr/bin/flock -n %s %s", lockPath, command), nil
+	return "cd " + shellQuote(workdir) + " && " + command, nil
+}
+
+// interpreter renvoie l'interpréteur PHP d'une tâche : le lien géré, ou le
+// binaire de la version que la tâche fixe. Une version absente de la machine
+// n'est relevée qu'en exécution réelle — un plan doit rester calculable sur une
+// machine qui ne l'a pas, comme pour les pools.
+func (p *Provider) interpreter(proj *model.Project, decl model.CronJob) (string, error) {
+	if decl.PHP == "" {
+		return filepath.Join(model.BinDir(proj.Spec.Layout.Root), "php"), nil
+	}
+	if err := validate.PHPVersion(decl.PHP); err != nil {
+		return "", fmt.Errorf("tâche %s : php : %w", decl.Name, err)
+	}
+	bin := p.Paths.PHPBin(decl.PHP)
+	if !p.Simulated {
+		if _, err := os.Stat(bin); err != nil {
+			return "", fmt.Errorf("tâche %s : PHP %s n'est pas installé (%s introuvable)",
+				decl.Name, decl.PHP, bin)
+		}
+	}
+	return bin, nil
+}
+
+// shellQuote cite un argument pour /bin/sh. Un guillemet simple présent dans la
+// valeur est fermé, échappé, puis réouvert.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 // Plan calcule les étapes du fichier cron et des fichiers de journal.

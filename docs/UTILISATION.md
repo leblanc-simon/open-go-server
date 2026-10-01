@@ -121,6 +121,9 @@ sudo ogs site create shop.fr \
 - `--service` démarre trois consommateurs de la file (voir [Les services](#les-services)) ;
 - `--cron` pose une tâche chaque minute, sous l'utilisateur du projet, enveloppée dans `flock` pour ne
   jamais se chevaucher, journalisée dans `~/logs/`.
+  La tâche se place d'abord dans `www/` (ou dans son `workdir`) ; `bin/console …` et `php …` passent par
+  `~/.local/bin/php`, sauf si la tâche fixe sa version par `php: "8.2"` (`ogs cron add --php 8.2`) — elle
+  ne suit alors plus `ogs php switch`.
 
 ### 4. Une application Node
 
@@ -246,6 +249,7 @@ spec:
     - name: purge-nocturne
       schedule: "30 3 * * *"
       command: bin/console app:purge --no-interaction
+      php: "8.2"                         # facultatif : /usr/bin/php8.2 au lieu du lien géré
 
   services:
     - name: messenger-async
