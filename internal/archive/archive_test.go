@@ -2,7 +2,9 @@ package archive
 
 import (
 	"archive/tar"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -54,7 +56,7 @@ func TestRoundTrip(t *testing.T) {
 	if err := w.AddSecret("mysql/shopfr", []byte("nonce"), []byte("chiffré")); err != nil {
 		t.Fatal(err)
 	}
-	if err := w.AddTree("tree", "tree", root); err != nil {
+	if err := w.AddTree(context.Background(), "tree", "tree", root); err != nil {
 		t.Fatal(err)
 	}
 	w.Note("utilisateur shopfr")
@@ -222,7 +224,7 @@ func archiver(t *testing.T, dir string, files map[string]string, links map[strin
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := w.AddTree("tree", "tree", src); err != nil {
+	if err := w.AddTree(context.Background(), "tree", "tree", src); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := w.Close(); err != nil {
@@ -498,7 +500,7 @@ func TestAddTreePorteLeProprietaireDeChaqueEntree(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := w.AddTree("tree", "tree", src); err != nil {
+	if err := w.AddTree(context.Background(), "tree", "tree", src); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := w.Close(); err != nil {
@@ -833,7 +835,7 @@ func TestAddTreeNeSuitPasUnAncetreSubstitue(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := w.AddTree("tree", "tree", root); err != nil {
+	if err := w.AddTree(context.Background(), "tree", "tree", root); err != nil {
 		t.Fatalf("AddTree : %v", err)
 	}
 	if _, err := w.Close(); err != nil {
@@ -894,7 +896,7 @@ func TestAddTreeNOuvreJamaisUnLienSubstitueAUnFichier(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := w.AddTree("tree", "tree", root); err != nil {
+	if err := w.AddTree(context.Background(), "tree", "tree", root); err != nil {
 		t.Fatalf("une entrée changée sous nos pieds ne doit pas faire échouer l'archive : %v", err)
 	}
 	if _, err := w.Close(); err != nil {
@@ -912,5 +914,103 @@ func TestAddTreeNOuvreJamaisUnLienSubstitueAUnFichier(t *testing.T) {
 	}
 	if got, err := ReadFile(path, "tree/www/voisin"); err != nil || string(got) != "voisin" {
 		t.Errorf("les autres entrées doivent être archivées : %q %v", got, err)
+	}
+}
+
+// bail pose un bail en écriture sur path, comme le propriétaire d'un fichier le
+// fait sans privilège ; il est rendu à la fin du test.
+func bail(t *testing.T, path string) {
+	t.Helper()
+	fd, err := unix.Open(path, unix.O_RDWR|unix.O_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := unix.FcntlInt(uintptr(fd), unix.F_SETLEASE, unix.F_WRLCK); err != nil {
+		unix.Close(fd)
+		t.Skipf("bail refusé par ce système de fichiers : %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = unix.FcntlInt(uintptr(fd), unix.F_SETLEASE, unix.F_UNLCK)
+		unix.Close(fd)
+	})
+}
+
+// arbreSousBaux crée une arborescence de n fichiers, chacun sous bail.
+func arbreSousBaux(t *testing.T, n int) (src string, w *Writer) {
+	t.Helper()
+	dir := t.TempDir()
+	src = filepath.Join(dir, "home")
+	for i := range n {
+		sub := filepath.Join(src, fmt.Sprintf("d%02d", i))
+		if err := os.MkdirAll(sub, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		f := filepath.Join(sub, "tenu")
+		if err := os.WriteFile(f, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		bail(t, f)
+	}
+	w, err := Create(filepath.Join(dir, "a"+Extension), Manifest{Project: "shopfr"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { w.Abort() })
+	return src, w
+}
+
+// Les attentes de baux se bornent sur l'archive entière, non fichier par
+// fichier : chaque bail coûtait 45 s, les attentes s'additionnaient, et un
+// locataire qui en posait un par répertoire tenait le verrou global d'ogs des
+// heures durant (Q-86).
+func TestArchiveBorneLAttenteDesBauxSurLOpérationEntière(t *testing.T) {
+	defer func(prev time.Duration) { leaseBudget = prev }(leaseBudget)
+	leaseBudget = 300 * time.Millisecond
+	src, w := arbreSousBaux(t, 20)
+	début := time.Now()
+	err := w.AddTree(context.Background(), "tree", "tree", src)
+	if err == nil || !strings.Contains(err.Error(), "bail") && !strings.Contains(err.Error(), "baux") {
+		t.Fatalf("des baux jamais rendus doivent faire échouer l'archive en les nommant : %v", err)
+	}
+	if d := time.Since(début); d > 5*time.Second {
+		t.Errorf("l'archive a attendu %v : le budget de l'opération (%v) n'a pas été tenu", d, leaseBudget)
+	}
+}
+
+// Une interruption arrête l'attente d'un bail aussitôt, et rend l'annulation :
+// la suppression l'abandonne alors en code 9, avant le point de non-retour.
+func TestArchiveSuitLeContextePendantUnBail(t *testing.T) {
+	src, w := arbreSousBaux(t, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(200*time.Millisecond, cancel)
+	début := time.Now()
+	err := w.AddTree(ctx, "tree", "tree", src)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("l'interruption doit être rendue : %v", err)
+	}
+	if d := time.Since(début); d > 5*time.Second {
+		t.Errorf("l'interruption a attendu %v", d)
+	}
+}
+
+// Une interruption reçue entre deux entrées arrête le parcours.
+func TestArchiveSuitLeContexteEntreDeuxEntrées(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "home")
+	if err := os.MkdirAll(src, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "f"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	w, err := Create(filepath.Join(dir, "a"+Extension), Manifest{Project: "shopfr"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Abort()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := w.AddTree(ctx, "tree", "tree", src); !errors.Is(err, context.Canceled) {
+		t.Fatalf("un contexte annulé doit arrêter le parcours : %v", err)
 	}
 }

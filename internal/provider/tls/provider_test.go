@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -1033,5 +1034,144 @@ func TestCompensationRendLUniteDeRenouvellementPrecedente(t *testing.T) {
 	}
 	if string(après) != string(avant) {
 		t.Error("la compensation doit rendre le timer précédent")
+	}
+}
+
+// Un vhost qui désigne un certificat de portée serveur par « @nom » le sert, et
+// le plan du projet l'émet ; supprimer ce certificat est refusé (D102).
+func TestVhostDésigneUnCertificatPartagé(t *testing.T) {
+	p := newProvider(t)
+	p.Cfg.Certificates["commun"] = config.SharedCert{Domains: []string{"*.groupe.fr"}, Challenge: "selfsigned"}
+	proj := newProject(t, "shop.fr", naming.EnvProd)
+	proj.Spec.Domains = append(proj.Spec.Domains, model.Domain{Name: "blog.groupe.fr", Role: "alias"})
+	principal := model.VHost{Name: "shopfr", Domains: []string{"shop.fr"}}
+	blog := model.VHost{Name: "blog", Domains: []string{"blog.groupe.fr"},
+		TLS: &model.TLS{Enabled: true, Certificate: "@commun"}}
+	proj.Spec.Web.VHosts = []model.VHost{principal, blog}
+
+	if cov := p.VHostCoverage(proj, blog); cov.Ref != "@commun" {
+		t.Errorf("le vhost du blog doit servir @commun : %q", cov.Ref)
+	}
+	if cov := p.VHostCoverage(proj, principal); cov.Ref != "shopfr" {
+		t.Errorf("le vhost principal garde le certificat du projet : %q", cov.Ref)
+	}
+	steps, err := p.Plan(context.Background(), proj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var res []string
+	for _, s := range steps {
+		res = append(res, s.Resource)
+	}
+	if !slices.Contains(res, "tls/certificate/@commun") {
+		t.Errorf("le plan doit émettre le certificat partagé désigné : %v", res)
+	}
+	for _, s := range steps {
+		if err := s.Apply(context.Background()); err != nil {
+			t.Fatalf("%s : %v", s.Resource, err)
+		}
+	}
+	if err := p.Delete("@commun", []*model.Project{proj}); err == nil {
+		t.Error("supprimer un certificat qu'un vhost sert doit être refusé")
+	}
+	if problems := p.ReferenceProblems(proj); len(problems) != 0 {
+		t.Errorf("aucune référence sans objet : %v", problems)
+	}
+}
+
+// La préproduction recopie spec.web.tls de la production (site clone) : la
+// référence au certificat de la production n'y désigne rien, le wildcard reste
+// servi, et rien n'est signalé — un code 6 à chaque apply serait faux.
+func TestPréproductionIgnoreLaRéférenceDeLaProduction(t *testing.T) {
+	p := newProvider(t)
+	prep := newProject(t, "shop.fr", naming.EnvPrep)
+	prep.Spec.Web.TLS = &model.TLS{Enabled: true, Certificate: "shopfr"}
+	vh := model.VHost{Name: "shopfrprep", Domains: []string{prep.Spec.Domains[0].Name}}
+	if cov := p.VHostCoverage(prep, vh); cov.Ref != "@wildcard-prep" {
+		t.Errorf("la préproduction doit servir le wildcard : %q", cov.Ref)
+	}
+	if problems := p.ReferenceProblems(prep); len(problems) != 0 {
+		t.Errorf("rien à signaler en préproduction : %v", problems)
+	}
+	steps, err := p.Plan(context.Background(), prep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(steps) != 1 {
+		t.Errorf("seul le wildcard est planifié : %d étape(s)", len(steps))
+	}
+}
+
+// Relecture de D102 : la préproduction hérite (site clone) de spec.web.tls de la
+// production, qui désigne un partagé ; il ne la couvre pas, ou pas mieux que le
+// wildcard. Le wildcard reste servi, rien n'est signalé, et le partagé n'est pas
+// émis avec la préproduction.
+func TestPréproductionGardeLeWildcardMalgréUnPartagéHérité(t *testing.T) {
+	p := newProvider(t)
+	p.Cfg.Certificates["commun"] = config.SharedCert{Domains: []string{"*.groupe.fr"}, Challenge: "selfsigned"}
+	prep := newProject(t, "shop.fr", naming.EnvPrep)
+	prep.Spec.Web.TLS = &model.TLS{Enabled: true, Certificate: "@commun"}
+	vh := model.VHost{Name: "shopfrprep", Domains: []string{prep.Spec.Domains[0].Name}}
+	if cov := p.VHostCoverage(prep, vh); cov.Ref != "@wildcard-prep" {
+		t.Errorf("la préproduction doit servir le wildcard : %q", cov.Ref)
+	}
+	if problems := p.ReferenceProblems(prep); len(problems) != 0 {
+		t.Errorf("rien à signaler en préproduction : %v", problems)
+	}
+	steps, err := p.Plan(context.Background(), prep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range steps {
+		if strings.Contains(s.Resource, "@commun") {
+			t.Errorf("le partagé hérité ne doit pas être émis avec la préproduction : %s", s.Resource)
+		}
+	}
+}
+
+// Une référence dont la demande ne couvre aucun nom du vhost ne lui retire pas
+// le certificat par défaut, et elle est signalée.
+func TestUneRéférenceQuiNeCouvreRienEstSignalée(t *testing.T) {
+	p := newProvider(t)
+	proj := newProject(t, "shop.fr", naming.EnvProd)
+	proj.Spec.Certificates = []model.Certificate{
+		{Name: "principal", Domains: []string{"shop.fr"}, Challenge: "selfsigned"},
+		{Name: "autre", Domains: []string{"autre.shop.fr"}, Challenge: "selfsigned"},
+	}
+	proj.Spec.Web.TLS = &model.TLS{Enabled: true, Certificate: "autre"}
+	vh := model.VHost{Name: "shopfr", Domains: []string{"shop.fr"}}
+	if cov := p.VHostCoverage(proj, vh); cov.Ref != "principal" {
+		t.Errorf("le vhost doit garder le certificat qui le couvre : %q", cov.Ref)
+	}
+	if problems := p.ReferenceProblems(proj); len(problems) != 1 || !strings.Contains(problems[0], "ne couvre aucun") {
+		t.Errorf("la référence sans objet doit être signalée : %v", problems)
+	}
+}
+
+// Un certificat désigné, pas encore émis, laisse servir le certificat présent
+// qui couvre le vhost, et se dit en attente (D79) ; émis, il est servi.
+func TestUnCertificatDésignéEnAttenteLaisseServirLePrésent(t *testing.T) {
+	p := newProvider(t)
+	p.Cfg.Certificates["commun"] = config.SharedCert{Domains: []string{"*.shop.fr", "shop.fr"}, Challenge: "selfsigned"}
+	proj := newProject(t, "shop.fr", naming.EnvProd)
+	vh := model.VHost{Name: "shopfr", Domains: []string{"shop.fr"}}
+	reqs, err := p.Requests(proj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.issue(context.Background(), reqs[0]); err != nil {
+		t.Fatal(err)
+	}
+	vh.TLS = &model.TLS{Enabled: true, Certificate: "@commun"}
+	cov := p.VHostCoverage(proj, vh)
+	if cov.Ref != proj.ID() || cov.Pending != "@commun" || !cov.Serves("shop.fr") {
+		t.Fatalf("le présent doit rester servi, le désigné en attente : %+v", cov)
+	}
+	shared, _ := p.SharedRequest("@commun")
+	if err := p.issue(context.Background(), shared); err != nil {
+		t.Fatal(err)
+	}
+	if cov := p.VHostCoverage(proj, vh); cov.Ref != "@commun" || cov.Pending != "" {
+		t.Errorf("émis, le désigné doit être servi : %+v", cov)
 	}
 }

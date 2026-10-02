@@ -3,9 +3,11 @@ package cli
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
@@ -32,24 +34,39 @@ func newTUICommand(app *App) *cobra.Command {
 			if err := app.openStore(); err != nil {
 				return err
 			}
-			return wrap(CodeError, tui.Run(&tuiBackend{app: app, cmd: cmd}))
+			err := tui.Run(cmd.Context(), &tuiBackend{app: app, cmd: cmd})
+			if errors.Is(err, tui.ErrInterrupted) {
+				return exitf(CodeCancelled, "interruption reçue : l'action en cours a été annulée")
+			}
+			return wrap(CodeError, err)
 		},
 	}
 }
 
 // tuiBackend relie l'interface aux providers. L'interface ne connaît jamais un
 // provider directement : elle reste ainsi éprouvable sans système.
+//
+// Ses appels sont sérialisés (mu) : chacun s'exécute dans sa propre goroutine,
+// et tous partagent l'App — Apply y détournait Out et posait Yes pendant qu'une
+// observation ou une seconde action les lisaient (Q-101).
 type tuiBackend struct {
 	app *App
 	cmd *cobra.Command
+	mu  sync.Mutex
 }
 
 // PrepDomain renvoie le domaine de préproduction configuré.
 func (b *tuiBackend) PrepDomain() string { return b.app.Cfg.PrepDomain() }
 
-func (b *tuiBackend) Projects() ([]*model.Project, error) { return b.app.loadProjects() }
+func (b *tuiBackend) Projects() ([]*model.Project, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.app.loadProjects()
+}
 
 func (b *tuiBackend) Snapshot(ctx context.Context, p *model.Project) (tui.Snapshot, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	provs, err := b.app.buildProviders()
 	if err != nil {
 		return tui.Snapshot{}, err
@@ -115,10 +132,12 @@ func (b *tuiBackend) Snapshot(ctx context.Context, p *model.Project) (tui.Snapsh
 func (b *tuiBackend) Apply(ctx context.Context, p *model.Project) (string, error) {
 	// La sortie est capturée pour être rendue dans l'interface : l'utilisateur
 	// doit voir exactement ce que la ligne de commande aurait affiché.
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	var buf bytes.Buffer
-	previous := b.app.Out
+	previousOut, previousYes := b.app.Out, b.app.Yes
 	b.app.Out, b.app.Yes = &buf, true
-	defer func() { b.app.Out = previous }()
+	defer func() { b.app.Out, b.app.Yes = previousOut, previousYes }()
 
 	lock, err := engine.Acquire(b.app.Paths.GlobalLock())
 	if err != nil {
@@ -168,6 +187,8 @@ func (b *tuiBackend) Apply(ctx context.Context, p *model.Project) (string, error
 }
 
 func (b *tuiBackend) Diff(ctx context.Context, p *model.Project) ([]string, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	provs, err := b.app.buildProviders()
 	if err != nil {
 		return nil, err
@@ -193,6 +214,8 @@ func (b *tuiBackend) Diff(ctx context.Context, p *model.Project) ([]string, erro
 }
 
 func (b *tuiBackend) Restart(ctx context.Context, p *model.Project) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	provs, err := b.app.buildProviders()
 	if err != nil {
 		return err
@@ -205,6 +228,8 @@ func (b *tuiBackend) Restart(ctx context.Context, p *model.Project) error {
 }
 
 func (b *tuiBackend) RenewCertificate(ctx context.Context, p *model.Project) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	provs, err := b.app.buildProviders()
 	if err != nil {
 		return err
@@ -221,6 +246,8 @@ func (b *tuiBackend) RenewCertificate(ctx context.Context, p *model.Project) err
 			}
 		}
 	}
+	// Les partagés que désignent ses vhosts se renouvellent avec lui (D102).
+	requests = append(requests, provs.TLS.DesignatedShared(p)...)
 	if len(requests) == 0 {
 		return fmt.Errorf("le projet %s ne demande aucun certificat", p.ID())
 	}
@@ -240,6 +267,8 @@ func (b *tuiBackend) RenewCertificate(ctx context.Context, p *model.Project) err
 }
 
 func (b *tuiBackend) Create(ctx context.Context, answers tui.WizardAnswers) (string, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	opts := siteOptions{
 		kind: answers.Kind, appVersion: answers.AppVersion, phpVersion: answers.PHPVersion,
 		env: answers.Env, database: answers.Database, tls: true, apply: false,

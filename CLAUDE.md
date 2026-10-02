@@ -770,6 +770,29 @@ Ils ont tous coûté un défaut réel ; les tests unitaires ne les voyaient pas.
   configuration —, un lien dont la cible sort de la préproduction aussi : la copie ne le suit pas, la
   préproduction le suivra. Un fichier qui porte un mot de passe est masqué, jamais retiré : un WordPress
   sans `wp-config.php` offre son installeur, comme un Prestashop dont `install/` a survécu.
+- **Le moteur ne compense jamais l'étape qui échoue**, seulement celles qui l'ont précédée : une étape qui
+  écrit un fichier géré puis lance une commande doit **rendre le fichier** si la commande échoue. Laissé en
+  place, il passe pour conforme au plan suivant, et la commande n'est jamais rejouée — `ufw app update` après
+  le fichier de profils (la règle gardait l'ancien port de sshd, et les sessions neuves ne passaient plus),
+  `daemon-reload` après le complément d'unité du serveur web (Q-06). Une commande qui n'est qu'une intention
+  de rechargement (`Step.Reload`) n'est pas concernée.
+- **Chaque vhost sert le certificat qu'il désigne, s'il le couvre** (D102) : `web.Provider.Certificate`
+  reçoit le vhost, câblé sur `tls.Provider.VHostCoverage`. La référence était lue puis ignorée, et le vhost
+  d'un second certificat restait en HTTP seul ; retenue dès qu'elle existait, elle retirait au contraire le
+  bloc 443 d'un site que le certificat désigné ne couvrait pas — `spec.web.tls.certificate` vaut pour tous
+  les vhosts —, en code 0, HSTS actif. Une référence ne compte que si sa demande couvre un nom du vhost, la
+  préproduction garde le wildcard, et un désigné pas encore émis laisse servir le présent jusqu'à la
+  bascule (`Coverage.Pending`, D79). Sans objet, elle retombe sur le choix par défaut et le plan la
+  signale — jamais un refus.
+- **Une attente se borne sur l'opération entière, pas pas à pas** : l'attente d'un bail `F_SETLEASE`, bornée
+  fichier par fichier, s'additionnait — 45 s par bail, qu'un locataire pose sans privilège à chaque
+  répertoire — et tenait le verrou global des heures durant. L'archive porte un budget (`fs.LeaseBudget`) et
+  suit le contexte jusque dans l'attente (`Dir.OpenFileContext`, `Writer.AddTree(ctx, …)`) (Q-86).
+- **Bubble Tea sort sur SIGTERM sans attendre ses commandes en vol**, et `q` rendait `tea.Quit` pendant une
+  action : la saga était abandonnée entre deux étapes, le processus sortant sous elle. La TUI écarte son
+  gestionnaire de signaux (`tea.WithoutSignalHandler`), reçoit l'interruption par le contexte de la commande,
+  n'admet qu'une action à la fois et ne se ferme qu'après elle ; `tuiBackend` sérialise ses appels, qui
+  partagent l'App (Q-101). `go test -race ./internal/tui/ ./internal/cli/` le verrouille.
 - **`--dry-run` est une option globale, donc reçue par des commandes qui ne la lisaient pas** (D88) :
   `project delete --dry-run` supprimait pour de bon — archive, bases, vhost, compte, home, `preDelete` et
   `postDelete` en root — et rendait 0 ; `project restore` et `cert renew` de même. La conduite de toute

@@ -124,6 +124,9 @@ func hostHelp(a WizardAnswers, prepDomain string) string {
 func (m *Model) wizardKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	w := &m.wizard
 	switch key.Type {
+	case tea.KeyCtrlC:
+		m.mode = modeList
+		return m.interrupt(false)
 	case tea.KeyEsc:
 		// Sortir de l'assistant ne perd rien : aucun projet n'est écrit avant la
 		// dernière étape.
@@ -159,15 +162,13 @@ func (m *Model) wizardKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if w.index == len(w.steps)-1 {
 			answers := w.answers
 			m.mode = modeList
-			m.busy = true
-			m.status = "création en cours…"
-			return m, func() tea.Msg {
-				out, err := m.backend.Create(context.Background(), answers)
+			return m, m.start("création en cours…", func(ctx context.Context) tea.Msg {
+				out, err := m.backend.Create(ctx, answers)
 				if err != nil {
 					return outputMsg{err: err}
 				}
 				return outputMsg{lines: strings.Split(strings.TrimRight(out, "\n"), "\n")}
-			}
+			})
 		}
 		w.index++
 		return m, nil

@@ -82,7 +82,7 @@ func (m *Model) viewList() string {
 	if m.status != "" {
 		b.WriteString("\n" + m.styles.help(m.status))
 	}
-	if m.busy {
+	if m.loading > 0 && !m.running {
 		b.WriteString("\n" + m.styles.help("observation en cours…"))
 	}
 	return b.String()

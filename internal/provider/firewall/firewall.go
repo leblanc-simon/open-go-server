@@ -806,9 +806,11 @@ func (p *Provider) profilesStep(profiles []Profile, kept map[string]string, obs 
 		if err := fs.WriteAtomic(path, content, 0o644, fs.KeepOwner); err != nil {
 			return fail(err)
 		}
-		for _, name := range changed {
+		for i, name := range changed {
 			if err := p.ufw(ctx, "app", "update", name); err != nil {
-				return fail(err)
+				// Le profil en échec est ramené lui aussi : ufw a pu réécrire
+				// user.rules avant d'échouer — au rechargement, par exemple.
+				return fail(p.unwriteProfiles(path, previous, changed[:i+1], err))
 			}
 		}
 		return nil
@@ -826,6 +828,35 @@ func (p *Provider) profilesStep(profiles []Profile, kept map[string]string, obs 
 		return nil
 	}
 	return s, changed, nil
+}
+
+// unwriteProfiles défait l'écriture du fichier de profils quand « ufw app
+// update » a échoué : le moteur ne compense jamais l'étape qui échoue, et un
+// fichier laissé aux nouveaux ports passait pour conforme au plan suivant — qui
+// ne rejouait plus la commande, la règle gardant l'ancien port pour toujours
+// (Q-06). Rendu tel qu'il était, le fichier redit ce que portent les règles, et
+// le plan suivant recalcule les profils à mettre à jour, gardes comprises. Ceux
+// qui l'ont déjà été sont ramenés au fichier rendu, au mieux : un fichier qui
+// dirait l'ancien port d'une règle passée au nouveau tromperait à son tour le
+// plan suivant.
+func (p *Provider) unwriteProfiles(path string, previous []byte, updated []string, cause error) error {
+	var err error
+	if previous == nil {
+		if err = os.Remove(path); os.IsNotExist(err) {
+			err = nil
+		}
+	} else {
+		err = fs.WriteAtomic(path, previous, 0o644, fs.KeepOwner)
+	}
+	if err != nil {
+		return fmt.Errorf("%w ; le fichier de profils n'a pas pu être rendu (%v) : le plan suivant le "+
+			"dira conforme alors que les règles portent encore les anciens ports", cause, err)
+	}
+	// Une interruption a pu annuler le contexte : la remise en place n'en dépend pas.
+	for _, name := range updated {
+		_ = p.ufw(context.Background(), "app", "update", name)
+	}
+	return cause
 }
 
 func usedBy(rules []ObservedRule, app string) bool {

@@ -366,7 +366,7 @@ func (a *App) buildProviders() (*providers, error) {
 		PHP:     php,
 		Web: &web.Provider{
 			Paths: a.Paths, Exec: a.Exec, Templates: tmpl, Engine: eng, PHP: php,
-			Certificate: certs.Coverage,
+			Certificate: certs.VHostCoverage,
 			CertDir:     certStore.Dir,
 			ProxyTarget: appProv.ProxyTarget,
 			Force:       a.Force,

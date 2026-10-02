@@ -614,6 +614,14 @@ func (a *App) runChecks(ctx context.Context) []check {
 		if list, err := provs.TLS.Store.List(); err == nil && len(list) > 0 {
 			add("certificats", "ok", fmt.Sprintf("%d présent(s)", len(list)), "")
 		}
+		// Une référence de certificat que rien ne porte (D102) : le vhost sert le
+		// certificat par défaut, et l'apply du projet rend le code 6.
+		for _, p := range projects {
+			for _, problem := range provs.TLS.ReferenceProblems(p) {
+				add("certificats désignés", "avertissement", "projet "+p.ID()+" : "+problem,
+					"corriger tls.certificate dans "+p.ID()+".yaml, ou déclarer ce certificat")
+			}
+		}
 	}
 	// Identifiants DNS (D97) : un jeu illisible, ou une zone que deux jeux
 	// revendiquent, ne se voient qu'au challenge — au renouvellement, des semaines

@@ -1,6 +1,7 @@
 package fs
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
@@ -10,6 +11,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -126,27 +128,99 @@ func (d *Dir) OpenDir(name string) (*Dir, error) {
 // locataire tenir indéfiniment le verrou global d'ogs.
 var leaseWait, leasePoll = 50 * time.Second, 50 * time.Millisecond
 
-// OpenFile ouvre en lecture le fichier régulier name. Le type est constaté sur le
-// descripteur ouvert, non sur le nom : ce que l'on lit est ce que l'on a vérifié.
-// Une fifo n'y bloque pas l'appelant, l'ouverture étant non bloquante ; un bail
-// ne la fait pas échouer d'emblée, l'ouverture étant retentée le temps que le
-// noyau le rompe (leaseWait).
+// DefaultLeaseBudget borne le temps qu'une opération entière — l'archivage d'un
+// projet — passe à attendre des baux, tous fichiers confondus. La borne de
+// leaseWait, fichier par fichier, ne tenait pas sa promesse : chaque bail coûtait
+// 45 s, les attentes s'additionnaient, et un locataire qui en posait un de plus
+// à chaque répertoire tenait le verrou global d'ogs des heures durant (Q-86).
+// Deux baux rompus par le noyau y tiennent ; au-delà, l'opération échoue en le
+// disant.
+const DefaultLeaseBudget = 2 * time.Minute
+
+// LeaseBudget est le temps d'attente des baux qui reste à une opération. Nil, il
+// n'y a que la borne de chaque fichier.
+type LeaseBudget struct {
+	mu    sync.Mutex
+	total time.Duration
+	left  time.Duration
+}
+
+// NewLeaseBudget rend un budget de d pour toute une opération.
+func NewLeaseBudget(d time.Duration) *LeaseBudget { return &LeaseBudget{total: d, left: d} }
+
+func (b *LeaseBudget) remaining() time.Duration {
+	if b == nil {
+		return leaseWait
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.left
+}
+
+func (b *LeaseBudget) spend(d time.Duration) {
+	if b == nil {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.left = max(b.left-d, 0)
+}
+
+// OpenFile ouvre en lecture le fichier régulier name, sans contexte ni budget
+// d'opération : l'attente d'un bail n'y est bornée que par leaseWait. Il ne
+// convient qu'à l'ouverture d'un fichier isolé ; un parcours passe par
+// OpenFileContext.
 func (d *Dir) OpenFile(name string) (*os.File, error) {
+	return d.OpenFileContext(context.Background(), name, nil)
+}
+
+// OpenFileContext ouvre en lecture le fichier régulier name. Le type est constaté
+// sur le descripteur ouvert, non sur le nom : ce que l'on lit est ce que l'on a
+// vérifié. Une fifo n'y bloque pas l'appelant, l'ouverture étant non bloquante ;
+// un bail ne la fait pas échouer d'emblée, l'ouverture étant retentée le temps
+// que le noyau le rompe — dans la limite de leaseWait pour ce fichier, et du
+// budget de l'opération. Une interruption (ctx) arrête l'attente aussitôt.
+func (d *Dir) OpenFileContext(ctx context.Context, name string, budget *LeaseBudget) (*os.File, error) {
 	p, err := d.child(name)
 	if err != nil {
 		return nil, err
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("%s : %w", p, err)
+	}
 	const flags = unix.O_RDONLY | unix.O_NOFOLLOW | unix.O_CLOEXEC | unix.O_NONBLOCK
 	fd, err := unix.Openat(d.fd, name, flags, 0)
-	for deadline := time.Now().Add(leaseWait); errors.Is(err, unix.EWOULDBLOCK) && time.Now().Before(deadline); {
-		time.Sleep(leasePoll)
-		fd, err = unix.Openat(d.fd, name, flags, 0)
+	exhausted := false
+	if errors.Is(err, unix.EWOULDBLOCK) {
+		deadline := time.Now().Add(leaseWait)
+		poll := time.NewTicker(leasePoll)
+		for errors.Is(err, unix.EWOULDBLOCK) && time.Now().Before(deadline) {
+			if budget.remaining() <= 0 {
+				exhausted = true
+				break
+			}
+			start := time.Now()
+			select {
+			case <-ctx.Done():
+				poll.Stop()
+				return nil, fmt.Errorf("%s : attente d'un bail interrompue : %w", p, ctx.Err())
+			case <-poll.C:
+			}
+			budget.spend(time.Since(start))
+			fd, err = unix.Openat(d.fd, name, flags, 0)
+		}
+		poll.Stop()
 	}
 	if err != nil {
 		if errors.Is(err, unix.ELOOP) {
 			return nil, fmt.Errorf("%s : %w", p, ErrNotRegular)
 		}
 		if errors.Is(err, unix.EWOULDBLOCK) {
+			if exhausted {
+				return nil, fmt.Errorf("%s : des baux (F_SETLEASE) tenus par un processus ont épuisé les %v "+
+					"d'attente de l'opération — arrêter les processus du projet, puis relancer : %w",
+					p, budget.total, err)
+			}
 			return nil, fmt.Errorf("%s : un bail (F_SETLEASE) tenu par un processus en interdit la lecture — "+
 				"arrêter les processus du projet, puis relancer : %w", p, err)
 		}

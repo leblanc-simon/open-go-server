@@ -280,6 +280,10 @@ type Coverage struct {
 	// Requested porte les domaines demandés : ceux que couvrira le certificat
 	// une fois émis.
 	Requested []string
+	// Pending est le certificat que le vhost désigne, servi dès que son matériel
+	// le couvrira : vide, rien n'est en attente (D102). Le certificat présent
+	// reste servi jusque-là, pour ne jamais retirer le HTTPS d'un vhost (D79).
+	Pending string
 }
 
 // Serves dit si le certificat présent couvre un nom.
@@ -295,7 +299,7 @@ func (c Coverage) Complete() bool {
 }
 
 // Coverage renvoie ce que le rendu des vhosts d'un projet doit savoir de son
-// certificat.
+// certificat principal : celui du premier vhost, à défaut de vhost désigné.
 func (p *Provider) Coverage(proj *model.Project) Coverage {
 	var cov Coverage
 	if shared := p.SharedRef(proj); shared != "" {
@@ -310,10 +314,209 @@ func (p *Provider) Coverage(proj *model.Project) Coverage {
 		}
 		cov.Ref, cov.Requested = reqs[0].Name, reqs[0].Domains
 	}
+	return p.present(cov)
+}
+
+// present complète une couverture par les noms du matériel présent et non
+// expiré : c'est lui, jamais la demande, qui décide du rendu (D79).
+func (p *Provider) present(cov Coverage) Coverage {
 	if info, ok, err := p.Store.Read(cov.Ref); err == nil && ok && !info.Expired(p.now()) {
 		cov.Present = info.Domains
 	}
 	return cov
+}
+
+// VHostCoverage renvoie le certificat que sert un vhost (D102) : celui qu'il
+// désigne (tls.certificate du vhost, sinon spec.web.tls.certificate), un
+// certificat du projet par son nom ou un certificat de portée serveur par
+// « @nom », pourvu que sa demande couvre l'un des noms du vhost ; à défaut, le
+// choix par défaut — le partagé de la préproduction, puis le premier
+// certificat du projet dont la demande couvre l'un de ses noms, puis le
+// premier tout court. Chaque vhost recevait le premier certificat déclaré, la
+// référence lue puis ignorée : le vhost d'un second certificat restait en HTTP
+// seul, et son certificat était renouvelé à vie sans servir.
+//
+// Trois règles empêchent une référence de retirer le HTTPS d'un vhost qui le
+// servait (D79) :
+//   - une référence que rien ne porte, ou dont la demande ne couvre aucun nom
+//     du vhost, retombe sur le choix par défaut, et le plan du projet le
+//     signale (ReferenceProblems) ;
+//   - une préproduction couverte par le wildcard le sert, quelle que soit la
+//     référence que « site clone » a recopiée de la production ;
+//   - tant que le certificat désigné ne couvre pas encore réellement le vhost
+//     — jamais émis, expiré —, le certificat présent qui le couvre reste
+//     servi : la bascule suit l'émission (Coverage.Pending, PlanTLS).
+func (p *Provider) VHostCoverage(proj *model.Project, vh model.VHost) Coverage {
+	def := p.defaultCoverage(proj, vh)
+	req, ok := p.designatedFor(proj, vh)
+	if !ok || req.Name == def.Ref {
+		return def
+	}
+	cov := p.present(Coverage{Ref: req.Name, Requested: req.Domains})
+	if servesAny(cov.Present, vh.Domains) || !servesAny(def.Present, vh.Domains) {
+		return cov
+	}
+	def.Pending = req.Name
+	return def
+}
+
+// defaultCoverage est le choix par défaut d'un vhost qui ne désigne rien qui le
+// couvre.
+func (p *Provider) defaultCoverage(proj *model.Project, vh model.VHost) Coverage {
+	if p.SharedRef(proj) != "" {
+		return p.Coverage(proj)
+	}
+	reqs, err := p.Requests(proj)
+	if err != nil || len(reqs) == 0 {
+		return Coverage{}
+	}
+	// Le matériel présent qui couvre le vhost passe avant la demande : un
+	// certificat ajouté en tête de spec.certificates, pas encore émis, ne retire
+	// pas le HTTPS que sert celui d'après (D79).
+	for _, req := range reqs {
+		if cov := p.present(Coverage{Ref: req.Name, Requested: req.Domains}); servesAny(cov.Present, vh.Domains) {
+			return cov
+		}
+	}
+	chosen := reqs[0]
+	for _, req := range reqs {
+		if servesAny(req.Domains, vh.Domains) {
+			chosen = req
+			break
+		}
+	}
+	return p.present(Coverage{Ref: chosen.Name, Requested: chosen.Domains})
+}
+
+// servesAny dit si des noms de certificat couvrent l'un des noms voulus.
+func servesAny(names, wanted []string) bool {
+	return len(names) > 0 && slices.ContainsFunc(wanted, func(d string) bool { return coveredBy(names, d) })
+}
+
+// certificateRef rend la référence de certificat que désigne un vhost, vide
+// s'il n'en désigne aucune.
+func certificateRef(proj *model.Project, vh model.VHost) string {
+	if vh.TLS != nil && vh.TLS.Certificate != "" {
+		return vh.TLS.Certificate
+	}
+	if t := proj.Spec.Web.TLS; t != nil {
+		return t.Certificate
+	}
+	return ""
+}
+
+// resolve rend la demande que désigne une référence, et faux si rien ne la
+// porte.
+func (p *Provider) resolve(proj *model.Project, ref string) (Request, bool) {
+	if strings.HasPrefix(ref, SharedPrefix) {
+		return p.SharedRequest(ref)
+	}
+	reqs, err := p.Requests(proj)
+	if err != nil {
+		return Request{}, false
+	}
+	for _, req := range reqs {
+		if req.Name == ref {
+			return req, true
+		}
+	}
+	return Request{}, false
+}
+
+// designatedFor rend le certificat que désigne un vhost, s'il en désigne un
+// que sa demande fait couvrir l'un de ses noms. Une préproduction couverte par
+// le wildcard n'en désigne jamais (D26).
+func (p *Provider) designatedFor(proj *model.Project, vh model.VHost) (Request, bool) {
+	ref := certificateRef(proj, vh)
+	if ref == "" || p.SharedRef(proj) != "" {
+		return Request{}, false
+	}
+	req, ok := p.resolve(proj, ref)
+	if !ok || !servesAny(req.Domains, vh.Domains) {
+		return Request{}, false
+	}
+	return req, true
+}
+
+// refUse est l'emploi d'une référence de certificat : où elle est écrite, et
+// les noms qu'elle doit couvrir.
+type refUse struct {
+	where, ref string
+	domains    []string
+}
+
+// refUses énumère les références de certificat d'un projet qui veut le TLS,
+// vhost par vhost — spec.web.tls vaut pour chaque vhost qui ne désigne rien, et
+// pour le vhost déduit d'un projet qui n'en déclare aucun. Une préproduction
+// couverte par le wildcard n'en a aucune : la référence que « site clone » a
+// recopiée de la production n'y désigne rien.
+func (p *Provider) refUses(proj *model.Project) []refUse {
+	if proj.Spec.Web.TLSDisabled() || p.SharedRef(proj) != "" {
+		return nil
+	}
+	var out []refUse
+	if len(proj.Spec.Web.VHosts) == 0 {
+		if t := proj.Spec.Web.TLS; t != nil && t.Certificate != "" {
+			out = append(out, refUse{"spec.web.tls", t.Certificate, servedDomains(proj)})
+		}
+		return out
+	}
+	for _, vh := range proj.Spec.Web.VHosts {
+		if vh.TLS != nil && !vh.TLS.Enabled {
+			continue
+		}
+		where := "le vhost " + vh.Name
+		if vh.TLS == nil || vh.TLS.Certificate == "" {
+			where += " (par spec.web.tls)"
+		}
+		if ref := certificateRef(proj, vh); ref != "" {
+			out = append(out, refUse{where, ref, vh.Domains})
+		}
+	}
+	return out
+}
+
+// DesignatedShared rend les demandes des certificats de portée serveur que
+// désignent les vhosts d'un projet et qui couvrent leurs noms : elles s'émettent
+// et se renouvellent avec le projet, comme le wildcard de la préproduction.
+func (p *Provider) DesignatedShared(proj *model.Project) []Request {
+	var out []Request
+	for _, u := range p.refUses(proj) {
+		if !strings.HasPrefix(u.ref, SharedPrefix) ||
+			slices.ContainsFunc(out, func(r Request) bool { return r.Name == u.ref }) {
+			continue
+		}
+		if req, ok := p.SharedRequest(u.ref); ok && servesAny(req.Domains, u.domains) {
+			out = append(out, req)
+		}
+	}
+	return out
+}
+
+// ReferenceProblems nomme les références de certificat sans objet : ni un
+// certificat du projet ni un partagé déclaré ne portent ce nom, ou sa demande
+// ne couvre aucun nom du vhost. Le vhost sert alors le certificat par défaut.
+// Le plan du projet en fait une étape non critique en échec, doctor un
+// avertissement ; le chargement du parc, jamais.
+func (p *Provider) ReferenceProblems(proj *model.Project) []string {
+	var out []string
+	for _, u := range p.refUses(proj) {
+		req, ok := p.resolve(proj, u.ref)
+		var what string
+		switch {
+		case !ok && strings.HasPrefix(u.ref, SharedPrefix):
+			what = "aucun certificat de portée serveur ne porte ce nom (certificates de config.yaml)"
+		case !ok:
+			what = "aucun certificat du projet ne porte ce nom (spec.certificates[].name)"
+		case !servesAny(req.Domains, u.domains):
+			what = fmt.Sprintf("il ne couvre aucun de ses noms (%s)", strings.Join(u.domains, ", "))
+		default:
+			continue
+		}
+		out = append(out, fmt.Sprintf("%s désigne le certificat « %s » : %s — le certificat par défaut est servi",
+			u.where, u.ref, what))
+	}
+	return out
 }
 
 // wantsTLS indique qu'au moins un vhost demande du TLS. En l'absence de
@@ -393,6 +596,14 @@ func (p *Provider) Plan(_ context.Context, proj *model.Project) ([]*engine.Step,
 			reqs = append(reqs, req)
 		}
 	}
+	// Un certificat de portée serveur que désigne un vhost s'émet avec le projet
+	// qui le sert, comme le wildcard de la préproduction : sans quoi il attendait
+	// « cert issue », et le vhost restait en HTTP seul.
+	for _, req := range p.DesignatedShared(proj) {
+		if !slices.ContainsFunc(reqs, func(r Request) bool { return r.Name == req.Name }) {
+			reqs = append(reqs, req)
+		}
+	}
 	var steps []*engine.Step
 	for _, req := range reqs {
 		step, err := p.certificateStep(req)
@@ -400,6 +611,15 @@ func (p *Provider) Plan(_ context.Context, proj *model.Project) ([]*engine.Step,
 			return nil, err
 		}
 		steps = append(steps, step)
+	}
+	if problems := p.ReferenceProblems(proj); len(problems) > 0 {
+		s := engine.NewStep("tls/reference/"+proj.ID(), engine.Update,
+			"référence de certificat sans objet : le certificat par défaut est servi")
+		s.Critical = false
+		s.Apply = func(context.Context) error {
+			return errors.New(strings.Join(problems, " ; "))
+		}
+		steps = append(steps, s)
 	}
 	return steps, nil
 }
@@ -796,6 +1016,15 @@ func (p *Provider) Users(ref string, projects []*model.Project) []string {
 	var out []string
 	for _, proj := range projects {
 		used, _ := p.CertificateFor(proj)
+		// Un vhost qui désigne son certificat le sert (D102) : le supprimer
+		// casserait ce vhost-là, non le premier du projet.
+		for _, vh := range proj.Spec.Web.VHosts {
+			if used != ref && !proj.Spec.Web.TLSDisabled() && (vh.TLS == nil || vh.TLS.Enabled) {
+				if cov := p.VHostCoverage(proj, vh); cov.Ref == ref || cov.Pending == ref {
+					used = ref
+				}
+			}
+		}
 		if used == ref {
 			out = append(out, proj.ID())
 		}

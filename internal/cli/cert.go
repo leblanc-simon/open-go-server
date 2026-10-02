@@ -279,6 +279,13 @@ func newCertRenewCommand(app *App) *cobra.Command {
 						return exitf(CodeValidation, "%s", err)
 					}
 					requests = append(requests, app.sansDevancerLApply(provs, p, reqs, &deferred)...)
+					// Les partagés que désignent ses vhosts se renouvellent avec lui
+					// (D102), comme « renew --all » les renouvelle.
+					for _, r := range provs.TLS.DesignatedShared(p) {
+						if !slices.ContainsFunc(requests, func(o tlsprov.Request) bool { return o.Name == r.Name }) {
+							requests = append(requests, r)
+						}
+					}
 				}
 			}
 			if len(requests) == 0 && deferred == 0 && len(refusés) == 0 {

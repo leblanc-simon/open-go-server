@@ -79,8 +79,8 @@ func project(t *testing.T, host string, kind model.AppKind, version, php string)
 
 // certificatCouvrant simule le certificat shopfr présent sur le disque, qui
 // couvre les noms donnés — les mêmes que la demande.
-func certificatCouvrant(noms ...string) func(*model.Project) tlsprov.Coverage {
-	return func(*model.Project) tlsprov.Coverage {
+func certificatCouvrant(noms ...string) func(*model.Project, model.VHost) tlsprov.Coverage {
+	return func(*model.Project, model.VHost) tlsprov.Coverage {
 		return tlsprov.Coverage{Ref: "shopfr", Present: noms, Requested: noms}
 	}
 }
@@ -894,8 +894,8 @@ func TestEveryTemplateServesHTTPSWhenTLSIsEnabled(t *testing.T) {
 
 // certificatEnAttente simule le certificat shopfr présent pour les noms déjà
 // servis, alors que la demande en porte d'autres : une réémission est en attente.
-func certificatEnAttente(presents []string, demandes ...string) func(*model.Project) tlsprov.Coverage {
-	return func(*model.Project) tlsprov.Coverage {
+func certificatEnAttente(presents []string, demandes ...string) func(*model.Project, model.VHost) tlsprov.Coverage {
+	return func(*model.Project, model.VHost) tlsprov.Coverage {
 		return tlsprov.Coverage{Ref: "shopfr", Present: presents, Requested: demandes}
 	}
 }
@@ -2638,5 +2638,39 @@ func TestPlanDropInSousLaRacineDesJournaux(t *testing.T) {
 	}
 	if steps[0].Mutates() {
 		t.Error("un projet de plus ne doit rien changer au complément, donc ne rien redémarrer")
+	}
+}
+
+// « systemctl daemon-reload » en échec après l'écriture du complément : le
+// fichier restait, le plan suivant le disait conforme, et ni le rechargement ni
+// le redémarrage du serveur web n'étaient jamais rejoués — systemd gardait
+// l'ancienne définition (Q-06).
+func TestComplementRejouéAprèsUnDaemonReloadEnÉchec(t *testing.T) {
+	p, _ := fixture(t, "apache")
+	p.LogsRoot = "/var/log/ogs-projects"
+	rec := exec.NewRecorder()
+	rec.Responses["systemctl show"] = exec.Result{Stdout: "active"}
+	rec.Errors["systemctl daemon-reload"] = errors.New("signal: killed")
+	p.Exec = &moteurRefusant{rec}
+	ctx := context.Background()
+
+	steps, err := p.PlanDropIn(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := engine.Execute(ctx, &engine.Plan{Steps: steps}, engine.Options{}); err == nil {
+		t.Fatal("l'échec de daemon-reload doit faire échouer l'étape")
+	}
+	if _, err := os.Stat(p.DropInPath()); !os.IsNotExist(err) {
+		t.Errorf("un complément créé dont le rechargement a échoué doit être retiré : %v", err)
+	}
+
+	delete(rec.Errors, "systemctl daemon-reload")
+	steps, err = p.PlanDropIn(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !steps[0].Mutates() || len(steps) < 2 {
+		t.Fatalf("le plan suivant doit rejouer le complément et le redémarrage : %d étape(s)", len(steps))
 	}
 }

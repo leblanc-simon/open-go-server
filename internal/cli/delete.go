@@ -1620,8 +1620,9 @@ func (a *App) archiveProject(cmd *cobra.Command, provs *providers, p *model.Proj
 	}
 	// Une interruption abandonne l'archive entre deux phases : les dumps et les
 	// arborescences peuvent prendre des minutes, qu'il serait vain de passer à
-	// recueillir ce qu'on ne supprimera pas. Pendant une phase, elle attend que
-	// celle-ci s'achève, et le point de non-retour la voit de toute façon.
+	// recueillir ce qu'on ne supprimera pas. Pendant une phase, les dumps et le
+	// parcours des arborescences suivent le contexte (Q-86), et le point de
+	// non-retour la voit de toute façon.
 	if err := interrupted(cmd.Context()); err != nil {
 		return "", nil, err
 	}
@@ -1685,7 +1686,7 @@ func (a *App) archiveProject(cmd *cobra.Command, provs *providers, p *model.Proj
 		return "", nil, err
 	}
 	if !scope.skipTree {
-		if err := w.AddTree("tree", "tree", p.Spec.Layout.Root); err != nil {
+		if err := w.AddTree(cmd.Context(), "tree", "tree", p.Spec.Layout.Root); err != nil {
 			return "", nil, wrap(CodeError, err)
 		}
 	}
@@ -1695,7 +1696,7 @@ func (a *App) archiveProject(cmd *cobra.Command, provs *providers, p *model.Proj
 		return "", nil, err
 	}
 	if info, err := os.Stat(p.Spec.Layout.LogDir); err == nil && info.IsDir() && !scope.skipLogs {
-		if err := w.AddTree("logs", "logs", p.Spec.Layout.LogDir); err != nil {
+		if err := w.AddTree(cmd.Context(), "logs", "logs", p.Spec.Layout.LogDir); err != nil {
 			return "", nil, wrap(CodeError, err)
 		}
 	}

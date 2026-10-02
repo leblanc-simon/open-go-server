@@ -1411,3 +1411,70 @@ func TestGardesComptentLesAutresProfils(t *testing.T) {
 		t.Errorf("la session arrivée sur 2222 repasse par sshalt : %v", err)
 	}
 }
+
+// « ufw app update » en échec après l'écriture du fichier de profils : le
+// fichier restait aux nouveaux ports, le plan suivant le disait conforme, et la
+// règle d'ogs gardait l'ancien port pour toujours — sshd déplacé sur 2200, plus
+// aucune session neuve ne passait, sans un mot du plan ni de doctor (Q-06).
+func TestProfilsRejouésAprèsUnAppUpdateEnÉchec(t *testing.T) {
+	b := nouveauBanc(t, "sources:\n  bureau:\n    addresses: [10.200.0.2]\ntrusted: [bureau]\n"+
+		"policy:\n  incoming: deny\n", "ssh")
+	b.write("/etc/ssh/sshd_config", "Port 22\n")
+	b.prov.Admin = session("10.200.0.2", "22")
+	b.sshdÉcoute("22")
+	b.reconcilier()
+
+	b.write("/etc/ssh/sshd_config", "Port 2200\n")
+	b.sshdÉcoute("2200")
+	b.rec.Errors["ufw app"] = errors.New("ERROR: problem running ufw-init (verrou)")
+	steps, err := b.planErr()
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := engine.Execute(context.Background(), &engine.Plan{Steps: steps}, engine.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Warnings) == 0 {
+		t.Fatal("l'échec d'« ufw app update » doit être signalé")
+	}
+	if got := b.profil("ogs-ssh"); got != "22/tcp" {
+		t.Errorf("le fichier de profils doit revenir aux ports que portent les règles : ogs-ssh = %s", got)
+	}
+	// Le profil en échec est ramené au fichier rendu : ufw a pu réécrire
+	// user.rules avant d'échouer.
+	updates := 0
+	for _, c := range b.rec.Calls() {
+		if c.Name == "ufw" && strings.Join(c.Args, " ") == "app update ogs-ssh" {
+			updates++
+		}
+	}
+	if updates != 2 {
+		t.Errorf("« ufw app update ogs-ssh » doit être retenté sur le fichier rendu : %d appel(s)", updates)
+	}
+
+	delete(b.rec.Errors, "ufw app")
+	steps, err = b.planErr()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res := resources(steps); len(res) != 1 || res[0] != "firewall/profiles" {
+		t.Fatalf("le plan suivant doit rejouer les profils : %v", res)
+	}
+	for _, s := range steps {
+		if s.Resource == "firewall/profiles" && !strings.Contains(s.Summary, "ports modifiés : ogs-ssh") {
+			t.Errorf("le profil dont les ports changent doit être nommé : %s", s.Summary)
+		}
+	}
+	before := len(b.rec.Calls())
+	if _, err := engine.Execute(context.Background(), &engine.Plan{Steps: steps}, engine.Options{}); err != nil {
+		t.Fatal(err)
+	}
+	replayed := false
+	for _, c := range b.rec.Calls()[before:] {
+		replayed = replayed || (c.Name == "ufw" && strings.Join(c.Args, " ") == "app update ogs-ssh")
+	}
+	if !replayed || b.profil("ogs-ssh") != "2200/tcp" {
+		t.Errorf("« ufw app update ogs-ssh » doit être rejoué : rejoué=%v, profil=%s", replayed, b.profil("ogs-ssh"))
+	}
+}

@@ -33,11 +33,12 @@ type Provider struct {
 	Templates *template.Set
 	Engine    Engine
 	PHP       *php.Provider
-	// Certificate résout le certificat d'un projet : sa référence, ce que couvre
-	// le matériel présent, ce que couvrira la demande. Le vhost n'est écrit en TLS
-	// que si le certificat existe — le contraire empêcherait le serveur web de
-	// démarrer — et couvre l'un de ses noms (vueTLSDe).
-	Certificate func(*model.Project) tlsprov.Coverage
+	// Certificate résout le certificat que sert un vhost — celui qu'il désigne,
+	// sinon celui du projet (D102) : sa référence, ce que couvre le matériel
+	// présent, ce que couvrira la demande. Le vhost n'est écrit en TLS que si le
+	// certificat existe — le contraire empêcherait le serveur web de démarrer — et
+	// couvre l'un de ses noms (vueTLSDe).
+	Certificate func(*model.Project, model.VHost) tlsprov.Coverage
 	// CertDir localise le matériel d'un certificat.
 	CertDir func(ref string) string
 	// ProxyTarget résout la cible d'un vhost de proxy : socket ou adresse locale.
@@ -417,7 +418,7 @@ func (p *Provider) coverage(proj *model.Project, vh model.VHost) tlsprov.Coverag
 	if !wantsTLS(proj, vh) || p.Certificate == nil {
 		return tlsprov.Coverage{}
 	}
-	return p.Certificate(proj)
+	return p.Certificate(proj, vh)
 }
 
 // vueTLS est ce que le certificat décide dans le rendu d'un vhost.
@@ -798,18 +799,23 @@ func (p *Provider) PlanTLS(_ context.Context, proj *model.Project) []*engine.Ste
 	var steps []*engine.Step
 	for _, vh := range p.vhosts(proj) {
 		cov := p.coverage(proj, vh)
-		if cov.Ref == "" || cov.Complete() || len(vh.Domains) == 0 {
+		// Un certificat désigné en attente (D102) : le vhost sert le certificat
+		// présent jusqu'à son émission, et bascule sur lui dans cette étape.
+		pending := cov.Pending != ""
+		if cov.Ref == "" || (cov.Complete() && !pending) || len(vh.Domains) == 0 {
 			continue
 		}
 		want := wantsTLS(proj, vh)
 		avant, après := vueTLSDe(proj, vh, want, cov.Serves), vueTLSDe(proj, vh, want, cov.WillServe)
-		if avant.equal(après) {
+		if avant.equal(après) && !pending {
 			continue
 		}
 		vhCopy := vh
 		name := p.vhostName(proj, vh)
 		summary := fmt.Sprintf("activation TLS du vhost %s", name)
 		switch {
+		case pending:
+			summary = fmt.Sprintf("bascule du vhost %s sur le certificat %s", name, cov.Pending)
 		case avant.on:
 			summary = fmt.Sprintf("bascule du vhost %s sur le certificat réémis", name)
 		case !après.on:
@@ -845,6 +851,16 @@ func (p *Provider) PlanTLS(_ context.Context, proj *model.Project) []*engine.Ste
 				écrit = true
 			}
 			cov := p.coverage(proj, vhCopy)
+			if cov.Pending != "" {
+				// Le certificat désigné ne couvre toujours pas le vhost : il reste
+				// servi avec le certificat en place.
+				manque := fmt.Errorf("certificat %s indisponible : le vhost reste servi avec %s "+
+					"(reprendre avec « ogs cert issue » puis « ogs apply %s »)", cov.Pending, cov.Ref, proj.ID())
+				if écrit {
+					return engine.Partial(manque)
+				}
+				return manque
+			}
 			vue := vueTLSDe(proj, vhCopy, want, cov.Serves)
 			if vue.equal(vueTLSDe(proj, vhCopy, want, cov.WillServe)) {
 				return nil
@@ -1006,6 +1022,7 @@ func (p *Provider) PlanDropIn(ctx context.Context, projects []*model.Project) ([
 	// disque a pu changer entre les deux.
 	var previous []byte
 	var hadPrevious bool
+	var restore func() error
 	s.Apply = func(ctx context.Context) error {
 		if data, err := os.ReadFile(path); err == nil {
 			previous, hadPrevious = data, true
@@ -1021,6 +1038,16 @@ func (p *Provider) PlanDropIn(ctx context.Context, projects []*model.Project) ([
 		}
 		_, err := p.Exec.Run(ctx, exec.Command{
 			Name: "systemctl", Args: []string{"daemon-reload"}})
+		if err != nil {
+			// Le moteur ne compense jamais l'étape qui échoue : le complément
+			// laissé en place passait pour conforme au plan suivant, qui ne
+			// rejouait ni le rechargement ni le redémarrage (Q-06). Rendu tel
+			// qu'il était, il redit ce que systemd a chargé.
+			if rerr := restore(); rerr != nil {
+				return fmt.Errorf("%w ; le complément n'a pas pu être rendu (%v) : le plan suivant le dira "+
+					"conforme sans que systemd l'ait relu", err, rerr)
+			}
+		}
 		return err
 	}
 	// La compensation rend le complément qui était en place. Le supprimer
@@ -1029,14 +1056,19 @@ func (p *Provider) PlanDropIn(ctx context.Context, projects []*model.Project) ([
 	// donc un maître qui s'arrête en 226/NAMESPACE ou sur AH00019 au prochain
 	// démarrage, tout le parc avec lui, alors qu'ogs vient d'annoncer un retour à
 	// l'état initial. La suppression n'est juste que si le fichier était absent.
-	s.Compensate = func(ctx context.Context) error {
+	restore = func() error {
 		if hadPrevious {
-			if err := fs.WriteAtomic(path, previous, 0o644, fs.KeepOwner); err != nil {
-				return err
-			}
-		} else if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return fs.WriteAtomic(path, previous, 0o644, fs.KeepOwner)
+		}
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 			// Une compensation en échec arrête tout le déroulage : un fichier déjà
 			// absent n'est pas une erreur.
+			return err
+		}
+		return nil
+	}
+	s.Compensate = func(ctx context.Context) error {
+		if err := restore(); err != nil {
 			return err
 		}
 		if p.Exec.Simulated() {

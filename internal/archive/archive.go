@@ -4,6 +4,7 @@ package archive
 
 import (
 	"archive/tar"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -109,7 +110,15 @@ type Writer struct {
 	tar      *tar.Writer
 	manifest Manifest
 	path     string
+	// leases borne l'attente des baux sur toute l'archive (fs.LeaseBudget) : un
+	// locataire qui en pose un par fichier ne tient pas le verrou global plus
+	// longtemps qu'un seul.
+	leases *fs.LeaseBudget
 }
+
+// leaseBudget est le budget d'attente des baux d'une archive ; les tests le
+// raccourcissent.
+var leaseBudget = fs.DefaultLeaseBudget
 
 // Create ouvre une archive en écriture. Le fichier est en 0600 : il contient les
 // données de l'application et ses secrets, même chiffrés.
@@ -133,7 +142,8 @@ func Create(path string, manifest Manifest) (*Writer, error) {
 	if manifest.CreatedAt.IsZero() {
 		manifest.CreatedAt = time.Now()
 	}
-	return &Writer{file: f, zstd: enc, tar: tar.NewWriter(enc), manifest: manifest, path: path}, nil
+	return &Writer{file: f, zstd: enc, tar: tar.NewWriter(enc), manifest: manifest, path: path,
+		leases: fs.NewLeaseBudget(leaseBudget)}, nil
 }
 
 // Path renvoie le chemin de l'archive.
@@ -188,7 +198,13 @@ func (w *Writer) AddFile(kind, name, origin string) error {
 // celui de la racine (Manifest.Owners) : sans eux, la restauration ne savait pas
 // ce qui était au projet, et rendait à l'utilisateur jusqu'au lien dur qu'il
 // aurait posé vers un fichier du système.
-func (w *Writer) AddTree(kind, prefix, root string) error {
+//
+// Le parcours suit ctx avant chaque entrée et chaque bloc lu, et pendant
+// l'attente d'un bail : une interruption l'arrête là où elle le trouve, et rend
+// ctx.Err() — l'archive, incomplète, est à abandonner. Il ne tenait aucun
+// contexte : Ctrl+C restait sans effet des heures durant, le locataire réglant
+// la durée de l'archivage à coups de baux (Q-86).
+func (w *Writer) AddTree(ctx context.Context, kind, prefix, root string) error {
 	dir, err := fs.OpenDir(filepath.Clean(root))
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -206,7 +222,7 @@ func (w *Writer) AddTree(kind, prefix, root string) error {
 	}
 	uid, gid := ownerOf(st)
 	w.manifest.Owners[prefix] = Owner{UID: uid, GID: gid}
-	return w.addDir(dir, prefix)
+	return w.addDir(ctx, dir, prefix)
 }
 
 // ownerOf rend le propriétaire numérique relevé par un stat, qu'il vienne d'un
@@ -227,13 +243,16 @@ func ownerOf(info os.FileInfo) (uid, gid int) {
 var entryChecked = func(name string) {}
 
 // addDir archive le contenu d'un répertoire ouvert, sous le nom name.
-func (w *Writer) addDir(dir *fs.Dir, name string) error {
+func (w *Writer) addDir(ctx context.Context, dir *fs.Dir, name string) error {
 	names, err := dir.Names()
 	if err != nil {
 		return err
 	}
 	for _, n := range names {
-		if err := w.addEntry(dir, n, path.Join(name, n)); err != nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := w.addEntry(ctx, dir, n, path.Join(name, n)); err != nil {
 			return err
 		}
 	}
@@ -244,7 +263,7 @@ func (w *Writer) addDir(dir *fs.Dir, name string) error {
 // ou change de nature entre son constat et son ouverture est passée : son contenu
 // n'est plus celui qu'on a constaté, et une entrée que l'utilisateur fait changer
 // sous nos pieds n'est pas une raison d'interrompre la suppression.
-func (w *Writer) addEntry(dir *fs.Dir, n, name string) error {
+func (w *Writer) addEntry(ctx context.Context, dir *fs.Dir, n, name string) error {
 	info, err := dir.Lstat(n)
 	if err != nil {
 		return skipChanged(err)
@@ -267,7 +286,7 @@ func (w *Writer) addEntry(dir *fs.Dir, n, name string) error {
 		}); err != nil {
 			return err
 		}
-		return w.addDir(sub, name)
+		return w.addDir(ctx, sub, name)
 	case info.Mode()&os.ModeSymlink != 0:
 		target, err := dir.Readlink(n)
 		if err != nil {
@@ -283,7 +302,7 @@ func (w *Writer) addEntry(dir *fs.Dir, n, name string) error {
 		return nil
 	}
 	entryChecked(name)
-	f, err := dir.OpenFile(n)
+	f, err := dir.OpenFileContext(ctx, n, w.leases)
 	if err != nil {
 		return skipChanged(err)
 	}
@@ -303,7 +322,7 @@ func (w *Writer) addEntry(dir *fs.Dir, n, name string) error {
 	// la lecture n'en donne pas davantage — tar refuserait l'excédent et ferait
 	// échouer toute l'archive —, et un fichier raccourci est complété de zéros,
 	// comme le fait GNU tar, l'en-tête étant déjà écrit.
-	written, err := io.CopyN(w.tar, f, st.Size())
+	written, err := io.CopyN(w.tar, ctxReader{ctx, f}, st.Size())
 	if errors.Is(err, io.EOF) {
 		_, err = io.CopyN(w.tar, zeros{}, st.Size()-written)
 	}
@@ -322,6 +341,20 @@ func skipChanged(err error) error {
 		return nil
 	}
 	return err
+}
+
+// ctxReader lit r tant que ctx n'est pas annulé : un fichier de plusieurs
+// gigaoctets ne retient pas une interruption jusqu'à sa fin.
+type ctxReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (c ctxReader) Read(p []byte) (int, error) {
+	if err := c.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return c.r.Read(p)
 }
 
 // zeros est une source inépuisable d'octets nuls.
