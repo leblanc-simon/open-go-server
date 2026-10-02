@@ -307,3 +307,52 @@ func TestLaRacineDesJournauxNePeutPasVivreSousLesHomes(t *testing.T) {
 		t.Errorf("une racine hors des homes doit être acceptée : %v", err)
 	}
 }
+
+// Q-34 : une clé que Config ne connaît pas est nommée par son chemin, à tous
+// les niveaux — dans une table comme dans une liste ; une clé qu'une version
+// antérieure écrivait est rangée à part.
+func TestUnknownKeysNommeChaqueCleInconnue(t *testing.T) {
+	doc := []byte(`
+naming:
+  homeRoot: /home
+monitoring:
+  fail2ban:
+    maxretry: 3
+    jails:
+      sshd: false
+log:
+  rotate: 30
+hardening:
+  skipp: [/etc/x]
+archives:
+  retentionDay: 14
+environments:
+  prep:
+    domian: x
+    basicAuth: true
+certificates:
+  wildcard:
+    domains: ["*.preprod.example"]
+    challeng: dns-01
+`)
+	unknown, retired, err := UnknownKeys(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"archives.retentionDay", "certificates.wildcard.challeng", "environments.prep.domian",
+		"hardening.skipp", "log", "monitoring.fail2ban.maxretry (« maxRetry » ?)"}
+	if strings.Join(unknown, " ") != strings.Join(want, " ") {
+		t.Errorf("clés inconnues : %v\nattendu      : %v", unknown, want)
+	}
+	if strings.Join(retired, " ") != "environments.prep.basicAuth" {
+		t.Errorf("clés retirées : %v", retired)
+	}
+	// Ce qu'écrit « ogs init » ne porte aucune clé inconnue.
+	data, err := yaml.Marshal(Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unknown, retired, err := UnknownKeys(data); err != nil || len(unknown)+len(retired) > 0 {
+		t.Errorf("la configuration par défaut : %v %v %v", unknown, retired, err)
+	}
+}

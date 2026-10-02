@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/goccy/go-yaml"
+	"github.com/spf13/cobra"
+	"golang.org/x/term"
 
 	"leblanc.io/open-go-server/internal/audit"
 	"leblanc.io/open-go-server/internal/config"
@@ -67,6 +69,11 @@ type App struct {
 	RecreateQueues bool
 	// allowNonRoot lève l'exigence de root pour la surface déléguée « ogs my ».
 	allowNonRoot bool
+	// cfgUnknown et cfgRetired sont les clés de config.yaml que Config ne
+	// connaît pas, et celles qu'une version antérieure écrivait (D101).
+	cfgUnknown, cfgRetired []string
+	// amqpWarned retient que l'avertissement sur amqp.yaml a été donné.
+	amqpWarned bool
 }
 
 // nowFunc est isolé pour rester substituable en test.
@@ -130,11 +137,64 @@ func (a *App) loadConfig() error {
 	if err := yaml.Unmarshal(data, cfg); err != nil {
 		return exitf(CodeValidation, "%s : %v", a.Paths.ConfigFile(), err)
 	}
+	// Les clés inconnues ne sont pas jugées ici : un refus au chargement
+	// arrêterait tout le parc, le renouvellement des certificats compris.
+	// configKeysPolicy décide, commande par commande (D101).
+	if unknown, retired, err := config.UnknownKeys(data); err == nil {
+		a.cfgUnknown, a.cfgRetired = unknown, retired
+	}
 	if err := cfg.Validate(); err != nil {
 		return exitf(CodeValidation, "%s : %v", a.Paths.ConfigFile(), err)
 	}
 	a.Cfg = cfg
 	return nil
+}
+
+// configTolerant énumère les commandes qui écrivent et que des clés inconnues
+// de config.yaml n'arrêtent pas, au-delà des consultations : le renouvellement
+// des certificats, que le timer lance sans personne pour lire un refus ;
+// « init », que le paquet relance à chaque mise à jour pour migrer la base
+// d'état ; et ce qui ne fait que démarrer ou arrêter des services, sans rien
+// calculer de la configuration.
+var configTolerant = map[string]bool{
+	"ogs cert renew":      true,
+	"ogs init":            true,
+	"ogs my restart":      true,
+	"ogs my start":        true,
+	"ogs my stop":         true,
+	"ogs service restart": true,
+	"ogs service start":   true,
+	"ogs service stop":    true,
+}
+
+// configKeysPolicy décide du sort d'une commande quand config.yaml porte des
+// clés inconnues (D101) : elles ne se taisent jamais. Une commande qui écrit
+// est refusée en code 3 — elle appliquerait un réglage que l'administrateur
+// croit avoir posé ; une consultation, et ce que configTolerant énumère,
+// l'annoncent sur la sortie d'erreur — hors du fil de la commande, qu'un
+// script lit peut-être — et continuent ; doctor la compte en échec
+// (configChecks). Une clé retirée depuis la version qui l'écrivait est nommée,
+// jamais refusée.
+func (a *App) configKeysPolicy(cmd *cobra.Command) error {
+	path := a.Paths.ConfigFile()
+	doctor := cmd.CommandPath() == "ogs doctor"
+	if len(a.cfgRetired) > 0 && !doctor {
+		fmt.Fprintf(a.Err, "⚠ %s : clé(s) retirée(s), sans effet, à supprimer : %s\n", path,
+			strings.Join(a.cfgRetired, ", "))
+	}
+	err := config.UnknownKeysError(path, a.cfgUnknown)
+	switch {
+	case err == nil || doctor:
+		return nil
+	case dryRunConductOf(cmd) == dryRunReadOnly || configTolerant[cmd.CommandPath()],
+		// « ogs » seul hors d'un terminal n'affiche que l'aide ; sur un terminal,
+		// il ouvre l'inspecteur, où l'on peut appliquer — refusé comme « ogs tui ».
+		!cmd.HasParent() && !term.IsTerminal(int(os.Stdout.Fd())):
+		fmt.Fprintf(a.Err, "⚠ %v — les commandes qui écrivent la refusent (D101)\n", err)
+		return nil
+	}
+	return exitf(CodeValidation, "%v — corriger le fichier : une commande qui écrit ne s'exécute pas "+
+		"sur un réglage perdu (D101)", err)
 }
 
 // openStore ouvre la base d'état et le keystore.
@@ -189,7 +249,7 @@ func (a *App) runHook(ctx context.Context, r *hook.Runner, p *model.Project,
 		if hook.Critical(event) {
 			return false, exitf(CodeError, "%v", err)
 		}
-		a.printf("⚠ %v\n", err)
+		a.warnf("⚠ %v\n", err)
 		return true, nil
 	}
 	return false, nil
@@ -446,6 +506,13 @@ func (a *App) amqpCredentials() (amqp.Credentials, error) {
 	var creds amqp.Credentials
 	if err := yaml.Unmarshal(data, &creds); err != nil {
 		return amqp.Credentials{}, fmt.Errorf("%s : %w", path, err)
+	}
+	// Une clé inconnue — « amqpport » — perdait son réglage en silence (Q-34).
+	// Le fichier reste lu : le refuser priverait de broker toutes les commandes
+	// pour une faute que doctor nomme aussi (D101).
+	if err := yaml.UnmarshalWithOptions(data, &amqp.Credentials{}, yaml.Strict()); err != nil && !a.amqpWarned {
+		a.amqpWarned = true
+		fmt.Fprintf(a.Err, "⚠ %s : %s — réglage ignoré\n", path, strictError(err))
 	}
 	return creds, nil
 }

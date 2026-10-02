@@ -67,7 +67,7 @@ func newInitCommand(app *App) *cobra.Command {
 					return wrap(CodeError, err)
 				}
 				app.printf("✓ clé maître générée : %s (mode 0400)\n", keyPath)
-				app.printf("  ⚠ sauvegarder ce fichier : sans lui, les secrets chiffrés sont irrécupérables.\n")
+				app.warnf("  ⚠ sauvegarder ce fichier : sans lui, les secrets chiffrés sont irrécupérables.\n")
 			} else {
 				app.printf("= clé maître déjà présente : %s\n", keyPath)
 			}

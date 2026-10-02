@@ -130,7 +130,7 @@ func newHardenCommand(app *App) *cobra.Command {
 					}
 				},
 				OnWarning: func(s *engine.Step, stepErr error) {
-					app.printf("  ⚠ %s : %v\n", s.Summary, stepErr)
+					app.warnf("  ⚠ %s : %v\n", s.Summary, stepErr)
 				},
 				Audit: func(s *engine.Step, outcome, detail string) {
 					_ = app.Audit.Record("", s.Resource, "harden", outcome, detail)

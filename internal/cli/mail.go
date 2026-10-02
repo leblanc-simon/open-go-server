@@ -365,16 +365,10 @@ func (a *App) runSteps(ctx context.Context, provs *providers, projectID string,
 	}
 	var warned []string
 	report, err := engine.Execute(ctx, plan, engine.Options{
-		OnStep: func(s *engine.Step, stepErr error) {
-			if stepErr == nil {
-				a.printf("  ✓ %s\n", s.Summary)
-			} else {
-				a.printf("  ✗ %s : %v\n", s.Summary, stepErr)
-			}
-		},
+		OnStep: func(s *engine.Step, stepErr error) { a.stepf("  ", s, stepErr) },
 		OnWarning: func(s *engine.Step, stepErr error) {
 			warned = append(warned, fmt.Sprintf("%s : %v", s.Summary, stepErr))
-			a.printf("  ⚠ %s : %v\n", s.Summary, stepErr)
+			a.warnf("  ⚠ %s : %v\n", s.Summary, stepErr)
 		},
 		Audit: func(s *engine.Step, outcome, detail string) {
 			_ = a.Audit.Record(projectID, s.Resource, "mail."+s.Action.String(), outcome, detail)
@@ -384,7 +378,7 @@ func (a *App) runSteps(ctx context.Context, provs *providers, projectID string,
 	})
 	if err != nil {
 		if report != nil && report.RolledBack {
-			a.printf("↶ rollback effectué\n")
+			a.warnf("↶ rollback effectué\n")
 		}
 		return wrap(CodeError, err)
 	}

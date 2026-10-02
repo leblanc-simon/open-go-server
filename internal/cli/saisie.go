@@ -37,7 +37,7 @@ func (a *App) saisieSecrets(cmd *cobra.Command) *saisieSecrets {
 // valeur rend le secret que porte l'option nommée, ou le demande.
 func (s *saisieSecrets) valeur(option, valeur, libellé string) (string, error) {
 	if valeur != "" {
-		s.app.printf("⚠ --%s : la valeur figure dans la ligne de commande — journal de sudo, historique "+
+		s.app.warnf("⚠ --%s : la valeur figure dans la ligne de commande — journal de sudo, historique "+
 			"du shell, /proc —, la faire tourner si d'autres ont accès à la machine ; l'omettre pour "+
 			"la saisir sans écho ou la passer sur l'entrée standard\n", option)
 		return valeur, nil

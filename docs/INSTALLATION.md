@@ -69,7 +69,10 @@ restreint le champ d'action (aucun serveur MySQL détecté, PHP 7.4 non install�
 
 `/etc/ogs/config.yaml` porte les réglages de portée serveur : moteur web par défaut, domaine de
 préproduction, fournisseur DNS, certificats partagés, connexions aux serveurs de bases. Le fichier est
-validé à chaque lecture ; une valeur inconnue est refusée plutôt qu'ignorée.
+validé à chaque lecture ; une valeur invalide est refusée plutôt qu'ignorée. Une clé inconnue — une faute
+d'orthographe, dont le réglage serait perdu — est nommée par son chemin (`archives.retentionDay`) : les
+commandes qui écrivent la refusent (code 3), les consultations et le renouvellement des certificats l'annoncent
+sur la sortie d'erreur sans s'arrêter, et `ogs doctor` la compte en échec (D101).
 
 Les identifiants d'administration n'y figurent pas : ils vivent en 0600 sous `/etc/ogs/credentials/`.
 MySQL et PostgreSQL n'en demandent aucun — ogs s'y connecte en root par le socket local. RabbitMQ et OVH,

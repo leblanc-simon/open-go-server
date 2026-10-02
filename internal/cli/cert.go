@@ -168,13 +168,13 @@ func newCertIssueCommand(app *App) *cobra.Command {
 			if partial != nil {
 				_ = app.Audit.Record("", "tls/certificate/"+req.Name, "cert.issue", "avertissement",
 					issueErr.Error())
-				app.printf("⚠ %v\n", issueErr)
+				app.warnf("⚠ %v\n", issueErr)
 				app.printf("✓ certificat %s émis pour %s, valable jusqu'au %s\n",
 					req.Name, strings.Join(partial.Covered, ", "), info.NotAfter.Format("02/01/2006"))
 			} else if fallback != nil {
 				_ = app.Audit.Record("", "tls/certificate/"+req.Name, "cert.issue", "avertissement",
 					issueErr.Error())
-				app.printf("⚠ %v\n", issueErr)
+				app.warnf("⚠ %v\n", issueErr)
 				app.printf("✓ certificat %s émis, valable jusqu'au %s\n",
 					req.Name, info.NotAfter.Format("02/01/2006"))
 			} else {
@@ -191,7 +191,7 @@ func newCertIssueCommand(app *App) *cobra.Command {
 			if err := provs.Web.Reload(cmd.Context()); err != nil {
 				// Code 6 : le certificat est émis, mais le serveur présente toujours
 				// l'ancien — un succès partiel, non un succès.
-				app.printf("⚠ rechargement du serveur web : %v\n", err)
+				app.warnf("⚠ rechargement du serveur web : %v\n", err)
 				return exitf(CodePartial, "certificat %s émis, mais le serveur web ne l'a pas relu", req.Name)
 			}
 			app.printf("  activer le TLS sur le vhost :\n    ogs apply\n")
@@ -299,7 +299,7 @@ func newCertRenewCommand(app *App) *cobra.Command {
 				_ = app.Audit.Record("", "tls/certificate/"+name, "cert.renew", "ok", "")
 			}
 			for _, e := range errs {
-				app.printf("⚠ %v\n", e)
+				app.warnf("⚠ %v\n", e)
 				_ = app.Audit.Record("", "tls/certificate", "cert.renew", "échec", e.Error())
 			}
 			// Le hook est déclenché même en cas d'échec partiel : les certificats
@@ -321,7 +321,7 @@ func newCertRenewCommand(app *App) *cobra.Command {
 			if len(done) > 0 {
 				app.printf("↻ rechargement de %s\n", provs.Engine.Unit())
 				if reloadErr = provs.Web.Reload(cmd.Context()); reloadErr != nil {
-					app.printf("⚠ rechargement du serveur web : %v\n", reloadErr)
+					app.warnf("⚠ rechargement du serveur web : %v\n", reloadErr)
 				}
 			}
 			if len(errs) > 0 {

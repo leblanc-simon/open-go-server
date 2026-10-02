@@ -690,3 +690,27 @@ func TestPlanRemonteUneUniteIllisible(t *testing.T) {
 		t.Fatalf("une unité illisible doit faire échouer le plan, %d étapes rendues", len(steps))
 	}
 }
+
+// Q-66 : les journaux d'un service atteignent la sortie, sans pager, et seule
+// une unité du projet peut être visée.
+func TestLogsEcritLesJournauxDansLaSortie(t *testing.T) {
+	prov, proj := fixture(t)
+	rec := prov.Exec.(*exec.Recorder)
+	rec.Responses["journalctl -u"] = exec.Result{Stdout: "messenger démarré\n"}
+	var out, errOut strings.Builder
+	if err := prov.Logs(context.Background(), proj, "async", false, 20, &out, &errOut); err != nil {
+		t.Fatal(err)
+	}
+	if out.String() != "messenger démarré\n" {
+		t.Errorf("les journaux doivent atteindre la sortie : %q", out.String())
+	}
+	calls := rec.Calls()
+	if len(calls) != 1 || !strings.Contains(calls[0].String(), "journalctl -u ogs-shopfr-async@* -n 20 --no-pager") {
+		t.Errorf("commande : %v", calls)
+	}
+	for _, nom := range []string{"*", "a*", "x@y", "a?", "[ab]", "", "-f"} {
+		if err := prov.Logs(context.Background(), proj, nom, false, 20, &out, &errOut); err == nil {
+			t.Errorf("le nom de service %q ne doit pas être accepté", nom)
+		}
+	}
+}

@@ -402,6 +402,12 @@ func TestDryRunChaqueCommandeSimuleOuRefuse(t *testing.T) {
 		}
 	}
 	cas := casDryRunParCommande(secret)
+	// Un groupe n'affiche que son aide, --dry-run compris (D101).
+	for path, c := range commandes {
+		if c.Annotations[groupAnnotation] == "true" {
+			cas[path] = casDryRun{strings.Fields(path)[1:], "Utilisation"}
+		}
+	}
 	for path := range cas {
 		if cmd := commandes[path]; cmd == nil || dryRunConductOf(cmd) == dryRunRefused {
 			t.Errorf("« %s » a un cas d'essai sans être inscrit dans dryRunConducts", path)

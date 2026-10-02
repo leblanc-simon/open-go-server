@@ -132,13 +132,13 @@ func newPHPSwitchCommand(app *App) *cobra.Command {
 						"PHP %s est incompatible avec l'application (%s) ; "+
 							"ajouter --force pour l'imposer malgré tout", version, detail)
 				}
-				app.printf("⚠ compatibilité forcée : %s\n", detail)
+				app.warnf("⚠ compatibilité forcée : %s\n", detail)
 				if app.Audit != nil {
 					_ = app.Audit.Record(id, "php/pool/"+target, "php.switch.force", "avertissement", detail)
 				}
 			} else if verdict.Unread != nil {
 				// Rien n'a été vérifié sur l'application elle-même : un ✓ le laisserait croire.
-				app.printf("⚠ composer.json non lu, compatibilité jugée sans lui : %s\n", detail)
+				app.warnf("⚠ composer.json non lu, compatibilité jugée sans lui : %s\n", detail)
 			} else {
 				app.printf("✓ compatibilité vérifiée : %s\n", detail)
 			}

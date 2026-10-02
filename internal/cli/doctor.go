@@ -7,6 +7,7 @@ import (
 	osexec "os/exec"
 	"os/user"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -14,11 +15,14 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/goccy/go-yaml"
 	"github.com/spf13/cobra"
 
 	"leblanc.io/open-go-server/internal/archive"
+	"leblanc.io/open-go-server/internal/config"
 	"leblanc.io/open-go-server/internal/exec"
 	"leblanc.io/open-go-server/internal/model"
+	"leblanc.io/open-go-server/internal/provider/amqp"
 	appprov "leblanc.io/open-go-server/internal/provider/app"
 	"leblanc.io/open-go-server/internal/provider/db"
 	"leblanc.io/open-go-server/internal/provider/hardening"
@@ -94,6 +98,22 @@ func certificateDeclarationChecks(projects []*model.Project, add func(name, stat
 		if err := validate.CertificateNames(p); err != nil {
 			add("certificats déclarés", "échec", "projet "+p.ID()+" : "+strings.ReplaceAll(err.Error(), "\n", " ; "),
 				"corriger spec.certificates dans "+p.ID()+".yaml ; plan et apply de ce projet le refusent")
+		}
+	}
+}
+
+// cronLegacyChecks nomme les tâches dont un nom nu n'est résolu dans le
+// répertoire de travail que par compatibilité (D101) : l'apply le dit aussi, par
+// une étape non critique, mais une tâche ne se relit pas à chaque apply.
+func cronLegacyChecks(provs *providers, projects []*model.Project, add func(name, status, detail, fix string)) {
+	for _, p := range projects {
+		legacy, err := provs.Cron.Legacy(p)
+		if err != nil {
+			continue // le plan du projet le refuse et le dit
+		}
+		for _, l := range legacy {
+			add("tâches planifiées", "avertissement", "projet "+p.ID()+" : "+l,
+				"« ogs cron » ou spec.crons dans "+p.ID()+".yaml")
 		}
 	}
 }
@@ -318,6 +338,60 @@ func listeBornee(elements []string, n int) string {
 	return fmt.Sprintf("%s et %d autre(s)", strings.Join(elements[:n], ", "), len(elements)-n)
 }
 
+// addConfigKeyChecks nomme les clés inconnues de config.yaml et des fichiers
+// d'identifiants (D101). Celles de config.yaml sont un échec : les commandes qui
+// écrivent les refusent. Celles des identifiants, écrits par « credentials set »
+// et non à la main, un avertissement : un jeu DNS reste servi tel que lu (D97),
+// et amqp.yaml aussi, l'avertissement accompagnant chaque commande qui le lit.
+func (a *App) addConfigKeyChecks(add func(name, status, detail, fix string)) {
+	path := a.Paths.ConfigFile()
+	switch {
+	case len(a.cfgUnknown) > 0:
+		add("configuration", "échec", config.UnknownKeysError(path, a.cfgUnknown).Error(),
+			"corriger l'orthographe de la clé ou la retirer : apply et les autres commandes qui écrivent la refusent")
+	case len(a.cfgRetired) > 0:
+		add("configuration", "avertissement", fmt.Sprintf("%s : clé(s) retirée(s), sans effet : %s", path,
+			strings.Join(a.cfgRetired, ", ")), "les retirer du fichier")
+	default:
+		if _, err := os.Stat(path); err == nil {
+			add("configuration", "ok", path+" : aucune clé inconnue", "")
+		}
+	}
+	amqpPath := filepath.Join(a.Paths.Etc(), "credentials", "amqp.yaml")
+	if data, err := os.ReadFile(amqpPath); err == nil {
+		var creds amqp.Credentials
+		if err := yaml.UnmarshalWithOptions(data, &creds, yaml.Strict()); err != nil {
+			add("identifiants RabbitMQ", "avertissement", amqpPath+" : "+strictError(err),
+				"ogs amqp credentials set --user <compte>")
+		}
+	}
+	entries, _ := os.ReadDir(a.Paths.DNSCredsDir())
+	for _, e := range entries {
+		name, ok := strings.CutSuffix(e.Name(), ".yaml")
+		if !ok || e.IsDir() {
+			continue
+		}
+		file := filepath.Join(a.Paths.DNSCredsDir(), e.Name())
+		data, err := os.ReadFile(file)
+		if err != nil {
+			continue // la lecture elle-même est jugée par les contrôles des certificats
+		}
+		var creds dnsCredentialsFile
+		if err := yaml.UnmarshalWithOptions(data, &creds, yaml.Strict()); err != nil {
+			add("identifiants DNS "+name, "avertissement", file+" : "+strictError(err),
+				"ogs cert dns-provider set "+name)
+		}
+	}
+}
+
+// unknownFieldRe reconnaît le refus d'une clé par le décodeur strict.
+var unknownFieldRe = regexp.MustCompile(`unknown field "([^"]*)"`)
+
+// strictError rend en français la première ligne d'un refus du décodeur strict.
+func strictError(err error) string {
+	return unknownFieldRe.ReplaceAllString(firstLine(err.Error()), "clé inconnue « $1 »")
+}
+
 func (a *App) runChecks(ctx context.Context) []check {
 	var out []check
 	add := func(name, status, detail, fix string) {
@@ -329,6 +403,8 @@ func (a *App) runChecks(ctx context.Context) []check {
 	} else {
 		add("privilèges", "ok", fmt.Sprintf("uid %d", os.Getuid()), "")
 	}
+
+	a.addConfigKeyChecks(add)
 
 	// Journaux de la base d'état : le mode est RELEVÉ avant toute ouverture —
 	// store.Open les remet en 0600, et regarder après reviendrait à taire ce que
@@ -575,6 +651,7 @@ func (a *App) runChecks(ctx context.Context) []check {
 				add("sudoers", "ok", "fichiers de délégation conformes", "")
 			}
 		}
+		cronLegacyChecks(provs, projects, add)
 		provs.close()
 	}
 	// « ogs my » s'exécute dans l'environnement que sudo reconstruit : env_reset

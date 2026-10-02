@@ -472,7 +472,7 @@ func (a *App) announceRollback(fw *firewall.Provider) {
 	if fw == nil || fw.Armed == 0 {
 		return
 	}
-	a.printf("\n⚠ ufw est actif. Depuis une NOUVELLE session SSH, confirmer dans les %s :\n"+
+	a.warnf("\n⚠ ufw est actif. Depuis une NOUVELLE session SSH, confirmer dans les %s :\n"+
 		"    ogs firewall confirm\n"+
 		"  Sans confirmation, ufw se désactivera de lui-même : une session coupée par le pare-feu\n"+
 		"  ne pourrait pas le faire.\n", fw.Armed)
@@ -845,10 +845,10 @@ func newApplyCommand(app *App) *cobra.Command {
 				}
 				report, err := engine.Execute(cmd.Context(), plan, engine.Options{
 					OnStep: func(s *engine.Step, stepErr error) {
-						app.printf("  %s\n", issueDÉtape(s, stepErr))
+						app.stepf("  ", s, stepErr)
 					},
 					OnWarning: func(s *engine.Step, stepErr error) {
-						app.printf("  ⚠ %s : %v\n", s.Summary, stepErr)
+						app.warnf("  ⚠ %s : %v\n", s.Summary, stepErr)
 					},
 					Audit: func(s *engine.Step, outcome, detail string) {
 						_ = app.Audit.Record(p.ID(), s.Resource, "apply."+s.Action.String(), outcome, detail)
@@ -858,13 +858,7 @@ func newApplyCommand(app *App) *cobra.Command {
 				})
 				warnings += len(report.Warnings)
 				if err != nil {
-					if report.RolledBack {
-						app.printf("↶ rollback effectué : le système est revenu à son état initial.\n")
-					}
-					if report.RollbackErr != nil {
-						app.printf("✗ le rollback a échoué : %v\n", report.RollbackErr)
-						app.printf("  état à vérifier manuellement (audit %s)\n", app.Audit.RunID())
-					}
+					app.reportRollback(report)
 					return wrap(CodeError, err)
 				}
 				if err := app.recordState(p); err != nil {
@@ -900,7 +894,7 @@ func newApplyCommand(app *App) *cobra.Command {
 							}
 						},
 						OnWarning: func(s *engine.Step, stepErr error) {
-							app.printf("  ⚠ %s : %v\n", s.Summary, stepErr)
+							app.warnf("  ⚠ %s : %v\n", s.Summary, stepErr)
 						},
 						Audit: func(s *engine.Step, outcome, detail string) {
 							_ = app.Audit.Record("", s.Resource, "apply."+s.Action.String(), outcome, detail)
@@ -913,6 +907,7 @@ func newApplyCommand(app *App) *cobra.Command {
 						OnReloadWarning: app.reloadWarning,
 					})
 					if err != nil {
+						app.reportRollback(report)
 						return wrap(CodeError, err)
 					}
 					warnings += len(report.Warnings)
@@ -1038,10 +1033,25 @@ func trimTrailingNewline(s string) string {
 
 var _ = tabwriter.NewWriter
 
+// reportRollback dit ce que la saga a défait après un échec critique, et
+// surtout ce qu'elle n'a pas pu défaire : jamais tu, même sous --quiet.
+func (a *App) reportRollback(report *engine.Report) {
+	if report == nil {
+		return
+	}
+	if report.RolledBack {
+		a.warnf("↶ rollback effectué : le système est revenu à son état initial.\n")
+	}
+	if report.RollbackErr != nil {
+		a.warnf("✗ le rollback a échoué : %v\n", report.RollbackErr)
+		a.warnf("  état à vérifier manuellement (audit %s)\n", a.Audit.RunID())
+	}
+}
+
 // reloadWarning affiche un rechargement en échec. Il n'appartient à aucune
 // étape : sans lui, seul le compte des avertissements en gardait la trace.
 func (a *App) reloadWarning(target string, err error) {
-	a.printf("  ⚠ rechargement %s : %v\n", target, err)
+	a.warnf("  ⚠ rechargement %s : %v\n", target, err)
 }
 
 // issueDÉtape rend la ligne qui annonce l'issue d'une étape. Une étape aboutie en

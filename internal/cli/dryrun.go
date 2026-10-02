@@ -119,6 +119,10 @@ var dryRunConducts = map[string]dryRunConduct{
 // forcément une ailleurs. Aucune conduite ne s'hérite d'un parent, pour la même
 // raison.
 func dryRunConductOf(cmd *cobra.Command) dryRunConduct {
+	// Un groupe n'affiche que son aide (D101) : une consultation.
+	if cmd.Annotations[groupAnnotation] == "true" {
+		return dryRunReadOnly
+	}
 	return dryRunConducts[cmd.CommandPath()]
 }
 

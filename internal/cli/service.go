@@ -1,8 +1,11 @@
 package cli
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
+	osexec "os/exec"
 	"os/user"
 	"strconv"
 	"text/tabwriter"
@@ -10,6 +13,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"leblanc.io/open-go-server/internal/model"
+	appprov "leblanc.io/open-go-server/internal/provider/app"
 	"leblanc.io/open-go-server/internal/provider/unit"
 	"leblanc.io/open-go-server/internal/spec"
 )
@@ -285,20 +289,55 @@ func newServiceLogsCommand(app *App) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			// Seule une unité du projet peut être visée : un service déclaré, ou
+			// l'application supervisée.
+			if !projectHasService(p, args[1]) {
+				return exitf(CodeUsage, "aucun service %q déclaré dans %s (« ogs service list %s »)",
+					args[1], p.ID(), p.ID())
+			}
 			provs, err := app.certProviders()
 			if err != nil {
 				return err
 			}
 			defer provs.close()
-			if err := provs.Unit.Logs(cmd.Context(), p, args[1], follow, lines); err != nil {
-				return exitf(CodeDependency, "%v", err)
+			if app.Exec.Simulated() {
+				app.warnf("mode simulé : journalctl n'est pas lancé\n")
 			}
-			return nil
+			return logsErr(provs.Unit.Logs(cmd.Context(), p, args[1], follow, lines, app.Out, app.Err))
 		},
 	}
 	cmd.Flags().BoolVarP(&follow, "follow", "f", false, "suivre les journaux")
 	cmd.Flags().IntVarP(&lines, "lines", "n", 50, "nombre de lignes à afficher")
 	return cmd
+}
+
+// projectHasService dit si name désigne une unité du projet.
+func projectHasService(p *model.Project, name string) bool {
+	if name == appprov.ServiceName && appprov.Applies(p) {
+		return true
+	}
+	for _, s := range p.Spec.Services {
+		if s.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// logsErr donne son code à la fin de « service logs ». Un Ctrl-C est une
+// interruption (code 9), comme partout ailleurs, et non une dépendance absente :
+// sous --follow, c'est la seule façon d'en sortir, et il rendait 5. Seul un
+// journalctl introuvable rend 5.
+func logsErr(err error) error {
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		return exitf(CodeCancelled, "consultation des journaux interrompue")
+	case errors.Is(err, osexec.ErrNotFound):
+		return wrap(CodeDependency, err)
+	}
+	return wrap(CodeError, err)
 }
 
 // newMyCommand est la surface déléguée à l'utilisateur d'un projet.

@@ -6,7 +6,9 @@ package exec
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	osexec "os/exec"
 	"strings"
 	"sync"
@@ -25,6 +27,12 @@ type Command struct {
 	// AsUser exécute la commande sous une autre identité. L'implémentation force
 	// le shell : le compte d'un projet peut en avoir un fermé (D62).
 	AsUser string
+	// Stdout et Stderr, fournis, reçoivent la sortie au fil de l'eau au lieu
+	// qu'elle soit retenue dans Result. Un flux sans fin — « journalctl -f » —
+	// s'accumulait sinon en mémoire sans rien montrer (Q-66). Un flux d'erreur
+	// fourni n'est plus cité par l'erreur de Run.
+	Stdout io.Writer
+	Stderr io.Writer
 }
 
 // String rend la commande lisible pour le plan et les journaux.
@@ -109,10 +117,23 @@ func (l *Local) Run(ctx context.Context, cmd Command) (Result, error) {
 	}
 	var out, errBuf bytes.Buffer
 	c.Stdout, c.Stderr = &out, &errBuf
+	if cmd.Stdout != nil {
+		c.Stdout = cmd.Stdout
+	}
+	if cmd.Stderr != nil {
+		c.Stderr = cmd.Stderr
+	}
 	err := c.Run()
 	res := Result{Stdout: out.String(), Stderr: errBuf.String()}
-	if ee, ok := err.(*osexec.ExitError); ok {
+	var ee *osexec.ExitError
+	if errors.As(err, &ee) {
 		res.ExitCode = ee.ExitCode()
+	}
+	// Une annulation se reconnaît comme telle : le processus est tué, et
+	// « signal: killed » ne dirait pas qu'on l'a demandé. Les deux causes restent
+	// accessibles à errors.Is et errors.As.
+	if err != nil && ctx.Err() != nil {
+		err = fmt.Errorf("%w (%w)", ctx.Err(), err)
 	}
 	if l.Trace != nil {
 		l.Trace(cmd, res, err)
@@ -170,6 +191,15 @@ func (r *Recorder) Run(_ context.Context, cmd Command) (Result, error) {
 		return Result{ExitCode: 1}, err
 	}
 	if res, ok := r.Responses[key]; ok {
+		// Comme Local, un flux fourni reçoit la sortie au lieu de Result.
+		if cmd.Stdout != nil {
+			_, _ = io.WriteString(cmd.Stdout, res.Stdout)
+			res.Stdout = ""
+		}
+		if cmd.Stderr != nil {
+			_, _ = io.WriteString(cmd.Stderr, res.Stderr)
+			res.Stderr = ""
+		}
 		return res, nil
 	}
 	return Result{}, nil

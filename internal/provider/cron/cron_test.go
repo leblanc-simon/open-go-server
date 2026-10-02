@@ -736,3 +736,215 @@ func TestPHPRefuseCeQuIlNePeutAppliquer(t *testing.T) {
 		t.Errorf("mode simulé : %v", err)
 	}
 }
+
+// Q-68 : seul le premier mot d'une commande relative est résolu, et seulement
+// s'il désigne un chemin ; ses arguments ne passent jamais par filepath, qui
+// réduisait « // » et résolvait « a/../b » en emportant le nom de la commande.
+func TestSeulLePremierMotDUneCommandeRelativeEstResolu(t *testing.T) {
+	prov, proj := fixture(t)
+	www := filepath.Join(proj.Spec.Layout.Root, "www")
+	link := filepath.Join(model.BinDir(proj.Spec.Layout.Root), "php")
+	cas := map[string]string{
+		// Un nom nu est cherché dans le PATH du fichier cron, comme sous un shell.
+		"curl -fsS https://exemple.fr//cron ../c": "curl -fsS https://exemple.fr//cron ../c",
+		// Un chemin relatif est résolu, ses arguments rendus à l'identique.
+		"scripts/run.sh --src=data/../../etc": www + "/scripts/run.sh --src=data/../../etc",
+		"./x.sh a//b":                         www + "/x.sh a//b",
+		// bin/console garde sa commande et ses arguments.
+		"bin/console app:x --dir=a/../b": link + " " + www + "/bin/console app:x --dir=a/../b",
+		"./bin/console app:x --dir=a//b": link + " " + www + "/bin/console app:x --dir=a//b",
+		"bin/consolidate.sh":             www + "/bin/consolidate.sh",
+	}
+	for commande, attendu := range cas {
+		proj.Spec.Crons = []model.CronJob{{Name: "t", Schedule: "* * * * *", Command: commande}}
+		_, jobs, err := prov.Build(proj)
+		if err != nil {
+			t.Fatalf("%q : %v", commande, err)
+		}
+		if !strings.HasSuffix(jobs[0].Command, ".lock "+attendu) {
+			t.Errorf("%q :\n  obtenu  %s\n  attendu …%s", commande, jobs[0].Command, attendu)
+		}
+	}
+	// « ~ » et « $ » sont au shell : rien à résoudre.
+	for _, commande := range []string{"~/x.sh a", "$HOME/x.sh a"} {
+		proj.Spec.Crons = []model.CronJob{{Name: "t", Schedule: "* * * * *", Command: commande}}
+		_, jobs, err := prov.Build(proj)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.HasSuffix(jobs[0].Command, ".lock "+commande) {
+			t.Errorf("%q ne doit pas être résolu : %s", commande, jobs[0].Command)
+		}
+	}
+}
+
+// D101 : une affectation de tête passe devant le verrou — derrière, flock la
+// prenait pour le nom du programme —, et la commande qui la suit est traitée
+// comme sans elle : bin/console passe par l'interpréteur géré (D30).
+func TestUneAffectationDeTetePasseDevantLeVerrou(t *testing.T) {
+	prov, proj := fixture(t)
+	www := filepath.Join(proj.Spec.Layout.Root, "www")
+	link := filepath.Join(model.BinDir(proj.Spec.Layout.Root), "php")
+	proj.Spec.Crons = []model.CronJob{{Name: "t", Schedule: "* * * * *",
+		Command: "APP_ENV=prod FOO=a/b bin/console app:x --dir=a//b"}}
+	_, jobs, err := prov.Build(proj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "' && APP_ENV=prod FOO=a/b /usr/bin/flock -n "
+	if !strings.Contains(jobs[0].Command, want) ||
+		!strings.HasSuffix(jobs[0].Command, ".lock "+link+" "+www+"/bin/console app:x --dir=a//b") {
+		t.Errorf("affectations avant flock, bin/console par l'interpréteur géré :\n%s", jobs[0].Command)
+	}
+	// Une affectation citée n'est pas analysée : elle reste en place.
+	proj.Spec.Crons[0].Command = "FOO='a b' /usr/bin/env"
+	if _, jobs, err = prov.Build(proj); err != nil || !strings.HasSuffix(jobs[0].Command, ".lock FOO='a b' /usr/bin/env") {
+		t.Errorf("affectation citée : %v %v", jobs, err)
+	}
+}
+
+// D101 : un nom nu qui désigne un fichier du répertoire de travail y reste
+// résolu — « backup.sh » lançait www/backup.sh —, et le plan le signale par une
+// étape non critique ; sans fichier homonyme, il va au PATH.
+func TestUnNomNuHomonymeDUnFichierEstGardeEtSignale(t *testing.T) {
+	prov, proj := fixture(t)
+	www := filepath.Join(proj.Spec.Layout.Root, "www")
+	if err := os.MkdirAll(www, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(www, "backup.sh"), []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	proj.Spec.Crons = []model.CronJob{
+		{Name: "sauv", Schedule: "0 2 * * *", Command: "backup.sh --dest /srv/x"},
+		{Name: "date", Schedule: "0 2 * * *", Command: "date -Iseconds"},
+	}
+	_, jobs, err := prov.Build(proj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasSuffix(jobs[0].Command, ".lock "+www+"/backup.sh --dest /srv/x") {
+		t.Errorf("le nom nu homonyme doit rester résolu : %s", jobs[0].Command)
+	}
+	if !strings.HasSuffix(jobs[1].Command, ".lock date -Iseconds") {
+		t.Errorf("sans homonyme, le nom nu va au PATH : %s", jobs[1].Command)
+	}
+	steps, err := prov.Plan(context.Background(), proj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var signal *engine.Step
+	for _, s := range steps {
+		if s.Resource == "cron/legacy/sauv" {
+			signal = s
+		}
+		if s.Resource == "cron/legacy/date" {
+			t.Error("une commande du PATH ne doit pas être signalée")
+		}
+	}
+	if signal == nil || signal.Critical {
+		t.Fatalf("une étape non critique doit signaler la compatibilité : %v", signal)
+	}
+	if err := signal.Apply(context.Background()); err == nil || !strings.Contains(err.Error(), "./backup.sh") {
+		t.Errorf("le signal doit proposer « ./backup.sh » : %v", err)
+	}
+	if l, err := prov.Legacy(proj); err != nil || len(l) != 1 {
+		t.Errorf("Legacy : %v %v", l, err)
+	}
+	// Un lien homonyme compte aussi, sans être suivi.
+	if err := os.Remove(filepath.Join(www, "backup.sh")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("/nulle/part", filepath.Join(www, "backup.sh")); err != nil {
+		t.Fatal(err)
+	}
+	if _, jobs, _ = prov.Build(proj); !strings.Contains(jobs[0].Command, www+"/backup.sh") {
+		t.Errorf("un lien homonyme doit être reconnu : %s", jobs[0].Command)
+	}
+}
+
+// D101 : un répertoire de travail qui ne se vérifie pas — un « current » lié de
+// Deployer, un parent illisible, un chemin lié hors du projet — ne prouve pas
+// l'absence : la résolution d'avant est gardée, et signalée avec sa cause.
+func TestUnRepertoireDeTravailNonVerifiableGardeLaResolution(t *testing.T) {
+	prov, proj := fixture(t)
+	www := filepath.Join(proj.Spec.Layout.Root, "www")
+	release := filepath.Join(www, "releases", "1")
+	if err := os.MkdirAll(release, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(release, "purge.sh"), []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("releases/1", filepath.Join(www, "current")); err != nil {
+		t.Fatal(err)
+	}
+	// Hors du projet, un répertoire lié.
+	ailleurs := t.TempDir()
+	if err := os.Mkdir(filepath.Join(ailleurs, "vrai"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("vrai", filepath.Join(ailleurs, "lien")); err != nil {
+		t.Fatal(err)
+	}
+	// Un parent illisible.
+	ferme := filepath.Join(www, "ferme")
+	if err := os.MkdirAll(filepath.Join(ferme, "sous"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(ferme, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(ferme, 0o755) })
+
+	for _, workdir := range []string{filepath.Join(www, "current"), filepath.Join(ailleurs, "lien"),
+		filepath.Join(ferme, "sous")} {
+		if workdir == filepath.Join(ferme, "sous") && os.Geteuid() == 0 {
+			continue // root traverse un répertoire en 000
+		}
+		proj.Spec.Crons = []model.CronJob{{Name: "purge", Schedule: "0 3 * * *", Command: "purge.sh --vieux",
+			Workdir: workdir}}
+		_, jobs, err := prov.Build(proj)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.HasSuffix(jobs[0].Command, ".lock "+workdir+"/purge.sh --vieux") {
+			t.Errorf("%s : la résolution d'avant doit être gardée : %s", workdir, jobs[0].Command)
+		}
+		legacy, err := prov.Legacy(proj)
+		if err != nil || len(legacy) != 1 || !strings.Contains(legacy[0], "non vérifiable") ||
+			!strings.Contains(legacy[0], "./purge.sh") {
+			t.Errorf("%s : le signal doit nommer la cause : %v %v", workdir, legacy, err)
+		}
+	}
+	// Un répertoire de travail pas encore déployé ne prouve rien non plus.
+	futur := filepath.Join(www, "futur", "app")
+	proj.Spec.Crons[0].Workdir = futur
+	if _, jobs, _ := prov.Build(proj); !strings.HasSuffix(jobs[0].Command, ".lock "+futur+"/purge.sh --vieux") {
+		t.Errorf("répertoire absent : la résolution d'avant doit être gardée : %s", jobs[0].Command)
+	}
+	if legacy, _ := prov.Legacy(proj); len(legacy) != 1 || !strings.Contains(legacy[0], "répertoire de travail absent") {
+		t.Errorf("répertoire absent : le signal doit le nommer : %v", legacy)
+	}
+	// www/, que l'apply crée vide, n'existe pas encore avant le premier : son
+	// absence vaut celle de l'entrée.
+	if err := os.Chmod(ferme, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(www); err != nil {
+		t.Fatal(err)
+	}
+	proj.Spec.Crons[0].Workdir = ""
+	if _, jobs, _ := prov.Build(proj); !strings.HasSuffix(jobs[0].Command, ".lock purge.sh --vieux") {
+		t.Errorf("www/ pas encore créé : le nom nu va au PATH : %s", jobs[0].Command)
+	}
+	if err := os.MkdirAll(release, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Seule l'absence de l'entrée dans un répertoire qui existe envoie au PATH.
+	proj.Spec.Crons[0].Workdir = release
+	proj.Spec.Crons[0].Command = "date -Iseconds"
+	if _, jobs, _ := prov.Build(proj); !strings.HasSuffix(jobs[0].Command, ".lock date -Iseconds") {
+		t.Errorf("entrée absente d'un répertoire existant : %s", jobs[0].Command)
+	}
+}

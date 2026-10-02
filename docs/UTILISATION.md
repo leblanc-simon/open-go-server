@@ -123,7 +123,10 @@ sudo ogs site create shop.fr \
   jamais se chevaucher, journalisée dans `~/logs/`.
   La tâche se place d'abord dans `www/` (ou dans son `workdir`) ; `bin/console …` et `php …` passent par
   `~/.local/bin/php`, sauf si la tâche fixe sa version par `php: "8.2"` (`ogs cron add --php 8.2`) — elle
-  ne suit alors plus `ogs php switch`.
+  ne suit alors plus `ogs php switch`. Un script de `www/` s'écrit `./backup.sh` ou `scripts/backup.sh` :
+  un nom nu (`curl`, `backup.sh`) est cherché dans le `PATH`, sauf s'il désigne un fichier du répertoire
+  de travail — il y est alors résolu par compatibilité, et `apply` (code 6) comme `doctor` proposent
+  `./backup.sh` (D101).
 
 ### 4. Une application Node
 
@@ -405,7 +408,7 @@ que le site n'est jamais exposé avec une application qui n'a pas encore démarr
 sudo ogs service list shopfr
 sudo ogs service restart shopfr                  # tous les services du projet (start, stop aussi)
 sudo ogs service scale shopfr messenger-async 5  # immédiat, sans toucher à la déclaration
-sudo ogs service logs shopfr messenger-async -f
+sudo ogs service logs shopfr messenger-async -f   # flux de journalctl ; Ctrl-C pour sortir (code 9)
 sudo ogs service remove shopfr export
 ```
 

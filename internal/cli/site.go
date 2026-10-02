@@ -419,7 +419,7 @@ func newSiteCloneCommand(app *App) *cobra.Command {
 				return nil
 			}
 			for _, d := range declared.lines {
-				app.printf("⚠ %s\n", d)
+				app.warnf("⚠ %s\n", d)
 			}
 			// Le hook « preCreate » garde la porte : il peut refuser la création
 			// avant que rien n'ait été écrit.
@@ -447,10 +447,10 @@ func newSiteCloneCommand(app *App) *cobra.Command {
 			dstWWW := filepath.Join(target.Spec.Layout.Root, "www")
 			skipped, err := app.copyTree(cmd.Context(), source, target, guard.Guard)
 			for _, s := range skipped.Named {
-				app.printf("⚠ non recopié : %s\n", s)
+				app.warnf("⚠ non recopié : %s\n", s)
 			}
 			if n := skipped.Count - len(skipped.Named); n > 0 {
-				app.printf("⚠ … et %d autre(s) entrée(s) non recopiée(s)\n", n)
+				app.warnf("⚠ … et %d autre(s) entrée(s) non recopiée(s)\n", n)
 			}
 			copied := !errors.Is(err, errNotCopied)
 			guarded := app.reportCloneCopy(skipped, guard, copied)
@@ -465,17 +465,17 @@ func newSiteCloneCommand(app *App) *cobra.Command {
 					"le projet %s est créé : « ogs project delete %s » avant un nouveau clone",
 					dstWWW, target.ID(), target.ID())
 			case errors.Is(err, errNotCopied):
-				app.printf("⚠ copie du contenu : %v\n", err)
+				app.warnf("⚠ copie du contenu : %v\n", err)
 				if partial == nil {
 					partial = exitf(CodePartial, "le contenu de %s n'a pas été recopié", srcWWW)
 				}
 			case err != nil:
-				app.printf("⚠ copie du contenu interrompue : %v — %s n'en porte qu'une partie\n", err, dstWWW)
+				app.warnf("⚠ copie du contenu interrompue : %v — %s n'en porte qu'une partie\n", err, dstWWW)
 				if partial == nil {
 					partial = exitf(CodePartial, "le contenu de %s n'a été recopié qu'en partie", srcWWW)
 				}
 			case skipped.Count > 0:
-				app.printf("⚠ contenu copié en partie : %s → %s, %d entrée(s) écartée(s)\n",
+				app.warnf("⚠ contenu copié en partie : %s → %s, %d entrée(s) écartée(s)\n",
 					srcWWW, dstWWW, skipped.Count)
 				if partial == nil {
 					partial = exitf(CodePartial, "%d entrée(s) de %s non recopiée(s)", skipped.Count, srcWWW)
@@ -484,7 +484,7 @@ func newSiteCloneCommand(app *App) *cobra.Command {
 				// Une copie expurgée, ou qui laisse passer ce qu'ogs sait désigner,
 				// n'est pas celle d'un contenu neutre : elle ne s'annonce pas comme
 				// faite, et le code de retour le dit (plus bas).
-				app.printf("⚠ contenu copié avec les réserves ci-dessus : %s → %s\n", srcWWW, dstWWW)
+				app.warnf("⚠ contenu copié avec les réserves ci-dessus : %s → %s\n", srcWWW, dstWWW)
 			default:
 				app.printf("✓ contenu copié : %s → %s\n", srcWWW, dstWWW)
 			}
@@ -495,7 +495,7 @@ func newSiteCloneCommand(app *App) *cobra.Command {
 						if target.IsPrep() {
 							public = ", et une préproduction est publique (D57)"
 						}
-						app.printf("⚠ installeur exposé : %s/ est recopié, et %s n'a aucun fichier de configuration — "+
+						app.warnf("⚠ installeur exposé : %s/ est recopié, et %s n'a aucun fichier de configuration — "+
 							"une application %s y renvoie tout visiteur%s : écrire sa configuration avant de "+
 							"l'ouvrir, ou retirer %s/\n", filepath.Join(dstWWW, d), target.ID(), at.Kind, public, d)
 						guarded = append(guarded, "installeur exposé")
@@ -510,7 +510,12 @@ func newSiteCloneCommand(app *App) *cobra.Command {
 						"depuis "+source.ID()+" : copie des données interrompue à la demande")
 					return err
 				} else if err != nil {
-					app.printf("⚠ copie des données : %v\n", err)
+					// Le projet est créé et sa base existe, vide : un succès partiel
+					// que le code de retour doit dire autant que l'avertissement, comme
+					// un contenu non recopié (Q-04).
+					app.warnf("⚠ copie des données : %v\n", err)
+					guarded = append(guarded, fmt.Sprintf("données de la base %s non copiées",
+						target.Spec.Databases[0].Name))
 				} else {
 					dataCopied = true
 				}
@@ -531,8 +536,16 @@ func newSiteCloneCommand(app *App) *cobra.Command {
 				}
 				partial = exitf(CodePartial, "%s", review)
 			}
-			_ = app.Audit.Record(target.ID(), "site", "site.clone", "ok", "depuis "+source.ID())
-			app.printf("\n✓ %s créé depuis %s\n", target.ID(), source.ID())
+			outcome, detail := "ok", "depuis "+source.ID()
+			if partial != nil {
+				outcome, detail = "avertissement", detail+" : "+partial.Error()
+			}
+			_ = app.Audit.Record(target.ID(), "site", "site.clone", outcome, detail)
+			if partial != nil {
+				app.warnf("\n⚠ %s créé depuis %s — succès partiel\n", target.ID(), source.ID())
+			} else {
+				app.printf("\n✓ %s créé depuis %s\n", target.ID(), source.ID())
+			}
 			return partial
 		},
 	}
@@ -742,10 +755,10 @@ func (a *App) applyProjects(cmd *cobra.Command, projects []*model.Project) error
 		}
 		report, err := engine.Execute(cmd.Context(), plan, engine.Options{
 			OnStep: func(s *engine.Step, stepErr error) {
-				a.printf("  %s\n", issueDÉtape(s, stepErr))
+				a.stepf("  ", s, stepErr)
 			},
 			OnWarning: func(s *engine.Step, stepErr error) {
-				a.printf("  ⚠ %s : %v\n", s.Summary, stepErr)
+				a.warnf("  ⚠ %s : %v\n", s.Summary, stepErr)
 			},
 			Audit: func(s *engine.Step, outcome, detail string) {
 				_ = a.Audit.Record(p.ID(), s.Resource, "apply."+s.Action.String(), outcome, detail)
@@ -755,12 +768,7 @@ func (a *App) applyProjects(cmd *cobra.Command, projects []*model.Project) error
 		})
 		warnings += len(report.Warnings)
 		if err != nil {
-			if report.RolledBack {
-				a.printf("↶ rollback effectué : le système est revenu à son état initial.\n")
-			}
-			if report.RollbackErr != nil {
-				a.printf("✗ le rollback a échoué : %v\n", report.RollbackErr)
-			}
+			a.reportRollback(report)
 			return wrap(CodeError, err)
 		}
 		if err := a.recordState(p); err != nil {
@@ -791,7 +799,7 @@ func (a *App) applyProjects(cmd *cobra.Command, projects []*model.Project) error
 				}
 			},
 			OnWarning: func(s *engine.Step, stepErr error) {
-				a.printf("  ⚠ %s : %v\n", s.Summary, stepErr)
+				a.warnf("  ⚠ %s : %v\n", s.Summary, stepErr)
 			},
 			// Les rechargements du plan global comptent autant que ceux d'un projet :
 			// c'est là que les répertoires d'exécution sont créés et que le timer de

@@ -67,7 +67,7 @@ func newAMQPCredentialsSetCommand(app *App) *cobra.Command {
 				return err
 			}
 			if user == "guest" {
-				app.printf("⚠ le compte « guest » est un compte par défaut connu : " +
+				app.warnf("⚠ le compte « guest » est un compte par défaut connu : " +
 					"créer un compte d'administration dédié est préférable.\n")
 			}
 			if brokerAccount == amqp.DefaultBrokerAccount {

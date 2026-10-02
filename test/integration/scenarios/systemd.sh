@@ -156,6 +156,29 @@ fi
 echo "et rien d'autre : la cible d'un autre projet lui est refusée"
 
 echo
+echo "--- journaux d'un service (D101) ---"
+# La sortie de journalctl était capturée puis jetée : rien ne s'affichait.
+journaux=$(ogs service logs shopfr veille -n 20 2>&1); rc=$?
+echo "$journaux" | tail -3
+if [ "$rc" != 0 ] || ! echo "$journaux" | grep -q "ogs-shopfr-veille@"; then
+    echo "ÉCHEC : « service logs » n'affiche pas les journaux des instances (code $rc)"
+    exit 1
+fi
+# Sous -f, le flux arrive avant l'interruption, et Ctrl-C rend 9, non 5.
+suivi=$(timeout --preserve-status -s INT 4 ogs service logs shopfr veille -f -n 5 2>&1); rc=$?
+if [ "$rc" != 9 ] || ! echo "$suivi" | grep -q "ogs-shopfr-veille@"; then
+    echo "ÉCHEC : « service logs -f » interrompu : code $rc (9 attendu), sortie :"
+    echo "$suivi" | tail -5
+    exit 1
+fi
+echo "« service logs -f » montre le flux, et l'interruption rend 9"
+ogs service logs shopfr sshd >/dev/null 2>&1; rc=$?
+if [ "$rc" != 2 ]; then
+    echo "ÉCHEC : une unité hors du projet doit être refusée en code 2 (obtenu $rc)"
+    exit 1
+fi
+
+echo
 echo "--- tâche planifiée : exécution immédiate ---"
 cat /etc/cron.d/ogs-shopfr
 sortie=$(ogs cron run shopfr horodate 2>&1)
@@ -172,6 +195,16 @@ if [ "$(stat -c %U /var/log/ogs-projects/shopfr)" != "root" ]; then
     echo "ÉCHEC : le répertoire des journaux doit appartenir à root"
     exit 1
 fi
+# Un nom nu reste au PATH du fichier cron : « date … » devenait <www>/date (D101).
+ogs cron add shopfr nu --schedule "0 0 1 1 *" --command "date -Iseconds" >/dev/null
+ogs apply shopfr --yes -q >/dev/null 2>&1
+sortie=$(ogs cron run shopfr nu 2>&1)
+if ! echo "$sortie" | grep -qE "[0-9]{4}-[0-9]{2}-[0-9]{2}T"; then
+    echo "ÉCHEC : une commande au nom nu doit être cherchée dans le PATH :"
+    grep " nu\|date" /etc/cron.d/ogs-shopfr; echo "$sortie" | tail -3
+    exit 1
+fi
+echo "une commande au nom nu passe par le PATH"
 
 echo
 echo "--- tâche planifiée : déclenchement réel par cron ---"

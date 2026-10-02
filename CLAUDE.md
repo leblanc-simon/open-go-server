@@ -804,6 +804,16 @@ Ils ont tous coûté un défaut réel ; les tests unitaires ne les voyaient pas.
   suivant. Celui des versions jusqu'à 0.0.3 désactivait le timer de renouvellement à chaque mise à jour, et
   plus aucun certificat ne se renouvelait, sans un mot (D89). Un paquet sans postrm ni fichier de
   configuration est oublié par dpkg dès le retrait, et `apt purge` n'a plus rien à faire.
+- **Cobra rend 0 sur un groupe mal suivi** (D101) : une commande qui n'existe que par ses sous-commandes
+  n'est pas exécutable, et cobra affiche son aide puis rend `nil` pour toute sous-commande inconnue —
+  `ogs db dmup shopfr > dump.sql` écrivait l'aide dans la sauvegarde, en code 0. Une feuille sans validateur
+  ignore ses arguments. `guardArgs` (`help.go`) rend chaque groupe exécutable et pose `NoArgs` par défaut ;
+  `ogs completion`, que cobra n'ajoute qu'à l'exécution, est créé d'avance pour y passer — il échappait aussi
+  à la traduction, et `ogs completion bash` exigeait root. Une sortie d'avertissement passe par `warnf`,
+  jamais par `printf`, que `--quiet` et `-o json` font taire.
+- **Un enfant d'`exec.Local` n'est pas au premier plan du terminal** (`Setpgid`) : un pager qu'il lance
+  reste arrêté sur sa première lecture. Une commande dont la sortie est branchée sur le terminal
+  (`Command.Stdout`) le désactive — `journalctl --no-pager`.
 - **bubbletea interroge le terminal dès l'initialisation** (couleur de fond : OSC 11 puis CSI 6n) : toute
   commande d'ogs dont la sortie standard est un terminal sans répondant attend jusqu'à cinq secondes et
   laisse des séquences d'échappement. C'est le pseudo-terminal qu'apt ouvre pour dpkg, même sous

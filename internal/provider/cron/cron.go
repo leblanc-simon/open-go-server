@@ -3,6 +3,7 @@ package cron
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -79,6 +80,12 @@ type job struct {
 	Log      string
 	Enabled  bool
 	LockPath string
+	// Legacy est le nom nu résolu dans le répertoire de travail par
+	// compatibilité (D101), vide sinon.
+	Legacy string
+	// LegacyCause dit pourquoi le répertoire de travail n'a pas pu être vérifié,
+	// vide quand le fichier homonyme y a été trouvé.
+	LegacyCause string
 }
 
 // Build calcule le contenu attendu du fichier cron.
@@ -155,7 +162,7 @@ func (p *Provider) jobs(proj *model.Project) ([]job, error) {
 		if decl.Name == "" {
 			return nil, fmt.Errorf("projet %s : tâche sans nom", proj.ID())
 		}
-		command, err := p.command(proj, decl)
+		command, legacy, cause, err := p.command(proj, decl)
 		if err != nil {
 			return nil, err
 		}
@@ -170,7 +177,9 @@ func (p *Provider) jobs(proj *model.Project) ([]job, error) {
 		out = append(out, job{
 			Name: decl.Name, Schedule: strings.TrimSpace(decl.Schedule),
 			Command: command, Log: logFile, Enabled: enabled,
-			LockPath: filepath.Join(runDir, decl.Name+".lock"),
+			LockPath:    filepath.Join(runDir, decl.Name+".lock"),
+			Legacy:      legacy,
+			LegacyCause: cause,
 		})
 	}
 	return out, nil
@@ -186,13 +195,29 @@ func (p *Provider) jobs(proj *model.Project) ([]job, error) {
 // auparavant qu'à compléter une commande relative, ce qui le rendait trompeur.
 // Le « cd » précède le verrou : flock exécute une commande, pas une ligne de
 // shell. S'il échoue, la tâche ne part pas, et le journal dit pourquoi.
-func (p *Provider) command(proj *model.Project, decl model.CronJob) (string, error) {
+func (p *Provider) command(proj *model.Project, decl model.CronJob) (line, legacy, legacyCause string, err error) {
 	if strings.ContainsAny(decl.Command, "\n\r") {
-		return "", fmt.Errorf("tâche %s : la commande ne peut pas contenir de retour à la ligne", decl.Name)
+		return "", "", "", fmt.Errorf("tâche %s : la commande ne peut pas contenir de retour à la ligne", decl.Name)
 	}
-	fields := strings.Fields(decl.Command)
+	// Les affectations de tête — « APP_ENV=prod bin/console … » — sont mises à
+	// part : placées après flock, qui exécute une commande et non une ligne de
+	// shell, elles étaient prises pour le nom du programme ; placées devant, elles
+	// atteignent la commande à travers lui. Seules les affectations sans
+	// guillemet ni échappement sont reconnues : au-delà, il faudrait analyser le
+	// shell (§20).
+	command := strings.TrimSpace(decl.Command)
+	var assigns []string
+	for {
+		fields := strings.Fields(command)
+		if len(fields) == 0 || !isAssignment(fields[0]) {
+			break
+		}
+		assigns = append(assigns, fields[0])
+		command = strings.TrimLeft(strings.TrimPrefix(command, fields[0]), " \t")
+	}
+	fields := strings.Fields(command)
 	if len(fields) == 0 {
-		return "", fmt.Errorf("tâche %s : commande vide", decl.Name)
+		return "", "", "", fmt.Errorf("tâche %s : commande vide", decl.Name)
 	}
 	workdir := decl.Workdir
 	if workdir == "" {
@@ -202,25 +227,45 @@ func (p *Provider) command(proj *model.Project, decl model.CronJob) (string, err
 	}
 	interp, err := p.interpreter(proj, decl)
 	if err != nil {
-		return "", err
+		return "", "", "", err
 	}
-	command := decl.Command
+	// Seul le premier mot est réécrit : ses arguments sont rendus à l'identique.
+	// Passer la ligne entière par filepath.Join réduisait « // » dans une URL et
+	// résolvait « a/../b » jusqu'à emporter le nom de la commande (Q-68).
+	first := fields[0]
+	rest := strings.TrimPrefix(command, first)
 	// Une commande relative est résolue depuis le répertoire de travail, et
 	// « bin/console » comme « php … » passent par l'interpréteur de la tâche :
 	// le lien géré par défaut, de sorte qu'une bascule de version PHP n'exige pas
 	// de réécrire les crons (D30), ou la version que fixe « php: » (D98).
 	switch {
-	case strings.HasPrefix(command, "bin/console") || strings.HasPrefix(command, "./bin/console"):
-		command = interp + " " + filepath.Join(workdir, strings.TrimPrefix(command, "./"))
-	case fields[0] == "php":
-		command = interp + strings.TrimPrefix(command, "php")
+	case first == "bin/console" || first == "./bin/console":
+		command = interp + " " + filepath.Join(workdir, "bin", "console") + rest
+	case first == "php":
+		command = interp + rest
 	case decl.PHP != "":
 		// Ignorer la version demandée ferait tourner la tâche sous une autre
 		// sans un mot : c'était le cas avant D98.
-		return "", fmt.Errorf("tâche %s : « php: %s » ne s'applique qu'à « bin/console … » ou "+
-			"« php … », pas à %q", decl.Name, decl.PHP, fields[0])
-	case !filepath.IsAbs(fields[0]):
-		command = filepath.Join(workdir, command)
+		return "", "", "", fmt.Errorf("tâche %s : « php: %s » ne s'applique qu'à « bin/console … » ou "+
+			"« php … », pas à %q", decl.Name, decl.PHP, first)
+	case filepath.IsAbs(first) || strings.ContainsAny(first, "~$`\"'"):
+		// Absolu, ou désigné par le shell (« ~/x.sh », « $HOME/x.sh ») : rien à
+		// résoudre ici.
+	case strings.Contains(first, "/"):
+		// Un chemin relatif — « scripts/x.sh », « ./x » — est résolu dans le
+		// répertoire de travail.
+		command = filepath.Join(workdir, first) + rest
+	default:
+		// Un nom nu qui désigne un fichier du répertoire de travail y était
+		// résolu, et des déclarations en dépendent : la résolution est gardée,
+		// signalée par une étape non critique (D101) — de même quand le
+		// répertoire ne peut pas être vérifié. Sans homonyme établi, le nom nu
+		// reste au PATH du fichier cron, comme sous un shell.
+		if found, cause := p.lookupIn(proj, workdir, first); found {
+			command = filepath.Join(workdir, first) + rest
+			legacy = first
+			legacyCause = cause
+		}
 	}
 
 	lock := decl.Lock == nil || *decl.Lock
@@ -228,7 +273,112 @@ func (p *Provider) command(proj *model.Project, decl model.CronJob) (string, err
 		lockPath := filepath.Join(p.Paths.ProjectRunDir(proj.ID()), decl.Name+".lock")
 		command = fmt.Sprintf("/usr/bin/flock -n %s %s", lockPath, command)
 	}
-	return "cd " + shellQuote(workdir) + " && " + command, nil
+	if len(assigns) > 0 {
+		command = strings.Join(assigns, " ") + " " + command
+	}
+	return "cd " + shellQuote(workdir) + " && " + command, legacy, legacyCause, nil
+}
+
+// isAssignment reconnaît une affectation de variable du shell sans guillemet ni
+// échappement : « NOM=valeur ».
+func isAssignment(word string) bool {
+	name, _, ok := strings.Cut(word, "=")
+	if !ok || name == "" || strings.ContainsAny(word, "'\"\\`$") {
+		return false
+	}
+	for i, r := range name {
+		switch {
+		case r == '_', r >= 'A' && r <= 'Z', r >= 'a' && r <= 'z':
+		case r >= '0' && r <= '9' && i > 0:
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// lookupIn dit si le répertoire de travail porte une entrée de ce nom. Il est
+// relu sans suivre de lien, depuis la racine du projet quand il s'y trouve —
+// le home appartient à l'utilisateur (D83) —, depuis « / » sinon. Seule
+// l'absence établie — l'entrée, ou un répertoire du chemin, n'existe pas —
+// envoie le nom au PATH. Toute autre issue — un parent lié, comme le
+// « current » de Deployer ou de Capistrano, un accès refusé — ne prouve rien :
+// la résolution d'avant D101 est gardée, et cause nomme pourquoi.
+func (p *Provider) lookupIn(proj *model.Project, workdir, name string) (found bool, cause string) {
+	root := filepath.Clean(proj.Spec.Layout.Root)
+	target := filepath.Join(workdir, name)
+	var err error
+	if rel, rerr := filepath.Rel(root, target); rerr == nil && rel != "." && !strings.HasPrefix(rel, "..") {
+		_, err = fs.LstatAt(root, rel)
+	} else {
+		_, err = fs.LstatAt("/", strings.TrimPrefix(target, "/"))
+	}
+	switch {
+	case err == nil:
+		return true, ""
+	case errors.Is(err, os.ErrNotExist):
+		// Seule l'absence de l'entrée dans un répertoire de travail qui existe
+		// envoie au PATH. Un répertoire pas encore déployé — « www/futur/app » —
+		// ne prouve rien : entre le déploiement et l'apply suivant, la tâche
+		// partirait au PATH et échouerait en silence, là où elle marchait.
+		info, werr := p.lstatWorkdir(root, workdir)
+		switch {
+		case werr == nil && info.IsDir():
+			return false, ""
+		case werr == nil || errors.Is(werr, fs.ErrNotDirectory):
+			return true, "répertoire de travail non vérifiable : un de ses composants est un lien"
+		case errors.Is(werr, os.ErrNotExist) && filepath.Clean(workdir) == filepath.Join(root, "www"):
+			// www/ est créé vide par l'apply même (model.defaultDirs) : avant le
+			// premier, son absence vaut celle de l'entrée.
+			return false, ""
+		case errors.Is(werr, os.ErrNotExist):
+			return true, "répertoire de travail absent"
+		}
+		return true, "répertoire de travail non vérifiable : " + werr.Error()
+	case errors.Is(err, fs.ErrNotDirectory):
+		return true, "répertoire de travail non vérifiable : un de ses composants est un lien"
+	}
+	return true, "répertoire de travail non vérifiable : " + err.Error()
+}
+
+// lstatWorkdir décrit le répertoire de travail lui-même, sans le suivre.
+func (p *Provider) lstatWorkdir(root, workdir string) (os.FileInfo, error) {
+	workdir = filepath.Clean(workdir)
+	if workdir == root {
+		return os.Lstat(root)
+	}
+	if rel, err := filepath.Rel(root, workdir); err == nil && !strings.HasPrefix(rel, "..") {
+		return fs.LstatAt(root, rel)
+	}
+	if workdir == "/" {
+		return os.Lstat("/")
+	}
+	return fs.LstatAt("/", strings.TrimPrefix(workdir, "/"))
+}
+
+// Legacy nomme les tâches dont la commande commence par un nom nu résolu dans
+// le répertoire de travail par compatibilité (D101), avec la forme à écrire.
+func (p *Provider) Legacy(proj *model.Project) ([]string, error) {
+	jobs, err := p.jobs(proj)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, j := range jobs {
+		if j.Legacy != "" {
+			out = append(out, legacyMessage(j))
+		}
+	}
+	return out, nil
+}
+
+func legacyMessage(j job) string {
+	if j.LegacyCause != "" {
+		return fmt.Sprintf("tâche %s : « %s » est résolu dans le répertoire de travail par compatibilité — %s "+
+			"(lien, accès refusé ou répertoire pas encore déployé) : écrire « ./%s » ou un chemin absolu", j.Name, j.Legacy, j.LegacyCause, j.Legacy)
+	}
+	return fmt.Sprintf("tâche %s : « %s » est résolu dans le répertoire de travail par compatibilité, "+
+		"un nom nu désignant sinon une commande du PATH — écrire « ./%s »", j.Name, j.Legacy, j.Legacy)
 }
 
 // interpreter renvoie l'interpréteur PHP d'une tâche : le lien géré, ou le
@@ -311,11 +461,11 @@ func (p *Provider) Plan(_ context.Context, proj *model.Project) ([]*engine.Step,
 	switch state {
 	case fs.StateCurrent:
 		steps = append(steps, engine.NewStep(resource, engine.NoOp, summary))
-		return steps, nil
+		return append(steps, legacySteps(jobs)...), nil
 	case fs.StateHandEdited, fs.StateForeign:
 		if !p.Force {
 			steps = append(steps, refusStep(resource, summary, path, p.Paths.BackupsDir(), state))
-			return steps, nil
+			return append(steps, legacySteps(jobs)...), nil
 		}
 		// --force : l'étape redevient une mise à jour ordinaire, annoncée comme
 		// telle par « plan » avant qu'« apply » ne l'exécute. La sauvegarde, elle,
@@ -362,7 +512,25 @@ func (p *Provider) Plan(_ context.Context, proj *model.Project) ([]*engine.Step,
 		return fs.WriteAtomic(path, previous, 0o644, fs.KeepOwner)
 	}
 	steps = append(steps, s)
-	return steps, nil
+	return append(steps, legacySteps(jobs)...), nil
+}
+
+// legacySteps signale, par une étape non critique (code 6), chaque tâche dont un
+// nom nu n'est résolu dans le répertoire de travail que par compatibilité.
+func legacySteps(jobs []job) []*engine.Step {
+	var out []*engine.Step
+	for _, j := range jobs {
+		if j.Legacy == "" {
+			continue
+		}
+		msg := legacyMessage(j)
+		s := engine.NewStep("cron/legacy/"+j.Name, engine.Update,
+			fmt.Sprintf("tâche %s : nom nu « %s » résolu par compatibilité", j.Name, j.Legacy))
+		s.Critical = false
+		s.Apply = func(context.Context) error { return errors.New(msg) }
+		out = append(out, s)
+	}
+	return out
 }
 
 // createLog crée un fichier de journal appartenant à l'utilisateur du projet, de

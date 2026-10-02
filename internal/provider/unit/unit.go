@@ -4,6 +4,7 @@ package unit
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -611,17 +612,27 @@ func (p *Provider) Scale(ctx context.Context, proj *model.Project, service strin
 	return changed, nil
 }
 
-// Logs renvoie la commande de consultation des journaux d'un service.
-func (p *Provider) Logs(ctx context.Context, proj *model.Project, service string, follow bool, lines int) error {
+// Logs écrit dans out les journaux des instances d'un service du projet, au fil
+// de l'eau — sans fin sous follow, jusqu'à l'annulation du contexte. La sortie
+// était capturée puis jetée : « service logs » n'affichait rien, et « -f »
+// accumulait le flux en mémoire (Q-66). journalctl ne lance jamais de pager : il
+// tourne dans son propre groupe de processus, hors du premier plan du terminal,
+// où un pager resterait arrêté sur sa première lecture.
+//
+// Le nom ne peut porter ni joker ni « @ » : le motif viserait alors les unités
+// d'autres services, voire d'autres projets. L'appelant vérifie en outre qu'il
+// désigne un service du projet.
+func (p *Provider) Logs(ctx context.Context, proj *model.Project, service string, follow bool, lines int,
+	out, errOut io.Writer) error {
+	if service == "" || strings.HasPrefix(service, "-") || strings.ContainsAny(service, "*?[]\\@/ ") {
+		return fmt.Errorf("nom de service invalide : %q", service)
+	}
 	pattern := fmt.Sprintf("ogs-%s-%s@*", proj.ID(), service)
-	args := []string{"-u", pattern, "-n", strconv.Itoa(lines)}
+	args := []string{"-u", pattern, "-n", strconv.Itoa(lines), "--no-pager"}
 	if follow {
 		args = append(args, "-f")
 	}
-	if p.Exec == nil || p.Exec.Simulated() {
-		return fmt.Errorf("mode simulé : la commande aurait été « journalctl %s »", strings.Join(args, " "))
-	}
-	_, err := p.Exec.Run(ctx, exec.Command{Name: "journalctl", Args: args})
+	_, err := p.Exec.Run(ctx, exec.Command{Name: "journalctl", Args: args, Stdout: out, Stderr: errOut})
 	return err
 }
 

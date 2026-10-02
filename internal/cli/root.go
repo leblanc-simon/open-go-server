@@ -44,7 +44,10 @@ func NewRootCommand() *cobra.Command {
 			if cmd.Annotations["skip-root"] == "true" || parentAllowsNonRoot(cmd) {
 				app.allowNonRoot = true
 			}
-			return app.setup()
+			if err := app.setup(); err != nil {
+				return err
+			}
+			return app.configKeysPolicy(cmd)
 		},
 		PersistentPostRun: func(*cobra.Command, []string) { app.close() },
 		RunE: func(cmd *cobra.Command, _ []string) error {
@@ -106,9 +109,19 @@ func NewRootCommand() *cobra.Command {
 		newMailCommand(app),
 		newFirewallCommand(app),
 	)
-	// Le générateur de scripts de complétion n'a pas besoin du système.
+	// Le générateur de scripts de complétion n'a pas besoin du système. Cobra ne
+	// l'ajoute qu'à l'exécution : le créer ici le soumet à la traduction et aux
+	// validateurs d'arguments (localize), et la dérogation vaut pour chacun des
+	// shells — posée sur le seul parent, elle laissait « ogs completion bash »
+	// exiger root.
+	root.InitDefaultCompletionCmd()
 	if c, _, err := root.Find([]string{"completion"}); err == nil && c != root {
-		c.Annotations = map[string]string{"skip-setup": "true"}
+		for _, sub := range walk(c) {
+			if sub.Annotations == nil {
+				sub.Annotations = map[string]string{}
+			}
+			sub.Annotations["skip-setup"] = "true"
+		}
 	}
 	installCompletions(root, app)
 	localize(root)

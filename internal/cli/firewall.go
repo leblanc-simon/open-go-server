@@ -139,7 +139,7 @@ func newFirewallInitCommand(app *App) *cobra.Command {
 			}
 			app.printf("✓ %s écrit. Le relire, puis : ogs firewall plan\n", path)
 			if !known {
-				app.printf("⚠ adresse de la session inconnue : SSH y est ouvert à tous, à restreindre\n")
+				app.warnf("⚠ adresse de la session inconnue : SSH y est ouvert à tous, à restreindre\n")
 			}
 			return nil
 		},
@@ -606,7 +606,7 @@ func (a *App) applyFirewall(cmd *cobra.Command, allowLockout bool) error {
 			}
 		},
 		OnWarning: func(s *engine.Step, stepErr error) {
-			a.printf("  ⚠ %s : %v\n", s.Summary, stepErr)
+			a.warnf("  ⚠ %s : %v\n", s.Summary, stepErr)
 		},
 		Audit: func(s *engine.Step, outcome, detail string) {
 			_ = a.Audit.Record("", s.Resource, "firewall."+s.Action.String(), outcome, detail)
@@ -661,12 +661,12 @@ func newFirewallConfirmCommand(app *App) *cobra.Command {
 							"ufw.yaml le demande (active: false)\n")
 						return nil
 					case obs.RolledBack():
-						app.printf("⚠ ufw est inactif : le retour automatique a défait l'activation, faute de " +
+						app.warnf("⚠ ufw est inactif : le retour automatique a défait l'activation, faute de " +
 							"confirmation dans le délai — « ogs firewall apply » la refait, à confirmer depuis une " +
 							"nouvelle session\n")
 						return exitf(CodePartial, "ufw est inactif : rien à confirmer")
 					default:
-						app.printf("⚠ ufw est inactif : aucune activation à confirmer — le retour automatique " +
+						app.warnf("⚠ ufw est inactif : aucune activation à confirmer — le retour automatique " +
 							"l'a défaite si le délai est échu, ou ufw n'a pas encore été activé ; « ogs firewall " +
 							"apply » l'active\n")
 						return exitf(CodePartial, "ufw est inactif : rien à confirmer")

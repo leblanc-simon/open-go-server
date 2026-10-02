@@ -362,10 +362,10 @@ func (a *App) reportCloneCopy(skipped fs.Skipped, g cloneGuard, copied bool) []s
 	}
 	named := func(prefix string, names []string, total int, more string) {
 		for _, s := range names {
-			a.printf("⚠ %s : %s\n", prefix, s)
+			a.warnf("⚠ %s : %s\n", prefix, s)
 		}
 		if n := total - len(names); n > 0 {
-			a.printf("⚠ … et %d autre(s) %s\n", n, more)
+			a.warnf("⚠ … et %d autre(s) %s\n", n, more)
 		}
 	}
 	named("non recopié", skipped.WithheldNamed, skipped.Withheld, "entrée(s) de configuration non recopiée(s)")
@@ -374,7 +374,7 @@ func (a *App) reportCloneCopy(skipped fs.Skipped, g cloneGuard, copied bool) []s
 		"fichier(s) lié(s) physiquement à une entrée non recopiée")
 	named("lien recopié tel quel", skipped.OutsideNamed, skipped.Outside, "lien(s) qui sortent de la destination")
 	for _, s := range unchecked {
-		a.printf("⚠ copie non vérifiée : %s\n", s)
+		a.warnf("⚠ copie non vérifiée : %s\n", s)
 	}
 	var parts []string
 	count := func(n int, what string) {
@@ -464,13 +464,13 @@ func (a *App) adviseCloneConfig(source, target *model.Project, g cloneGuard, ski
 		removed = append(removed, g.searched...)
 		switch {
 		case len(removed) == 0:
-			a.printf("\n⚠ ogs n'a rien retiré de la copie : il ne connaît pas les fichiers de configuration "+
+			a.warnf("\n⚠ ogs n'a rien retiré de la copie : il ne connaît pas les fichiers de configuration "+
 				"d'une application %s, et n'a cherché aucun secret de %s\n", at.Kind, source.ID())
 		case len(at.Config) == 0:
-			a.printf("\n⚠ ogs n'a retiré de la copie que %s — il ne connaît pas les fichiers de configuration "+
+			a.warnf("\n⚠ ogs n'a retiré de la copie que %s — il ne connaît pas les fichiers de configuration "+
 				"d'une application %s\n", enumerate(removed), at.Kind)
 		default:
-			a.printf("\n⚠ ogs n'a retiré de la copie que %s\n", enumerate(removed))
+			a.warnf("\n⚠ ogs n'a retiré de la copie que %s\n", enumerate(removed))
 		}
 		if len(at.Config) > 0 {
 			keep("fichiers", "tout autre fichier de www (un .env versionné, un fichier de config/…) : "+
@@ -500,8 +500,12 @@ func (a *App) adviseCloneConfig(source, target *model.Project, g cloneGuard, ski
 		if !copied {
 			a.printf("\n")
 		}
-		a.printf("⚠ %s reprend tel quel de %s :\n", target.ID(), source.ID())
-		show(kept)
+		// L'en-tête et sa liste ne se taisent pas : ce qui passe tel quel de la
+		// production est ce que l'exploitant doit relire (D101).
+		a.warnf("⚠ %s reprend tel quel de %s :\n", target.ID(), source.ID())
+		for _, l := range kept {
+			a.warnf("  %-22s %s\n", l.label, l.text)
+		}
 	}
 
 	var todo []line

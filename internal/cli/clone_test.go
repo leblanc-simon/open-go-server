@@ -650,3 +650,26 @@ func TestLeCloneDUnProjetAdopteNEstPasAdopte(t *testing.T) {
 		t.Errorf("la source doit rester adoptée : %v\n%s", err, source)
 	}
 }
+
+// Q-04 : une base que le clone n'a pas pu remplir est un succès partiel que le
+// code de retour et son motif disent, et que l'audit n'enregistre pas « ok ».
+// Le mode préfixé n'a pas de moteur : la copie des données y échoue toujours.
+func TestLeCloneDitLaCopieDesDonneesEnEchec(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRunPartial("site", "create", "shop.fr", "--kind", "php-prestashop", "--php", "8.1",
+		"--db", "mysql", "--yes")
+	out, code := h.run("site", "clone", "shopfr", "--to", "prep", "--yes")
+	if code != CodePartial {
+		t.Fatalf("code %d, 6 attendu :\n%s", code, out)
+	}
+	_, motif, _ := strings.Cut(out, "\nogs : ")
+	if !strings.Contains(motif, "données de la base") {
+		t.Errorf("le motif du code 6 doit nommer la base non copiée : %q", motif)
+	}
+	for _, ligne := range strings.Split(h.read(t, filepath.Join("var", "log", "ogs", "audit.log")), "\n") {
+		if strings.Contains(ligne, "site.clone") && strings.Contains(ligne, "\tok\t") {
+			t.Errorf("un clone sans ses données ne s'enregistre pas « ok » : %q", ligne)
+		}
+	}
+}

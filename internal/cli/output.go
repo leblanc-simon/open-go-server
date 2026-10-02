@@ -2,12 +2,15 @@ package cli
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
 	"text/tabwriter"
 
 	"github.com/goccy/go-yaml"
+
+	"leblanc.io/open-go-server/internal/engine"
 )
 
 // envelope est l'enveloppe stable des sorties machine.
@@ -56,12 +59,46 @@ func orEmpty(s []string) []string {
 	return s
 }
 
-// printf écrit sur la sortie, sauf en mode silencieux ou machine.
+// printf écrit la progression sur la sortie, sauf en mode silencieux ou
+// machine. Un avertissement, un échec ou ce que l'exploitant doit faire ne
+// passent jamais par lui : voir warnf.
 func (a *App) printf(format string, args ...any) {
 	if a.Quiet || a.Format != "table" {
 		return
 	}
 	fmt.Fprintf(a.Out, format, args...)
+}
+
+// warnf écrit un avertissement, un échec ou une consigne, qui ne se taisent
+// jamais (D101) : en mode table, ils suivent le fil de la sortie ; sous --quiet
+// ou -o json|yaml, ils passent sur la sortie d'erreur, qui laisse la sortie
+// standard au seul document. Par printf, « apply -q » rendait le code 6 sans
+// dire quel avertissement, et taisait le retour automatique d'ufw.
+func (a *App) warnf(format string, args ...any) {
+	w := a.Out
+	if a.Quiet || a.Format != "table" {
+		w = a.Err
+	}
+	if w == nil {
+		w = os.Stderr
+	}
+	fmt.Fprintf(w, format, args...)
+}
+
+// stepf annonce l'issue d'une étape : une étape critique en échec est un
+// avertissement, les autres de la progression. Une étape non critique en échec
+// ne dit rien ici : le moteur la remonte aussi par OnWarning, dont la ligne « ⚠ »
+// est la seule — sans quoi chaque avertissement s'affichait deux fois, « ✗ »
+// puis « ⚠ » du même message.
+func (a *App) stepf(indent string, s *engine.Step, stepErr error) {
+	line := indent + issueDÉtape(s, stepErr) + "\n"
+	partial := (*engine.PartialError)(nil)
+	switch {
+	case stepErr == nil, errors.As(stepErr, &partial):
+		a.printf("%s", line)
+	case s.Critical:
+		a.warnf("%s", line)
+	}
 }
 
 // confirm demande une confirmation. En mode non interactif, l'absence de --yes
