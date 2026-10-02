@@ -45,8 +45,6 @@ type AppType struct {
 	// défaut et surchargeables. Prestashop, par exemple, ne fonctionne pas avec
 	// les valeurs par défaut de PHP.
 	PHPSettings map[string]string
-	// AllowOverride vaut vrai pour les applications s'appuyant sur .htaccess.
-	AllowOverride bool
 	// Config énumère, relatifs à www, les fichiers où le type range par
 	// convention la configuration d'un environnement : les identifiants et les
 	// adresses de ses bases et de son transport, mais aussi ses secrets — clé
@@ -79,7 +77,7 @@ var appTypes = map[AppKind]AppType{
 	KindPHPPlain: {Kind: KindPHPPlain, Docroot: "www", VHostTemplate: "php-fpm", NeedsPHP: true},
 	KindPrestashop: {
 		Kind: KindPrestashop, Docroot: "www", FrontController: "index.php",
-		VHostTemplate: "php-fpm", NeedsPHP: true, AllowOverride: true,
+		VHostTemplate: "php-fpm", NeedsPHP: true,
 		// parameters.php depuis la 1.7.4, parameters.yml avant elle,
 		// settings.inc.php pour la 1.6 : base, clés des cookies, secret.
 		Config: []string{"app/config/parameters.php", "app/config/parameters.yml", "config/settings.inc.php"},

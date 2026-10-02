@@ -25,6 +25,7 @@ import (
 	"leblanc.io/open-go-server/internal/provider/monitoring"
 	"leblanc.io/open-go-server/internal/provider/system"
 	tlsprov "leblanc.io/open-go-server/internal/provider/tls"
+	"leblanc.io/open-go-server/internal/provider/web"
 	"leblanc.io/open-go-server/internal/validate"
 )
 
@@ -201,6 +202,120 @@ func (a *App) checkDefaultAuthorizedKeys() (status, detail, fix string) {
 			"chown root:root " + keys + " && chmod 0644 " + keys
 	}
 	return "ok", fmt.Sprintf("%s (mode %04o), lié dans le .ssh de chaque projet", keys, perm), ""
+}
+
+// htaccessChecks signale, pour chaque projet servi par Apache, ce que ses
+// .htaccess portent et que le vhost ne reprend pas. Depuis D99, ogs n'active plus
+// les .htaccess sous Apache (AllowOverride None) — un .htaccess servi par
+// www-data pouvait détourner le serveur vers le socket FPM d'un voisin ou vers
+// server-status — et porte lui-même les règles des .htaccess que livre
+// Prestashop. Seul est donc signalé ce que le template ne couvre pas : boutique
+// en sous-répertoire, URI virtuelles du multi-boutique, directives hors du bloc
+// ~~start~~/~~end~~ du .htaccess racine, .htaccess de sous-répertoire qui ne
+// ressemble pas à ceux que Prestashop livre ; pour un autre type, tout .htaccess
+// qui porte une directive. Un .htaccess vide ne dit rien, et rien n'est lu à
+// travers un lien (D51) : un docroot lié est passé.
+func (a *App) htaccessChecks(projects []*model.Project, add func(name, status, detail, fix string)) {
+	for _, p := range projects {
+		if p.Spec.Layout.Docroot == "" {
+			continue // application relayée : aucun docroot servi
+		}
+		reps, err := web.ListerHtaccess(p)
+		if err != nil || len(reps) == 0 {
+			continue
+		}
+		surcharges := "les surcharges du docroot du vhost (…/" + p.ID() + "/docroot/*.conf, D63)"
+		var constats, propres []string
+		for _, rel := range reps {
+			contenu, err := web.LireHtaccess(p, rel)
+			if err != nil || !web.HtaccessSignificatif(contenu) {
+				continue
+			}
+			switch {
+			case p.Spec.App.Kind != model.KindPrestashop:
+				propres = append(propres, rel)
+			case rel == ".":
+				constats = append(constats, web.ConstatsHtaccessRacine(contenu, true)...)
+			case web.EngendreParPrestashop(contenu):
+				// Boutique installée dans un sous-répertoire du docroot.
+				for _, c := range web.ConstatsHtaccessRacine(contenu, true) {
+					constats = append(constats, rel+"/ : "+c)
+				}
+			case !web.HtaccessSousRepertoireCouvert(contenu):
+				propres = append(propres, rel)
+			}
+		}
+		if len(propres) > 0 {
+			constats = append(constats, "directives propres dans "+listeBornee(propres, 5))
+		}
+		if len(constats) == 0 {
+			continue
+		}
+		detail := "le .htaccess n'est pas lu sous Apache (AllowOverride None, D99), et ses directives sont ignorées : "
+		if p.Spec.App.Kind == model.KindPrestashop {
+			detail = "le template reprend les .htaccess livrés par Prestashop, pas ceci (AllowOverride None, D99) : "
+		}
+		add("htaccess "+p.ID(), "avertissement", detail+strings.Join(constats, " ; "),
+			"porter les règles nécessaires dans "+surcharges)
+	}
+}
+
+// prestashopVersionChecks rapproche, pour chaque Prestashop déployé, la version
+// en place des règles que son vhost porte (D99) : elles diffèrent d'une branche à
+// l'autre, et le vhost n'est réécrit qu'au prochain apply. Une version
+// indéterminée est servie avec les règles de la branche par défaut, ce qui se dit
+// aussi.
+func prestashopVersionChecks(projects []*model.Project, eng web.Engine, add func(name, status, detail, fix string)) {
+	for _, p := range projects {
+		if p.Spec.App.Kind != model.KindPrestashop || p.Spec.Layout.Docroot == "" || !web.CodePrestashopPresent(p) {
+			continue
+		}
+		nom := "prestashop " + p.ID()
+		version := web.VersionPrestashop(p)
+		branche := web.BranchePrestashop(version)
+		if branche == "" {
+			add(nom, "avertissement", fmt.Sprintf("version de Prestashop indéterminée (%s) : le vhost porte les "+
+				"règles de la %s (D99)", valeurOuAbsente(version), web.BrancheParDefaut),
+				"src/Core/Version.php (8, 9) ou app/AppKernel.php (1.7), sous le docroot, doit appartenir à son "+
+					"propriétaire, ne pas être un lien et ne pas dépasser 256 Kio")
+			continue
+		}
+		vhosts := p.VHosts()
+		if len(vhosts) == 0 {
+			continue
+		}
+		chemin := filepath.Join(eng.AvailableDir(), p.VHostFile(vhosts[0]))
+		contenu, err := os.ReadFile(chemin)
+		if err != nil {
+			continue // vhost pas encore écrit : le plan le dira
+		}
+		if !web.RenduPourBranche(contenu, branche) {
+			add(nom, "avertissement", fmt.Sprintf("Prestashop %s en place, mais le vhost %s ne porte pas les "+
+				"règles de la %s (D99)", version, chemin, branche), "ogs apply "+p.ID())
+			continue
+		}
+		add(nom, "ok", fmt.Sprintf("Prestashop %s, vhost aux règles de la %s", version, branche), "")
+	}
+}
+
+func valeurOuAbsente(v string) string {
+	if v == "" {
+		return "aucune version lisible"
+	}
+	return "version " + v
+}
+
+// listeBornee énumère au plus n éléments, puis en dit le reste.
+func listeBornee(elements []string, n int) string {
+	for i, e := range elements {
+		if e == "." {
+			elements[i] = "la racine"
+		}
+	}
+	if len(elements) <= n {
+		return strings.Join(elements, ", ")
+	}
+	return fmt.Sprintf("%s et %d autre(s)", strings.Join(elements[:n], ", "), len(elements)-n)
 }
 
 func (a *App) runChecks(ctx context.Context) []check {
@@ -439,6 +554,15 @@ func (a *App) runChecks(ctx context.Context) []check {
 	}
 	add("projets", "ok", fmt.Sprintf("%d déclaré(s)", len(projects)), "")
 	certificateDeclarationChecks(projects, add)
+
+	// .htaccess sous Apache : ogs ne les active plus (AllowOverride None, D99) et
+	// porte lui-même les règles de base. Ce qu'un .htaccess ajoute est ignoré.
+	if eng, err := a.webEngine(); err == nil {
+		if eng.Name() == "apache" {
+			a.htaccessChecks(projects, add)
+		}
+		prestashopVersionChecks(projects, eng, add)
+	}
 
 	// Délégation sudo : un fichier au préfixe ogs- non généré par l'outil, ou
 	// élargi à la main, mérite d'être signalé.

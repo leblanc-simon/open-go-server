@@ -150,14 +150,41 @@ func correspond(t *testing.T, motif, sujet string) bool {
 	if i < 0 {
 		return compiler(motif).MatchString(sujet)
 	}
-	if !strings.HasSuffix(motif, ")") || strings.Contains(motif[:i], "|") {
+	if !strings.HasSuffix(motif, ")") || alternanceDePremierNiveau(motif[:i]) {
 		t.Fatalf("assertion négative hors de la forme « début(?!exclu) » : %s", motif)
 	}
 	debut := compiler(motif[:i])
-	exclu := compiler("^(?:" + motif[i+3:len(motif)-1] + ")")
+	// Un « (?i) » de tête vaut pour tout le motif, assertion comprise, comme sous PCRE.
+	drapeaux := ""
+	if strings.HasPrefix(motif, "(?i)") {
+		drapeaux = "(?i)"
+	}
+	exclu := compiler(drapeaux + "^(?:" + motif[i+3:len(motif)-1] + ")")
 	for _, m := range debut.FindAllStringIndex(sujet, -1) {
 		if !exclu.MatchString(sujet[m[1]:]) {
 			return true
+		}
+	}
+	return false
+}
+
+// alternanceDePremierNiveau dit si un motif porte un « | » hors de toute
+// parenthèse : l'assertion négative qui le suit ne vaudrait alors que pour la
+// dernière branche, ce que l'émulation ne sait pas rendre. Un « (/|$) » est admis.
+func alternanceDePremierNiveau(motif string) bool {
+	profondeur := 0
+	for i := 0; i < len(motif); i++ {
+		switch motif[i] {
+		case '\\':
+			i++
+		case '(':
+			profondeur++
+		case ')':
+			profondeur--
+		case '|':
+			if profondeur == 0 {
+				return true
+			}
 		}
 	}
 	return false
@@ -339,32 +366,6 @@ func optionsEnVigueur(vhost, chemin string) map[string]bool {
 	return opts
 }
 
-// optionsOuvertesAuHtaccess renvoie les options qu'un .htaccess peut régler
-// sous une directive AllowOverride, comme Apache la lit : « All » et « Options »
-// nu ouvrent toutes les options, « Options=liste » les restreint, dans l'ordre
-// des mots.
-func optionsOuvertesAuHtaccess(ligne string) map[string]bool {
-	toutes := map[string]bool{"all": true}
-	out := map[string]bool{}
-	for _, mot := range strings.Fields(ligne)[1:] {
-		cle, liste, avecListe := strings.Cut(mot, "=")
-		switch {
-		case strings.EqualFold(cle, "None"):
-			out = map[string]bool{}
-		case strings.EqualFold(cle, "All"):
-			out = toutes
-		case strings.EqualFold(cle, "Options") && !avecListe:
-			out = toutes
-		case strings.EqualFold(cle, "Options"):
-			out = map[string]bool{}
-			for _, o := range strings.Split(liste, ",") {
-				out[strings.ToLower(o)] = true
-			}
-		}
-	}
-	return out
-}
-
 // directivesApache renvoie les directives de premier niveau d'un corps de
 // section : celles des sections qu'il contient n'y figurent pas.
 func directivesApache(corps string) []string {
@@ -473,27 +474,39 @@ func TestLeServeurWebNeSuitUnLienQueVersCeQuiAppartientASonAuteur(t *testing.T) 
 					chemin, opts)
 			}
 		}
-		// Un .htaccess ne doit pas pouvoir rétablir FollowSymLinks : Prestashop lit
-		// les siens (AllowOverride), et « All » ouvre toutes les options.
+		// Aucun .htaccess n'est honoré sous Apache : AllowOverride None partout,
+		// jamais « All » ni une AllowOverrideList — un simple RewriteRule d'un
+		// .htaccess suffisait à détourner le serveur (D99).
 		for _, l := range strings.Split(vhost, "\n") {
-			if !strings.HasPrefix(l, "AllowOverride ") {
+			l = strings.TrimSpace(l)
+			if !strings.HasPrefix(l, "AllowOverride") {
 				continue
 			}
-			// SymLinksIfOwnerMatch reste réglable : le retirer ne fait que cesser
-			// de suivre les liens. ExecCGI et Includes feraient exécuter du code
-			// sous www-data, membre de tous les groupes.
-			ouvertes := optionsOuvertesAuHtaccess(l)
-			for _, o := range []string{"all", "followsymlinks", "execcgi", "includes", "includesnoexec"} {
-				if ouvertes[o] {
-					t.Errorf("« %s » laisse un .htaccess régler %s (%v)", l, o, ouvertes)
+			if l != "AllowOverride None" {
+				t.Errorf("le docroot doit poser « AllowOverride None », pas %q", l)
+			}
+		}
+		// Les règles dont Prestashop a besoin sont portées par le template, comme
+		// sous nginx : front controller, API, images, et refus des répertoires de
+		// code et de données que ses .htaccess protègent.
+		if p.Spec.App.Kind == model.KindPrestashop {
+			for _, r := range []string{
+				"RewriteRule ^api",
+				"webservice/dispatcher.php",
+				"img/p/",
+				"RewriteRule ^.*$ index.php",
+			} {
+				if !strings.Contains(vhost, r) {
+					t.Errorf("règle Prestashop absente du vhost : %q\n%s", r, vhost)
 				}
 			}
-			if p.Spec.App.Kind == model.KindPrestashop && !ouvertes["symlinksifownermatch"] {
-				t.Errorf("« %s » fait répondre 500 à un .htaccess qui pose la forme sûre, "+
-					"« Options +SymLinksIfOwnerMatch »", l)
+			for _, dir := range []string{"app", "config", "var", "vendor", "classes", "controllers", "src", "translations"} {
+				if !refuseApache(t, vhost, "/"+dir+"/x") {
+					t.Errorf("le répertoire /%s/ doit être refusé (protégé par un .htaccess de Prestashop)", dir)
+				}
 			}
-			if p.Spec.App.Kind == model.KindPrestashop && !strings.Contains(l, "All") {
-				t.Errorf("Prestashop s'appuie sur ses .htaccess : %q", l)
+			if strings.Contains(vhost, "AllowOverrideList") || strings.Contains(vhost, "SetHandler default-handler") {
+				t.Error(".htaccess n'étant plus honoré, ni AllowOverrideList ni SetHandler default-handler n'ont lieu d'être")
 			}
 		}
 	})
@@ -917,31 +930,66 @@ func TestApacheReelNeSuitNiLiensEtrangersNiFichiersCaches(t *testing.T) {
 				t.Fatal(err)
 			}
 			if c.kind == model.KindPrestashop {
-				// Ce que Prestashop écrit dans ses .htaccess reste admis ; un
-				// « Require all granted » n'y rouvre pas les fichiers cachés.
-				ecrire(".htaccess", "Options -MultiViews\nDirectoryIndex index.php\n"+
-					"<IfModule mod_rewrite.c>\nRewriteEngine on\n</IfModule>\nRequire all granted\n")
-				// Les .htaccess sont bien lus : celui de app/ ferme son répertoire,
-				// comme Prestashop le fait pour app/, config/ ou var/.
-				ecrire("app/.htaccess", "Require all denied\n")
-				ecrire("app/parameters.txt", "secret\n")
-				// Un .htaccess ne rétablit pas le suivi des liens : Apache refuse
-				// la directive, et la requête avec elle.
+				// ogs n'active plus les .htaccess sous Apache (AllowOverride None,
+				// D99) : ceux que Prestashop et ses modules déposent sont ignorés. On
+				// le vérifie sur les directives dangereuses — un .htaccess ne doit ni
+				// détourner le serveur (socket FPM d'un voisin, server-status) ni faire
+				// répondre 500 : il est simplement sans effet.
+				ecrire("seth-status/.htaccess", "SetHandler server-status\n")
+				ecrire("seth-status/page.txt", "contenu seth-status\n")
+				ecrire("seth-voisin/.htaccess",
+					"SetHandler \"proxy:unix:/run/php/voisin.sock|fcgi://localhost\"\n")
+				ecrire("seth-voisin/page.txt", "contenu seth-voisin\n")
+				ecrire("addt-status/.htaccess", "AddType server-status .txt\n")
+				ecrire("addt-status/page.txt", "contenu addt\n")
+				ecrire("hflag-status/.htaccess",
+					"RewriteEngine on\nRewriteRule ^ - [H=server-status]\n")
+				ecrire("hflag-status/page.txt", "contenu hflag\n")
+				ecrire("tflag-status/.htaccess",
+					"RewriteEngine on\nRewriteRule ^ - [T=server-status]\n")
+				ecrire("tflag-status/page.txt", "contenu tflag\n")
+				// Un .htaccess qui rouvrirait le suivi des liens est sans effet : le
+				// template garde SymLinksIfOwnerMatch (D87) — un lien vers un fichier
+				// étranger n'est pas suivi, un lien vers ses propres fichiers l'est.
 				ecrire("rouvre/.htaccess", "Options +FollowSymLinks\n")
 				lier(etranger, "rouvre/etranger.txt")
-				// La forme sûre reste admise, dans un sens comme dans l'autre :
-				// retirer SymLinksIfOwnerMatch ne fait que cesser de suivre les liens.
-				ecrire("sur/.htaccess", "Options +SymLinksIfOwnerMatch\n")
-				lier("../page.txt", "sur/lien.txt")
-				ecrire("strict/.htaccess", "Options -SymLinksIfOwnerMatch\n")
-				lier("../page.txt", "strict/lien.txt")
-				// Toute autre option est refusée, retrait compris : Apache ne
-				// distingue pas « -ExecCGI » de « +ExecCGI ».
-				ecrire("cgi/.htaccess", "Options -ExecCGI\n")
-				ecrire("cgi/page.txt", "page\n")
-				// MultiViews reste admise au .htaccess : Prestashop la retire,
-				// un projet peut l'ouvrir.
-				ecrire("negocie/.htaccess", "Options +MultiViews\n")
+				lier("../page.txt", "rouvre/lien.txt")
+				// Répertoires que Prestashop protège par un .htaccess « Require all
+				// denied » : le refus est désormais porté par le template. Un asset de
+				// module reste servi.
+				ecrire("app/config/params.txt", "secret\n")
+				ecrire("var/logs/debug.txt", "secret\n")
+				ecrire("config/settings.txt", "secret\n")
+				ecrire("vendor/autoload.txt", "secret\n")
+				ecrire("modules/x/views/templates/t.tpl", "secret smarty\n")
+				ecrire("modules/x/views/css/style.css", "body{}\n")
+				// Répertoire d'administration renommé à l'installation, reconnu à son
+				// cron_currency_rates.php.
+				ecrire("admin7x2k/cron_currency_rates.php", "<?php\n")
+				ecrire("admin7x2k/backups/sauvegarde.sql.bz2", "secret\n")
+				ecrire("admin7x2k/export/clients.csv", "secret\n")
+				ecrire("admin7x2k/import/produits.csv", "secret\n")
+				ecrire("admin7x2k/themes/default/css/admin.css", "body{}\n")
+				// Tout backups/, export/ ou import/ d'un répertoire de premier niveau est
+				// refusé, quel que soit son nom : la 9 n'a plus de get-file-admin.php.
+				ecrire("rapports/export/public.txt", "secret\n")
+				// Listes blanches par extension et exceptions ouvertes par Prestashop.
+				ecrire("img/notes.txt", "secret\n")
+				ecrire("themes/classic/config/theme.yml", "secret\n")
+				ecrire("themes/classic/assets/css/theme.css", "body{}\n")
+				ecrire("js/porte.php", "<?php\n")
+				ecrire("js/jquery/jquery.js", "jquery\n")
+				ecrire("mails/fr/order_conf.html", "secret\n")
+				ecrire("mails/themes/modern/assets/logo.png", "logo\n")
+				ecrire("templates/index.tpl", "secret\n")
+				ecrire("docs/csv_import/produits.csv", "exemple\n")
+				ecrire("docs/readme.txt", "secret\n")
+				ecrire("translations/cldr/fr.json", "{}\n")
+				ecrire("tools/foundation/foundation.js", "outil\n")
+				ecrire("tools/profiling/Profiler.txt", "secret\n")
+				// Images de produit à plusieurs chiffres, et .jpeg.
+				ecrire("img/p/1/2/3/123-home_default.jpg", "image-123\n")
+				ecrire("img/p/1/2/3/4/5/6/7/1234567-large_default.jpeg", "image-1234567\n")
 			}
 
 			bp := buildMain(t, prov, p)
@@ -988,16 +1036,60 @@ func TestApacheReelNeSuitNiLiensEtrangersNiFichiersCaches(t *testing.T) {
 			attendre("/etranger.txt", 403)
 			attendre("/repertoire-etranger/"+filepath.Base(etranger), 403)
 			if c.kind == model.KindPrestashop {
-				attendre("/app/parameters.txt", 403)
-				attendre("/rouvre/etranger.txt", 500)
-				attendre("/sur/lien.txt", 200)
-				attendre("/strict/lien.txt", 403)
-				attendre("/cgi/page.txt", 500)
-				// La variante est cherchée par une sous-requête sur le fichier,
-				// qui ne passe pas par la traduction de l'URL : le RedirectMatch
-				// ne la voit pas.
-				attendre("/negocie/page", 200)
-				nonServi("/negocie/composer")
+				// Répertoires de code et de données refusés par le template (D99),
+				// et modèles de modules jamais servis bruts.
+				for _, uri := range []string{"/app/config/params.txt", "/var/logs/debug.txt",
+					"/config/settings.txt", "/vendor/autoload.txt", "/modules/x/views/templates/t.tpl"} {
+					attendre(uri, 403)
+				}
+				// Un asset de module reste servi.
+				attendre("/modules/x/views/css/style.css", 200)
+				// Les .htaccess malveillants sont ignorés : le fichier propre du projet
+				// est servi tel quel, jamais l'état du serveur ni le FPM d'un voisin, et
+				// sans 500.
+				for _, cas := range []struct{ uri, contenu string }{
+					{"/seth-status/page.txt", "contenu seth-status"},
+					{"/seth-voisin/page.txt", "contenu seth-voisin"},
+					{"/addt-status/page.txt", "contenu addt"},
+					{"/hflag-status/page.txt", "contenu hflag"},
+					{"/tflag-status/page.txt", "contenu tflag"},
+				} {
+					code, corps := obtenir(cas.uri)
+					if code != 200 || !strings.Contains(corps, cas.contenu) || strings.Contains(corps, "Server Status") {
+						t.Errorf("GET %s : %d, un .htaccess détourne encore le serveur (%.80q)",
+							cas.uri, code, corps)
+					}
+				}
+				// SymLinksIfOwnerMatch reste en vigueur malgré un .htaccess contraire.
+				attendre("/rouvre/lien.txt", 200)
+				attendre("/rouvre/etranger.txt", 403)
+				// Ce que les .htaccess de sous-répertoires livrés refusent, et ce
+				// qu'ils ouvrent (D99).
+				for _, uri := range []string{
+					"/admin7x2k/backups/sauvegarde.sql.bz2", "/admin7x2k/export/clients.csv",
+					"/admin7x2k/import/produits.csv", "/rapports/export/public.txt", "/img/notes.txt",
+					"/themes/classic/config/theme.yml",
+					"/js/porte.php", "/mails/fr/order_conf.html", "/templates/index.tpl",
+					"/docs/readme.txt", "/tools/profiling/Profiler.txt",
+				} {
+					attendre(uri, 403)
+				}
+				for _, uri := range []string{
+					"/admin7x2k/themes/default/css/admin.css",
+					"/themes/classic/assets/css/theme.css", "/js/jquery/jquery.js",
+					"/mails/themes/modern/assets/logo.png", "/docs/csv_import/produits.csv",
+					"/translations/cldr/fr.json", "/tools/foundation/foundation.js",
+				} {
+					attendre(uri, 200)
+				}
+				for uri, contenu := range map[string]string{
+					"/123-home_default/t-shirt.jpg":    "image-123",
+					"/1234567-large_default/pull.jpeg": "image-1234567",
+				} {
+					if code, corps := obtenir(uri); code != 200 || !strings.Contains(corps, contenu) {
+						t.Errorf("GET %s : %d, l'image de produit n'est pas réécrite (%.60q)", uri, code, corps)
+					}
+				}
 			}
 
 			// Une restriction d'accès ordinaire, déposée dans le contexte du vhost
@@ -1030,7 +1122,12 @@ func TestApacheReelNeSuitNiLiensEtrangersNiFichiersCaches(t *testing.T) {
 			for _, uri := range urlsSensibles {
 				attendre(uri, 403)
 			}
-			attendre("/negocie/page", 200)
+			// Sous Prestashop, le répartiteur porté par le template conduit une URL
+			// sans fichier au front controller avant toute négociation ; la variante
+			// MultiViews ne s'observe que sur les types à FallbackResource.
+			if c.kind != model.KindPrestashop {
+				attendre("/negocie/page", 200)
+			}
 			nonServi("/negocie/composer")
 
 			// Le docroot lui-même remplacé par un lien : le home appartient à
@@ -1070,7 +1167,10 @@ func demarrerApache(t *testing.T, apache, modules, vhost string) string {
 		filepath.Join(dir, "httpd.pid"), dir, dir, filepath.Join(dir, "error.log"))
 	// mod_negotiation est actif par défaut sous Debian : c'est lui qui sert
 	// MultiViews.
-	for _, m := range []string{"mpm_event", "authz_core", "alias", "dir", "mime", "negotiation", "rewrite", "headers", "proxy", "proxy_fcgi"} {
+	// mod_status est chargé pour éprouver la neutralisation du repli « type →
+	// gestionnaire » (D99) : sans lui, le gestionnaire « server-status » n'existe
+	// pas et l'épreuve serait creuse.
+	for _, m := range []string{"mpm_event", "authz_core", "alias", "dir", "mime", "negotiation", "rewrite", "headers", "proxy", "proxy_fcgi", "status"} {
 		fmt.Fprintf(&b, "LoadModule %s_module %s/mod_%s.so\n", m, modules, m)
 	}
 	b.WriteString("TypesConfig /etc/mime.types\nAccessFileName .htaccess\n")

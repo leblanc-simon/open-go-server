@@ -13,7 +13,7 @@ Les commits ne mentionnent jamais l'assistance d'un outil d'IA.
 ## La référence
 
 [`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md) fait autorité : 96 décisions d'architecture
-arbitrées (D1–D96, tableau §2), spécification par module, plan de tests, découpage en lots. **Consulter le
+arbitrées (D1–D99, tableau §2), spécification par module, plan de tests, découpage en lots. **Consulter le
 tableau des décisions avant de proposer une architecture** — la plupart des questions « pourquoi pas
 plutôt… ? » y sont déjà tranchées, avec leur raison. Toute décision nouvelle s'y ajoute.
 
@@ -496,6 +496,42 @@ Ils ont tous coûté un défaut réel ; les tests unitaires ne les voyaient pas.
 - **Apache traite les sections `<Location>` dans l'ordre du fichier**, non par spécificité. Un
   `<Location />  Require all denied` placé en dernier annule les autorisations accordées plus haut : le
   vhost paraît correct et répond 403 à tout le monde.
+- **ogs n'active jamais les `.htaccess` sous Apache** (`AllowOverride None`, D99), et porte les règles utiles
+  dans le template comme sous nginx. La raison : `www-data` sert tous les projets, et un `.htaccess` écrit par
+  le compte du projet pouvait détourner le serveur hors de son site par un **simple `RewriteRule`** —
+  `[H=server-status]` (activité du parc), `[H=proxy:unix:…/<voisin>.sock|fcgi://localhost]` (FPM d'un voisin),
+  `[P]` vers `unix:…<voisin>.sock|fcgi://localhost/tmp/x.php` (exécution d'un script choisi, `/tmp` étant dans
+  l'`open_basedir` du voisin). Une borne par `AllowOverrideList` **ne suffit pas** : elle contrôle quelles
+  directives sont admises, pas les drapeaux d'un `RewriteRule` — que Prestashop emploie légitimement —, et
+  `<Proxy> Require all denied` ne filtre pas `[P]` (vérifié sur le vrai Apache). Un `AllowOverrideList` qui
+  oublie une directive livrée (p. ex. `AddOutputFilterByType`, bloc « Optimisations Apache » de Prestashop)
+  fait en outre répondre **500 à toute la boutique**, sans que `apply` ni `doctor` le voient. D'où le choix
+  d'ignorer le `.htaccess`. Reprendre ses règles se fait aux sources réelles : `Tools::generateHtaccess` (le
+  `.htaccess` racine) et les 32 `.htaccess` de sous-répertoires, à traduire en `RewriteRule` dans le
+  `<Directory>` du docroot (mêmes sémantiques qu'en `.htaccess`) et en `RedirectMatch 403` — **listes blanches
+  par extension comprises** (`img/`, `themes/`, `js/`) et exceptions (`docs/csv_import`, `mails/themes`,
+  `translations/cldr`, `tools/` hors `profiling`), faute de quoi un portage « par répertoires » sert ce que
+  Prestashop refusait (`themes/**/config/theme.yml`, un `.php` de thème exécuté). Les images de produit ont
+  **une règle par longueur d'identifiant, 1 à 7 chiffres** ; le répertoire d'administration, renommé, se
+  reconnaît à son `cron_currency_rates.php` — `get-file-admin.php` n'existe plus en 9, et ses sauvegardes
+  repassaient en 200. **Les `.htaccess` livrés diffèrent d'une branche à l'autre** (1.7, 8, 9 : images,
+  listes blanches, `upload/`, scripts de `modules/`, `admin-api/`) : le template les rend d'après la version
+  lue au rendu dans `src/Core/Version.php` ou `app/AppKernel.php` (par descripteur), la 8 pour une version
+  indéterminée — refuser les `.php` de modules d'une 8 casserait ses appels ajax. Sous-répertoire
+  (`REWRITEBASE`) et URI virtuelles ne sont pas repris : le plan et `doctor` les annoncent. Une règle de ce
+  template ne se juge qu'**URL par URL contre les `.htaccess` livrés actifs**, sur un vrai Apache et un vrai
+  nginx : c'est ainsi qu'est apparu qu'Apache rend 403 à un fichier absent sous un répertoire absent d'`img/`
+  ou de `js/`, son `<Files>` jugeant le premier composant manquant et non le nom demandé, et qu'un refus de
+  `^/[^/]+/(backups|export|import)` sans condition coupait des URL propres (`/fr/import/12-x.html`,
+  `/module/export/ajax`) : il ne vaut que sous un **répertoire réel**. Sous nginx, ce contrôle vit au niveau
+  du `server` (`if (-d $var)`) : une location regex qui le porterait devrait inclure les surcharges du docroot
+  (D63), où une location imbriquée est fatale ; et la variable part d'un chemin absolu qui ne peut être un
+  répertoire (`/dev/null/ogs`). **Sous `disable_symlinks`** (`on` ou `if_not_owner`, avec ou sans `from=`),
+  nginx ouvre le chemin composant par composant et, d'un chemin vide, éprouve le répertoire de départ :
+  `if (-d $v)` est vrai pour `$v` vide, et **tout** le site répondait 403. Sans `disable_symlinks`, faux —
+  un essai sur un nginx nu ne le montre pas. Les tests émulent l'assertion négative de PCRE (`correspond`) : elle
+  doit **finir** le motif, et un `(?i)` de tête vaut pour elle. Reste ouverte la course `SymLinksIfOwnerMatch`
+  de D87, qui tient à l'identité `www-data` (D25, §20).
 - **`mod_proxy_fcgi` dérive `SCRIPT_NAME` de l'URI demandée**, non du chemin de la cible `fcgi://`. Un
   `ProxyPass /x unix:…|fcgi://localhost/ogs-fpm-status` ne suffit donc pas : FPM ne reconnaît pas son
   `pm.status_path`, cherche un fichier et répond « Primary script unknown ». `ProxyFCGISetEnvIf` réécrit la

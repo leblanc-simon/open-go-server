@@ -142,6 +142,97 @@ if [ "$code" = "200" ] && [ -s /tmp/piege.out ]; then
 fi
 
 echo
+echo "--- Prestashop : les règles de ses .htaccess sont portées par le template (D99) ---"
+# nginx ne lit pas les .htaccess : les mêmes règles que sous Apache sont portées
+# par le template — images de produit de 1 à 7 chiffres, refus des répertoires et
+# listes blanches par extension des .htaccess de sous-répertoires livrés.
+ogs site create boutique.test --kind php-prestashop --php "$version" --tls=false --yes -q >/dev/null 2>&1
+# FPM : rechargé par son pidfile, le titre réécrit du maître échappant à pkill -f.
+sock=$(sed -n 's/^listen = //p' "/etc/php/$version/fpm/pool.d/boutiquetest.conf")
+kill -USR2 "$(cat "/run/php/php$version-fpm.pid")" 2>/dev/null || true
+for _ in $(seq 1 10); do
+    [ -S "$sock" ] && break
+    sleep 1
+done
+racineps=/home/boutique.test/www
+poser() { mkdir -p "$(dirname "$racineps/$1")" && printf '%s\n' "$2" > "$racineps/$1"; }
+poser index.php '<?php echo "front boutique\n";'
+poser admin7x2k/cron_currency_rates.php '<?php'
+poser admin7x2k/index.php '<?php echo "back-office\n";'
+poser webservice/dispatcher.php '<?php echo "api ok\n";'
+poser admin7x2k/backups/sauvegarde.sql.bz2 'secret'
+poser admin7x2k/export/clients.csv 'secret'
+poser img/p/1/2/3/123-home_default.jpg 'image-123'
+poser img/p/1/2/3/4/5/6/7/1234567-large_default.jpeg 'image-1234567'
+poser img/notes.txt 'secret'
+poser themes/classic/config/theme.yml 'secret'
+poser themes/classic/assets/css/theme.css 'body{}'
+poser upload/x.txt 'secret'
+poser var/logs/debug.log 'secret'
+poser mails/fr/order_conf.html 'secret'
+poser templates/index.tpl 'secret'
+poser docs/csv_import/produits.csv 'exemple'
+poser translations/cldr/fr.json '{}'
+poser tools/foundation/foundation.js 'outil'
+poser img/c/3_thumb-category_default.jpg 'vignette-3'
+poser modules/m/logs/m.log 'secret'
+poser modules/m/views/css/front.css 'body{}'
+# Une 9 : l'apply réécrit le vhost, écrit à la création sur un docroot vide, avec
+# les règles de cette branche.
+poser src/Core/Version.php "<?php
+final class Version
+{
+    public const VERSION = '9.0.0';"
+chown -R boutiquetest:boutiquetest "$racineps"
+ogs apply boutiquetest --yes >/dev/null 2>&1
+if ! grep -q "Règles de Prestashop 9\." /etc/nginx/sites-available/boutiquetest*; then
+    echo "ÉCHEC : le vhost nginx n'a pas été réécrit pour la 9"
+    exit 1
+fi
+# L'appartenance de www-data au groupe du projet n'est prise qu'au démarrage des
+# workers (voir plus bas) : un rechargement en relance.
+systemctl reload nginx
+sleep 1
+attendu() {
+    local uri=$1 code=$2 contenu=${3:-} obtenu
+    obtenu=$(curl -s -o /tmp/ps.out -w '%{http_code}' -H 'Host: boutique.test' "http://127.0.0.1$uri")
+    printf '  %-42s %s %s\n' "$uri" "$obtenu" "$(head -c 40 /tmp/ps.out | tr '\n' ' ')"
+    if [ "$obtenu" != "$code" ] || { [ -n "$contenu" ] && ! grep -q "$contenu" /tmp/ps.out; }; then
+        echo "ÉCHEC : $uri devait répondre $code${contenu:+ avec « $contenu »}"
+        exit 1
+    fi
+}
+attendu / 200 "front boutique"
+attendu /ma-categorie/mon-produit 200 "front boutique"
+attendu /123-home_default/t-shirt.jpg 200 image-123
+attendu /1234567-large_default/pull.jpeg 200 image-1234567
+attendu /c/3_thumb-category_default/vetements.jpg 200 vignette-3
+for uri in /admin7x2k/backups/sauvegarde.sql.bz2 /admin7x2k/export/clients.csv \
+    /admin7x2k/backups/absent.sql /img/notes.txt /themes/classic/config/theme.yml \
+    /upload/x.txt /var/logs/debug.log /mails/fr/order_conf.html /templates/index.tpl \
+    /modules/m/logs/m.log; do
+    attendu "$uri" 403
+done
+attendu /modules/m/views/css/front.css 200
+# Une URL propre dont le deuxième segment est « export » ou « import » n'est
+# refusée que sous un répertoire réel : catégorie sous un préfixe de langue,
+# contrôleur front d'un module ainsi nommé.
+attendu /fr/export/12-produit.html 200 "front boutique"
+attendu /module/export/ajax 200 "front boutique"
+attendu /docs/csv_import/produits.csv 200 exemple
+attendu /translations/cldr/fr.json 200
+attendu /tools/foundation/foundation.js 200 outil
+attendu /themes/classic/assets/css/theme.css 200
+# Limite préexistante, relevée sans être tranchée ici : le vhost PHP de nginx
+# n'exécute que le front controller racine, si bien que le webservice et le
+# back-office — d'autres index.php — y répondent 404. On le constate.
+for uri in /api/products /admin7x2k/index.php; do
+    echo "  (constat) $uri → HTTP $(curl -s -o /dev/null -w '%{http_code}' -H 'Host: boutique.test' "http://127.0.0.1$uri")"
+done
+ogs project delete boutiquetest --yes >/dev/null 2>&1
+echo "les règles de Prestashop sont servies sous nginx comme sous Apache"
+
+echo
 echo "--- l'accueil reste servi sous disable_symlinks ---"
 # « / » désigne le docroot lui-même, en 0710 (D51) : sous disable_symlinks,
 # nginx n'éprouve plus un répertoire par stat() mais l'ouvre en lecture, ce que

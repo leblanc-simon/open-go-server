@@ -510,8 +510,16 @@ func TestPrestashopAndSymfonyCoexist(t *testing.T) {
 	if !strings.Contains(vhShop, filepath.Join("shop.fr", "www", "public")) {
 		t.Errorf("Symfony sert www/public :\n%s", vhShop)
 	}
-	if !strings.Contains(vhBoutique, "AllowOverride All") || !strings.Contains(vhShop, "AllowOverride None") {
-		t.Error("AllowOverride doit suivre le type d'application")
+	// ogs n'active jamais les .htaccess sous Apache (AllowOverride None, D99) : les
+	// deux vhosts le posent, et Prestashop porte ses règles dans le template.
+	if strings.Contains(vhBoutique, "AllowOverride All") || strings.Contains(vhBoutique, "AllowOverrideList") {
+		t.Errorf("Prestashop : le .htaccess ne doit plus être honoré (AllowOverride None, D99) :\n%s", vhBoutique)
+	}
+	if !strings.Contains(vhBoutique, "AllowOverride None") || !strings.Contains(vhShop, "AllowOverride None") {
+		t.Error("les vhosts Apache doivent poser AllowOverride None")
+	}
+	if !strings.Contains(vhBoutique, "webservice/dispatcher.php") {
+		t.Errorf("Prestashop : les règles de son .htaccess doivent être portées par le template :\n%s", vhBoutique)
 	}
 }
 

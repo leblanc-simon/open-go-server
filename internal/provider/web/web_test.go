@@ -120,16 +120,37 @@ func TestApacheSymfonyVHost(t *testing.T) {
 	}
 }
 
-func TestApachePrestashopUsesHtaccess(t *testing.T) {
+func TestApachePrestashopCarriesRewrites(t *testing.T) {
 	prov, _ := fixture(t, "apache")
 	p := project(t, "boutique.fr", model.KindPrestashop, "", "7.4")
 	bp := buildMain(t, prov, p)
 	c := string(bp.Content)
-	if !strings.Contains(c, "AllowOverride All") {
-		t.Error("Prestashop s'appuie sur .htaccess : AllowOverride All est requis")
+	// ogs n'active plus les .htaccess sous Apache (AllowOverride None, D99) : ni
+	// « All » ni une AllowOverrideList — un .htaccess pouvait détourner le serveur.
+	if strings.Contains(c, "AllowOverride All") || strings.Contains(c, "AllowOverrideList") {
+		t.Errorf("le .htaccess ne doit plus être honoré (AllowOverride None) :\n%s", c)
+	}
+	if !strings.Contains(c, "AllowOverride None") {
+		t.Error("le docroot Prestashop doit poser AllowOverride None")
+	}
+	// Les règles du .htaccess de Prestashop sont portées par le template, comme
+	// sous nginx : front controller, API, images.
+	for _, want := range []string{
+		"RewriteRule ^api",
+		"webservice/dispatcher.php",
+		"img/p/",
+		"RewriteRule ^.*$ index.php",
+	} {
+		if !strings.Contains(c, want) {
+			t.Errorf("règle Prestashop absente du vhost, %q :\n%s", want, c)
+		}
+	}
+	// Les répertoires que ses .htaccess protègent sont refusés par le template.
+	if !strings.Contains(c, "RedirectMatch 403 \"^/(app|") {
+		t.Errorf("le refus des répertoires de code/données doit être porté par le vhost :\n%s", c)
 	}
 	if strings.Contains(c, "FallbackResource") {
-		t.Error("Prestashop gère son routage par .htaccess, pas par FallbackResource")
+		t.Error("Prestashop route par le répartiteur porté au template, pas par FallbackResource")
 	}
 	if !strings.Contains(c, filepath.Join(p.Spec.Layout.Root, "www")+"\n") &&
 		!strings.Contains(c, "DocumentRoot "+filepath.Join(p.Spec.Layout.Root, "www")) {
@@ -145,8 +166,9 @@ func TestNginxPrestashopCarriesRewrites(t *testing.T) {
 	bp := buildMain(t, prov, p)
 	c := string(bp.Content)
 	for _, want := range []string{
-		"rewrite ^/api/?(.*)$",
-		"/img/p/",
+		"rewrite ^/api(?:/(.*))?$ /webservice/dispatcher.php?url=$1 last;",
+		"/img/p/$2/$3/$4/$5/$6/$7/$8/$1$9 last;", // identifiants jusqu'à 7 chiffres
+		"jpe?g",
 		"deny all;",
 		"fastcgi_pass unix:",
 	} {
@@ -1319,12 +1341,19 @@ func TestLesVHostsNginxNEmploientQueDesVariablesDefinies(t *testing.T) {
 	verifier := func(t *testing.T, prov *Provider, contenu string) {
 		t.Helper()
 		_, parLeFragment := definies(t, prov)
+		// Une variable posée par « set » dans le vhost même y est définie, mais une
+		// fois seulement avant tout emploi : nginx n'a pas d'ordre de lecture, et
+		// une variable lue sans « set » préalable vaut la chaîne vide.
+		parLeVhost := map[string]bool{}
+		for _, m := range regexp.MustCompile(`(?m)^\s*set\s+(\$[a-z_]+)\s`).FindAllStringSubmatch(contenu, -1) {
+			parLeVhost[m[1]] = true
+		}
 		for _, l := range strings.Split(contenu, "\n") {
 			if strings.HasPrefix(strings.TrimSpace(l), "#") {
 				continue
 			}
 			for _, mot := range regexp.MustCompile(`\$[a-z_]+`).FindAllString(l, -1) {
-				if integrees[mot] || parLeFragment[mot] {
+				if integrees[mot] || parLeFragment[mot] || parLeVhost[mot] {
 					continue
 				}
 				t.Errorf("variable %s employée par le vhost mais définie nulle part :\n%s", mot, contenu)
@@ -1364,6 +1393,14 @@ func TestLesVHostsNginxNEmploientQueDesVariablesDefinies(t *testing.T) {
 				verifier(t, prov, string(bp.Content))
 			})
 		}
+	}
+	// Le vhost Prestashop diffère d'une branche à l'autre (D99) : chacune est rendue.
+	for version := range versionsDeReference {
+		t.Run("prestashop-"+version, func(t *testing.T) {
+			prov, _ := fixture(t, "nginx")
+			_, bp := boutique(t, prov, version)
+			verifier(t, prov, string(bp.Content))
+		})
 	}
 	t.Run("supervision", func(t *testing.T) {
 		prov, _ := fixture(t, "nginx")

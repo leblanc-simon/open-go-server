@@ -342,6 +342,194 @@ fi
 echo "PHP est exécuté sous l'identité du projet, comme prévu."
 
 echo
+echo "--- .htaccess ignoré sous Apache, règles portées par le template (D99) ---"
+# ogs n'active plus les .htaccess (AllowOverride None) : servi par www-data, membre
+# du groupe de tous les projets, un .htaccess du projet pouvait détourner le serveur
+# hors de son site (socket FPM d'un voisin, server-status) d'un simple RewriteRule.
+# Les règles des .htaccess que livre Prestashop sont donc portées par le template ;
+# un .htaccess du projet est sans effet, ni détournement ni 500.
+sortie=$(ogs site create boutique.test --kind php-prestashop --php "$version" --tls=false --yes 2>&1)
+echo "$sortie" | grep -E "vhost apache|pool php" | sed 's/^/  /'
+# Le seul avertissement attendu est le rechargement de FPM : le substitut de
+# systemctl le fait par « pkill -USR2 -f /usr/sbin/php-fpm<v> », qui ne trouve
+# jamais le maître — son titre est réécrit en « php-fpm: master process (…) » —,
+# donc pkill rend 1 et ogs le signale. On recharge FPM nous-mêmes ci-dessous.
+avert=$(echo "$sortie" | grep "⚠")
+echo "avertissement(s) de la création : ${avert:-aucun}"
+if [ -n "$avert" ] && echo "$avert" | grep -qv "rechargement de php$version-fpm"; then
+    echo "ÉCHEC : avertissement inattendu à la création de la boutique"
+    exit 1
+fi
+# On vise le maître FPM par son pidfile : son titre de processus est réécrit, et
+# « pkill -f /usr/sbin/php-fpm » le manque.
+sock=$(sed -n 's/^listen = //p' "/etc/php/$version/fpm/pool.d/boutiquetest.conf")
+kill -USR2 "$(cat "/run/php/php$version-fpm.pid")" 2>/dev/null || true
+for _ in $(seq 1 10); do
+    [ -S "$sock" ] && break
+    sleep 1
+done
+if [ ! -S "$sock" ]; then
+    echo "ÉCHEC : le pool FPM de boutique.test n'écoute pas ($sock)"
+    exit 1
+fi
+racineps=/home/boutique.test/www
+poser() { mkdir -p "$(dirname "$racineps/$1")" && printf '%s\n' "$2" > "$racineps/$1"; }
+poser index.php '<?php echo "front boutique: ", ($_GET["controller"] ?? "accueil"), "\n";'
+poser webservice/dispatcher.php '<?php echo "api ok\n";'
+# Répertoire d'administration renommé à l'installation : reconnu à son
+# cron_currency_rates.php ; une route sans fichier va à son index.php.
+poser admin7x2k/cron_currency_rates.php '<?php'
+poser admin7x2k/index.php '<?php echo "back-office\n";'
+poser admin7x2k/backups/sauvegarde.sql.bz2 'secret'
+poser admin7x2k/export/clients.csv 'secret'
+poser admin7x2k/import/produits.csv 'secret'
+poser admin-api/index.php '<?php echo "api admin\n";'
+poser modules/m/ajax.php '<?php echo "ajax module\n";'
+poser modules/m/logs/m.log 'secret'
+poser js/retro-compat.js.php '<?php echo "retro ", $_GET["file"] ?? "", "\n";'
+poser img/p/1/1-t-shirt.jpg 'image-1'
+poser img/p/1/2/3/123-home_default.jpg 'image-123'
+poser img/p/1/2/3/4/5/6/7/1234567-large_default.jpeg 'image-1234567'
+poser img/c/3_thumb-category_default.jpg 'vignette-3'
+poser img/notes.txt 'secret'
+poser themes/classic/config/theme.yml 'secret'
+poser themes/classic/assets/css/theme.css 'body{}'
+poser js/porte.php '<?php echo "exécuté";'
+poser police.woff2 'police'
+poser upload/x.txt 'secret'
+poser var/logs/debug.log 'secret'
+poser app/config/parameters.php 'secret'
+poser mails/fr/order_conf.html 'secret'
+poser templates/index.tpl 'secret'
+poser docs/csv_import/produits.csv 'exemple'
+poser translations/cldr/fr.json '{}'
+poser tools/foundation/foundation.js 'outil'
+poser relais/page.txt 'contenu relais'
+# Le code déployé est celui d'une 9 : le vhost, écrit à la création sur un
+# docroot vide, porte encore les règles de la branche par défaut (la 8).
+poser src/Core/Version.php "<?php
+final class Version
+{
+    public const VERSION = '9.0.0';"
+# Un .htaccess racine tel que l'engendre Prestashop — ici pour une boutique en
+# sous-répertoire, que le template ne reprend pas — suivi, hors du bloc, d'un
+# détournement par le drapeau [H] ; dans relais/, un SetHandler vers le socket
+# d'un voisin. Tous ignorés.
+cat > "$racineps/.htaccess" <<'HT'
+# ~~start~~ Do not remove this comment, Prestashop will keep automatically the code outside this comment when .htaccess will be generated again
+<IfModule mod_rewrite.c>
+RewriteEngine on
+RewriteRule . - [E=REWRITEBASE:/sub/]
+RewriteRule ^api(?:/(.*))?$ %{ENV:REWRITEBASE}webservice/dispatcher.php?url=$1 [QSA,L]
+RewriteRule ^.*$ %{ENV:REWRITEBASE}index.php [NC,L]
+</IfModule>
+# ~~end~~ Do not remove this comment, Prestashop will keep automatically the code outside this comment when .htaccess will be generated again
+RewriteEngine on
+RewriteRule ^ - [H=server-status]
+HT
+cat > "$racineps/relais/.htaccess" <<HT
+SetHandler "proxy:unix:/run/php/php$version-fpm-voisin.sock|fcgi://localhost"
+HT
+chown -R boutiquetest:boutiquetest "$racineps"
+if ! apache2ctl configtest 2>&1 | tail -1; then
+    echo "ÉCHEC : le vhost Prestashop est refusé"
+    exit 1
+fi
+apache2ctl graceful
+sleep 1
+# attendu URI code [contenu] : le contenu, s'il est donné, doit figurer dans la
+# réponse, et « Server Status » jamais.
+attendu() {
+    local uri=$1 code=$2 contenu=${3:-} obtenu corps
+    corps=$(curl -s -o /tmp/ps.out -w '%{http_code}' -H 'Host: boutique.test' "http://127.0.0.1$uri")
+    obtenu=$corps
+    printf '  %-42s %s %s\n' "$uri" "$obtenu" "$(head -c 40 /tmp/ps.out | tr '\n' ' ')"
+    if [ "$obtenu" != "$code" ] || grep -q "Server Status" /tmp/ps.out ||
+        { [ -n "$contenu" ] && ! grep -q "$contenu" /tmp/ps.out; }; then
+        echo "ÉCHEC : $uri devait répondre $code${contenu:+ avec « $contenu »}"
+        exit 1
+    fi
+}
+# 0. Règles de la 8, écrites avant le déploiement : les scripts de modules et
+#    retro-compat.js.php s'exécutent, et doctor dit que le vhost ne suit pas la 9.
+attendu /modules/m/ajax.php 200 "ajax module"
+attendu /js/ancien-module.js 200 "retro ancien-module.js"
+diag=$(ogs doctor 2>&1 | grep "prestashop boutiquetest")
+echo "  doctor : $diag"
+if [[ "$diag" != *"ne porte pas les règles de la 9"* ]]; then
+    echo "ÉCHEC : doctor ne signale pas le vhost resté aux règles de la 8"
+    exit 1
+fi
+# L'apply réécrit le vhost pour la 9 ; la boutique en sous-répertoire du
+# .htaccess racine y est annoncée par une étape non critique (code 6).
+sortie=$(ogs apply boutiquetest --yes 2>&1)
+code=$?
+echo "$sortie" | grep -E "vhost|sous-répertoire" | sed 's/^/  /'
+if [ "$code" != 6 ] || [[ "$sortie" != *"sous-répertoire (REWRITEBASE /sub/)"* ]]; then
+    echo "ÉCHEC : l'apply devait annoncer la boutique en sous-répertoire (code $code)"
+    exit 1
+fi
+if ! grep -q "Règles de Prestashop 9\." /etc/apache2/sites-available/boutiquetest.conf; then
+    echo "ÉCHEC : le vhost n'a pas été réécrit pour la 9"
+    exit 1
+fi
+sleep 1
+# 1. Front controller et routes, malgré le .htaccess racine malveillant.
+attendu / 200 "front boutique"
+attendu /ma-categorie/mon-produit 200 "front boutique"
+attendu /api/products 200 "api ok"
+attendu /admin7x2k/sell/catalog/products 200 "back-office"
+attendu /admin-api/oauth/token 200 "api admin"
+# Refus des sauvegardes sous un répertoire réel seulement : une URL propre passe.
+attendu /fr/import/12-produit.html 200 "front boutique"
+attendu /module/export/ajax 200 "front boutique"
+attendu /js/ancien-module.js 200 "front boutique"
+# 2. Images de produit, identifiants de 1, 3 et 7 chiffres, .jpeg compris, et
+#    vignette de catégorie de la 9.
+attendu /1-t-shirt/vue.jpg 200 image-1
+attendu /123-home_default/t-shirt.jpg 200 image-123
+attendu /1234567-large_default/pull.jpeg 200 image-1234567
+attendu /c/3_thumb-category_default/vetements.jpg 200 vignette-3
+# 3. Ce que les .htaccess livrés refusent, et ce qu'ils ouvrent ; en 9, modules/
+#    refuse aussi ses scripts et ses journaux.
+for uri in /upload/x.txt /var/logs/debug.log /app/config/parameters.php \
+    /admin7x2k/backups/sauvegarde.sql.bz2 /admin7x2k/export/clients.csv \
+    /admin7x2k/import/produits.csv /img/notes.txt /themes/classic/config/theme.yml \
+    /js/porte.php /js/retro-compat.js.php /mails/fr/order_conf.html /templates/index.tpl \
+    /modules/m/ajax.php /modules/m/logs/m.log; do
+    attendu "$uri" 403
+done
+attendu /docs/csv_import/produits.csv 200 exemple
+attendu /translations/cldr/fr.json 200
+attendu /tools/foundation/foundation.js 200 outil
+attendu /themes/classic/assets/css/theme.css 200
+# 4. Le SetHandler d'un .htaccess vers un voisin est ignoré : la page est servie.
+attendu /relais/page.txt 200 "contenu relais"
+police=$(curl -sI -H 'Host: boutique.test' http://127.0.0.1/police.woff2 | grep -i '^content-type')
+echo "  police : $police"
+[[ "$police" == *"font/woff2"* ]] || { echo "ÉCHEC : AddType des polices absent"; exit 1; }
+# 5. doctor nomme ce que le template ne reprend pas — la boutique en
+#    sous-répertoire, les directives hors du bloc, le .htaccess de relais/ —, et
+#    rien des .htaccess que livre Prestashop ; le vhost suit désormais la 9.
+diag=$(ogs doctor 2>&1 | grep "htaccess boutiquetest")
+echo "  doctor : $diag"
+for mot in "sous-répertoire" "/sub/" "hors du bloc" "relais"; do
+    if [[ "$diag" != *"$mot"* ]]; then
+        echo "ÉCHEC : doctor ne signale pas « $mot »"
+        exit 1
+    fi
+done
+diag=$(ogs doctor 2>&1 | grep "prestashop boutiquetest")
+echo "  doctor : $diag"
+if [[ "$diag" != *"vhost aux règles de la 9"* ]]; then
+    echo "ÉCHEC : doctor ne voit pas le vhost aux règles de la 9"
+    exit 1
+fi
+ogs project delete boutiquetest --yes >/dev/null 2>&1
+kill -USR2 "$(cat "/run/php/php$version-fpm.pid")" 2>/dev/null || true
+echo "le .htaccess est ignoré, les règles du template servent le site, les répertoires protégés sont refusés"
+
+echo
 echo "--- les fichiers cachés et les métadonnées du dépôt ne sont pas servis ---"
 # php-plain sert www/, la racine même du dépôt qu'un « git pull » y tire :
 # .git, .env et composer.json y sont à portée de requête, et AllowOverride None

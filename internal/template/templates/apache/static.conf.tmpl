@@ -59,17 +59,12 @@
         Options -FollowSymLinks +SymLinksIfOwnerMatch
     </Directory>
     <Directory {{ .Docroot }}>
-{{- if .AllowOverride }}
-        # Options= vient après All, qui ouvre toutes les options : un .htaccess
-        # peut régler Indexes, MultiViews et SymLinksIfOwnerMatch — le retirer ne
-        # fait que cesser de suivre les liens —, jamais rétablir FollowSymLinks.
-        # Toute autre option y est refusée, et le répertoire répond 500 : ExecCGI
-        # ou Includes feraient exécuter du code sous www-data, et Apache ne
-        # distingue pas la pose du retrait.
-        AllowOverride All Options=Indexes,MultiViews,SymLinksIfOwnerMatch
-{{- else }}
+        # ogs n'active jamais les .htaccess sous Apache (AllowOverride None) : servi
+        # par www-data, membre du groupe de tous les projets (D25), un .htaccess du
+        # projet pouvait détourner le serveur hors de son site — socket FPM d'un
+        # voisin, server-status — par un simple RewriteRule (D99). Un site statique
+        # n'a besoin d'aucune règle portée par ogs.
         AllowOverride None
-{{- end }}
         Require all granted
         Options -Indexes -FollowSymLinks +SymLinksIfOwnerMatch
         IncludeOptional {{ .IncludeDocroot }}/*.conf

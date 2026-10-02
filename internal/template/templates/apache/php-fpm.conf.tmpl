@@ -60,24 +60,182 @@
         Options -FollowSymLinks +SymLinksIfOwnerMatch
     </Directory>
     <Directory {{ .Docroot }}>
-{{- if .AllowOverride }}
-        # Options= vient après All, qui ouvre toutes les options : un .htaccess
-        # peut régler Indexes, MultiViews et SymLinksIfOwnerMatch — le retirer ne
-        # fait que cesser de suivre les liens —, jamais rétablir FollowSymLinks.
-        # Toute autre option y est refusée, et le répertoire répond 500 : ExecCGI
-        # ou Includes feraient exécuter du code sous www-data, et Apache ne
-        # distingue pas la pose du retrait.
-        AllowOverride All Options=Indexes,MultiViews,SymLinksIfOwnerMatch
-{{- else }}
+        # ogs n'active jamais les .htaccess sous Apache (AllowOverride None) : servi
+        # par www-data, membre du groupe de tous les projets (D25), un .htaccess écrit
+        # par le compte du projet pouvait, d'un simple RewriteRule, assigner un
+        # gestionnaire hors de son site — socket FPM d'un voisin (exécution sous son
+        # identité) ou server-status (activité de tout le parc) — sans qu'aucune liste
+        # de directives ne borne les drapeaux [P]/[H] (D99). Les règles dont un site a
+        # besoin sont donc portées ici, comme le template nginx le fait déjà ; ce qu'un
+        # .htaccess du projet ajouterait est ignoré, et doctor le signale.
         AllowOverride None
-{{- end }}
         Require all granted
         Options -Indexes -FollowSymLinks +SymLinksIfOwnerMatch
-{{- if not .AllowOverride }}
+{{- if eq .AppKind "php-prestashop" }}
+        # {{ .MarquePrestashop }}{{ if .PrestashopIndeterminee }} (version indéterminée){{ end }}.
+        # Réécritures reprises des .htaccess que livre cette branche — le .htaccess
+        # racine qu'engendre Tools::generateHtaccess, ceux de js/, tools/, admin-api/
+        # et du répertoire d'administration (D99). En contexte <Directory>,
+        # mod_rewrite a les mêmes sémantiques qu'en .htaccess : motifs relatifs au
+        # répertoire, REQUEST_FILENAME résolu en chemin réel. La branche est lue au
+        # rendu dans les sources de la boutique : une mise à jour de Prestashop
+        # change le vhost, que le plan suivant réécrit. Ne sont pas repris la
+        # boutique en sous-répertoire (REWRITEBASE ≠ /) ni les URI virtuelles du
+        # multi-boutique : le plan et doctor les signalent.
+        RewriteEngine On
+        # L'en-tête Authorization n'atteint pas PHP-FPM sans cela (webservice, back-office).
+        RewriteCond %{HTTP:Authorization} .
+        RewriteRule .* - [E=HTTP_AUTHORIZATION:%{HTTP:Authorization}]
+        # Répertoire d'administration, renommé à l'installation et reconnu à son
+        # cron_currency_rates.php (de la 1.6 à la 9), et admin-api/ (9) : un fichier
+        # y est servi tel quel, toute autre route va à leur index.php.
+        RewriteCond %{DOCUMENT_ROOT}/$1/cron_currency_rates.php -f
+        RewriteCond %{REQUEST_FILENAME} -f
+        RewriteRule ^([^/]+)/ - [L]
+        # Ses anciens points d'entrée ne passent jamais par son index.php.
+        RewriteCond %{DOCUMENT_ROOT}/$1/cron_currency_rates.php -f
+{{- if eq .Prestashop "1.7" }}
+        RewriteRule ^([^/]+)/(ajax|ajax_products_list|ajax-tab|backup|cron_currency_rates|displayImage|drawer|footer\.inc|functions|get-file-admin|grider|header\.inc|init|login|password|pdf|searchcron)\.php$ - [L]
+{{- else }}
+        RewriteRule ^([^/]+)/(cron_currency_rates|get-file-admin)\.php$ - [L]
+{{- end }}
+        RewriteCond %{DOCUMENT_ROOT}/$1/cron_currency_rates.php -f
+        RewriteRule ^([^/]+)/ $1/index.php [L]
+        RewriteCond %{DOCUMENT_ROOT}/admin-api/index.php -f
+        RewriteCond %{REQUEST_FILENAME} -f
+        RewriteRule ^admin-api/ - [L]
+        RewriteCond %{DOCUMENT_ROOT}/admin-api/index.php -f
+        RewriteRule ^admin-api/ admin-api/index.php [L]
+        RewriteRule ^api(?:/(.*))?$ webservice/dispatcher.php?url=$1 [QSA,L]
+{{- if eq .Prestashop "1.7" }}
+        # upload/ : le front controller sert les personnalisations des clients ; en
+        # 1.7, upload/.htaccess ne refuse rien quand mod_rewrite est là.
+        RewriteRule ^upload/.+$ {{ .FrontController }} [QSA,L]
+        # Images de produit (.jpg seulement), une règle par longueur d'identifiant,
+        # et de catégorie.
+        RewriteRule ^([0-9])(\-[_a-zA-Z0-9-]*)?(-[0-9]+)?/.+\.jpg$ img/p/$1/$1$2$3.jpg [L]
+        RewriteRule ^([0-9])([0-9])(\-[_a-zA-Z0-9-]*)?(-[0-9]+)?/.+\.jpg$ img/p/$1/$2/$1$2$3$4.jpg [L]
+        RewriteRule ^([0-9])([0-9])([0-9])(\-[_a-zA-Z0-9-]*)?(-[0-9]+)?/.+\.jpg$ img/p/$1/$2/$3/$1$2$3$4$5.jpg [L]
+        RewriteRule ^([0-9])([0-9])([0-9])([0-9])(\-[_a-zA-Z0-9-]*)?(-[0-9]+)?/.+\.jpg$ img/p/$1/$2/$3/$4/$1$2$3$4$5$6.jpg [L]
+        RewriteRule ^([0-9])([0-9])([0-9])([0-9])([0-9])(\-[_a-zA-Z0-9-]*)?(-[0-9]+)?/.+\.jpg$ img/p/$1/$2/$3/$4/$5/$1$2$3$4$5$6$7.jpg [L]
+        RewriteRule ^([0-9])([0-9])([0-9])([0-9])([0-9])([0-9])(\-[_a-zA-Z0-9-]*)?(-[0-9]+)?/.+\.jpg$ img/p/$1/$2/$3/$4/$5/$6/$1$2$3$4$5$6$7$8.jpg [L]
+        RewriteRule ^([0-9])([0-9])([0-9])([0-9])([0-9])([0-9])([0-9])(\-[_a-zA-Z0-9-]*)?(-[0-9]+)?/.+\.jpg$ img/p/$1/$2/$3/$4/$5/$6/$7/$1$2$3$4$5$6$7$8$9.jpg [L]
+        RewriteRule ^c/([0-9]+)(\-[\.*_a-zA-Z0-9-]*)(-[0-9]+)?/.+\.jpg$ img/c/$1$2$3.jpg [L]
+        RewriteRule ^c/([a-zA-Z_-]+)(-[0-9]+)?/.+\.jpg$ img/c/$1$2.jpg [L]
+{{- else }}
+        # Images de produit, une règle par longueur d'identifiant, de 1 à 7 chiffres,
+        # et de catégorie{{ if eq .Prestashop "9" }}, vignettes « _thumb » comprises{{ end }}.
+        RewriteRule ^(([\d])(?:\-[\w-]*)?)/.+(\.(?:jpe?g|webp|png|avif))$ img/p/$2/$1$3 [L]
+        RewriteRule ^(([\d])([\d])(?:\-[\w-]*)?)/.+(\.(?:jpe?g|webp|png|avif))$ img/p/$2/$3/$1$4 [L]
+        RewriteRule ^(([\d])([\d])([\d])(?:\-[\w-]*)?)/.+(\.(?:jpe?g|webp|png|avif))$ img/p/$2/$3/$4/$1$5 [L]
+        RewriteRule ^(([\d])([\d])([\d])([\d])(?:\-[\w-]*)?)/.+(\.(?:jpe?g|webp|png|avif))$ img/p/$2/$3/$4/$5/$1$6 [L]
+        RewriteRule ^(([\d])([\d])([\d])([\d])([\d])(?:\-[\w-]*)?)/.+(\.(?:jpe?g|webp|png|avif))$ img/p/$2/$3/$4/$5/$6/$1$7 [L]
+        RewriteRule ^(([\d])([\d])([\d])([\d])([\d])([\d])(?:\-[\w-]*)?)/.+(\.(?:jpe?g|webp|png|avif))$ img/p/$2/$3/$4/$5/$6/$7/$1$8 [L]
+        RewriteRule ^(([\d])([\d])([\d])([\d])([\d])([\d])([\d])(?:\-[\w-]*)?)/.+(\.(?:jpe?g|webp|png|avif))$ img/p/$2/$3/$4/$5/$6/$7/$8/$1$9 [L]
+{{- if eq .Prestashop "9" }}
+        RewriteRule ^c/([\d]+)(|_thumb)(\-[\.*\w-]*)/.+(\.(?:jpe?g|webp|png|avif))$ img/c/$1$2$3$4 [L]
+        RewriteRule ^c/([a-zA-Z_-]+)(|_thumb)(-[\d]+)?/.+(\.(?:jpe?g|webp|png|avif))$ img/c/$1$2$3$4 [L]
+{{- else }}
+        RewriteRule ^c/([\d]+)(\-[\.*\w-]*)/.+(\.(?:jpe?g|webp|png|avif))$ img/c/$1$2$3 [L]
+        RewriteRule ^c/([a-zA-Z_-]+)(-[\d]+)?/.+(\.(?:jpe?g|webp|png|avif))$ img/c/$1$2$3 [L]
+{{- end }}
+{{- end }}
+        RewriteRule ^images_ie/?([^/]+)\.(jpe?g|png|gif)$ js/jquery/plugins/fancybox/images/$1.$2 [L]
+{{- if ne .Prestashop "9" }}
+        # js/ : un script absent passe par retro-compat.js.php (anciens modules){{ if eq .Prestashop "1.7" }},
+        # une feuille absente par css/retro-compat.css.php{{ end }}.
+        RewriteCond %{REQUEST_FILENAME} !-f
+        RewriteRule ^js/(?:.*/)?([^/]*)\.js$ js/retro-compat.js.php?file=$1.js [QSA,L]
+{{- if eq .Prestashop "1.7" }}
+        RewriteCond %{REQUEST_FILENAME} !-f
+        RewriteRule ^js/(?:.*/)?([^/]*)\.css$ css/retro-compat.css.php?file=$1.css [QSA,L]
+{{- end }}
+{{- end }}
+        # Répartiteur : un fichier non vide, un lien ou un répertoire réel est servi
+        # tel quel ; tout le reste passe par le front controller.
+        RewriteCond %{REQUEST_FILENAME} -s [OR]
+        RewriteCond %{REQUEST_FILENAME} -l [OR]
+        RewriteCond %{REQUEST_FILENAME} -d
+        RewriteRule ^.*$ - [L]
+        RewriteRule ^.*$ {{ .FrontController }} [L]
+{{- if eq .Prestashop "9" }}
+        # admin-api/ vérifie la version de TLS de l'appel (SSL_PROTOCOL).
+        <IfModule mod_ssl.c>
+            SSLOptions +StdEnvVars
+        </IfModule>
+{{- end }}
+{{- else if .FrontController }}
         FallbackResource /{{ .FrontController }}
 {{- end }}
         IncludeOptional {{ .IncludeDocroot }}/*.conf
     </Directory>
+{{- if eq .AppKind "php-prestashop" }}
+
+    # Ce que les .htaccess livrés par Prestashop refusent, traduit ici puisqu'ils ne
+    # sont plus lus (D99) ; rendu dès la traduction de l'URL, aucun « Require » ni
+    # surcharge ne le rouvre.
+{{- if eq .Prestashop "9" }}
+    RedirectMatch 403 "\.git"
+{{- end }}
+    # Sauvegardes, exports et imports du répertoire d'administration, quel que soit
+    # son nom et sans témoin : refusés dès que le premier segment est un répertoire
+    # réel. Une URL propre (/fr/import/12-produit.html, /module/export/ajax) n'en a
+    # pas, et va au front controller. Réécriture de portée vhost : elle précède
+    # celles du <Directory>.
+    RewriteEngine On
+    RewriteCond %{DOCUMENT_ROOT}/$1 -d
+    RewriteRule ^/([^/]+)/(backups|export|import)(/|$) - [F]
+    # Répertoires refusés en entier, sauf les exceptions que Prestashop y ouvre
+    # (docs/csv_import, mails/themes, translations/cldr ; de tools/, seul profiling
+    # est fermé). translations/ est ici plus strict que Prestashop : hors cldr, ses
+    # catalogues ne servent qu'au PHP.
+    RedirectMatch 403 "^/(app|bin|cache|classes|config|controllers|download|localization|override|src|templates|tests|var|vendor{{ if ne .Prestashop "1.7" }}|upload{{ end }})(/|$)"
+    RedirectMatch 403 "^/docs(/|$)(?!csv_import(/|$))"
+    RedirectMatch 403 "^/mails(/|$)(?!themes(/|$))"
+    RedirectMatch 403 "^/translations(/|$)(?!cldr(/|$))"
+    RedirectMatch 403 "^/tools/profiling(/|$)"
+    # Modèles jamais servis bruts (Smarty, Twig){{ if ne .Prestashop "1.7" }}, déclarations de modules{{ end }}{{ if eq .Prestashop "9" }}, et de modules/ ses scripts, journaux et fichiers de données{{ end }}.
+    RedirectMatch 403 "(?i)\.(tpl|twig)$"
+{{- if ne .Prestashop "1.7" }}
+    RedirectMatch 403 "^/modules/.*(config\.xml|config_[a-z]+\.xml)$"
+{{- end }}
+{{- if eq .Prestashop "9" }}
+    RedirectMatch 403 "^/modules/.*(\.php|\.log|\.txt|\.lock|\.json|\.yml|\.yaml)$"
+{{- end }}
+    # Listes blanches par extension : tout autre fichier — un .php compris, qui ne
+    # devient pas un point d'entrée — est refusé.
+{{- if eq .Prestashop "1.7" }}
+    RedirectMatch 403 "(?i)^/img/(?!.*\.(jpg|jpeg|gif|png|bmp|tiff|svg|pdf|mov|mpeg|mp4|avi|mpg|wma|flv|webm|ico)$)"
+    # En 1.7, js/ n'a pas de liste blanche, et de themes/ seuls les répertoires
+    # config/ et _dev/ sont fermés — ici pour tout thème, et non le seul classic.
+    RedirectMatch 403 "^/themes/[^/]+/(config|_dev)(/|$)"
+{{- else }}
+    RedirectMatch 403 "(?i)^/img/(?!.*\.(jpg|jpeg|gif|png|bmp|tiff|svg|pdf|mov|mpeg|mp4|avi|mpg|wma|flv|webm|ico|webp|avif)$)"
+    RedirectMatch 403 "(?i)^/themes/(?!.*\.(jpg|jpeg|gif|png|bmp|tiff|svg|pdf|mov|mpeg|mp4|avi|mpg|wma|flv|webm|ico|webp|woff|woff2|ttf|eot|otf|css|js|zip{{ if eq .Prestashop "9" }}|avif{{ end }})$)"
+{{- if eq .Prestashop "9" }}
+    RedirectMatch 403 "(?i)^/js/(?!.*\.(css|js|gif|png|jpg|svg|html|map|eot|ttf|woff)$)"
+{{- else }}
+    RedirectMatch 403 "(?i)^/js/(?!.*(\.(css|js|gif|png|jpg|svg|html|map|eot|ttf|woff)|jquery\.noConflict\.php|retro-compat\.js\.php)$)"
+{{- end }}
+{{- end }}
+
+    # Types des polices et partage d'origine, repris du .htaccess de Prestashop.
+    AddType application/vnd.ms-fontobject .eot
+    AddType font/ttf .ttf
+    AddType font/otf .otf
+    AddType application/font-woff .woff
+    AddType font/woff2 .woff2
+    <FilesMatch "\.(ttf|ttc|otf|eot|woff|woff2|svg)$">
+        Header set Access-Control-Allow-Origin "*"
+    </FilesMatch>
+{{- if eq .Prestashop "1.7" }}
+    <FilesMatch "\.pdf$">
+        Header set Content-Disposition "Attachment"
+        Header set X-Content-Type-Options "nosniff"
+    </FilesMatch>
+{{- end }}
+    ErrorDocument 404 /{{ .FrontController }}?controller=404
+{{- end }}
 
     # Fichiers et répertoires cachés — .git, .env, .htaccess — et métadonnées de
     # dépendances : la racine d'un dépôt tiré par « git pull » est souvent le

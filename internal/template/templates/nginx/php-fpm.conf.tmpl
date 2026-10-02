@@ -68,24 +68,136 @@ server {
     # location /, donc sous ses surcharges (D63), et atteint le front controller
     # quelle que soit la méthode.
 {{ if eq .AppKind "php-prestashop" }}
-    # Prestashop s'appuie sur .htaccess, que nginx ne lit pas : les règles de
-    # réécriture doivent être fournies ici, sans quoi le site n'est qu'à moitié
-    # fonctionnel (images, pages de catégorie, API). Le deuxième essai cherche un
-    # répertoire : pour « / », c'est le nom réservé .ogs-accueil/ (fragment d'ogs).
+    # {{ .MarquePrestashop }}{{ if .PrestashopIndeterminee }} (version indéterminée){{ end }}.
+    # nginx ne lit pas les .htaccess : les règles de ceux que livre cette branche
+    # sont portées ici, les mêmes que sous Apache (D99), sans quoi le site n'est qu'à
+    # moitié fonctionnel (images, pages de catégorie) et sert ce que Prestashop
+    # refuse. Le deuxième essai cherche un répertoire : pour « / », c'est le nom
+    # réservé .ogs-accueil/ (fragment d'ogs). Ce vhost n'exécute que le front
+    # controller : back-office, webservice et scripts de modules n'y répondent pas
+    # (§20 du cahier des charges).
     location / {
         try_files $ogs_fichier $ogs_fichier/ /{{ .FrontController }}$is_args$args;
         include {{ .IncludeDocroot }}/*.conf;
     }
-    rewrite ^/api/?(.*)$ /webservice/dispatcher.php?url=$1 last;
-    rewrite ^/([0-9])(-[\w-]+)?/(.+)\.(jpg|webp|png|avif)$ /img/p/$1/$1$2.$4 last;
-    rewrite ^/([0-9])([0-9])(-[\w-]+)?/(.+)\.(jpg|webp|png|avif)$ /img/p/$1/$2/$1$2$3.$5 last;
-    rewrite ^/c/([0-9]+)(-[\w-]+)?/(.+)\.(jpg|webp|png|avif)$ /img/c/$1$2.$4 last;
-    rewrite ^/c/([\w-]+)/(.+)\.(jpg|webp|png|avif)$ /img/c/$1.$3 last;
+    # Sauvegardes, exports et imports du répertoire d'administration, quel que soit
+    # son nom et sans témoin : refusés dès que le premier segment est un répertoire
+    # réel. Une URL propre (/fr/import/12-produit.html, /module/export/ajax) n'en a
+    # pas, et va au front controller. Le contrôle vit au niveau du server, avant le
+    # choix d'une location : une location regex qui le porterait devrait inclure
+    # les surcharges du docroot (D63), où une location imbriquée serait fatale. La
+    # valeur de départ est un chemin absolu qui ne peut être un répertoire : sous
+    # disable_symlinks, nginx ouvre le chemin composant par composant et, d'un
+    # chemin vide, éprouve le répertoire de départ — « -d » d'une variable vide y
+    # est vrai, et tout le site répondait 403. Après le if, la variable n'est
+    # jamais vide : [^/]+ exige un composant.
+    set $ogs_rep_prive /dev/null/ogs;
+    if ($uri ~ "^/([^/]+)/(backups|export|import)(/|$)") {
+        set $ogs_rep_prive $document_root/$1;
+    }
+    if (-d $ogs_rep_prive) {
+        return 403;
+    }
+    rewrite ^/api(?:/(.*))?$ /webservice/dispatcher.php?url=$1 last;
+{{- if eq .Prestashop "1.7" }}
+    # upload/ : le front controller sert les personnalisations des clients.
+    rewrite ^/upload/.+$ /{{ .FrontController }} last;
+    # Images de produit (.jpg seulement), une règle par longueur d'identifiant, et
+    # de catégorie.
+    rewrite ^/([0-9])(-[_a-zA-Z0-9-]*)?(-[0-9]+)?/.+\.jpg$ /img/p/$1/$1$2$3.jpg last;
+    rewrite ^/([0-9])([0-9])(-[_a-zA-Z0-9-]*)?(-[0-9]+)?/.+\.jpg$ /img/p/$1/$2/$1$2$3$4.jpg last;
+    rewrite ^/([0-9])([0-9])([0-9])(-[_a-zA-Z0-9-]*)?(-[0-9]+)?/.+\.jpg$ /img/p/$1/$2/$3/$1$2$3$4$5.jpg last;
+    rewrite ^/([0-9])([0-9])([0-9])([0-9])(-[_a-zA-Z0-9-]*)?(-[0-9]+)?/.+\.jpg$ /img/p/$1/$2/$3/$4/$1$2$3$4$5$6.jpg last;
+    rewrite ^/([0-9])([0-9])([0-9])([0-9])([0-9])(-[_a-zA-Z0-9-]*)?(-[0-9]+)?/.+\.jpg$ /img/p/$1/$2/$3/$4/$5/$1$2$3$4$5$6$7.jpg last;
+    rewrite ^/([0-9])([0-9])([0-9])([0-9])([0-9])([0-9])(-[_a-zA-Z0-9-]*)?(-[0-9]+)?/.+\.jpg$ /img/p/$1/$2/$3/$4/$5/$6/$1$2$3$4$5$6$7$8.jpg last;
+    rewrite ^/([0-9])([0-9])([0-9])([0-9])([0-9])([0-9])([0-9])(-[_a-zA-Z0-9-]*)?(-[0-9]+)?/.+\.jpg$ /img/p/$1/$2/$3/$4/$5/$6/$7/$1$2$3$4$5$6$7$8$9.jpg last;
+    rewrite ^/c/([0-9]+)(-[.*_a-zA-Z0-9-]*)(-[0-9]+)?/.+\.jpg$ /img/c/$1$2$3.jpg last;
+    rewrite ^/c/([a-zA-Z_-]+)(-[0-9]+)?/.+\.jpg$ /img/c/$1$2.jpg last;
+{{- else }}
+    # Images de produit, une règle par longueur d'identifiant, de 1 à 7 chiffres, et
+    # de catégorie{{ if eq .Prestashop "9" }}, vignettes « _thumb » comprises{{ end }}.
+    rewrite ^/(([0-9])(?:-[\w-]*)?)/.+(\.(?:jpe?g|webp|png|avif))$ /img/p/$2/$1$3 last;
+    rewrite ^/(([0-9])([0-9])(?:-[\w-]*)?)/.+(\.(?:jpe?g|webp|png|avif))$ /img/p/$2/$3/$1$4 last;
+    rewrite ^/(([0-9])([0-9])([0-9])(?:-[\w-]*)?)/.+(\.(?:jpe?g|webp|png|avif))$ /img/p/$2/$3/$4/$1$5 last;
+    rewrite ^/(([0-9])([0-9])([0-9])([0-9])(?:-[\w-]*)?)/.+(\.(?:jpe?g|webp|png|avif))$ /img/p/$2/$3/$4/$5/$1$6 last;
+    rewrite ^/(([0-9])([0-9])([0-9])([0-9])([0-9])(?:-[\w-]*)?)/.+(\.(?:jpe?g|webp|png|avif))$ /img/p/$2/$3/$4/$5/$6/$1$7 last;
+    rewrite ^/(([0-9])([0-9])([0-9])([0-9])([0-9])([0-9])(?:-[\w-]*)?)/.+(\.(?:jpe?g|webp|png|avif))$ /img/p/$2/$3/$4/$5/$6/$7/$1$8 last;
+    rewrite ^/(([0-9])([0-9])([0-9])([0-9])([0-9])([0-9])([0-9])(?:-[\w-]*)?)/.+(\.(?:jpe?g|webp|png|avif))$ /img/p/$2/$3/$4/$5/$6/$7/$8/$1$9 last;
+{{- if eq .Prestashop "9" }}
+    rewrite ^/c/([0-9]+)(|_thumb)(-[.*\w-]*)/.+(\.(?:jpe?g|webp|png|avif))$ /img/c/$1$2$3$4 last;
+    rewrite ^/c/([a-zA-Z_-]+)(|_thumb)(-[0-9]+)?/.+(\.(?:jpe?g|webp|png|avif))$ /img/c/$1$2$3$4 last;
+{{- else }}
+    rewrite ^/c/([0-9]+)(-[.*\w-]*)/.+(\.(?:jpe?g|webp|png|avif))$ /img/c/$1$2$3 last;
+    rewrite ^/c/([a-zA-Z_-]+)(-[0-9]+)?/.+(\.(?:jpe?g|webp|png|avif))$ /img/c/$1$2$3 last;
+{{- end }}
+{{- end }}
+    rewrite ^/images_ie/?([^/]+)\.(jpe?g|png|gif)$ /js/jquery/plugins/fancybox/images/$1.$2 last;
 
-    # Répertoires qui ne doivent jamais être servis.
-    location ~ ^/(app|bin|cache|classes|config|controllers|docs|localization|override|src|tests|tools|translations|travis-scripts|vendor|var)/ {
+    # Ce que les .htaccess livrés par Prestashop refusent. En tête des regex, sauf
+    # les fichiers cachés : nginx retient la première qui correspond.
+{{- if eq .Prestashop "9" }}
+    location ~ \.git {
         deny all;
     }
+{{- end }}
+    # Répertoires entiers, sauf les exceptions que Prestashop y ouvre (docs/csv_import,
+    # mails/themes, translations/cldr ; de tools/, seul profiling est fermé).
+    location ~ ^/(app|bin|cache|classes|config|controllers|download|localization|override|src|templates|tests|travis-scripts|var|vendor{{ if ne .Prestashop "1.7" }}|upload{{ end }})(/|$) {
+        deny all;
+    }
+    location ~ ^/docs(/|$)(?!csv_import(/|$)) {
+        deny all;
+    }
+    location ~ ^/mails(/|$)(?!themes(/|$)) {
+        deny all;
+    }
+    location ~ ^/translations(/|$)(?!cldr(/|$)) {
+        deny all;
+    }
+    location ~ ^/tools/profiling(/|$) {
+        deny all;
+    }
+    # Modèles jamais servis bruts (Smarty, Twig){{ if ne .Prestashop "1.7" }}, déclarations de modules{{ end }}{{ if eq .Prestashop "9" }}, et de modules/ ses scripts, journaux et fichiers de données{{ end }}.
+    location ~* \.(tpl|twig)$ {
+        deny all;
+    }
+{{- if ne .Prestashop "1.7" }}
+    location ~ ^/modules/.*(config\.xml|config_[a-z]+\.xml)$ {
+        deny all;
+    }
+{{- end }}
+{{- if eq .Prestashop "9" }}
+    location ~ ^/modules/.*(\.php|\.log|\.txt|\.lock|\.json|\.yml|\.yaml)$ {
+        deny all;
+    }
+{{- end }}
+    # Listes blanches par extension.
+{{- if eq .Prestashop "1.7" }}
+    location ~* ^/img/(?!.*\.(jpg|jpeg|gif|png|bmp|tiff|svg|pdf|mov|mpeg|mp4|avi|mpg|wma|flv|webm|ico)$) {
+        deny all;
+    }
+    # En 1.7, js/ n'a pas de liste blanche, et de themes/ seuls les répertoires
+    # config/ et _dev/ sont fermés — ici pour tout thème, et non le seul classic.
+    location ~ ^/themes/[^/]+/(config|_dev)(/|$) {
+        deny all;
+    }
+{{- else }}
+    location ~* ^/img/(?!.*\.(jpg|jpeg|gif|png|bmp|tiff|svg|pdf|mov|mpeg|mp4|avi|mpg|wma|flv|webm|ico|webp|avif)$) {
+        deny all;
+    }
+    location ~* ^/themes/(?!.*\.(jpg|jpeg|gif|png|bmp|tiff|svg|pdf|mov|mpeg|mp4|avi|mpg|wma|flv|webm|ico|webp|woff|woff2|ttf|eot|otf|css|js|zip{{ if eq .Prestashop "9" }}|avif{{ end }})$) {
+        deny all;
+    }
+{{- if eq .Prestashop "9" }}
+    location ~* ^/js/(?!.*\.(css|js|gif|png|jpg|svg|html|map|eot|ttf|woff)$) {
+        deny all;
+    }
+{{- else }}
+    location ~* ^/js/(?!.*(\.(css|js|gif|png|jpg|svg|html|map|eot|ttf|woff)|jquery\.noConflict\.php|retro-compat\.js\.php)$) {
+        deny all;
+    }
+{{- end }}
+{{- end }}
 {{- else }}
     # Front controller unique : tout passe par {{ .FrontController }}.
     location / {

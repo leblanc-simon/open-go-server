@@ -2,6 +2,7 @@ package web
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -316,7 +317,6 @@ func (p *Provider) Build(proj *model.Project, vh model.VHost) (*VHostPlan, error
 		"Docroot":         docroot,
 		"LogDir":          proj.Spec.Layout.LogDir,
 		"FrontController": frontController,
-		"AllowOverride":   at.AllowOverride,
 		// La racine du projet borne le suivi des liens : tout composant sous elle,
 		// docroot compris, est à la main de l'utilisateur (D51).
 		"Root": proj.Spec.Layout.Root,
@@ -341,6 +341,20 @@ func (p *Provider) Build(proj *model.Project, vh model.VHost) (*VHostPlan, error
 		"ProxyTarget":    optionString(vh.Options, "proxyTarget", ""),
 		"FPMHandler":     "",
 		"FPMPass":        "",
+	}
+
+	if proj.Spec.App.Kind == model.KindPrestashop {
+		// Les règles des .htaccess livrés suivent la branche en place (D99) : un
+		// changement de version change le rendu, que le plan suivant réécrit.
+		// Seule la branche entre dans le rendu : une version corrective ne réécrit
+		// pas le vhost.
+		branche := BranchePrestashop(VersionPrestashop(proj))
+		ctx["PrestashopIndeterminee"] = branche == ""
+		if branche == "" {
+			branche = BrancheParDefaut
+		}
+		ctx["Prestashop"] = branche
+		ctx["MarquePrestashop"] = MarquePrestashop(branche)
 	}
 
 	if at.NeedsPHP {
@@ -547,7 +561,7 @@ func (p *Provider) Plan(_ context.Context, proj *model.Project, obs Observed) ([
 		}
 	}
 	var steps []*engine.Step
-	for _, vh := range p.vhosts(proj) {
+	for i, vh := range p.vhosts(proj) {
 		if err := p.checkFile(vh); err != nil {
 			return nil, err
 		}
@@ -563,6 +577,11 @@ func (p *Provider) Plan(_ context.Context, proj *model.Project, obs Observed) ([
 			return nil, err
 		}
 		steps = append(steps, p.vhostStep(proj, bp)...)
+		if i == 0 {
+			if s := p.htaccessStep(proj, bp); s != nil {
+				steps = append(steps, s)
+			}
+		}
 	}
 	for _, stale := range obs.Stale {
 		s, err := p.removeStep(stale, proj.ID())
@@ -574,6 +593,50 @@ func (p *Provider) Plan(_ context.Context, proj *model.Project, obs Observed) ([
 		}
 	}
 	return steps, nil
+}
+
+// htaccessStep annonce, là où le vhost d'un Prestashop va être écrit, ce que le
+// template ne reprend pas (D99) : sous Apache, ce que porte son .htaccess racine,
+// qu'ogs ne lit plus (AllowOverride None) — une boutique en sous-répertoire ou à
+// URI virtuelle tomberait en silence à l'application — ; sous les deux moteurs,
+// une version de Prestashop indéterminée alors que le code est en place, servie
+// avec les règles de la branche par défaut. L'étape est non critique — le vhost
+// est écrit, l'apply rend le code 6 — et nomme la sortie. Nil s'il n'y a rien à
+// dire, ou si le vhost reste tel quel : doctor rappelle alors le cas à chaque
+// passage.
+func (p *Provider) htaccessStep(proj *model.Project, bp *VHostPlan) *engine.Step {
+	if proj.Spec.App.Kind != model.KindPrestashop {
+		return nil
+	}
+	if bp.State != fs.StateAbsent && bp.State != fs.StateOutdated &&
+		!((bp.State == fs.StateHandEdited || bp.State == fs.StateForeign) && p.Force) {
+		return nil
+	}
+	var constats, remedes []string
+	if p.Engine.Name() == "apache" {
+		if c := ConstatsBoutiques(proj, false); len(c) > 0 {
+			constats = append(constats, c...)
+			remedes = append(remedes, fmt.Sprintf("les .htaccess du docroot %s ne sont plus lus sous Apache "+
+				"(AllowOverride None, D99) : porter ces règles dans %s/*.conf (D63), sans quoi le site "+
+				"ne sert plus ces URL", proj.Spec.Layout.Docroot, p.IncludeDir(bp.Name, IncludeDocroot)))
+		}
+	}
+	if BranchePrestashop(VersionPrestashop(proj)) == "" && CodePrestashopPresent(proj) {
+		constats = append(constats, "version de Prestashop indéterminée")
+		remedes = append(remedes, fmt.Sprintf("ni src/Core/Version.php ni app/AppKernel.php — lus au "+
+			"propriétaire du docroot, sans suivre de lien, 256 Kio au plus — n'en donnent une version 1.7, 8 ou 9 : le vhost "+
+			"porte les règles de la %s (D99)", BrancheParDefaut))
+	}
+	if len(constats) == 0 {
+		return nil
+	}
+	s := engine.NewStep("web/vhost/"+bp.Name+"/htaccess", engine.Update,
+		fmt.Sprintf("vhost %s : %s (D99)", bp.Name, strings.Join(constats, ", ")))
+	s.Critical = false
+	s.Apply = func(context.Context) error {
+		return errors.New(strings.Join(remedes, " ; "))
+	}
+	return s
 }
 
 func (p *Provider) vhostStep(proj *model.Project, bp *VHostPlan) []*engine.Step {

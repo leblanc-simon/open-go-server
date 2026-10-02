@@ -201,11 +201,17 @@ func TestLesTemplatesQuiServentUnDocrootLeProtegent(t *testing.T) {
 				t.Errorf("%s : « %s » éprouve $uri, donc le docroot pour « / »", nom, l)
 			}
 		}
-		// « All » ouvre toutes les options à un .htaccess, FollowSymLinks compris,
-		// sauf si un « Options= » le suit.
-		for _, l := range strings.Split(s, "\n") {
-			if i := strings.Index(l, "AllowOverride All"); i >= 0 && !strings.Contains(l[i:], " Options=") {
-				t.Errorf("%s : « %s » laisse un .htaccess rétablir FollowSymLinks", nom, strings.TrimSpace(l))
+		// ogs n'active jamais les .htaccess sous Apache (AllowOverride None, D99) :
+		// un .htaccess servi par www-data pouvait détourner le serveur (socket FPM
+		// d'un voisin, server-status) d'un simple RewriteRule. Aucun « AllowOverride
+		// All » ni « AllowOverrideList », et tout vhost Apache qui sert un docroot
+		// pose « AllowOverride None ». (nginx n'a pas de directive AllowOverride.)
+		if moteur == "apache/" {
+			if strings.Contains(s, "AllowOverride All") || strings.Contains(s, "AllowOverrideList") {
+				t.Errorf("%s : le .htaccess ne doit pas être honoré (AllowOverride None)", nom)
+			}
+			if !strings.Contains(s, "AllowOverride None") {
+				t.Errorf("%s : un vhost qui sert un docroot doit poser AllowOverride None", nom)
 			}
 		}
 	}
