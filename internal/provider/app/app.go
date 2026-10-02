@@ -18,6 +18,7 @@ import (
 	"leblanc.io/open-go-server/internal/fs"
 	"leblanc.io/open-go-server/internal/model"
 	"leblanc.io/open-go-server/internal/naming"
+	"leblanc.io/open-go-server/internal/provider/removal"
 	runtimeprov "leblanc.io/open-go-server/internal/provider/runtime"
 	"leblanc.io/open-go-server/internal/store"
 	"leblanc.io/open-go-server/internal/template"
@@ -626,6 +627,7 @@ func (p *Provider) unitStep(proj *model.Project, at model.AppType, endpoint Endp
 			return fs.UnifiedDiff(string(current), string(content), path), nil
 		}
 		var previous []byte
+		var released []store.Allocation
 		s.Apply = func(context.Context) error {
 			if data, err := os.ReadFile(path); err == nil {
 				previous = data
@@ -640,9 +642,17 @@ func (p *Provider) unitStep(proj *model.Project, at model.AppType, endpoint Endp
 			if err := fs.EnsureDir(filepath.Dir(path), 0o755, fs.KeepOwner); err != nil {
 				return err
 			}
-			return fs.WriteAtomic(path, content, 0o644, fs.KeepOwner)
+			if err := fs.WriteAtomic(path, content, 0o644, fs.KeepOwner); err != nil {
+				return err
+			}
+			// L'unité ne sert plus que le port de son runtime : celui d'un runtime
+			// quitté est libéré (D100), une fois l'unité réécrite.
+			released = p.releaseOtherRuntimes(proj, "app-"+at.Runtime)
+			return nil
 		}
 		s.Compensate = func(context.Context) error {
+			// L'ancienne unité rendue sert de nouveau son ancien port.
+			p.reclaim(released)
 			// Compenser en retirant le fichier effacerait l'unité qui existait avant
 			// l'étape — sous --force, celle de l'exploitant.
 			if previous == nil {
@@ -659,6 +669,91 @@ func (p *Provider) unitStep(proj *model.Project, at model.AppType, endpoint Endp
 		return s, nil
 	}
 	return engine.NewStep("app/unit/"+proj.ID(), engine.NoOp, "unité applicative"), nil
+}
+
+// releaseOtherRuntimes libère les ports que l'application tenait dans la plage
+// d'un autre runtime que keep, et les rend : un projet passé de Node à Python
+// gardait sinon le port 21xxx à jamais (D100).
+func (p *Provider) releaseOtherRuntimes(proj *model.Project, keep string) []store.Allocation {
+	if p.Store == nil {
+		return nil
+	}
+	list, err := p.Store.ProjectAllocations(proj.ID())
+	if err != nil {
+		return nil
+	}
+	var out []store.Allocation
+	for _, a := range list {
+		if a.Name != ServiceName || !strings.HasPrefix(a.Scope, "app-") || a.Scope == keep {
+			continue
+		}
+		if err := p.Store.Release(a.Scope, a.Project, a.Name); err == nil {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+// reclaim réinscrit des ports libérés, quand une compensation rend l'unité qui
+// les servait.
+func (p *Provider) reclaim(list []store.Allocation) {
+	for _, a := range list {
+		_, _ = p.Store.Claim(a.Scope, a.Project, a.Name, a.Number)
+	}
+}
+
+// PlanStale retire l'unité applicative d'un projet qui n'a plus d'application
+// supervisée — passé d'un type à runtime à un type PHP —, et libère son port
+// (D100). Elle survivait sinon, invisible de « systemctl list-units » faute
+// d'instance chargée, et son port restait réservé. Le retrait passe par les cinq
+// états : une unité qu'ogs n'a pas écrite pour ce projet reste en place. Les
+// instances sont arrêtées avant, par le provider d'unités.
+func (p *Provider) PlanStale(proj *model.Project) (*engine.Step, error) {
+	if Applies(proj) {
+		return nil, nil
+	}
+	path := p.unitPath(proj)
+	// L'en-tête attribue le fichier par le projet ET la ressource (D76) : un
+	// service déclaré « app » porte le même nom de fichier, sous la ressource
+	// « unit/app », et c'est le provider d'unités qui en décide.
+	if owner, resource, err := fs.ManagedResource(path); err != nil || owner != proj.ID() ||
+		resource != "app/"+ServiceName {
+		return nil, nil
+	}
+	s, err := removal.File{
+		Resource: "app/unit/" + proj.ID(),
+		Summary:  "unité applicative obsolète " + path,
+		Path:     path,
+		Project:  proj.ID(),
+		Force:    p.Force,
+		Backups:  p.Paths.BackupsDir(),
+		Now:      p.now,
+		Reload:   []string{"systemd:daemon-reload"},
+	}.Step()
+	if err != nil || s == nil || s.Action != engine.Delete || p.Store == nil {
+		return s, err
+	}
+	var released []store.Allocation
+	remove, restore := s.Apply, s.Compensate
+	s.Apply = func(ctx context.Context) error {
+		if err := remove(ctx); err != nil {
+			return err
+		}
+		if _, err := os.Lstat(path); os.IsNotExist(err) {
+			released = p.releaseOtherRuntimes(proj, "")
+		}
+		return nil
+	}
+	s.Compensate = func(ctx context.Context) error {
+		if restore != nil {
+			if err := restore(ctx); err != nil {
+				return err
+			}
+		}
+		p.reclaim(released)
+		return nil
+	}
+	return s, nil
 }
 
 // refusStep produit l'étape qui refuse d'écraser un fichier qu'ogs n'a pas

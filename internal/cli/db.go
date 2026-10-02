@@ -187,8 +187,11 @@ func newDBRemoveCommand(app *App) *cobra.Command {
 	return &cobra.Command{
 		Use:   "remove <id> <base>",
 		Short: "Retirer la déclaration d'une base",
-		Long: "Retire la déclaration du fichier du projet. La base et son utilisateur ne sont\n" +
-			"pas supprimés du serveur : cette opération ne détruit aucune donnée.",
+		Long: "Retire la déclaration du fichier du projet. La base n'est pas supprimée du\n" +
+			"serveur : cette opération ne détruit aucune donnée. Son compte reste tant qu'il y\n" +
+			"a ses droits : il est la preuve qu'ogs a créé la base, et la redéclarer la\n" +
+			"reprendra. Les comptes additionnels de la base, s'ils ne sont déclarés nulle\n" +
+			"part ailleurs, sont retirés au prochain apply.",
 		Args: cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			p, err := app.loadProject(args[0])
@@ -212,7 +215,8 @@ func newDBRemoveCommand(app *App) *cobra.Command {
 				return wrap(CodeError, err)
 			}
 			app.printf("✓ déclaration retirée : %s\n", args[1])
-			app.printf("  la base et son utilisateur subsistent sur le serveur ; les supprimer manuellement si besoin.\n")
+			app.printf("  la base et son compte subsistent sur le serveur, et « ogs project delete » les y laisse ; " +
+				"les comptes additionnels qu'aucune autre base ne déclare partent au prochain apply.\n")
 			return nil
 		},
 	}

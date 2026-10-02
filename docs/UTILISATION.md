@@ -595,11 +595,13 @@ sous un compte encore vivant serait le pire des états. Les refus sont éprouvé
 faite : un partage monté pendant l'archivage fait encore renoncer, archive retirée et services relancés.
 `--dry-run` est refusé : `project delete` ne sait pas simuler.
 
-Deux choses ne suivent pas la règle commune. Le **certificat** du projet, clé privée comprise, reste en
-place et n'est pas archivé : `ogs cert delete <id>` le retire, sans quoi `doctor` en signale l'échéance
-indéfiniment. Le **fichier d'environnement** `/etc/ogs/env/<id>.env` part toujours, `--keep-data` compris,
-parce qu'il porte des secrets : sa copie scellée est dans l'archive, que la restauration réécrit — sous
-`--purge`, il n'en reste rien.
+Le **certificat** du projet part avec lui, une fois le serveur web rechargé ; l'archive en garde une copie
+scellée, clé privée comprise, que la restauration remet en place. Un certificat qu'un autre projet déclare
+sous le même nom reste. Les **numéros** de pool et les ports applicatifs reviennent à leur plage, et les
+**secrets** quittent le keystore — sauf ceux qui prouvent une base, un compte ou un vhost AMQP resté en
+place, qui partiront avec eux. Le **fichier d'environnement** `/etc/ogs/env/<id>.env` part aussi, sa copie
+scellée dans l'archive ; sous `--purge`, il n'en reste rien, et la confirmation le nomme. `--keep-data`, qui
+garde données et contenu, le laisse en place, comme tous les secrets du projet.
 
 La restauration recrée le projet — refusée s'il existe déjà —, applique sa déclaration, puis remet son home
 tel que l'utilisateur l'avait laissé, chaque fichier rendu à qui le possédait ; ce qui n'était pas à

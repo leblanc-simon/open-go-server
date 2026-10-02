@@ -17,6 +17,7 @@ import (
 	"leblanc.io/open-go-server/internal/exec"
 	"leblanc.io/open-go-server/internal/fs"
 	"leblanc.io/open-go-server/internal/model"
+	"leblanc.io/open-go-server/internal/provider/removal"
 	"leblanc.io/open-go-server/internal/template"
 )
 
@@ -234,9 +235,16 @@ func (p *Provider) Plan(_ context.Context, proj *model.Project, obs Observed) ([
 	// disponibilité échouerait en accusant l'application.
 	appInstances := appServiceInstances(proj)
 	if len(proj.Spec.Services) == 0 && appInstances == 0 {
-		return p.cleanupSteps(proj, obs), nil
+		return p.cleanupSteps(proj, obs)
 	}
 	var steps []*engine.Step
+	// Les modèles des services retirés ou renommés partent, après l'arrêt de
+	// leurs instances (D100).
+	stale, err := p.staleSteps(proj, false)
+	if err != nil {
+		return nil, err
+	}
+	steps = append(steps, stale...)
 
 	// 1. La cible, qui permet le pilotage groupé.
 	targetPath := filepath.Join(p.Paths.SystemdDir(), TargetName(proj.ID()))
@@ -331,8 +339,12 @@ func appServiceInstances(proj *model.Project) int {
 	return 1
 }
 
-// cleanupSteps retire les unités d'un projet qui n'en déclare plus.
-func (p *Provider) cleanupSteps(proj *model.Project, obs Observed) []*engine.Step {
+// cleanupSteps retire les unités d'un projet qui n'en déclare plus : instances
+// arrêtées, cible détachée du démarrage, puis modèles et cible retirés (D100).
+// Seuls les seconds survivaient : un projet qui retirait son dernier service
+// gardait à jamais modèle et cible, que « project delete » ne connaissait pas
+// davantage.
+func (p *Provider) cleanupSteps(proj *model.Project, obs Observed) ([]*engine.Step, error) {
 	var steps []*engine.Step
 	for name := range obs.Enabled {
 		steps = append(steps, p.disableStep(proj, name))
@@ -340,8 +352,131 @@ func (p *Provider) cleanupSteps(proj *model.Project, obs Observed) []*engine.Ste
 	if s := p.disableTargetStep(proj); s != nil {
 		steps = append(steps, s)
 	}
+	stale, err := p.staleSteps(proj, true)
+	if err != nil {
+		return nil, err
+	}
+	steps = append(steps, stale...)
 	sortSteps(steps)
-	return steps
+	return steps, nil
+}
+
+// StaleFiles énumère les fichiers d'unité qu'ogs a écrits pour un projet, lus
+// sur l'en-tête et jamais sur le nom (D76) : modèles de service (« unit/<nom> »),
+// cible (« unit/target ») et unité applicative (« app/app »). « project delete »
+// y trouve les modèles d'un service retiré avant lui, que la déclaration ne
+// nomme plus.
+func (p *Provider) StaleFiles(id string) ([]string, error) {
+	matches, err := filepath.Glob(filepath.Join(p.Paths.SystemdDir(), "ogs-*"))
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, path := range matches {
+		if !strings.HasSuffix(path, "@.service") && !strings.HasSuffix(path, ".target") {
+			continue
+		}
+		info, err := os.Lstat(path)
+		if err != nil || !info.Mode().IsRegular() {
+			continue
+		}
+		owner, resource, err := fs.ManagedResource(path)
+		if err != nil || owner != id {
+			continue
+		}
+		if strings.HasPrefix(resource, "unit/") || resource == "app/app" {
+			out = append(out, path)
+		}
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+// staleSteps retire, sous les cinq états, les modèles d'unité des services que
+// le projet ne déclare plus et, si withTarget, sa cible. L'unité applicative
+// relève du provider applicatif, qui libère aussi son port.
+func (p *Provider) staleSteps(proj *model.Project, withTarget bool) ([]*engine.Step, error) {
+	paths, err := p.StaleFiles(proj.ID())
+	if err != nil {
+		return nil, err
+	}
+	declared := map[string]bool{}
+	for _, svc := range proj.Spec.Services {
+		declared[filepath.Join(p.Paths.SystemdDir(), ServiceName(proj.ID(), svc.Name))] = true
+	}
+	targetPath := filepath.Join(p.Paths.SystemdDir(), TargetName(proj.ID()))
+	var steps []*engine.Step
+	for _, path := range paths {
+		_, resource, _ := fs.ManagedResource(path)
+		var step removal.File
+		switch {
+		case resource == "app/app", declared[path]:
+			continue
+		case path == targetPath:
+			if !withTarget {
+				continue
+			}
+			step = removal.File{Resource: "unit/target/" + proj.ID(),
+				Summary: "cible obsolète " + TargetName(proj.ID())}
+		case resource == "unit/target":
+			// Une cible au nom d'un autre projet : son en-tête désigne celui-ci,
+			// mais rien ne la lie à ses services. Laissée, comme tout ce qu'on ne
+			// sait pas attribuer.
+			continue
+		default:
+			step = removal.File{Resource: "unit/service/" + strings.TrimPrefix(resource, "unit/"),
+				Summary: "unité obsolète " + filepath.Base(path)}
+		}
+		path := path
+		step.Path = path
+		step.Project = proj.ID()
+		step.Force = p.Force
+		step.Backups = p.Paths.BackupsDir()
+		step.Now = p.now
+		step.Reload = []string{"systemd:daemon-reload"}
+		step.Links = func() []string { return p.linksTo(proj.ID(), path) }
+		s, err := step.Step()
+		if err != nil {
+			return nil, err
+		}
+		if s == nil {
+			continue
+		}
+		if path == targetPath && s.Action == engine.Delete {
+			// Le répertoire .wants de la cible part avec elle, s'il est vide : ses
+			// instances viennent d'être désactivées.
+			remove := s.Apply
+			s.Apply = func(ctx context.Context) error {
+				if err := remove(ctx); err != nil {
+					return err
+				}
+				_ = os.Remove(p.wantsDir(proj.ID()))
+				return nil
+			}
+		}
+		steps = append(steps, s)
+	}
+	return steps, nil
+}
+
+// linksTo énumère les liens d'activation qui désignent un fichier d'unité : ils
+// partent avec lui, sans quoi systemd garderait une référence à une unité
+// introuvable.
+func (p *Provider) linksTo(id, path string) []string {
+	var out []string
+	for _, dir := range []string{p.wantsDir(id), filepath.Join(p.Paths.SystemdDir(), "multi-user.target.wants")} {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			link := filepath.Join(dir, e.Name())
+			if target, err := os.Readlink(link); err == nil && filepath.Clean(target) == path {
+				out = append(out, link)
+			}
+		}
+	}
+	return out
 }
 
 // fileStep produit l'étape d'écriture d'un fichier d'unité, ou rien s'il est

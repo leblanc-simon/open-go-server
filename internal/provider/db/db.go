@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 
@@ -33,6 +34,11 @@ type Provider struct {
 	// supervision — et qu'aucun projet ne doit toucher (D91) ; les noms fixes et
 	// le rôle d'administration PostgreSQL s'y ajoutent d'eux-mêmes.
 	Reserved []string
+
+	// Force autorise « project delete » à retirer les comptes orphelins d'un
+	// projet adopté, comme ses bases (D77) : ogs n'en a pas la propriété. L'apply
+	// n'en tient pas compte — son --force reprend un fichier retouché.
+	Force bool
 
 	// Clients est le cache des connexions ouvertes, par moteur ou cluster.
 	clients map[string]Client
@@ -155,6 +161,30 @@ type DBState struct {
 	// des privilèges sous MySQL. C'est ce que laisse toute création d'ogs, et ce
 	// qui reconnaît sans marque les bases d'un parc antérieur à D91.
 	DBOwned bool
+	// Moved associe à un compte MySQL du projet l'hôte sous lequel il existe
+	// encore, quand l'hôte déclaré a changé (D100) : son mot de passe est scellé,
+	// il n'existe pas sous l'hôte déclaré et n'existe que sous cet autre-là. C'est
+	// le compte qu'ogs a créé sous l'ancienne déclaration ; l'apply le recrée sous
+	// l'hôte déclaré, puis retire l'ancien. Plusieurs hôtes restent un refus : rien
+	// ne dit lequel ogs a créé.
+	Moved map[string][]string
+	// Retired associe à un compte MySQL du projet, présent sous l'hôte déclaré,
+	// les autres hôtes que sa marque désigne (movedName) : leurs comptes partent,
+	// puis la marque — vide, il ne reste que la marque à oublier.
+	Retired map[string][]string
+	// Holders énumère les autres comptes à ogs pour ce projet — mot de passe
+	// scellé — qui ont leurs droits sur la base (la propriété sous PostgreSQL).
+	// Ils prouvent la base à ogs comme son compte principal (D91) : c'est l'ancien
+	// compte principal quand spec.databases[].user a changé, ou le compte sous
+	// l'ancien hôte (D100).
+	Holders []string
+	// Revoke énumère, sous MySQL, les comptes à ogs pour ce projet qu'une autre
+	// déclaration emploie encore et qui gardent des droits sur cette base sans y
+	// être déclarés : un compte additionnel retiré de cette base-ci (D100).
+	Revoke []string
+	// pgOwner est, sous PostgreSQL, le compte à ogs qui possède la base quand ce
+	// n'est pas le compte déclaré : la propriété lui est reprise.
+	pgOwner string
 }
 
 // account nomme un compte comme le moteur le désigne.
@@ -172,6 +202,9 @@ func (s DBState) account(user string) string {
 // Observed regroupe l'état de toutes les bases d'un projet.
 type Observed struct {
 	States []DBState
+	// Orphans énumère les comptes dont le mot de passe est scellé dans la portée
+	// du projet et qu'aucune de ses déclarations ne nomme plus (D100).
+	Orphans []Orphan
 }
 
 // Observe inspecte les moteurs déclarés par le projet.
@@ -184,6 +217,8 @@ func (p *Provider) Observe(ctx context.Context, proj *model.Project) (Observed, 
 			ExtraOwned: map[string]bool{}, Adopted: proj.Metadata.Labels["adopted"] == "true",
 			projectID: proj.ID()}
 		state.UserOwned = p.sealed(proj.ID(), decl.Engine, decl.User)
+		state.Moved = map[string][]string{}
+		state.Retired = map[string][]string{}
 		for _, u := range decl.ExtraUsers {
 			state.ExtraOwned[u.User] = p.sealed(proj.ID(), decl.Engine, u.User)
 		}
@@ -236,6 +271,29 @@ func (p *Provider) Observe(ctx context.Context, proj *model.Project) (Observed, 
 					state.OtherHosts[decl.User] = other
 				}
 			}
+			// Un compte recréé sous l'hôte déclaré par un apply précédent : celui
+			// d'avant, que la marque désigne, part maintenant que le remplaçant
+			// existait à l'observation (D100).
+			names := []string{decl.User}
+			for _, u := range decl.ExtraUsers {
+				names = append(names, u.User)
+			}
+			for _, user := range names {
+				if !users[user+"@"+host] || state.Adopted {
+					continue
+				}
+				// Retour à un hôte déjà tenu compris : c'est alors le compte posé
+				// sous l'hôte quitté qui part, jamais celui de l'hôte déclaré.
+				if marked := p.movedHosts(proj.ID(), decl.Engine, user); len(marked) > 0 {
+					retired := []string{}
+					for _, h := range marked {
+						if h != host {
+							retired = append(retired, h)
+						}
+					}
+					state.Retired[user] = retired
+				}
+			}
 			for _, u := range decl.ExtraUsers {
 				state.ExtraUsers[u.User] = users[u.User+"@"+host]
 				if !state.ExtraUsers[u.User] {
@@ -263,9 +321,12 @@ func (p *Provider) Observe(ctx context.Context, proj *model.Project) (Observed, 
 				state.Extensions = exts
 			}
 		}
-		state.DBOwned = state.DBExists && state.UserExists && state.UserOwned && state.Grants[decl.Name] != ""
+		p.observeOthers(ctx, client, proj, &state, users, host)
+		state.DBOwned = state.DBExists && (state.UserExists && state.UserOwned && state.Grants[decl.Name] != "" ||
+			len(state.Holders) > 0)
 		obs.States = append(obs.States, state)
 	}
+	obs.Orphans = p.observeOrphans(ctx, proj)
 	return obs, nil
 }
 
@@ -354,9 +415,13 @@ func (p *Provider) Plan(ctx context.Context, proj *model.Project, obs Observed) 
 		conforming := state.DBExists && state.UserExists && hasGrant &&
 			extensionsSatisfied(decl, state) && extraUsersSatisfied(decl, state)
 
+		// Ce qu'une déclaration changée laisse derrière elle (D100) : l'ancien
+		// compte sous l'hôte d'avant, les droits d'un compte retiré de la base.
+		follow := p.followSteps(resource, decl, state, host)
 		if conforming {
 			steps = append(steps, engine.NewStep(resource, engine.NoOp,
 				fmt.Sprintf("base %s %s (utilisateur %s)", decl.Engine, decl.Name, decl.User)))
+			steps = append(steps, follow...)
 			continue
 		}
 
@@ -392,8 +457,24 @@ func (p *Provider) Plan(ctx context.Context, proj *model.Project, obs Observed) 
 		// Les mots de passe que l'étape a scellés, pour que la compensation les
 		// retire avec les comptes qu'elle supprime : un secret resté derrière ferait
 		// d'un homonyme créé plus tard par un tiers un compte d'ogs.
-		var sealedHere []string
+		var sealedHere, movedHere []string
+		// La marque d'avant, pour qu'un déroulage la rende au lieu de l'effacer :
+		// elle prouve encore les comptes d'un déplacement précédent.
+		previousMarks := map[string][]string{}
 		s.Apply = func(ctx context.Context) error {
+			// La marque d'un compte déplacé précède sa recréation sous l'hôte
+			// déclaré : l'ancien ne partira qu'à l'apply suivant, le remplaçant
+			// observé (D100). Le retirer dans la foulée laissait la base sans aucun
+			// compte si la saga se déroulait ensuite.
+			for _, user := range sortedListKeys(stateCopy.Moved) {
+				before := p.movedHosts(proj.ID(), declCopy.Engine, user)
+				previousMarks[user] = before
+				hosts := append(append(append([]string(nil), before...), stateCopy.Moved[user]...), host)
+				if err := p.sealMoved(proj.ID(), declCopy.Engine, user, hosts); err != nil {
+					return err
+				}
+				movedHere = append(movedHere, user)
+			}
 			return p.apply(ctx, proj, declCopy, stateCopy, priv, host, func(user string) {
 				sealedHere = append(sealedHere, user)
 			})
@@ -406,6 +487,16 @@ func (p *Provider) Plan(ctx context.Context, proj *model.Project, obs Observed) 
 			targets := dropTargets{}
 			if !stateCopy.DBExists {
 				targets.database = true
+			}
+			// Sous PostgreSQL, la base reprise par le compte déclaré revient à son
+			// ancien propriétaire avant que la compensation ne retire le nouveau :
+			// sans quoi DROP ROLE échoue, et la base resterait à un compte disparu.
+			if restore := pgOwnershipRestore(declCopy, stateCopy); restore != "" {
+				if client, err := p.clientFor(declCopy); err == nil {
+					if err := client.Exec(ctx, restore); err != nil {
+						return err
+					}
+				}
 			}
 			if !stateCopy.UserExists {
 				targets.users = append(targets.users, declCopy.User)
@@ -423,10 +514,25 @@ func (p *Provider) Plan(ctx context.Context, proj *model.Project, obs Observed) 
 					_ = p.Store.DeleteSecret(proj.ID(), secretName(declCopy.Engine, user))
 				}
 			}
+			for _, user := range movedHere {
+				if p.Store == nil {
+					continue
+				}
+				if before := previousMarks[user]; len(before) > 0 {
+					_ = p.sealMoved(proj.ID(), declCopy.Engine, user, before)
+					continue
+				}
+				_ = p.Store.DeleteSecret(proj.ID(), movedName(declCopy.Engine, user))
+			}
 			return nil
 		}
 		steps = append(steps, s)
+		steps = append(steps, follow...)
 	}
+	// Les comptes qu'aucune déclaration ne nomme plus viennent en dernier : un
+	// compte renommé ne part qu'une fois son remplaçant créé, et la propriété
+	// d'une base PostgreSQL reprise par le compte déclaré.
+	steps = append(steps, p.orphanSteps(proj, obs.Orphans)...)
 	return steps, nil
 }
 
@@ -533,6 +639,11 @@ func maskedAccounts(decl model.Database, state DBState, host string) string {
 	}
 	var out []string
 	for _, user := range users {
+		if len(state.Moved[user]) > 0 {
+			// L'ancien compte d'ogs sous l'hôte d'avant : recréé sous l'hôte
+			// déclaré, il est retiré aussitôt après (followSteps).
+			continue
+		}
 		for _, other := range state.OtherHosts[user] {
 			out = append(out, fmt.Sprintf("'%s'@'%s'", user, other))
 		}
@@ -625,6 +736,7 @@ func (p *Provider) statements(decl model.Database, state DBState, priv Privilege
 		if err != nil {
 			return nil, err
 		}
+		stmts.Cluster = append(stmts.Cluster, pgOwnership(decl, state)...)
 		return append(stmts.Cluster, stmts.InDatabase...), nil
 	}
 	return nil, fmt.Errorf("moteur %q inconnu", decl.Engine)
@@ -699,6 +811,7 @@ func (p *Provider) apply(ctx context.Context, proj *model.Project, decl model.Da
 		if err != nil {
 			return err
 		}
+		stmts.Cluster = append(stmts.Cluster, pgOwnership(decl, state)...)
 		for _, stmt := range stmts.Cluster {
 			if err := client.Exec(ctx, stmt); err != nil {
 				return err
@@ -773,9 +886,26 @@ func (p *Provider) Drop(ctx context.Context, decl model.Database, state DBState)
 			}
 		case state.Adopted || owned:
 			targets.users = append(targets.users, user)
+			// L'ancien compte sous l'hôte d'avant part avec lui (D100) ; un nom
+			// présent sous plusieurs autres hôtes ne dit pas lequel ogs a créé.
+			for _, other := range state.OtherHosts[user] {
+				if !slices.Contains(state.Moved[user], other) {
+					kept = append(kept, fmt.Sprintf("compte '%s'@'%s' (autre hôte que celui déclaré)", user, other))
+				}
+			}
 		case exists:
 			kept = append(kept, state.account(user))
 		}
+	}
+	// Les comptes que la marque prouve partent aussi, sous l'hôte d'avant comme
+	// sous un hôte quitté : entre l'apply qui a déplacé le compte et celui qui
+	// aurait retiré l'ancien, la suppression du projet le laissait sans preuve.
+	targets.moved = map[string][]string{}
+	for user, hosts := range state.Moved {
+		targets.moved[user] = append(targets.moved[user], hosts...)
+	}
+	for user, hosts := range state.Retired {
+		targets.moved[user] = append(targets.moved[user], hosts...)
 	}
 	// Le mot de passe d'un compte supprimé part avec lui, au fil de chaque
 	// suppression réussie — l'archive en garde la copie scellée. Laissé au
@@ -785,6 +915,7 @@ func (p *Provider) Drop(ctx context.Context, decl model.Database, state DBState)
 	targets.dropped = func(user string) {
 		if p.Store != nil {
 			_ = p.Store.DeleteSecret(state.projectID, secretName(decl.Engine, user))
+			_ = p.Store.DeleteSecret(state.projectID, movedName(decl.Engine, user))
 		}
 	}
 	return kept, p.dropTargets(ctx, decl, targets)
@@ -798,6 +929,10 @@ type dropTargets struct {
 	// dropped, s'il est donné, est appelé après la suppression réussie de chaque
 	// compte.
 	dropped func(user string)
+	// moved associe à un compte MySQL l'hôte d'avant sous lequel ogs l'a créé
+	// (DBState.Moved) : il part avec lui, avant que son mot de passe ne quitte le
+	// keystore.
+	moved map[string][]string
 }
 
 // dropTargets supprime la base et les comptes désignés, et rien d'autre.
@@ -845,6 +980,16 @@ func (p *Provider) dropTargets(ctx context.Context, decl model.Database, t dropT
 		if err != nil {
 			return err
 		}
+		for _, old := range t.moved[user] {
+			if old == host || decl.Engine == "postgres" {
+				continue
+			}
+			more, err := DropMySQL("", user, old, nil)
+			if err != nil {
+				return err
+			}
+			stmts = append(stmts, more...)
+		}
 		for _, stmt := range stmts {
 			if err := client.Exec(ctx, stmt); err != nil {
 				return err
@@ -859,6 +1004,58 @@ func (p *Provider) dropTargets(ctx context.Context, decl model.Database, t dropT
 
 // secretName localise un secret dans le keystore.
 func secretName(engine, user string) string { return engine + "/" + user }
+
+// movedName nomme la marque d'un compte MySQL qu'ogs a recréé sous un autre
+// hôte (D100) : elle porte les hôtes sous lesquels ogs a tenu ce compte. Le
+// compte d'un hôte quitté ne part qu'à l'apply suivant, une fois le remplaçant
+// observé ; sans la marque, deux comptes de même nom sous deux hôtes ne disent
+// pas lequel ogs a créé (D78).
+func movedName(engine, user string) string { return engine + "-moved/" + user }
+
+// sealMoved scelle la marque d'un compte déplacé : l'ensemble des hôtes sous
+// lesquels ogs le tient.
+func (p *Provider) sealMoved(project, engine, user string, hosts []string) error {
+	if p.Store == nil || p.Keys == nil {
+		return nil
+	}
+	set := map[string]bool{}
+	var list []string
+	for _, h := range hosts {
+		if h != "" && !set[h] {
+			set[h] = true
+			list = append(list, h)
+		}
+	}
+	sort.Strings(list)
+	nonce, ciphertext, err := p.Keys.Seal(project, movedName(engine, user), []byte(strings.Join(list, "\n")))
+	if err != nil {
+		return err
+	}
+	return p.Store.PutSecret(project, movedName(engine, user), nonce, ciphertext)
+}
+
+// movedHosts rend les hôtes que la marque d'un compte déplacé porte, aucun sans
+// marque.
+func (p *Provider) movedHosts(project, engine, user string) []string {
+	if p.Store == nil || p.Keys == nil {
+		return nil
+	}
+	nonce, ciphertext, err := p.Store.GetSecret(project, movedName(engine, user))
+	if err != nil {
+		return nil
+	}
+	data, err := p.Keys.Open(project, movedName(engine, user), nonce, ciphertext)
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, h := range strings.Split(string(data), "\n") {
+		if h != "" {
+			out = append(out, h)
+		}
+	}
+	return out
+}
 
 // ensurePassword renvoie le mot de passe du compte, en le générant et le
 // scellant s'il n'existe pas encore. Un mot de passe déjà émis n'est jamais

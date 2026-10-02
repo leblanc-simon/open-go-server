@@ -314,6 +314,33 @@ fi
 echo "  .bin/ retiré, instance toujours active"
 
 echo
+echo "--- service retiré : son modèle part, son instance s'arrête (D100) ---"
+ogs service add shopfr rapport --template worker --command "/home/shop.fr/www/veille.sh" --instances 1 >/dev/null
+ogs apply shopfr --yes >/tmp/apply-rapport.log 2>&1
+if [ "$(systemctl is-active ogs-shopfr-rapport@1.service 2>&1)" != "active" ]; then
+    cat /tmp/apply-rapport.log
+    echo "ÉCHEC : le second service n'a pas démarré"
+    exit 1
+fi
+ogs service remove shopfr rapport >/dev/null
+ogs apply shopfr --yes >/tmp/apply-retrait.log 2>&1
+systemctl daemon-reload
+if [ -e /etc/systemd/system/ogs-shopfr-rapport@.service ]; then
+    cat /tmp/apply-retrait.log
+    echo "ÉCHEC : le modèle du service retiré est resté"
+    exit 1
+fi
+if [ "$(systemctl is-active ogs-shopfr-rapport@1.service 2>&1)" = "active" ]; then
+    echo "ÉCHEC : l'instance du service retiré tourne encore"
+    exit 1
+fi
+if [ "$(systemctl is-active ogs-shopfr-veille@1.service 2>&1)" != "active" ]; then
+    echo "ÉCHEC : le service encore déclaré a été arrêté"
+    exit 1
+fi
+echo "  modèle retiré, instance arrêtée, l'autre service toujours actif"
+
+echo
 echo "--- suppression : plus rien ne subsiste dans systemd ---"
 ogs project delete shopfr --yes >/dev/null 2>&1
 systemctl daemon-reload

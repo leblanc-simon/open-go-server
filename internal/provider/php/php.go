@@ -95,6 +95,11 @@ type PoolPlan struct {
 	Content []byte
 	State   fs.State
 	Version string
+	// Fixed dit que le numéro est imposé par la déclaration : l'étape l'inscrit
+	// à la place de celui que le pool tenait (D100).
+	Fixed bool
+	// Project est l'identifiant du projet, pour l'inscription du numéro.
+	Project string
 }
 
 // Observed est l'état réel des pools d'un projet.
@@ -179,12 +184,14 @@ func (p *Provider) poolName(proj *model.Project, pool model.Pool) (string, error
 // version, de sorte qu'un pool garde un numéro lisible : 18501 pour le premier
 // pool en PHP 8.5.
 func (p *Provider) number(proj *model.Project, pool model.Pool, name string) (int, error) {
-	if pool.Number != "" && pool.Number != "auto" {
+	explicit := pool.Number != "" && pool.Number != "auto"
+	var fixed int
+	if explicit {
 		n, err := strconv.Atoi(pool.Number)
 		if err != nil {
 			return 0, fmt.Errorf("numéro de pool %q illisible", pool.Number)
 		}
-		return n, nil
+		fixed = n
 	}
 	min, err := naming.PoolNumber(pool.Version, 1)
 	if err != nil {
@@ -195,6 +202,9 @@ func (p *Provider) number(proj *model.Project, pool model.Pool, name string) (in
 		return 0, err
 	}
 	if p.Store == nil {
+		if explicit {
+			return fixed, nil
+		}
 		// Sans base d'état (calcul de plan hors ligne), le premier numéro de la
 		// plage est utilisé : le plan reste lisible, l'attribution définitive a
 		// lieu à l'application.
@@ -207,12 +217,27 @@ func (p *Provider) number(proj *model.Project, pool model.Pool, name string) (in
 	if p.recoveryErr != nil {
 		return 0, fmt.Errorf("reprise des numéros des pools écrits : %w", p.recoveryErr)
 	}
+	if explicit {
+		// Le numéro imposé est inscrit par l'étape qui écrit le pool, non au
+		// calcul du plan (poolStep) : un plan refusé ne retire rien.
+		return fixed, nil
+	}
 	var inUse map[int]bool
 	if pool.Listen == "tcp" && p.PortsInUse != nil {
 		inUse = p.PortsInUse()
 	}
+	// Les numéros que d'autres pools du projet s'imposent ne sont pas encore
+	// inscrits au calcul du plan : l'attribution automatique les évite.
+	imposed := map[int]bool{}
+	for _, other := range proj.Spec.PHP.Pools {
+		if other.Version == pool.Version && other.Number != "" && other.Number != "auto" {
+			if n, err := strconv.Atoi(other.Number); err == nil {
+				imposed[n] = true
+			}
+		}
+	}
 	return p.Store.Allocate("php-"+pool.Version, proj.ID(), name, min, max,
-		func(n int) bool { return inUse[n] })
+		func(n int) bool { return inUse[n] || imposed[n] })
 }
 
 // reListenLine relit l'écoute d'un pool écrit : le port TCP, ou le numéro que
@@ -344,6 +369,7 @@ func (p *Provider) Build(proj *model.Project, pool model.Pool) (*PoolPlan, error
 	return &PoolPlan{
 		Pool: pool, Name: name, Number: num, Path: path, Listen: listen,
 		Unix: unix, Content: content, State: state, Version: pool.Version,
+		Fixed: pool.Number != "" && pool.Number != "auto", Project: proj.ID(),
 	}, nil
 }
 
@@ -440,7 +466,20 @@ func (p *Provider) poolStep(proj *model.Project, bp *PoolPlan) *engine.Step {
 				return err
 			}
 		}
-		return p.writePool(ctx, bp)
+		if err := p.writePool(ctx, bp); err != nil {
+			return err
+		}
+		// Le numéro imposé est inscrit à la place de celui que le pool tenait :
+		// l'attribution automatique d'un autre pool le prenait sinon (D100). Tenu
+		// par une autre ressource, il est employé sans être repris — en socket
+		// Unix, le nom du pool distingue les deux sockets. Un apply déroulé rend
+		// l'ancien numéro (Store.CancelAllocations).
+		if bp.Fixed && p.Store != nil {
+			if _, err := p.Store.Reserve("php-"+bp.Version, bp.Project, bp.Name, bp.Number); err != nil {
+				return err
+			}
+		}
+		return nil
 	}
 	// La compensation rend le pool qui était servi. Le supprimer serait juste
 	// pour une création, destructeur pour une mise à jour — un écrasement forcé
@@ -462,8 +501,14 @@ func (p *Provider) poolStep(proj *model.Project, bp *PoolPlan) *engine.Step {
 // removeStep retire un pool devenu inutile, sous le régime des cinq états : un
 // pool retouché exige --force et part sauvegardé, un pool qu'ogs n'a pas écrit
 // pour ce projet reste en place.
+//
+// Le numéro du pool retiré est libéré une fois le fichier parti (D100) : sans
+// quoi chaque pool renommé, retiré ou passé à une autre version gardait le sien
+// à jamais, et la plage de la version finissait saturée. Il ne l'est qu'alors —
+// un pool refusé, resté en place, sert encore son numéro.
 func (p *Provider) removeStep(proj *model.Project, path string) (*engine.Step, error) {
-	return removal.File{
+	version := versionFromPoolPath(path)
+	s, err := removal.File{
 		Resource: "php/pool/" + filepath.Base(path),
 		Summary:  fmt.Sprintf("pool php obsolète %s", path),
 		Path:     path,
@@ -471,8 +516,58 @@ func (p *Provider) removeStep(proj *model.Project, path string) (*engine.Step, e
 		Force:    p.Force,
 		Backups:  p.Paths.BackupsDir(),
 		Now:      p.now,
-		Reload:   []string{"php:" + versionFromPoolPath(path)},
+		Reload:   []string{"php:" + version},
 	}.Step()
+	if err != nil || s == nil || p.Store == nil {
+		return s, err
+	}
+	owner, resource, _ := fs.ManagedResource(path)
+	name, ok := strings.CutPrefix(resource, "php/pool/")
+	if owner != proj.ID() || !ok || name == "" {
+		return s, nil
+	}
+	scope := "php-" + version
+	released := 0
+	remove, restore := s.Apply, s.Compensate
+	s.Apply = func(ctx context.Context) error {
+		if err := remove(ctx); err != nil {
+			return err
+		}
+		if _, err := os.Lstat(path); !os.IsNotExist(err) {
+			return nil
+		}
+		released = allocatedNumber(p.Store, scope, proj.ID(), name)
+		return p.Store.Release(scope, proj.ID(), name)
+	}
+	// Le pool rendu par une compensation reprend son numéro : il le sert de
+	// nouveau.
+	s.Compensate = func(ctx context.Context) error {
+		if restore != nil {
+			if err := restore(ctx); err != nil {
+				return err
+			}
+		}
+		if released > 0 {
+			_, err := p.Store.Claim(scope, proj.ID(), name, released)
+			return err
+		}
+		return nil
+	}
+	return s, nil
+}
+
+// allocatedNumber rend le numéro qu'une ressource tient en base, zéro sinon.
+func allocatedNumber(st *store.Store, scope, project, name string) int {
+	list, err := st.Allocations(scope)
+	if err != nil {
+		return 0
+	}
+	for _, a := range list {
+		if a.Project == project && a.Name == name {
+			return a.Number
+		}
+	}
+	return 0
 }
 
 // writePool écrit le fichier de pool puis valide la configuration FPM. La

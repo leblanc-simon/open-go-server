@@ -12,6 +12,7 @@ import (
 	"leblanc.io/open-go-server/internal/config"
 	"leblanc.io/open-go-server/internal/engine"
 	"leblanc.io/open-go-server/internal/exec"
+	"leblanc.io/open-go-server/internal/fs"
 	"leblanc.io/open-go-server/internal/model"
 	"leblanc.io/open-go-server/internal/naming"
 	"leblanc.io/open-go-server/internal/template"
@@ -315,9 +316,10 @@ func TestRemovingServicesCleansUp(t *testing.T) {
 	proj.Spec.Services = nil
 	plan := apply(t, prov, proj)
 	// Les deux instances, plus le détachement de la cible : un projet sans service
-	// ne doit plus être réclamé au démarrage.
-	if len(plan.Mutating()) != 3 {
-		t.Errorf("deux instances et la cible doivent être désactivées :\n%s", plan.String())
+	// ne doit plus être réclamé au démarrage. Puis le modèle et la cible partent
+	// (D100).
+	if len(plan.Mutating()) != 5 {
+		t.Errorf("deux instances et la cible doivent être désactivées, modèle et cible retirés :\n%s", plan.String())
 	}
 }
 
@@ -427,7 +429,10 @@ func TestCleanupStopsInstancesBeforeRemovingFiles(t *testing.T) {
 	obs := Observed{Enabled: map[string]bool{
 		InstanceName(proj.ID(), "veille", 1): true,
 	}}
-	steps := prov.cleanupSteps(proj, obs)
+	steps, err := prov.cleanupSteps(proj, obs)
+	if err != nil {
+		t.Fatal(err)
+	}
 	var arret, detachement = -1, -1
 	for i, s := range steps {
 		if strings.HasPrefix(s.Resource, "unit/instance/") && arret < 0 {
@@ -712,5 +717,107 @@ func TestLogsEcritLesJournauxDansLaSortie(t *testing.T) {
 		if err := prov.Logs(context.Background(), proj, nom, false, 20, &out, &errOut); err == nil {
 			t.Errorf("le nom de service %q ne doit pas être accepté", nom)
 		}
+	}
+}
+
+// R1-74 (D100) : le modèle d'un service retiré de la déclaration restait sur le
+// disque, et la cible d'un projet sans plus aucun service aussi — ni l'apply ni
+// « project delete » ne les connaissaient plus.
+func TestServiceRetireEtCibleSontRetires(t *testing.T) {
+	prov, proj := fixture(t)
+	proj.Spec.Services = []model.Service{
+		{Name: "veille", Template: TemplateMessenger},
+		{Name: "rapports", Template: TemplateMessenger},
+	}
+	apply(t, prov, proj)
+	dir := prov.Paths.SystemdDir()
+	rapports := filepath.Join(dir, ServiceName(proj.ID(), "rapports"))
+	veille := filepath.Join(dir, ServiceName(proj.ID(), "veille"))
+	target := filepath.Join(dir, TargetName(proj.ID()))
+	for _, path := range []string{rapports, veille, target} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("%s devrait exister après le premier apply : %v", path, err)
+		}
+	}
+
+	// Un service retiré : son modèle part, ses instances avec lui.
+	proj.Spec.Services = proj.Spec.Services[:1]
+	apply(t, prov, proj)
+	if _, err := os.Lstat(rapports); !os.IsNotExist(err) {
+		t.Errorf("le modèle du service retiré est resté : %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(prov.wantsDir(proj.ID()), InstanceName(proj.ID(), "rapports", 1))); !os.IsNotExist(err) {
+		t.Errorf("l'instance du service retiré est restée activée : %v", err)
+	}
+	if _, err := os.Stat(veille); err != nil {
+		t.Errorf("le service encore déclaré a été retiré : %v", err)
+	}
+
+	// Plus aucun service : modèle, cible et répertoire .wants partent.
+	proj.Spec.Services = nil
+	apply(t, prov, proj)
+	for _, path := range []string{veille, target, prov.wantsDir(proj.ID())} {
+		if _, err := os.Lstat(path); !os.IsNotExist(err) {
+			t.Errorf("%s est resté alors que le projet ne déclare plus de service : %v", path, err)
+		}
+	}
+}
+
+// Le retrait suit les cinq états : un modèle retouché ne part que sous --force,
+// un fichier au nom du projet qu'ogs n'a pas écrit pour lui ne part jamais.
+func TestServiceRetireSousLesCinqEtats(t *testing.T) {
+	prov, proj := fixture(t)
+	proj.Spec.Services = []model.Service{
+		{Name: "veille", Template: TemplateMessenger},
+		{Name: "rapports", Template: TemplateMessenger},
+	}
+	apply(t, prov, proj)
+	dir := prov.Paths.SystemdDir()
+	rapports := filepath.Join(dir, ServiceName(proj.ID(), "rapports"))
+	data, err := os.ReadFile(rapports)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(rapports, append(data, []byte("# retouche\n")...), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Le fichier d'un voisin dont le nom prolonge l'identifiant.
+	voisin := filepath.Join(dir, "ogs-"+proj.ID()+"-x@.service")
+	if err := os.WriteFile(voisin, fs.Render(fs.Header{Project: proj.ID() + "-x", Resource: "unit/x",
+		Generated: time.Now()}, []byte("[Unit]\n"), "#"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	proj.Spec.Services = proj.Spec.Services[:1]
+	ctx := context.Background()
+	obs, _ := prov.Observe(ctx, proj)
+	steps, err := prov.Plan(ctx, proj, obs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := &engine.Plan{Project: proj.ID()}
+	for _, s := range steps {
+		plan.Add(s)
+	}
+	report, err := engine.Execute(ctx, plan, engine.Options{})
+	if err != nil {
+		t.Fatalf("un retrait refusé ne doit pas faire échouer l'apply : %v", err)
+	}
+	if len(report.Warnings) == 0 {
+		t.Error("le refus de retirer un modèle retouché doit avertir")
+	}
+	if _, err := os.Stat(rapports); err != nil {
+		t.Errorf("un modèle retouché ne part pas sans --force : %v", err)
+	}
+	if _, err := os.Stat(voisin); err != nil {
+		t.Errorf("le fichier d'un autre projet a été retiré : %v", err)
+	}
+
+	prov.Force = true
+	apply(t, prov, proj)
+	if _, err := os.Lstat(rapports); !os.IsNotExist(err) {
+		t.Errorf("sous --force, le modèle retouché doit partir : %v", err)
+	}
+	if _, err := os.Stat(voisin); err != nil {
+		t.Errorf("le fichier d'un autre projet ne part jamais, --force compris : %v", err)
 	}
 }

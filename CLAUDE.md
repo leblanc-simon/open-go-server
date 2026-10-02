@@ -178,7 +178,9 @@ Trois corollaires, chacun payé d'un défaut réel :
   un pool de `shop`, c'est le pool principal de `shop_api` : l'attribution par préfixe faisait retirer, au
   premier apply de `shop`, le pool et le vhost du voisin, en code 0 et sans copie. Les providers lisent la
   ligne `projet: … ressource: …` là où `Inspect` lit la marque, dans les trois premières lignes
-  (`fs.ManagedResource`, `fs.CheckOwner`) — ce que l'un attribue, l'autre doit le juger de même. **Tout
+  (`fs.ManagedResource`, `fs.CheckOwner`) — ce que l'un attribue, l'autre doit le juger de même. La **ressource** de l'en-tête compte autant que le projet : `ogs-<id>-app@.service` est l'unité
+  applicative (`app/app`) comme le modèle d'un service déclaré « app » (`unit/app`), et le retrait de l'unité
+  d'une application quittée, qui n'exigeait que le projet, emportait ce service un apply sur deux (D100). **Tout
   retrait** passe par `removal.File`, sous les cinq états, l'état relu à l'application : un fichier
   retouché ne part que sous `--force`, sauvegardé ; un fichier non géré, ou marqué pour un autre projet,
   ne part jamais ; et un projet n'écrit jamais le fichier d'un autre, `--force` compris (code 4). Seul
@@ -186,8 +188,9 @@ Trois corollaires, chacun payé d'un défaut réel :
   décide seul de ce qu'il efface, et ne pas reconnaître un fichier le laisse en place. Trois exceptions,
   retirées en bloc sans lire d'en-tête : les clés DKIM du projet (`/etc/opendkim/keys/<id>`), le répertoire
   `.wants` de sa cible, et le fichier d'environnement de D75 : ogs n'en écrit pas le contenu, il ne porte donc aucun en-tête, et il
-  part dans tous les cas, `--keep-data` compris — il porte des secrets, dont l'archive garde la copie
-  scellée.
+  part hors `--keep-data` — il porte des secrets, dont l'archive garde la copie scellée. Sous `--keep-data`,
+  il reste : c'est le contenu de l'exploitant, que rien ne reproduit (D100), et la purge le nomme avant la
+  saisie de l'identifiant.
 
 La sauvegarde de `--force` va dans **`/var/lib/ogs/backups`**, jamais à côté de l'original : tout répertoire
 de configuration est relu en entier par quelqu'un — son démon, ou ogs lui-même, qui inventorie
@@ -838,6 +841,47 @@ Ils ont tous coûté un défaut réel ; les tests unitaires ne les voyaient pas.
   port libre. Une écoute se juge à son uid (`/proc/net/tcp`, `app.ReadListeners`), l'attribution écarte les
   ports en écoute, et une écoute étrangère — ni le projet, ni root — rend l'attente critique. doctor relit le
   port dans l'unité écrite : il n'attribue rien, sans quoi, sans base, tout projet aurait reçu le premier.
+- **Un numéro ne se libère qu'une fois son fichier parti, et ne s'inscrit qu'à l'apply** (D100). `plan`,
+  `diff`, `status` et la TUI réservaient un numéro à chaque pool calculé, la suppression n'en libérait aucun,
+  et la plage d'une version PHP se saturait. Les commandes qui calculent sans appliquer passent le store en
+  aperçu (`Store.PreviewAllocations`) ; un apply refusé ou déroulé rend ses réservations
+  (`CancelAllocations`). Libérer le numéro d'un pool ou d'une unité restés sur le disque — non écrits par
+  ogs, retrait en échec — le ferait donner à un autre projet, dont le vhost relaierait vers ce qui tourne
+  encore : la libération suit le retrait, et une compensation qui rend le fichier rend le numéro.
+- **Une preuve de propriété part après sa ressource, jamais avant** (D100). La suppression vide le keystore
+  du projet, mais les secrets `mysql/`, `mariadb/`, `postgres/`, `amqp/`, `amqp-vhost/` et
+  `amqp-declared/` restent l'affaire de leur provider : retirés d'avance, ils feraient d'une base ou d'un
+  vhost resté en place — moteur injoignable, retrait en échec, `--keep-data` — une ressource étrangère
+  qu'ogs ne reprendrait plus jamais.
+- **Un ancien compte ne part qu'une fois son remplaçant observé, jamais dans l'apply qui le crée** (D100).
+  Un utilisateur SGBD renommé, un hôte changé, un vhost ou un compte AMQP remplacés : l'étape qui crée le
+  nouveau le compense en cas de déroulage, et le retrait de l'ancien, lui, ne se compense pas. Une étape
+  critique en échec plus loin laissait la base sans aucun compte ni secret, refusée ensuite comme étrangère,
+  pendant que la CLI annonçait « revenu à son état initial ». Le retrait attend l'apply suivant ; un hôte
+  changé laisse une marque scellée (`<moteur>-moved/<compte>`) qui porte **les hôtes** sous lesquels ogs a
+  tenu le compte, seule preuve, entre deux comptes de même nom, de ceux qu'ogs a posés (D78) : l'apply
+  suivant retire ceux des hôtes quittés — un hôte d'origine retrouvé ne voyait sinon rien partir, et la
+  marque restait à jamais —, et `project delete` les emporte tous, faute de quoi un compte à mot de passe
+  survivait sans preuve entre les deux applies. **Jamais pour un projet adopté** : son mot de passe scellé, tiré au
+  premier apply d'un compte qui existait, n'est pas celui que le compte porte — `CREATE USER IF NOT EXISTS`
+  ne le pose pas. Le recréer avec sous l'hôte déclaré coupait l'application (MySQL préfère l'hôte le plus
+  précis), puis l'apply suivant détruisait le compte réel ; un adopté garde le refus de D78.
+- **Une lecture en échec n'est pas une absence** (Q-20) : sur le broker, une lecture d'exchanges, de files,
+  de bindings ou de policies qui échoue faisait créer, en étapes critiques, ce qui existait, et la trace de
+  D100 oubliait des objets restés sur le broker. L'observation incomplète ne fonde ni création ni retrait. Et **la restauration ne réinjecte que les preuves de ce que la
+  déclaration nomme** : l'archive précède les retraits, et la preuve d'une ressource détruite depuis
+  faisait retirer par l'apply l'homonyme que l'administrateur avait créé entre-temps.
+- **Un rôle PostgreSQL qui a reçu des droits ne se retire pas par `DROP ROLE`** : ses privilèges, privilèges
+  par défaut compris, en dépendent, et `DROP OWNED` seul supprime les tables qu'il a créées. D'où
+  `REASSIGN OWNED` vers le propriétaire de la base, puis `DROP OWNED`, base par base. `REASSIGN OWNED` touche
+  aussi les objets partagés, bases comprises : un rôle qui possède encore une base n'est pas retiré. Sous
+  MySQL, `DROP DATABASE` laisse les droits de `mysql.db` : une base « où le compte a ses droits » se juge
+  sur son existence, pas sur `SCHEMA_PRIVILEGES` seul.
+- **Une file quorum refuse `if-empty` et `if-unused`** : `DELETE /api/queues/<v>/<f>?if-empty=true&if-unused=true`
+  rend 400, et le préréglage Messenger déclare ses transports en quorum. Le retrait d'une file relit ses
+  compteurs juste avant de la retirer sans condition ; seule une file classique est jugée par le broker
+  lui-même. Et ce que l'application crée elle-même dans son vhost (Messenger, `auto_setup`) n'est jamais
+  retiré : seul ce que la trace `amqp-declared/<vhost>` dit qu'ogs a déclaré l'est (D100).
 
 ## Codes de retour
 

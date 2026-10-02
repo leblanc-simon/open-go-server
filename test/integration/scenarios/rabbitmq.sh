@@ -131,8 +131,108 @@ if [ "$apres" != "0" ]; then
 fi
 
 echo
+echo "--- ce que la déclaration ne porte plus quitte le broker (D100) ---"
+# Le transport emails est retiré de la déclaration alors que sa file porte trois
+# messages : la file d'échec, vide, et les bindings partent ; la file pleine
+# reste, et l'apply le dit (code 6). Une file que l'application a créée
+# elle-même n'a jamais été déclarée par ogs : elle reste quoi qu'il arrive.
+curl -sf -u "$auth" -X PUT "$api/queues/shopfr/applicative" -H 'content-type: application/json' \
+    -d '{"durable":true}' || { echo "ÉCHEC : file applicative non créée"; exit 1; }
+python3 /scenarios/amqp-client.py remplir-emails
+for _ in $(seq 1 20); do
+    [ "$(compte)" = "3" ] && break
+    sleep 1
+done
+[ "$(compte)" = "3" ] || { echo "ÉCHEC : les 3 messages ne sont pas comptés dans emails"; exit 1; }
+ogs amqp messenger shopfr --transport async >/dev/null
+sortie=$(ogs apply shopfr --yes --recreate-queues 2>&1)
+code=$?
+echo "$sortie" | grep -Ei "emails|retiré" | head -6
+if [ "$code" != 6 ] || ! echo "$sortie" | grep -q "emails.*3 message(s)"; then
+    echo "ÉCHEC : la file pleine devait être conservée et nommée, en code 6 (code $code)"
+    echo "$sortie" | tail -8
+    exit 1
+fi
+curl -sf -u "$auth" "$api/queues/shopfr/emails" >/dev/null ||
+    { echo "ÉCHEC : la file emails, pleine, est partie"; exit 1; }
+if curl -sf -u "$auth" "$api/queues/shopfr/emails_failed" >/dev/null 2>&1; then
+    echo "ÉCHEC : la file emails_failed, vide et retirée de la déclaration, subsiste"
+    exit 1
+fi
+if curl -sf -u "$auth" "$api/bindings/shopfr/e/messages/q/emails" | grep -q '"routing_key":"emails"'; then
+    echo "ÉCHEC : le binding messages → emails, retiré de la déclaration, subsiste"
+    exit 1
+fi
+ogs amqp queue purge shopfr emails --yes >/dev/null 2>&1
+for _ in $(seq 1 20); do
+    [ "$(compte)" = "0" ] && break
+    sleep 1
+done
+sortie=$(ogs apply shopfr --yes 2>&1)
+code=$?
+if [ "$code" != 0 ] || curl -sf -u "$auth" "$api/queues/shopfr/emails" >/dev/null 2>&1; then
+    echo "ÉCHEC : vidée, la file emails devait partir au passage suivant (code $code)"
+    echo "$sortie" | tail -6
+    exit 1
+fi
+curl -sf -u "$auth" "$api/queues/shopfr/applicative" >/dev/null ||
+    { echo "ÉCHEC : la file créée par l'application est partie"; exit 1; }
+echo "file d'échec et bindings retirés, file pleine gardée puis retirée une fois vide, file applicative intacte"
+
+echo
+echo "--- vhost et compte remplacés dans la déclaration (D100) ---"
+sed -i -e 's/^    vhost: shopfr$/    vhost: shopfr2/' -e 's/^    user: shopfr$/    user: shopfr2/' \
+    /etc/ogs/projects/shopfr.yaml
+grep -q "^    vhost: shopfr2$" /etc/ogs/projects/shopfr.yaml ||
+    { echo "ÉCHEC : l'édition de la déclaration n'a pas mordu"; exit 1; }
+sortie=$(ogs apply shopfr --yes 2>&1)
+code=$?
+echo "$sortie" | grep -Ei "vhost amqp|compte amqp|utilisateur amqp" | head -4
+if [ "$code" != 0 ]; then
+    echo "ÉCHEC : le remplacement devait aboutir (code $code)"
+    echo "$sortie" | tail -8
+    exit 1
+fi
+# L'apply qui crée les remplaçants garde les anciens : une saga déroulée plus
+# loin retirerait les nouveaux, et le projet resterait sans aucun (D100).
+if ! curl -sf -u "$auth" "$api/vhosts/shopfr" >/dev/null 2>&1 ||
+    ! curl -sf -u "$auth" "$api/users/shopfr" >/dev/null 2>&1; then
+    echo "ÉCHEC : l'ancien vhost ou l'ancien compte est parti dans l'apply qui crée le remplaçant"
+    exit 1
+fi
+sortie=$(ogs apply shopfr --yes 2>&1)
+code=$?
+echo "$sortie" | grep -Ei "vhost amqp|compte amqp" | head -4
+if [ "$code" != 0 ]; then
+    echo "ÉCHEC : le retrait des anciens devait aboutir (code $code)"
+    echo "$sortie" | tail -8
+    exit 1
+fi
+if curl -sf -u "$auth" "$api/vhosts/shopfr" >/dev/null 2>&1 ||
+    curl -sf -u "$auth" "$api/users/shopfr" >/dev/null 2>&1; then
+    echo "ÉCHEC : l'ancien vhost ou l'ancien compte d'ogs subsiste"
+    exit 1
+fi
+curl -sf -u "$auth" "$api/vhosts/shopfr2" >/dev/null ||
+    { echo "ÉCHEC : le nouveau vhost n'a pas été créé"; exit 1; }
+if ogs secrets list shopfr 2>/dev/null | grep -qE "amqp(-vhost|-declared)?/shopfr\b"; then
+    echo "ÉCHEC : les preuves de l'ancien vhost ou de l'ancien compte restent au keystore"
+    ogs secrets list shopfr
+    exit 1
+fi
+echo "ancien vhost et ancien compte retirés avec leurs preuves"
+
+echo
 echo "--- suppression : le vhost et l'utilisateur partent avec le projet ---"
 ogs project delete shopfr --yes >/dev/null 2>&1
+if curl -sf -u "$auth" "$api/vhosts/shopfr2" >/dev/null 2>&1; then
+    echo "ÉCHEC : le vhost subsiste"
+    exit 1
+fi
+if curl -sf -u "$auth" "$api/users/shopfr2" >/dev/null 2>&1; then
+    echo "ÉCHEC : l'utilisateur subsiste"
+    exit 1
+fi
 if curl -sf -u "$auth" "$api/vhosts/shopfr" >/dev/null 2>&1; then
     echo "ÉCHEC : le vhost subsiste"
     exit 1

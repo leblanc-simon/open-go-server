@@ -185,6 +185,39 @@ fi
 echo "le compte lecture lit mais n'écrit pas"
 
 echo
+echo "--- un compte additionnel retiré de la déclaration part au prochain apply (D100) ---"
+ogs db user add shopfr ancien --privileges readonly >/dev/null
+ogs apply shopfr --yes >/dev/null 2>&1
+if [ -z "$(mariadb -N -e "SELECT user FROM mysql.user WHERE user='ancien'")" ]; then
+    echo "ÉCHEC : le compte ancien n'a pas été créé"
+    exit 1
+fi
+sed -i '/- user: ancien$/,/privileges:/d' /etc/ogs/projects/shopfr.yaml
+if grep -q ancien /etc/ogs/projects/shopfr.yaml; then
+    echo "ÉCHEC : le compte ancien est encore déclaré"
+    exit 1
+fi
+ogs plan shopfr 2>&1 | grep -E "ancien" | head -3
+if ! ogs apply shopfr --yes >/tmp/ancien.log 2>&1; then
+    echo "ÉCHEC : l'apply qui retire le compte a échoué"
+    cat /tmp/ancien.log
+    exit 1
+fi
+if [ -n "$(mariadb -N -e "SELECT user FROM mysql.user WHERE user='ancien'")" ]; then
+    echo "ÉCHEC : le compte retiré de la déclaration subsiste"
+    exit 1
+fi
+if ogs secrets list shopfr 2>/dev/null | grep -q "mysql/ancien"; then
+    echo "ÉCHEC : le mot de passe du compte retiré est resté au keystore"
+    exit 1
+fi
+if ! mariadb -h 127.0.0.1 -u lecture -p"$lecturepass" shopfr -e "SELECT count(*) FROM essai" >/dev/null 2>&1; then
+    echo "ÉCHEC : le compte lecture, toujours déclaré, a perdu l'accès"
+    exit 1
+fi
+echo "le compte ancien est retiré avec son mot de passe ; lecture reste"
+
+echo
 echo "--- dump ---"
 ogs db dump shopfr shopfr 2>&1 | tail -2
 # Le dump doit atterrir dans un emplacement défini, non dans le répertoire
@@ -258,6 +291,13 @@ rm -f /root/hostile.sql /root/shopfr-vue.sql /tmp/restore-identite
 
 echo
 echo "--- suppression : les bases partent avec le projet ---"
+# « lecture » est retiré de la déclaration sans apply : la suppression du projet
+# doit l'emporter quand même (D100) — elle ne visait que les comptes déclarés.
+sed -i '/- user: lecture$/,/privileges:/d' /etc/ogs/projects/shopfr.yaml
+if grep -q "user: lecture" /etc/ogs/projects/shopfr.yaml; then
+    echo "ÉCHEC : lecture encore déclaré"
+    exit 1
+fi
 ogs project delete shopfr --yes >/dev/null 2>&1
 restantes=$(mariadb -N -e "SELECT schema_name FROM information_schema.schemata WHERE schema_name IN ('shopfr','shopfr_stats')")
 if [ -n "$restantes" ]; then

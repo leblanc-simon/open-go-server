@@ -145,6 +145,12 @@ if [ -f /etc/apache2/sites-available/phptest.conf ]; then
     echo "ÉCHEC : le vhost existe encore"
     echecs=1
 fi
+# Le numéro du pool revient à la plage (D100) : il restait attribué à jamais.
+if ogs php ports 2>&1 | grep -q phptest; then
+    echo "ÉCHEC : le numéro du pool est resté attribué"
+    ogs php ports
+    echecs=1
+fi
 
 # Une suppression complète ne doit pas se solder par un succès partiel : le
 # code 6 signalerait qu'une ressource est restée en place.

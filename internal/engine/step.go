@@ -67,6 +67,12 @@ type Step struct {
 	// challenge HTTP-01 a besoin que le serveur web ait relu son vhost, faute de
 	// quoi l'autorité reçoit un 404.
 	FlushReloads bool
+	// Bookkeeping marque une étape qui ne tient que l'état propre d'ogs — la
+	// trace de ce qu'il a déclaré sur le broker, par exemple (D100) : elle
+	// s'applique comme une autre, mais n'est pas un écart du système, et « diff »
+	// ou « status » ne la comptent pas. Sans quoi la mise à jour d'ogs ferait
+	// rendre le code 6 à tout le parc jusqu'au premier apply de chaque projet.
+	Bookkeeping bool
 }
 
 // NewStep construit une étape critique par défaut : le cas dangereux est celui

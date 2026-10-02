@@ -389,7 +389,7 @@ func (a *App) buildProviders() (*providers, error) {
 	php.PortsInUse = appProv.PortsInUse
 	amqpProv := a.amqpProvider()
 	amqpPort := amqpProv.Port
-	dbProv := &db.Provider{Paths: a.Paths, Exec: a.Exec, Store: a.Store, Keys: a.Keys, AMQPPort: amqpPort,
+	dbProv := &db.Provider{Paths: a.Paths, Exec: a.Exec, Store: a.Store, Keys: a.Keys, AMQPPort: amqpPort, Force: a.Force,
 		Reserved: a.reservedDBAccounts()}
 	certStore := tlsprov.Store{Paths: a.Paths}
 	certs := &tlsprov.Provider{
@@ -471,7 +471,7 @@ func (a *App) firewallProvider(webUnit string) (*firewall.Provider, error) {
 // rapportée par le plan plutôt qu'en erreur d'initialisation.
 func (a *App) amqpProvider() *amqp.Provider {
 	prov := &amqp.Provider{Paths: a.Paths, Store: a.Store, Keys: a.Keys,
-		RecreateQueues: a.RecreateQueues}
+		RecreateQueues: a.RecreateQueues, Fleet: a.loadProjects}
 	creds, err := a.amqpCredentials()
 	if err != nil {
 		return prov

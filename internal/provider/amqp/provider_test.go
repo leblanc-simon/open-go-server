@@ -34,6 +34,9 @@ type memClient struct {
 	failUsers error
 	failPerms error
 	failVhost error
+	// failRead fait échouer la lecture d'une sorte d'objets du vhost :
+	// « exchanges », « queues », « bindings » ou « policies » (Q-20).
+	failRead map[string]error
 }
 
 func newMemClient() *memClient {
@@ -104,6 +107,9 @@ func (m *memClient) EnsurePermission(_ context.Context, p Permission) error {
 	return nil
 }
 func (m *memClient) Exchanges(_ context.Context, vhost string) ([]Exchange, error) {
+	if err := m.failRead["exchanges"]; err != nil {
+		return nil, err
+	}
 	var out []Exchange
 	for _, e := range m.exchanges {
 		if e.Vhost == vhost {
@@ -117,6 +123,9 @@ func (m *memClient) EnsureExchange(_ context.Context, e Exchange) error {
 	return nil
 }
 func (m *memClient) Queues(_ context.Context, vhost string) ([]Queue, error) {
+	if err := m.failRead["queues"]; err != nil {
+		return nil, err
+	}
 	var out []Queue
 	for _, q := range m.queues {
 		if q.Vhost == vhost {
@@ -152,6 +161,37 @@ func (m *memClient) DeleteQueue(_ context.Context, vhost, name string) error {
 	m.deleted = append(m.deleted, "queue:"+name)
 	return nil
 }
+func (m *memClient) DeleteIdleQueue(_ context.Context, vhost, name string) error {
+	if q, ok := m.queues[vhost+"/"+name]; ok && (q.Messages > 0 || q.Consumers > 0) {
+		return errors.New("PRECONDITION_FAILED - queue not empty or in use")
+	}
+	delete(m.queues, vhost+"/"+name)
+	m.deleted = append(m.deleted, "queue:"+name)
+	return nil
+}
+func (m *memClient) DeleteExchange(_ context.Context, vhost, name string) error {
+	for _, b := range m.bindings {
+		if b.Vhost == vhost && b.Source == name {
+			return errors.New("PRECONDITION_FAILED - exchange in use")
+		}
+	}
+	delete(m.exchanges, vhost+"/"+name)
+	m.deleted = append(m.deleted, "exchange:"+name)
+	return nil
+}
+func (m *memClient) DeleteBinding(_ context.Context, b Binding) error {
+	kept := m.bindings[:0]
+	for _, o := range m.bindings {
+		if o.Vhost == b.Vhost && o.Source == b.Source && o.Destination == b.Destination &&
+			o.RoutingKey == b.RoutingKey {
+			m.deleted = append(m.deleted, "binding:"+b.Source+"->"+b.Destination)
+			continue
+		}
+		kept = append(kept, o)
+	}
+	m.bindings = kept
+	return nil
+}
 func (m *memClient) PurgeQueue(_ context.Context, vhost, name string) error {
 	if q, ok := m.queues[vhost+"/"+name]; ok {
 		q.Messages = 0
@@ -160,6 +200,9 @@ func (m *memClient) PurgeQueue(_ context.Context, vhost, name string) error {
 	return nil
 }
 func (m *memClient) Bindings(_ context.Context, vhost string) ([]Binding, error) {
+	if err := m.failRead["bindings"]; err != nil {
+		return nil, err
+	}
 	var out []Binding
 	for _, b := range m.bindings {
 		if b.Vhost == vhost {
@@ -173,6 +216,9 @@ func (m *memClient) EnsureBinding(_ context.Context, b Binding) error {
 	return nil
 }
 func (m *memClient) Policies(_ context.Context, vhost string) ([]Policy, error) {
+	if err := m.failRead["policies"]; err != nil {
+		return nil, err
+	}
 	var out []Policy
 	for _, p := range m.policies {
 		if p.Vhost == vhost {
@@ -831,5 +877,60 @@ func TestMarqueDuVhostPoseeAvantLui(t *testing.T) {
 	apply(t, p, proj)
 	if plan := replan(t, p, proj); !plan.Empty() {
 		t.Errorf("le plan doit être vide :\n%s", plan.String())
+	}
+}
+
+// Q-20 : une lecture en échec des exchanges, files, bindings ou policies
+// devenait « rien n'existe » — des créations critiques factices, et, avec la
+// trace de D100, des objets tenus pour absents puis oubliés d'elle, laissés à
+// jamais sur le broker. Une observation incomplète ne fonde ni création ni
+// retrait, laisse la trace telle quelle, et le dit par une étape non critique.
+func TestLectureEnÉchecNeVautPasAbsence(t *testing.T) {
+	for _, kind := range []string{"exchanges", "queues", "bindings", "policies"} {
+		t.Run(kind, func(t *testing.T) {
+			p, client, proj := fixture(t)
+			apply(t, p, proj)
+			before, _, _ := p.Store.GetSecret(proj.ID(), DeclaredMarker("shopfr"))
+			client.failRead = map[string]error{kind: errors.New("lecture refusée")}
+			ctx := context.Background()
+			obs, err := p.Observe(ctx, proj)
+			if err != nil {
+				t.Fatal(err)
+			}
+			steps, err := p.Plan(ctx, proj, obs)
+			if err != nil {
+				t.Fatal(err)
+			}
+			named := false
+			for _, s := range steps {
+				if !s.Mutates() {
+					continue
+				}
+				if s.Critical {
+					t.Errorf("étape critique fondée sur une lecture en échec : %s", s.Summary)
+				}
+				if strings.Contains(s.Summary, kind) || strings.Contains(s.Resource, "incomplete") {
+					named = true
+				}
+				if s.Action == engine.Delete {
+					t.Errorf("retrait fondé sur une lecture en échec : %s", s.Summary)
+				}
+			}
+			if !named {
+				t.Errorf("la lecture en échec doit être nommée par une étape : %v", steps)
+			}
+			plan := &engine.Plan{Project: proj.ID()}
+			for _, s := range steps {
+				plan.Add(s)
+			}
+			report, err := engine.Execute(ctx, plan, engine.Options{})
+			if err != nil || len(report.Warnings) == 0 {
+				t.Errorf("non critique, avec avertissement (code 6) : %v %v", err, report.Warnings)
+			}
+			after, _, _ := p.Store.GetSecret(proj.ID(), DeclaredMarker("shopfr"))
+			if string(before) != string(after) {
+				t.Error("la trace ne change pas sur une observation incomplète")
+			}
+		})
 	}
 }

@@ -22,7 +22,6 @@ import (
 	"leblanc.io/open-go-server/internal/fs"
 	"leblanc.io/open-go-server/internal/hook"
 	"leblanc.io/open-go-server/internal/model"
-	"leblanc.io/open-go-server/internal/provider/amqp"
 	appprov "leblanc.io/open-go-server/internal/provider/app"
 	"leblanc.io/open-go-server/internal/provider/cron"
 	"leblanc.io/open-go-server/internal/provider/system"
@@ -141,6 +140,13 @@ func newDeleteCommand(app *App) *cobra.Command {
 			}
 
 			if purge {
+				// Ce qui part sans copie est nommé avant la saisie : le fichier
+				// d'environnement est le seul contenu de l'exploitant qu'ogs efface
+				// hors du home, et la purge n'en garde rien (D100).
+				if _, err := os.Lstat(app.Paths.EnvFile(p.ID())); err == nil && !keepData {
+					app.printf("= --purge : %s (contenu de l'exploitant) sera effacé sans copie\n",
+						app.Paths.EnvFile(p.ID()))
+				}
 				// La purge ne laisse aucun recours : la confirmation exige de saisir
 				// l'identifiant, ce qui rend l'erreur de frappe improbable.
 				if err := app.confirmExact(p.ID(),
@@ -215,6 +221,10 @@ func newDeleteCommand(app *App) *cobra.Command {
 			// recueille, et son manifeste ne déclare retiré, que ce qui part vraiment.
 			files, kept := app.projectFiles(provs, p)
 			scope.files = files
+			// Les certificats du projet aussi (D100) : ils partaient nulle part, et
+			// doctor avertissait à vie de leur expiration.
+			certs, keptCerts := app.projectCertificates(provs, p)
+			scope.certs = certs
 
 			var removed []string
 			archived := ""
@@ -282,11 +292,18 @@ func newDeleteCommand(app *App) *cobra.Command {
 				}
 			}
 			// Le fichier d'environnement porte des secrets : il ne survit pas au
-			// projet. L'archive en garde une copie scellée.
-			if err := os.Remove(app.Paths.EnvFile(p.ID())); err == nil {
-				removed = append(removed, app.Paths.EnvFile(p.ID()))
+			// projet, et l'archive en garde une copie scellée. Mais son contenu est
+			// celui de l'exploitant, qu'ogs n'a jamais écrit (D75) : sous
+			// --keep-data, qui garde données et contenu, il reste (D100) — il
+			// partait sans que rien ne puisse le reproduire.
+			if envFile := app.Paths.EnvFile(p.ID()); keepData {
+				if _, err := os.Lstat(envFile); err == nil {
+					app.printf("= --keep-data : %s conservé\n", envFile)
+				}
+			} else if err := os.Remove(envFile); err == nil {
+				removed = append(removed, envFile)
 			} else if !os.IsNotExist(err) {
-				warn("%s : %v", app.Paths.EnvFile(p.ID()), err)
+				warn("%s : %v", envFile, err)
 			}
 			// Les instances activées disparaissent avec leur répertoire .wants, qui
 			// suit le sort de la cible : une cible conservée garde ses instances.
@@ -348,6 +365,13 @@ func newDeleteCommand(app *App) *cobra.Command {
 			if err := app.systemctl(cmd.Context(), "daemon-reload"); err != nil {
 				warn("daemon-reload : %v", err)
 			}
+			// Les certificats partent une fois le serveur web rechargé sans les
+			// vhosts qui les désignaient : retirés avant, le rechargement échouait
+			// sur un fichier introuvable. L'archive en garde une copie scellée.
+			for _, k := range keptCerts {
+				warn("certificat %s conservé : %s", k.name, k.reason)
+			}
+			app.removeCertificates(provs, certs, &removed, warn)
 
 			// 5. Compte système et arborescence, une fois que plus rien ne tourne
 			// sous cette identité.
@@ -360,7 +384,9 @@ func newDeleteCommand(app *App) *cobra.Command {
 				}
 			}
 
-			// 6. Le projet quitte l'inventaire actif.
+			// 6. Le projet quitte l'inventaire actif, et ses numéros de pool et de
+			// port reviennent à la plage — seulement ceux dont le fichier est parti.
+			app.releaseAllocations(provs, p, warn)
 			if purge {
 				if err := os.Remove(app.Paths.ProjectFile(p.ID())); err != nil && !os.IsNotExist(err) {
 					return wrap(CodeError, err)
@@ -395,12 +421,23 @@ func newDeleteCommand(app *App) *cobra.Command {
 			// elles : retirées avant, le démon les désignerait encore, et retiendrait
 			// en file le courrier qui s'en réclame. Elles restent scellées et suivent
 			// le projet dans l'archive.
+			dkimKept := false
 			if len(dkimRecords) > 0 {
 				if err := provs.Mail.RemoveProject(p.ID()); err != nil {
+					dkimKept = true
 					warn("clés DKIM : %v", err)
 				} else {
 					removed = append(removed, "clés DKIM "+p.ID())
 				}
+			}
+			// Les secrets qui ne prouvent plus rien quittent le keystore (D100) ;
+			// l'archive en garde la copie. Sous --keep-data, ils restent avec ce
+			// qu'ils servent.
+			if !keepData {
+				app.purgeSecrets(p, dkimKept, &removed, warn)
+			} else if names, err := app.Store.SecretNames(p.ID()); err == nil && len(names) > 0 {
+				app.printf("= --keep-data : %d secret(s) conservé(s) au keystore, avec ce qu'ils servent ; "+
+					"un projet recréé sous l'identifiant %s les reprend\n", len(names), p.ID())
 			}
 
 			_, _ = app.runHook(cmd.Context(), provs.Hooks, p, hook.PostDelete,
@@ -478,6 +515,16 @@ func (a *App) generatedFiles(provs *providers, p *model.Project) []string {
 	// invisible de « systemctl list-units » puisqu'aucune instance ne la charge.
 	if appprov.Applies(p) {
 		files = append(files, provs.App.UnitPath(p))
+	}
+	// Et toute unité que l'en-tête attribue au projet (D100) : le modèle d'un
+	// service retiré, l'unité d'une application quittée pour un type PHP, que la
+	// déclaration ne nomme plus.
+	if stale, err := provs.Unit.StaleFiles(p.ID()); err == nil {
+		for _, path := range stale {
+			if !slices.Contains(files, path) {
+				files = append(files, path)
+			}
+		}
 	}
 	// Les noms réels des fichiers : celui d'un vhost adopté ne porte pas toujours
 	// l'extension du moteur (« shop.fr » sur nginx), et le composer depuis le nom
@@ -595,9 +642,10 @@ func (a *App) dropResources(cmd *cobra.Command, provs *providers, p *model.Proje
 	warn func(format string, args ...any)) {
 	// La garde d'entrée (forcedRemovals) l'a déjà refusé ; elle est
 	// refaite ici pour que le seul appel qui supprime n'en dépende pas.
-	if len(p.Spec.Databases) > 0 && adopted(p) && !a.Force {
+	dbs := len(p.Spec.Databases) > 0
+	if dbs && adopted(p) && !a.Force {
 		warn("bases conservées : %s est adopté, et les supprimer exige --force", p.ID())
-	} else if len(p.Spec.Databases) > 0 {
+	} else {
 		obs, err := provs.DB.Observe(cmd.Context(), p)
 		if err != nil {
 			warn("bases : %v", err)
@@ -623,62 +671,38 @@ func (a *App) dropResources(cmd *cobra.Command, provs *providers, p *model.Proje
 					state.Declaration.Engine, state.Declaration.Name))
 			}
 		}
-	}
-	if p.Spec.AMQP != nil && provs.AMQP.Client != nil {
-		// Ce qu'ogs n'a pas créé reste en place (D93) : un vhost homonyme de
-		// l'administrateur partait avec ses files et leurs messages. Vhost et
-		// compte se jugent chacun sur sa propre preuve — le mot de passe du compte
-		// ne dit rien du vhost, que spec.amqp.vhost a pu faire désigner après coup.
-		// Broker injoignable, rien n'est tenté : la suppression n'aurait pas mieux
-		// réussi.
-		spec := p.Spec.AMQP
-		obs, err := provs.AMQP.Observe(cmd.Context(), p)
-		if err == nil && obs.Unavailable != nil {
-			err = obs.Unavailable
-		}
-		if err != nil {
-			warn("vhost amqp %s et compte %s conservés : %v", spec.Vhost, spec.User, err)
-			return
-		}
-		switch {
-		case !obs.VhostOwned():
-			warn("vhost amqp %s conservé : ogs ne l'a pas créé (aucune marque scellée)", spec.Vhost)
-		case obs.VhostExists:
-			if err := provs.AMQP.Client.DeleteVhost(cmd.Context(), spec.Vhost); err != nil {
-				warn("suppression du vhost amqp : %v", err)
-				break
+		// Puis les comptes que la déclaration ne nomme plus (D100) : un compte
+		// additionnel retiré, l'ancien compte d'une base renommée. Seuls partent
+		// ceux dont le mot de passe est scellé dans la portée du projet, avec lui ;
+		// ce qui reste garde son secret, qui en prouve l'appartenance.
+		for _, r := range provs.DB.DropOrphans(cmd.Context(), p) {
+			o := r.Orphan
+			switch {
+			case r.Dropped && r.Kept == nil:
+				*removed = append(*removed, fmt.Sprintf("compte %s %s", o.Engine, o.User))
+			case r.Unreachable:
+				a.printf("= compte %s %s : moteur injoignable, et plus aucune base %s déclarée — son mot de "+
+					"passe reste scellé (%v)\n", o.Engine, o.User, o.Engine, r.Kept)
+			case r.Dropped:
+				warn("compte %s %s supprimé, mais son mot de passe est resté au keystore : %v", o.Engine, o.User, r.Kept)
+			case r.Kept != nil:
+				warn("compte %s %s conservé, avec son mot de passe scellé : %v", o.Engine, o.User, r.Kept)
 			}
-			*removed = append(*removed, "vhost amqp "+spec.Vhost)
-			fallthrough
-		default:
-			// La marque part avec le vhost : restée au keystore, elle ferait tenir
-			// pour sien l'homonyme qu'un autre créerait ensuite, et qu'un projet
-			// recréé sous le même identifiant reprendrait puis supprimerait.
-			a.dropSecret(p.ID(), amqp.VhostMarker(spec.Vhost), warn)
-		}
-		switch {
-		case !obs.UserOwned():
-			warn("compte amqp %s conservé : ogs ne l'a pas créé (aucun mot de passe scellé)", spec.User)
-		case obs.UserExists:
-			if err := provs.AMQP.Client.DeleteUser(cmd.Context(), spec.User); err != nil {
-				warn("suppression du compte amqp : %v", err)
-				break
-			}
-			fallthrough
-		default:
-			a.dropSecret(p.ID(), "amqp/"+spec.User, warn)
 		}
 	}
-}
-
-// dropSecret retire un secret du projet, et signale l'échec.
-func (a *App) dropSecret(project, name string, warn func(format string, args ...any)) {
-	if a.Store == nil {
-		return
+	// Ce qu'ogs n'a pas créé reste en place (D93) : un vhost homonyme de
+	// l'administrateur partait avec ses files et leurs messages. Vhost et compte
+	// se jugent chacun sur sa propre preuve — le mot de passe du compte ne dit
+	// rien du vhost, que spec.amqp.vhost a pu faire désigner après coup. Ceux
+	// qu'une déclaration changée ou retirée a laissés derrière elle partent aussi
+	// (D100) : leurs preuves restaient au keystore, et un projet recréé sous le
+	// même identifiant les aurait repris. Broker injoignable, rien n'est tenté :
+	// la suppression n'aurait pas mieux réussi, et les preuves restent.
+	report := provs.AMQP.DropProject(cmd.Context(), p)
+	for _, w := range report.Warnings {
+		warn("%s", w)
 	}
-	if err := a.Store.DeleteSecret(project, name); err != nil {
-		warn("secret %s : %v", name, err)
-	}
+	*removed = append(*removed, report.Removed...)
 }
 
 // adopted dit si le projet a été repris d'un serveur existant (« ogs import ») :
@@ -802,8 +826,40 @@ func (a *App) forcedRemovals(p *model.Project) ([]string, *refusal) {
 		for _, d := range p.Spec.Databases {
 			out = append(out, fmt.Sprintf("la base %s, qui existait avant ogs", databaseLabel(d, a.reservedDBAccounts())))
 		}
+		// Les comptes que la déclaration ne nomme plus et dont le mot de passe est
+		// scellé — par une rotation, par exemple : --force les emporte aussi (D100).
+		if orphans := a.undeclaredDBAccounts(p); len(orphans) > 0 {
+			out = append(out, "les comptes SGBD que la déclaration ne nomme plus : "+strings.Join(orphans, ", "))
+		}
 	}
 	return out, nil
+}
+
+// undeclaredDBAccounts nomme les comptes SGBD scellés pour le projet qu'aucune
+// de ses déclarations ne nomme.
+func (a *App) undeclaredDBAccounts(p *model.Project) []string {
+	if a.Store == nil {
+		return nil
+	}
+	names, err := a.Store.SecretNames(p.ID())
+	if err != nil {
+		return nil
+	}
+	declared := map[string]bool{}
+	for _, d := range p.Spec.Databases {
+		for _, u := range append([]string{d.User}, extraUserNames(d)...) {
+			declared[u] = true
+		}
+	}
+	var out []string
+	for _, n := range names {
+		for _, prefix := range []string{"mysql/", "mariadb/", "postgres/"} {
+			if user, ok := strings.CutPrefix(n, prefix); ok && !declared[user] {
+				out = append(out, strings.TrimSuffix(prefix, "/")+" "+user)
+			}
+		}
+	}
+	return out
 }
 
 // databaseLabel nomme une base et les comptes que sa suppression emporte — et
@@ -956,7 +1012,10 @@ const noDumpHint = "suppression abandonnée avant tout retrait. Relancer avec --
 // skipLogs écartent, sous --keep-data, ce qui n'est pas au seul projet
 // (archiveExclusions).
 type archiveScope struct {
-	files              []string
+	files []string
+	// certs nomme les certificats que la suppression retire, scellés dans
+	// l'archive (D100).
+	certs              []string
 	dumps              []model.Database
 	strict             bool
 	skipTree, skipLogs bool
@@ -1664,6 +1723,11 @@ func (a *App) archiveProject(cmd *cobra.Command, provs *providers, p *model.Proj
 			}
 		}
 	}
+	// Les certificats que la suppression retire, scellés eux aussi : la clé
+	// privée n'a pas à voyager en clair (D100).
+	if err := a.archiveCertificates(w, provs, p, scope.certs); err != nil {
+		return "", nil, wrap(CodeError, err)
+	}
 	// Le fichier d'environnement, scellé comme les secrets du keystore : il en
 	// porte, et le recopier en clair ferait de l'archive leur porte de sortie.
 	if data, err := os.ReadFile(a.Paths.EnvFile(p.ID())); err == nil {
@@ -1783,12 +1847,24 @@ func newRestoreCommand(app *App) *cobra.Command {
 			if err != nil {
 				return wrap(CodeError, err)
 			}
+			skipped := 0
 			for name, pair := range secrets {
+				if !restorableSecret(p, name) {
+					if keystoreSecret(name) {
+						skipped++
+					}
+					continue
+				}
 				if err := app.Store.PutSecret(p.ID(), name, pair[0], pair[1]); err != nil {
 					return wrap(CodeError, err)
 				}
 			}
+			if skipped > 0 {
+				app.printf("= %d preuve(s) de ressources que la déclaration ne nomme plus, non réinjectée(s) : "+
+					"la suppression les avait retirées (D100)\n", skipped)
+			}
 			app.restoreEnvFile(p, secrets)
+			app.restoreCertificates(p, secrets)
 			if len(secrets) > 0 {
 				app.printf("✓ %d secret(s) réinjecté(s)\n", len(secrets))
 				if app.Keys != nil {

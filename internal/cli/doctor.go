@@ -88,6 +88,28 @@ func newDoctorCommand(app *App) *cobra.Command {
 	}
 }
 
+// orphanCertificateChecks nomme les certificats de projet qu'aucun projet du parc
+// ne déclare plus : ceux qu'une suppression antérieure à D100 laissait, clé
+// privée comprise, et dont l'expiration faisait avertir doctor à vie.
+func orphanCertificateChecks(provs *providers, projects []*model.Project, list []tlsprov.Info,
+	add func(name, status, detail, fix string)) {
+	used := map[string]bool{}
+	for _, p := range projects {
+		used[p.ID()] = true
+		reqs, _ := provs.TLS.Requests(p)
+		for _, r := range reqs {
+			used[r.Name] = true
+		}
+	}
+	for _, info := range list {
+		if info.Shared || used[info.Name] {
+			continue
+		}
+		add("certificats", "avertissement", "certificat "+info.Name+" sans projet qui le déclare "+
+			"(laissé par une suppression antérieure à D100 ?)", "ogs cert delete "+info.Name)
+	}
+}
+
 // certificateDeclarationChecks nomme les déclarations de certificat à corriger
 // (D94) : un nom qui sort de l'espace du projet, ou deux certificats d'un projet
 // sous un même nom, que plan et apply refusent au seul projet qui les porte. Le
@@ -690,6 +712,7 @@ func (a *App) runChecks(ctx context.Context) []check {
 		}
 		if list, err := provs.TLS.Store.List(); err == nil && len(list) > 0 {
 			add("certificats", "ok", fmt.Sprintf("%d présent(s)", len(list)), "")
+			orphanCertificateChecks(provs, projects, list, add)
 		}
 		// Une référence de certificat que rien ne porte (D102) : le vhost sert le
 		// certificat par défaut, et l'apply du projet rend le code 6.

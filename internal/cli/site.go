@@ -740,8 +740,10 @@ func (a *App) applyProjects(cmd *cobra.Command, projects []*model.Project) error
 	reload := a.reloadFunc(provs)
 	warnings := 0
 	for _, p := range projects {
+		mark := a.Store.AllocationMark()
 		plan, err := a.buildPlan(cmd.Context(), provs, p)
 		if err != nil {
+			_ = a.Store.CancelAllocations(mark)
 			return err
 		}
 		if plan.Empty() {
@@ -749,8 +751,11 @@ func (a *App) applyProjects(cmd *cobra.Command, projects []*model.Project) error
 			continue
 		}
 		a.printf("\n%s\n", plan.String())
+		// Un plan refusé ou déroulé n'a rien écrit : ses numéros reviennent à la
+		// plage (D100).
 		if err := a.confirm(fmt.Sprintf("appliquer %d changement(s) sur %s ?",
 			len(plan.Mutating()), p.ID())); err != nil {
+			_ = a.Store.CancelAllocations(mark)
 			return err
 		}
 		report, err := engine.Execute(cmd.Context(), plan, engine.Options{
@@ -768,6 +773,9 @@ func (a *App) applyProjects(cmd *cobra.Command, projects []*model.Project) error
 		})
 		warnings += len(report.Warnings)
 		if err != nil {
+			if report.RolledBack && report.RollbackErr == nil {
+				_ = a.Store.CancelAllocations(mark)
+			}
 			a.reportRollback(report)
 			return wrap(CodeError, err)
 		}
@@ -860,6 +868,8 @@ func newStatusCommand(app *App) *cobra.Command {
 			if err := app.openStore(); err != nil {
 				return err
 			}
+			// L'état se calcule sans rien réserver (D100).
+			app.Store.PreviewAllocations(true)
 			provs, err := app.buildProviders()
 			if err != nil {
 				return err
@@ -882,7 +892,7 @@ func newStatusCommand(app *App) *cobra.Command {
 					rows = append(rows, row)
 					continue
 				}
-				row.Drift = len(plan.Mutating())
+				row.Drift = len(plan.Drift())
 				if row.Drift > 0 {
 					row.Health = "dérive"
 					problems++

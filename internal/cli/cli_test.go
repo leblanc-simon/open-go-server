@@ -3275,7 +3275,9 @@ func TestDeleteThenRestoreRoundTrip(t *testing.T) {
 	st.Close()
 
 	out := h.mustRun("project", "delete", "shopfr", "--yes")
-	if !strings.Contains(out, "1 secret(s)") {
+	// Le mot de passe, et les trois fichiers du certificat auto-signé, scellés
+	// eux aussi (D100).
+	if !strings.Contains(out, "4 secret(s)") {
 		t.Errorf("le secret doit être inclus dans l'archive :\n%s", out)
 	}
 

@@ -33,6 +33,18 @@ func (p *Plan) Mutating() []*Step {
 	return out
 }
 
+// Drift renvoie les étapes qui corrigent un écart du système : les étapes
+// mutantes, hors tenue de l'état d'ogs (Step.Bookkeeping).
+func (p *Plan) Drift() []*Step {
+	out := make([]*Step, 0, len(p.Steps))
+	for _, s := range p.Mutating() {
+		if !s.Bookkeeping {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
 // Empty indique qu'aucun changement n'est nécessaire : c'est le résultat attendu
 // d'un apply rejoué sur un système déjà conforme.
 func (p *Plan) Empty() bool { return len(p.Mutating()) == 0 }

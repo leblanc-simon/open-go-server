@@ -59,7 +59,9 @@ func (a *App) buildPlan(ctx context.Context, provs *providers, p *model.Project)
 	// Les bases viennent après l'utilisateur et avant les pools : une application
 	// n'a pas besoin de sa base pour que son pool existe, mais l'ordre du cahier
 	// des charges place les données avant l'exécution.
-	if len(p.Spec.Databases) > 0 {
+	// Un projet qui ne déclare plus aucune base peut encore tenir des comptes
+	// d'ogs, que le plan retire (D100).
+	if len(p.Spec.Databases) > 0 || provs.DB.HasAccounts(p) {
 		dbObs, err := provs.DB.Observe(ctx, p)
 		if err != nil {
 			return nil, wrap(CodeError, err)
@@ -73,7 +75,10 @@ func (a *App) buildPlan(ctx context.Context, provs *providers, p *model.Project)
 		}
 	}
 
-	if p.Spec.AMQP != nil {
+	// Sans spec.amqp, le projet peut encore porter les preuves d'un vhost et d'un
+	// compte qu'ogs a créés pour lui : la déclaration ne les demandant plus, le
+	// plan les retire (D100).
+	if p.Spec.AMQP != nil || provs.AMQP.HasLeftovers(p) {
 		amqpObs, err := provs.AMQP.Observe(ctx, p)
 		if err != nil {
 			return nil, wrap(CodeError, err)
@@ -157,6 +162,15 @@ func (a *App) buildPlan(ctx context.Context, provs *providers, p *model.Project)
 	}
 	for _, s := range unitSteps {
 		plan.Add(s)
+	}
+	// L'unité applicative d'un projet qui n'en a plus part après l'arrêt de ses
+	// instances, que les étapes d'unités viennent de porter (D100).
+	appStale, err := provs.App.PlanStale(p)
+	if err != nil {
+		return nil, wrap(CodeError, err)
+	}
+	if appStale != nil {
+		plan.Add(appStale)
 	}
 
 	// L'attente de disponibilité vient après le démarrage des instances : attendre
@@ -325,6 +339,12 @@ func (a *App) buildGlobalPlan(ctx context.Context, provs *providers, targeted []
 	for _, p := range targeted {
 		projects = withProject(projects, p)
 	}
+	// Le plan global lit les pools de tout le parc (vhost d'état, Telegraf) : il
+	// n'en réserve aucun numéro. Celui d'un projet qu'aucun apply n'a encore visé
+	// l'était sinon par l'apply d'un voisin (D100). L'aperçu reste en vigueur
+	// jusqu'à la fin du processus, car certaines étapes ne rendent leur contenu
+	// qu'à l'application : le plan global vient toujours après les projets.
+	a.Store.PreviewAllocations(true)
 
 	plan := &engine.Plan{Project: "*"}
 
@@ -674,6 +694,8 @@ func newPlanCommand(app *App) *cobra.Command {
 			if err := app.openStore(); err != nil {
 				return err
 			}
+			// Un plan ne réserve aucun numéro (D100).
+			app.Store.PreviewAllocations(true)
 			provs, err := app.buildProviders()
 			if err != nil {
 				return err
@@ -737,6 +759,7 @@ func newDiffCommand(app *App) *cobra.Command {
 			if err := app.openStore(); err != nil {
 				return err
 			}
+			app.Store.PreviewAllocations(true)
 			provs, err := app.buildProviders()
 			if err != nil {
 				return err
@@ -748,7 +771,8 @@ func newDiffCommand(app *App) *cobra.Command {
 				if err != nil {
 					return err
 				}
-				mutating := plan.Mutating()
+				// La tenue de l'état d'ogs n'est pas un écart du système (D100).
+				mutating := plan.Drift()
 				if len(mutating) == 0 {
 					app.printf("= %s : conforme\n", p.ID())
 					continue
@@ -814,6 +838,8 @@ func newApplyCommand(app *App) *cobra.Command {
 			if err := app.openStore(); err != nil {
 				return err
 			}
+			// --dry-run calcule sans rien réserver (D100).
+			app.Store.PreviewAllocations(app.DryRun)
 			provs, err := app.buildProviders()
 			if err != nil {
 				return err
@@ -822,8 +848,10 @@ func newApplyCommand(app *App) *cobra.Command {
 			reload := app.reloadFunc(provs)
 			warnings := 0
 			for _, p := range projects {
+				mark := app.Store.AllocationMark()
 				plan, err := app.buildPlan(cmd.Context(), provs, p)
 				if err != nil {
+					_ = app.Store.CancelAllocations(mark)
 					return err
 				}
 				if plan.Empty() {
@@ -835,12 +863,16 @@ func newApplyCommand(app *App) *cobra.Command {
 					app.printf("--dry-run : rien n'a été appliqué.\n")
 					continue
 				}
+				// Un plan refusé n'a rien écrit : les numéros qu'il a réservés
+				// reviennent à la plage (D100).
 				if err := app.confirm(fmt.Sprintf("appliquer %d changement(s) sur %s ?",
 					len(plan.Mutating()), p.ID())); err != nil {
+					_ = app.Store.CancelAllocations(mark)
 					return err
 				}
 				// Le hook « preApply » garde la porte : son refus arrête l'opération.
 				if _, err := app.runHook(cmd.Context(), provs.Hooks, p, hook.PreApply, hook.Context{}); err != nil {
+					_ = app.Store.CancelAllocations(mark)
 					return err
 				}
 				report, err := engine.Execute(cmd.Context(), plan, engine.Options{
@@ -858,6 +890,10 @@ func newApplyCommand(app *App) *cobra.Command {
 				})
 				warnings += len(report.Warnings)
 				if err != nil {
+					if report.RolledBack && report.RollbackErr == nil {
+						// Déroulé, le plan n'a laissé aucun fichier qui serve ses numéros.
+						_ = app.Store.CancelAllocations(mark)
+					}
 					app.reportRollback(report)
 					return wrap(CodeError, err)
 				}

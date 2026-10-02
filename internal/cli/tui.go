@@ -67,6 +67,9 @@ func (b *tuiBackend) Projects() ([]*model.Project, error) {
 func (b *tuiBackend) Snapshot(ctx context.Context, p *model.Project) (tui.Snapshot, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	// L'affichage ne réserve aucun numéro (D100).
+	b.app.Store.PreviewAllocations(true)
+	defer b.app.Store.PreviewAllocations(false)
 	provs, err := b.app.buildProviders()
 	if err != nil {
 		return tui.Snapshot{}, err
@@ -79,7 +82,7 @@ func (b *tuiBackend) Snapshot(ctx context.Context, p *model.Project) (tui.Snapsh
 		snapshot.Problems = []string{err.Error()}
 		return snapshot, nil
 	}
-	snapshot.Drift = len(plan.Mutating())
+	snapshot.Drift = len(plan.Drift())
 	if snapshot.Drift > 0 {
 		snapshot.Health = "dérive"
 	}
@@ -189,6 +192,8 @@ func (b *tuiBackend) Apply(ctx context.Context, p *model.Project) (string, error
 func (b *tuiBackend) Diff(ctx context.Context, p *model.Project) ([]string, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	b.app.Store.PreviewAllocations(true)
+	defer b.app.Store.PreviewAllocations(false)
 	provs, err := b.app.buildProviders()
 	if err != nil {
 		return nil, err

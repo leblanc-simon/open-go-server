@@ -428,3 +428,55 @@ func TestAllocateEviteUnNumeroOccupe(t *testing.T) {
 		t.Fatalf("attribution instable : %d %v", n, err)
 	}
 }
+
+// D100 : l'aperçu n'inscrit rien mais ne promet pas deux fois le même numéro ;
+// un numéro imposé remplace celui de la ressource sans jamais reprendre celui
+// d'une autre ; l'annulation retire ce qu'un plan non appliqué a réservé.
+func TestAperçuRéservationEtAnnulation(t *testing.T) {
+	s := open(t)
+	if _, err := s.Allocate("php-8.5", "a", "web", 18501, 18599); err != nil {
+		t.Fatal(err)
+	}
+	s.PreviewAllocations(true)
+	b, _ := s.Allocate("php-8.5", "b", "web", 18501, 18599)
+	c, _ := s.Allocate("php-8.5", "c", "web", 18501, 18599)
+	again, _ := s.Allocate("php-8.5", "b", "web", 18501, 18599)
+	if b != 18502 || c != 18503 || again != b {
+		t.Errorf("aperçu : b=%d c=%d b encore=%d", b, c, again)
+	}
+	if h, err := s.Reserve("php-8.5", "d", "web", 18540); err != nil || h != nil {
+		t.Fatalf("réservation en aperçu : %v %v", h, err)
+	}
+	if err := s.Release("php-8.5", "a", "web"); err != nil {
+		t.Fatal(err)
+	}
+	s.PreviewAllocations(false)
+	if list, _ := s.Allocations("php-8.5"); len(list) != 1 || list[0].Project != "a" {
+		t.Fatalf("l'aperçu ne doit rien écrire : %v", list)
+	}
+
+	if n, _ := s.Allocate("php-8.5", "b", "web", 18501, 18599); n != 18502 {
+		t.Fatalf("b=%d", n)
+	}
+	mark := s.AllocationMark()
+	if h, err := s.Reserve("php-8.5", "b", "web", 18501); err != nil || h == nil || h.Project != "a" {
+		t.Fatalf("un numéro tenu par une autre ressource n'est jamais repris : %v %v", h, err)
+	}
+	if h, err := s.Reserve("php-8.5", "b", "web", 18550); err != nil || h != nil {
+		t.Fatalf("réservation : %v %v", h, err)
+	}
+	if list, _ := s.Allocations("php-8.5"); len(list) != 2 || list[1].Number != 18550 {
+		t.Fatalf("le numéro imposé remplace l'ancien : %v", list)
+	}
+	if n, _ := s.Allocate("php-8.5", "e", "web", 18501, 18599); n != 18502 {
+		t.Fatalf("e=%d", n)
+	}
+	if err := s.CancelAllocations(mark); err != nil {
+		t.Fatal(err)
+	}
+	// L'annulation retire e et rend à b le numéro que la réservation avait
+	// remplacé.
+	if list, _ := s.Allocations("php-8.5"); len(list) != 2 || list[1].Project != "b" || list[1].Number != 18502 {
+		t.Errorf("l'annulation doit retirer e et rendre 18502 à b : %v", list)
+	}
+}

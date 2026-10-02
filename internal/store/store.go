@@ -18,6 +18,24 @@ import (
 type Store struct {
 	db   *sql.DB
 	path string
+
+	// preview fait d'Allocate un calcul sans écriture (PreviewAllocations) : ce
+	// que « plan », « diff » et « status » affichent ne doit rien réserver.
+	preview bool
+	// pending retient, en aperçu, les numéros déjà promis dans ce processus :
+	// deux pools neufs d'un même plan ne doivent pas s'afficher sous le même.
+	pending map[string]map[int]string
+	// fresh énumère les numéros inscrits par ce processus, dans l'ordre :
+	// CancelAllocations retire ceux d'un plan qui ne s'est pas appliqué, et rend
+	// ceux qu'une réservation avait remplacés.
+	fresh []freshAllocation
+}
+
+// freshAllocation est un numéro inscrit par ce processus, et celui qu'il a
+// remplacé pour la même ressource, s'il en est un.
+type freshAllocation struct {
+	added    Allocation
+	replaced *Allocation
 }
 
 // ErrNotFound signale une ligne absente.
@@ -311,6 +329,11 @@ func (s *Store) ForgetFile(path string) error {
 // busy écarte, pour une attribution nouvelle seulement, les numéros que la
 // machine tient déjà : un port en écoute (D94). Le numéro déjà attribué à la
 // ressource est rendu tel quel — c'est sa propre application qui l'écoute.
+//
+// En aperçu (PreviewAllocations), rien n'est inscrit : le numéro rendu est celui
+// qu'une application choisirait (D100). « plan » réservait sinon un numéro à
+// chaque pool calculé, projet jamais appliqué compris, et la plage finissait
+// saturée de numéros que rien ne servait.
 func (s *Store) Allocate(scope, projectID, name string, min, max int, busy ...func(int) bool) (int, error) {
 	var existing int
 	err := s.db.QueryRow(`SELECT number FROM allocations WHERE scope = ? AND project_id = ? AND name = ?`,
@@ -320,6 +343,14 @@ func (s *Store) Allocate(scope, projectID, name string, min, max int, busy ...fu
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		return 0, err
+	}
+	key := projectID + "\x00" + name
+	if s.preview {
+		for n, k := range s.pending[scope] {
+			if k == key {
+				return n, nil
+			}
+		}
 	}
 	rows, err := s.db.Query(`SELECT number FROM allocations WHERE scope = ? ORDER BY number`, scope)
 	if err != nil {
@@ -342,13 +373,127 @@ func (s *Store) Allocate(scope, projectID, name string, min, max int, busy ...fu
 		if taken[n] || anyBusy(busy, n) {
 			continue
 		}
+		if s.preview {
+			if _, promised := s.pending[scope][n]; promised {
+				continue
+			}
+			if s.pending == nil {
+				s.pending = map[string]map[int]string{}
+			}
+			if s.pending[scope] == nil {
+				s.pending[scope] = map[int]string{}
+			}
+			s.pending[scope][n] = key
+			return n, nil
+		}
 		if _, err := s.db.Exec(`INSERT INTO allocations (scope, number, project_id, name, created_at)
 			VALUES (?, ?, ?, ?, ?)`, scope, n, projectID, name, now()); err != nil {
 			return 0, err
 		}
+		s.fresh = append(s.fresh, freshAllocation{added: Allocation{Scope: scope, Number: n, Project: projectID, Name: name}})
 		return n, nil
 	}
 	return 0, fmt.Errorf("plage %s saturée (%d à %d) : aucun numéro disponible", scope, min, max)
+}
+
+// PreviewAllocations fait d'Allocate, de Reserve et de Release des calculs sans
+// écriture, jusqu'à nouvel ordre : les commandes qui calculent un plan sans
+// l'appliquer — plan, diff, status, apply --dry-run, l'affichage de la TUI — ne
+// réservent rien (D100). Le quitter oublie les numéros promis en aperçu.
+func (s *Store) PreviewAllocations(on bool) {
+	if s == nil {
+		return
+	}
+	s.preview = on
+	if !on {
+		s.pending = nil
+	}
+}
+
+// AllocationMark repère les numéros inscrits jusqu'ici par ce processus.
+func (s *Store) AllocationMark() int {
+	if s == nil {
+		return 0
+	}
+	return len(s.fresh)
+}
+
+// CancelAllocations retire les numéros inscrits depuis mark : ceux d'un plan
+// refusé à la confirmation, ou déroulé. Le pool ou l'unité qui les auraient
+// servis n'ont pas été écrits — ou ont été retirés par la compensation.
+func (s *Store) CancelAllocations(mark int) error {
+	if s == nil || mark < 0 || mark > len(s.fresh) {
+		return nil
+	}
+	for i := len(s.fresh) - 1; i >= mark; i-- {
+		a, prev := s.fresh[i].added, s.fresh[i].replaced
+		if _, err := s.db.Exec(`DELETE FROM allocations WHERE scope = ? AND number = ? AND project_id = ? AND name = ?`,
+			a.Scope, a.Number, a.Project, a.Name); err != nil {
+			return err
+		}
+		if prev != nil {
+			if _, err := s.Claim(prev.Scope, prev.Project, prev.Name, prev.Number); err != nil {
+				return err
+			}
+		}
+	}
+	s.fresh = s.fresh[:mark]
+	return nil
+}
+
+// Reserve inscrit pour une ressource le numéro que sa déclaration impose
+// (« number: 18542 »), à la place de celui qu'elle tenait (D100). Sans quoi
+// l'attribution automatique d'un autre pool pouvait le prendre. Un numéro tenu
+// par une autre ressource n'est jamais repris : holder la nomme, et rien ne
+// change — un pool en socket Unix porte son nom dans celui du socket, deux
+// numéros égaux n'y collisionnent pas, et le refuser bloquerait ce qui marche.
+// En aperçu, rien n'est écrit.
+func (s *Store) Reserve(scope, projectID, name string, number int) (holder *Allocation, err error) {
+	var h Allocation
+	err = s.db.QueryRow(`SELECT scope, number, project_id, name FROM allocations WHERE scope = ? AND number = ?`,
+		scope, number).Scan(&h.Scope, &h.Number, &h.Project, &h.Name)
+	switch {
+	case err == nil && h.Project == projectID && h.Name == name:
+		return nil, nil
+	case err == nil:
+		return &h, nil
+	case !errors.Is(err, sql.ErrNoRows):
+		return nil, err
+	}
+	if s.preview {
+		return nil, nil
+	}
+	var replaced *Allocation
+	var previous int
+	switch err := s.db.QueryRow(`SELECT number FROM allocations WHERE scope = ? AND project_id = ? AND name = ?`,
+		scope, projectID, name).Scan(&previous); {
+	case err == nil:
+		replaced = &Allocation{Scope: scope, Number: previous, Project: projectID, Name: name}
+	case !errors.Is(err, sql.ErrNoRows):
+		return nil, err
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	if _, err := tx.Exec(`DELETE FROM allocations WHERE scope = ? AND project_id = ? AND name = ?`,
+		scope, projectID, name); err != nil {
+		tx.Rollback()
+		return nil, err
+	}
+	if _, err := tx.Exec(`INSERT INTO allocations (scope, number, project_id, name, created_at)
+		VALUES (?, ?, ?, ?, ?)`, scope, number, projectID, name, now()); err != nil {
+		tx.Rollback()
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	s.fresh = append(s.fresh, freshAllocation{
+		added:    Allocation{Scope: scope, Number: number, Project: projectID, Name: name},
+		replaced: replaced,
+	})
+	return nil, nil
 }
 
 func anyBusy(busy []func(int) bool, n int) bool {
@@ -391,11 +536,32 @@ func (s *Store) Claim(scope, projectID, name string, number int) (bool, error) {
 	return n == 1, err
 }
 
-// Release libère un numéro.
+// Release libère le numéro d'une ressource. L'appelant s'assure d'abord que
+// plus rien ne le sert — le pool ou l'unité retirés du disque (D100) : sans
+// quoi l'attribution suivante le rendrait à un autre projet, dont le vhost
+// relaierait vers l'application d'un voisin. En aperçu, rien n'est écrit.
 func (s *Store) Release(scope, projectID, name string) error {
+	if s.preview {
+		return nil
+	}
 	_, err := s.db.Exec(`DELETE FROM allocations WHERE scope = ? AND project_id = ? AND name = ?`,
 		scope, projectID, name)
 	return err
+}
+
+// ProjectAllocations liste les numéros attribués aux ressources d'un projet.
+func (s *Store) ProjectAllocations(projectID string) ([]Allocation, error) {
+	all, err := s.Allocations("")
+	if err != nil {
+		return nil, err
+	}
+	var out []Allocation
+	for _, a := range all {
+		if a.Project == projectID {
+			out = append(out, a)
+		}
+	}
+	return out, nil
 }
 
 // Allocation est un numéro attribué à une ressource.

@@ -140,6 +140,42 @@ fi
 echo "et il voit les tables créées après son ajout (privilèges par défaut)"
 
 echo
+echo "--- un rôle additionnel retiré de la déclaration part au prochain apply (D100) ---"
+ogs db user add shopfr ancien --privileges readonly >/dev/null
+ogs apply shopfr --yes >/dev/null 2>&1
+if ! pg "SELECT rolname FROM pg_roles WHERE rolname='ancien'" | grep -q ancien; then
+    echo "ÉCHEC : le rôle ancien n'a pas été créé"
+    exit 1
+fi
+sed -i '/- user: ancien$/,/privileges:/d' /etc/ogs/projects/shopfr.yaml
+if grep -q ancien /etc/ogs/projects/shopfr.yaml; then
+    echo "ÉCHEC : le rôle ancien est encore déclaré"
+    exit 1
+fi
+ogs plan shopfr 2>&1 | grep -E "ancien" | head -3
+if ! ogs apply shopfr --yes >/tmp/ancien.log 2>&1; then
+    echo "ÉCHEC : l'apply qui retire le rôle a échoué"
+    cat /tmp/ancien.log
+    exit 1
+fi
+# Ses droits et privilèges par défaut vivaient dans la base : DROP ROLE les
+# refuserait sans la réattribution et le DROP OWNED qui le précèdent.
+if pg "SELECT rolname FROM pg_roles WHERE rolname='ancien'" | grep -q ancien; then
+    echo "ÉCHEC : le rôle retiré de la déclaration subsiste"
+    cat /tmp/ancien.log
+    exit 1
+fi
+if ogs secrets list shopfr 2>/dev/null | grep -q "postgres/ancien"; then
+    echo "ÉCHEC : le mot de passe du rôle retiré est resté au keystore"
+    exit 1
+fi
+if ! PGPASSWORD="$lecturepass" psql -h 127.0.0.1 -U lecture -d shopfr -tAc "SELECT count(*) FROM essai" >/dev/null 2>&1; then
+    echo "ÉCHEC : le compte lecture, toujours déclaré, a perdu l'accès"
+    exit 1
+fi
+echo "le rôle ancien est retiré avec son mot de passe ; lecture et les données restent"
+
+echo
 echo "--- sélection explicite d'un cluster ---"
 ogs db add shopfr --role archive --engine postgres --cluster "$version/second" >/dev/null
 ogs apply shopfr --yes 2>&1 | grep -Ei "archive" | head -3

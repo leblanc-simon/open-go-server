@@ -465,3 +465,51 @@ func TestCompteDuBrokerParSonUID(t *testing.T) {
 		t.Errorf("uid admis : %v", uids)
 	}
 }
+
+func TestRetraitDUneFileQuorumRelitSesCompteurs(t *testing.T) {
+	// Une file quorum refuse if-empty et if-unused (400) : le retrait relit ses
+	// compteurs et ne la retire que vide et sans consommateur.
+	for _, cas := range []struct {
+		messages int
+		retiree  bool
+	}{{0, true}, {4, false}} {
+		var seen []string
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			seen = append(seen, r.Method+" "+r.URL.RequestURI())
+			switch {
+			case r.Method == http.MethodDelete && r.URL.RawQuery != "":
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"error":"bad_request","reason":"queue.delete operations with ` +
+					`if-unused flag set are not supported by quorum queues"}`))
+			case r.Method == http.MethodGet:
+				_ = json.NewEncoder(w).Encode(map[string]any{"name": "emails", "messages": cas.messages})
+			default:
+				w.WriteHeader(http.StatusNoContent)
+			}
+		}))
+		client, err := NewHTTPClient(Credentials{URL: srv.URL, User: "admin", Password: "x",
+			BrokerAccount: compteDuTest(t)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = client.DeleteIdleQueue(context.Background(), "shopfr", "emails")
+		srv.Close()
+		retiree := len(seen) > 0 && seen[len(seen)-1] == "DELETE /api/queues/shopfr/emails"
+		if retiree != cas.retiree || (err == nil) != cas.retiree {
+			t.Errorf("%d message(s) : retirée %v, erreur %v (%v)", cas.messages, retiree, err, seen)
+		}
+	}
+}
+
+func TestRetraitDUnBindingParSaCleDeProprietes(t *testing.T) {
+	client, seen := fakeBroker(t, nil)
+	err := client.DeleteBinding(context.Background(), Binding{Vhost: "shopfr", Source: "messages",
+		Destination: "emails", RoutingKey: "emails", PropertiesKey: "emails"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := (*seen)[0]
+	if got.Method != http.MethodDelete || got.Path != "/api/bindings/shopfr/e/messages/q/emails/emails" {
+		t.Errorf("retrait du binding : %s %s", got.Method, got.Path)
+	}
+}

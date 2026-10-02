@@ -103,6 +103,9 @@ type Binding struct {
 	DestinationType string         `json:"destination_type"`
 	RoutingKey      string         `json:"routing_key"`
 	Arguments       map[string]any `json:"arguments"`
+	// PropertiesKey est la clé par laquelle l'API désigne le binding pour le
+	// retirer : la clé de routage et les arguments, encodés par le broker.
+	PropertiesKey string `json:"properties_key"`
 }
 
 // Policy décrit une policy observée.
@@ -132,9 +135,17 @@ type Client interface {
 	Queues(ctx context.Context, vhost string) ([]Queue, error)
 	EnsureQueue(ctx context.Context, q Queue) error
 	DeleteQueue(ctx context.Context, vhost, name string) error
+	// DeleteIdleQueue retire une file seulement si elle est vide et sans
+	// consommateur : le broker en juge lui-même, au moment du retrait. C'est le
+	// retrait d'une file que la déclaration ne porte plus (D100), jamais celui
+	// d'une recréation consentie.
+	DeleteIdleQueue(ctx context.Context, vhost, name string) error
+	// DeleteExchange retire un exchange seulement s'il n'a plus de binding.
+	DeleteExchange(ctx context.Context, vhost, name string) error
 	PurgeQueue(ctx context.Context, vhost, name string) error
 	Bindings(ctx context.Context, vhost string) ([]Binding, error)
 	EnsureBinding(ctx context.Context, b Binding) error
+	DeleteBinding(ctx context.Context, b Binding) error
 	Policies(ctx context.Context, vhost string) ([]Policy, error)
 	EnsurePolicy(ctx context.Context, p Policy) error
 	DeletePolicy(ctx context.Context, vhost, name string) error
@@ -321,6 +332,36 @@ func (c *httpClient) DeleteQueue(ctx context.Context, vhost, name string) error 
 	return c.do(ctx, http.MethodDelete, "/api/queues/"+escape(vhost)+"/"+escape(name), nil, nil)
 }
 
+func (c *httpClient) DeleteIdleQueue(ctx context.Context, vhost, name string) error {
+	path := "/api/queues/" + escape(vhost) + "/" + escape(name)
+	err := c.do(ctx, http.MethodDelete, path+"?if-empty=true&if-unused=true", nil, nil)
+	if err == nil || !strings.Contains(err.Error(), "not supported by quorum queues") {
+		return err
+	}
+	// Une file quorum refuse if-empty et if-unused : le broker ne sait pas en
+	// juger lui-même au retrait. Ses compteurs sont relus juste avant, et elle ne
+	// part que vide et sans consommateur. Une fenêtre subsiste entre la lecture et
+	// le retrait — les compteurs du broker ont quelques secondes de retard —, mais
+	// ses bindings sont retirés d'abord : seul un envoi direct à la file, par son
+	// nom, peut encore l'atteindre.
+	var q Queue
+	if err := c.do(ctx, http.MethodGet, path, nil, &q); err != nil {
+		return err
+	}
+	if q.Name == "" {
+		return nil
+	}
+	if q.Messages > 0 || q.Consumers > 0 {
+		return fmt.Errorf("la file %s porte %d message(s) et %d consommateur(s)", name, q.Messages, q.Consumers)
+	}
+	return c.do(ctx, http.MethodDelete, path, nil, nil)
+}
+
+func (c *httpClient) DeleteExchange(ctx context.Context, vhost, name string) error {
+	return c.do(ctx, http.MethodDelete,
+		"/api/exchanges/"+escape(vhost)+"/"+escape(name)+"?if-unused=true", nil, nil)
+}
+
 func (c *httpClient) PurgeQueue(ctx context.Context, vhost, name string) error {
 	return c.do(ctx, http.MethodDelete,
 		"/api/queues/"+escape(vhost)+"/"+escape(name)+"/contents", nil, nil)
@@ -336,6 +377,21 @@ func (c *httpClient) EnsureBinding(ctx context.Context, b Binding) error {
 	return c.do(ctx, http.MethodPost,
 		"/api/bindings/"+escape(b.Vhost)+"/e/"+escape(b.Source)+"/q/"+escape(b.Destination),
 		map[string]any{"routing_key": b.RoutingKey, "arguments": orEmptyArgs(b.Arguments)}, nil)
+}
+
+func (c *httpClient) DeleteBinding(ctx context.Context, b Binding) error {
+	key := b.PropertiesKey
+	if key == "" {
+		// Sans arguments, la clé de propriétés est la clé de routage elle-même
+		// (« ~ » quand elle est vide).
+		key = b.RoutingKey
+		if key == "" {
+			key = "~"
+		}
+	}
+	return c.do(ctx, http.MethodDelete,
+		"/api/bindings/"+escape(b.Vhost)+"/e/"+escape(b.Source)+"/q/"+escape(b.Destination)+"/"+escape(key),
+		nil, nil)
 }
 
 func (c *httpClient) Policies(ctx context.Context, vhost string) ([]Policy, error) {

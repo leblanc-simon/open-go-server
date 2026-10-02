@@ -30,6 +30,11 @@ type Provider struct {
 	// ManagementURL est l'adresse de l'API d'administration. La supervision en a
 	// besoin : c'est par elle que les métriques du broker sont lues.
 	ManagementURL string
+	// Fleet rend les déclarations du parc : un vhost ou un compte qu'un autre
+	// projet déclare n'est jamais retiré comme obsolète, preuve ou non — un
+	// voisin antérieur à D93 n'en porte aucune (D100). Nil, ou en échec, tout
+	// retrait d'obsolète est contesté : c'est le sens qui ne supprime rien.
+	Fleet func() ([]*model.Project, error)
 }
 
 // Name identifie le provider.
@@ -46,6 +51,11 @@ type Observed struct {
 	Queues      map[string]Queue
 	Bindings    []Binding
 	Policies    map[string]Policy
+	// Incomplete nomme les lectures du vhost en échec — exchanges, files,
+	// bindings, policies. Une lecture en échec n'est pas une absence (Q-20) :
+	// aucune création ni aucun retrait ne se fonde sur elle, et la trace de
+	// D100 reste telle quelle.
+	Incomplete []string
 	// Degraded indique que le broker est piloté sans le plugin management.
 	Degraded bool
 	// Sealed dit si le keystore porte le mot de passe du compte pour ce projet :
@@ -58,6 +68,15 @@ type Observed struct {
 	// soit : il a été planifié depuis D93, et le critère du parc antérieur ne
 	// vaut plus pour lui (VhostOwned).
 	Marked bool
+	// Declared est la trace de ce qu'ogs a déclaré dans le vhost au dernier
+	// apply (DeclaredMarker), vide si elle est absente ; DeclaredSealed dit si
+	// elle existe.
+	Declared       Declared
+	DeclaredSealed bool
+	// ObsoleteVhosts et ObsoleteUsers sont les vhosts et comptes qu'ogs a créés
+	// pour le projet et que la déclaration ne désigne plus (D100).
+	ObsoleteVhosts []ObsoleteVhost
+	ObsoleteUsers  []ObsoleteUser
 }
 
 // VhostMarker nomme le secret qui marque un vhost créé par ogs. Sa valeur est le
@@ -100,33 +119,30 @@ func (p *Provider) Observe(ctx context.Context, proj *model.Project) (Observed, 
 		Queues:    map[string]Queue{},
 		Policies:  map[string]Policy{},
 	}
-	if proj.Spec.AMQP == nil {
+	spec := proj.Spec.AMQP
+	// Les vhosts et comptes qu'ogs a créés pour le projet et que la déclaration
+	// ne désigne plus se connaissent par ses secrets (D100), spec.amqp retiré
+	// compris. Un keystore illisible n'en fait connaître aucun : rien n'est alors
+	// retiré.
+	oldVhosts, oldUsers, _, _ := p.leftovers(proj.ID(), spec)
+	if spec == nil && len(oldVhosts)+len(oldUsers) == 0 {
 		return obs, nil
 	}
 	if p.Client == nil {
 		obs.Unavailable = fmt.Errorf("%w : aucun accès configuré", ErrUnavailable)
 		return obs, nil
 	}
+	_, obs.Degraded = p.Client.(*ctlClient)
 	version, err := p.Client.Overview(ctx)
 	if err != nil {
 		obs.Unavailable = err
 		return obs, nil
 	}
 	obs.Version = version
-	obs.Sealed = p.sealed(proj.ID(), "amqp/"+proj.Spec.AMQP.User)
-	obs.VhostSealed = p.sealed(proj.ID(), VhostMarker(proj.Spec.AMQP.Vhost))
-	obs.Marked = obs.VhostSealed || p.marked(proj.ID())
-
-	vhost := proj.Spec.AMQP.Vhost
 	vhosts, err := p.Client.Vhosts(ctx)
 	if err != nil {
 		obs.Unavailable = err
 		return obs, nil
-	}
-	for _, v := range vhosts {
-		if v.Name == vhost {
-			obs.VhostExists = true
-		}
 	}
 	// Une lecture qui échoue après Overview et Vhosts n'est pas plus fatale que
 	// les précédentes : les cinq passent par le même appel HTTP, et « broker
@@ -139,41 +155,79 @@ func (p *Provider) Observe(ctx context.Context, proj *model.Project) (Observed, 
 		obs.Unavailable = err
 		return obs, nil
 	}
-	for _, u := range users {
-		if u.Name == proj.Spec.AMQP.User {
-			obs.UserExists = true
-		}
+	vhostExists := map[string]bool{}
+	for _, v := range vhosts {
+		vhostExists[v.Name] = true
 	}
+	userExists := map[string]bool{}
+	for _, u := range users {
+		userExists[u.Name] = true
+	}
+	for _, name := range oldVhosts {
+		v := ObsoleteVhost{Name: name, Exists: vhostExists[name],
+			Contested: p.contestedBy(proj.ID(), VhostMarker(name), func(a *model.AMQP) bool { return a.Vhost == name })}
+		if v.Exists {
+			v.Queues, v.QueueErr = p.Client.Queues(ctx, name)
+		}
+		obs.ObsoleteVhosts = append(obs.ObsoleteVhosts, v)
+	}
+	for _, name := range oldUsers {
+		obs.ObsoleteUsers = append(obs.ObsoleteUsers, ObsoleteUser{Name: name, Exists: userExists[name],
+			Contested: p.contestedBy(proj.ID(), userSecretPrefix+name, func(a *model.AMQP) bool { return a.User == name })})
+	}
+	if spec == nil {
+		return obs, nil
+	}
+	obs.Sealed = p.sealed(proj.ID(), userSecretPrefix+spec.User)
+	obs.VhostSealed = p.sealed(proj.ID(), VhostMarker(spec.Vhost))
+	obs.Marked = obs.VhostSealed || p.marked(proj.ID())
+	obs.DeclaredSealed = p.sealed(proj.ID(), DeclaredMarker(spec.Vhost))
+	obs.Declared = p.readDeclared(proj.ID(), spec.Vhost)
+
+	vhost := spec.Vhost
+	obs.VhostExists = vhostExists[vhost]
+	obs.UserExists = userExists[spec.User]
 	perms, err := p.Client.Permissions(ctx)
 	if err != nil {
 		obs.Unavailable = err
 		return obs, nil
 	}
 	for i := range perms {
-		if perms[i].Vhost == vhost && perms[i].User == proj.Spec.AMQP.User {
+		if perms[i].Vhost == vhost && perms[i].User == spec.User {
 			obs.Permission = &perms[i]
 		}
 	}
 	if !obs.VhostExists {
 		return obs, nil
 	}
+	incomplete := func(what string, err error) {
+		obs.Incomplete = append(obs.Incomplete, fmt.Sprintf("%s (%v)", what, err))
+	}
 	if exchanges, err := p.Client.Exchanges(ctx, vhost); err == nil {
 		for _, e := range exchanges {
 			obs.Exchanges[e.Name] = e
 		}
+	} else {
+		incomplete("exchanges", err)
 	}
 	if queues, err := p.Client.Queues(ctx, vhost); err == nil {
 		for _, q := range queues {
 			obs.Queues[q.Name] = q
 		}
+	} else {
+		incomplete("files", err)
 	}
 	if bindings, err := p.Client.Bindings(ctx, vhost); err == nil {
 		obs.Bindings = bindings
+	} else {
+		incomplete("bindings", err)
 	}
 	if policies, err := p.Client.Policies(ctx, vhost); err == nil {
 		for _, pol := range policies {
 			obs.Policies[pol.Name] = pol
 		}
+	} else {
+		incomplete("policies", err)
 	}
 	return obs, nil
 }
@@ -183,7 +237,22 @@ func (p *Provider) Observe(ctx context.Context, proj *model.Project) (Observed, 
 func (p *Provider) Plan(ctx context.Context, proj *model.Project, obs Observed) ([]*engine.Step, error) {
 	spec := proj.Spec.AMQP
 	if spec == nil {
-		return nil, nil
+		// La déclaration ne porte plus d'AMQP : ce qu'ogs avait créé pour le
+		// projet se retire comme un vhost ou un compte remplacés (D100).
+		if len(obs.ObsoleteVhosts)+len(obs.ObsoleteUsers) == 0 && obs.Unavailable == nil {
+			return nil, nil
+		}
+		if obs.Unavailable != nil {
+			// Comme pour les bases : un broker injoignable ou désinstallé alors que
+			// plus rien ne le déclare n'est pas un défaut du projet. Une étape en
+			// échec rendait le code 6 à chaque apply et à chaque diff, sans issue.
+			// Les preuves restent, et le prochain apply qui le joint retire ce
+			// qu'elles prouvent.
+			return []*engine.Step{engine.NewStep("amqp/obsolete/"+proj.ID(), engine.NoOp,
+				fmt.Sprintf("ressources amqp que la déclaration ne porte plus — broker injoignable, "+
+					"conservées avec leurs preuves (%v)", obs.Unavailable))}, nil
+		}
+		return p.obsoleteSteps(proj, obs, true, true), nil
 	}
 	if obs.Unavailable != nil {
 		s := engine.NewStep("amqp/vhost/"+spec.Vhost, engine.Create,
@@ -206,6 +275,21 @@ func (p *Provider) Plan(ctx context.Context, proj *model.Project, obs Observed) 
 	}
 	steps = append(steps, userStep)
 	steps = append(steps, p.permissionStep(spec, obs))
+	// Une lecture du vhost en échec n'est pas une absence (Q-20) : créer ce
+	// qu'on n'a pas pu lire, ou retirer de la trace ce qu'on n'a pas vu, se
+	// fonderait sur du vide. Vhost, compte et permissions, lus sans faute, sont
+	// réconciliés ; le reste attend une lecture complète, et l'étape le dit.
+	if len(obs.Incomplete) > 0 {
+		s := engine.NewStep("amqp/incomplete/"+spec.Vhost, engine.Update, fmt.Sprintf(
+			"vhost amqp %s — lecture incomplète (%s) : exchanges, files, bindings et policies non réconciliés",
+			spec.Vhost, strings.Join(obs.Incomplete, ", ")))
+		s.Critical = false
+		reason := fmt.Errorf("lecture du vhost %s en échec : %s — rien n'est créé ni retiré sur cette base ; "+
+			"relancer l'apply une fois le broker joignable", spec.Vhost, strings.Join(obs.Incomplete, ", "))
+		s.Apply = func(context.Context) error { return reason }
+		steps = append(steps, s)
+		return steps, nil
+	}
 	steps = append(steps, p.exchangeSteps(spec, obs)...)
 	queueSteps, err := p.queueSteps(spec, obs)
 	if err != nil {
@@ -214,6 +298,17 @@ func (p *Provider) Plan(ctx context.Context, proj *model.Project, obs Observed) 
 	steps = append(steps, queueSteps...)
 	steps = append(steps, p.bindingSteps(spec, obs)...)
 	steps = append(steps, p.policySteps(spec, obs)...)
+	// Ce que la déclaration ne porte plus vient après ce qu'elle porte : un
+	// binding retiré part avant sa file, une file avant son exchange, et le vhost
+	// remplacé une fois le nouveau en place (D100). Rien de cela quand le vhost
+	// ou le compte déclarés sont refusés : l'issue la plus probable est de revenir
+	// à la déclaration précédente.
+	steps = append(steps, p.retiredSteps(proj, spec, obs)...)
+	// L'ancien vhost ou l'ancien compte ne partent que si leur remplaçant existait
+	// à l'observation : l'apply qui le crée les garde, sans quoi une saga
+	// déroulée plus loin retirerait le nouveau et laisserait le projet sans
+	// aucun (D100).
+	steps = append(steps, p.obsoleteSteps(proj, obs, obs.VhostExists, obs.UserExists)...)
 	return steps, nil
 }
 

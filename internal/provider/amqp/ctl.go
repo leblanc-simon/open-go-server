@@ -169,6 +169,20 @@ func (c *ctlClient) DeleteQueue(ctx context.Context, vhost, name string) error {
 	return err
 }
 
+func (c *ctlClient) DeleteIdleQueue(ctx context.Context, vhost, name string) error {
+	_, err := c.run(ctx, "delete_queue", "-p", vhost, name, "--if-empty", "--if-unused")
+	return err
+}
+
+func (c *ctlClient) DeleteExchange(_ context.Context, _, name string) error {
+	return fmt.Errorf("%w : retirer l'exchange %s exige le plugin management", ErrDegraded, name)
+}
+
+func (c *ctlClient) DeleteBinding(_ context.Context, b Binding) error {
+	return fmt.Errorf("%w : retirer le binding %s → %s exige le plugin management",
+		ErrDegraded, b.Source, b.Destination)
+}
+
 func (c *ctlClient) PurgeQueue(ctx context.Context, vhost, name string) error {
 	_, err := c.run(ctx, "purge_queue", "-p", vhost, name)
 	return err
