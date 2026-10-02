@@ -356,3 +356,49 @@ certificates:
 		t.Errorf("la configuration par défaut : %v %v %v", unknown, retired, err)
 	}
 }
+
+// La section php.pool (D103) se lit telle quelle, nulles comprises, et ne se
+// contrôle pas au chargement : une clé verrouillée y est nommée par doctor et
+// au plan, jamais refusée ici.
+func TestSectionPHPPool(t *testing.T) {
+	c := Default()
+	if c.PHP.Pool.PresetName() != DefaultPoolPreset || len(c.PHP.Pool.DisabledFunctions()) != 7 {
+		t.Errorf("défauts livrés : %q %v", c.PHP.Pool.PresetName(), c.PHP.Pool.DisabledFunctions())
+	}
+	doc := `php:
+  pool:
+    defaultPreset: small
+    defaults:
+      pm.max_requests: 1000
+      request_slowlog_timeout: 5s
+      php_admin_value[open_basedir]: ~
+      user: root
+    presets:
+      maison:
+        pm: static
+    disableFunctions: []
+    capacityWarnPercent: 0
+`
+	if err := yaml.Unmarshal([]byte(doc), c); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Validate(); err != nil {
+		t.Errorf("la section ne se contrôle pas au chargement : %v", err)
+	}
+	p := c.PHP.Pool
+	if v, _ := p.Defaults.Get("pm.max_requests"); v != "1000" || p.PresetName() != "small" {
+		t.Errorf("lecture : %+v", p)
+	}
+	if v, present := p.Defaults["php_admin_value[open_basedir]"]; !present || v != nil {
+		t.Error("une valeur nulle doit être lue nulle")
+	}
+	if p.DisableFunctions == nil || len(p.DisabledFunctions()) != 0 {
+		t.Errorf("une liste vide déclarée ne pose rien : %v", p.DisableFunctions)
+	}
+	if p.CapacityWarn() != 0 || Default().PHP.Pool.CapacityWarn() != DefaultCapacityWarnPercent {
+		t.Errorf("seuil de capacité : %d (défaut %d)", p.CapacityWarn(), Default().PHP.Pool.CapacityWarn())
+	}
+	if v, _ := p.Presets["maison"].Get("pm"); v != "static" {
+		t.Errorf("preset ajouté : %v", p.Presets)
+	}
+}

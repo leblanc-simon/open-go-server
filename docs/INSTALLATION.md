@@ -90,6 +90,36 @@ par le compte `rabbitmq` (`--broker-account`, nom ou uid, pour un autre) : broke
 pourrait ouvrir le port de management. Un broker en conteneur dont le port est publié par DNAT (Docker sans
 userland-proxy) se désigne par l'adresse du conteneur (`--url`).
 
+### Pools PHP-FPM : les défauts de la machine
+
+La section `php.pool` fixe ce que la machine impose ou propose à tous les pools (D103). Elle se place
+entre le socle d'ogs et le preset ; le type d'application et la déclaration du projet passent après elle :
+
+```yaml
+php:
+  pool:
+    defaultPreset: ondemand          # preset d'un pool qui n'en déclare pas (défaut : ondemand)
+    defaults:
+      pm.max_requests: "1000"        # socle d'ogs : 500
+      request_slowlog_timeout: 5s    # socle d'ogs : 10s
+    presets:                         # redéfinit un preset livré clé par clé, ou en ajoute un
+      large:
+        pm.max_children: "80"
+    disableFunctions: [exec, passthru, shell_exec, system, proc_open, popen, pcntl_exec]  # php-plain
+    capacityWarnPercent: 200         # seuil d'avertissement de doctor (0 : jamais)
+```
+
+Ces valeurs sont **vivantes**, à la différence de `user.shell` : les changer réécrit, au prochain
+`ogs apply`, tous les pools qu'elles touchent, et FPM est rechargé une fois par version. Un pool dont la
+déclaration nomme un preset le garde ; les projets créés avant cette section portent `preset: medium` en
+toutes lettres et ne suivent donc pas `defaultPreset`. Les clés `user`, `group`, `listen` et les `listen.*` d'accès,
+`slowlog`, `access.log`, `php_admin_value[error_log]`, `include` et `prefix` sont refusées ici comme dans
+un projet, quelle que soit leur casse : `doctor`
+et le plan les nomment, la configuration se charge malgré elles. `doctor` affiche aussi, par version, la
+somme des `pm.max_children × memory_limit` rapportée à la mémoire de la machine — toujours, en
+information — et n'avertit (code 6) qu'au-delà de `capacityWarnPercent`, 200 % par défaut : la somme est un
+pire cas, tous les workers présents à leur limite, qu'un parc n'atteint presque jamais.
+
 ### PostgreSQL : un rôle d'administration à créer une fois
 
 `ogs` administre un cluster par socket Unix, où PostgreSQL emploie l'authentification `peer` : le rôle

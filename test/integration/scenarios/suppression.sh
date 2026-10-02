@@ -22,7 +22,9 @@ fi
 
 ogs init --quiet
 choisir_moteur apache
-ogs site create php.test --kind php-plain --php "$version" --tls=false --yes 2>&1 | tail -3
+# Preset small (pm dynamic) : le défaut, ondemand (D103), ne tient aucun worker
+# tant que rien n'est servi, et le scénario n'aurait plus de processus à éprouver.
+ogs site create php.test --kind php-plain --php "$version" --preset small --tls=false --yes 2>&1 | tail -3
 
 # Le maître FPM doit tourner sous systemd, avec le pool du projet : sans workers
 # vivants sous l'identité du projet, le scénario n'éprouverait rien — et c'est le

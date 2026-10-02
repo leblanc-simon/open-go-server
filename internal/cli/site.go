@@ -305,7 +305,7 @@ func (a *App) summarizeSite(p *model.Project) {
 		a.printf("  docroot      %s\n", p.Spec.Layout.Docroot)
 	}
 	for _, pool := range p.Spec.PHP.Pools {
-		a.printf("  php          %s (pool %s, %s)\n", pool.Version, pool.Name, pool.Preset)
+		a.printf("  php          %s (pool %s, %s)\n", pool.Version, pool.Name, a.poolPreset(p, pool))
 	}
 	for _, d := range p.Spec.Databases {
 		a.printf("  base         %s %s (utilisateur %s)\n", d.Engine, d.Name, d.User)
@@ -582,7 +582,10 @@ func (a *App) cloneProject(source *model.Project, env naming.Env) (*model.Projec
 	clone.Spec.PHP.Pools = slices.Clone(source.Spec.PHP.Pools)
 	for i := range clone.Spec.PHP.Pools {
 		clone.Spec.PHP.Pools[i].Env = maps.Clone(clone.Spec.PHP.Pools[i].Env)
-		clone.Spec.PHP.Pools[i].Settings = maps.Clone(clone.Spec.PHP.Pools[i].Settings)
+		// Copie profonde : les valeurs sont pointées (D103), et le masquage des
+		// secrets les réécrit en place — il réécrirait celles de la source.
+		clone.Spec.PHP.Pools[i].Settings = clone.Spec.PHP.Pools[i].Settings.Clone()
+		clone.Spec.PHP.Pools[i].AllowFunctions = slices.Clone(clone.Spec.PHP.Pools[i].AllowFunctions)
 	}
 	// Tâches et services partent désactivés : sur une copie des données de la
 	// production, une relance, un envoi ou un import agiraient comme elle — sur

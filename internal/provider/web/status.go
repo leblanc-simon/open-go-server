@@ -221,8 +221,8 @@ func (p *Provider) statusPools(projects []*model.Project) ([]StatusPool, error) 
 			pools = append(pools, StatusPool{
 				Name: bp.Name, Project: proj.ID(),
 				Pass:   p.Engine.FPMReference(bp.Listen, bp.Unix),
-				Status: cheminEtat(bp.Pool.Settings, "pm.status_path", config.PoolStatusPath),
-				Ping:   cheminEtat(bp.Pool.Settings, "ping.path", config.PoolPingPath),
+				Status: cheminEtat(bp.Resolved.Settings, "pm.status_path", config.PoolStatusPath),
+				Ping:   cheminEtat(bp.Resolved.Settings, "ping.path", config.PoolPingPath),
 			})
 		}
 	}

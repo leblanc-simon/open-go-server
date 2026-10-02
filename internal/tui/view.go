@@ -117,7 +117,7 @@ func (m *Model) viewDetail(p *model.Project) string {
 	}
 	line("utilisateur", p.Spec.User.Name+":"+p.Spec.User.Group)
 	for _, pool := range p.Spec.PHP.Pools {
-		line("php", fmt.Sprintf("%s (pool %s, %s)", pool.Version, pool.Name, pool.Preset))
+		line("php", fmt.Sprintf("%s (pool %s, %s)", pool.Version, pool.Name, pool.PresetLabel()))
 	}
 	for _, db := range p.Spec.Databases {
 		line("base", fmt.Sprintf("%s %s", db.Engine, db.Name))

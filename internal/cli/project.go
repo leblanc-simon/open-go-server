@@ -266,7 +266,7 @@ func newProjectShowCommand(app *App) *cobra.Command {
 					fmt.Fprintf(tw, "base\t%s %s (utilisateur %s)\n", db.Engine, db.Name, db.User)
 				}
 				for _, pool := range p.Spec.PHP.Pools {
-					fmt.Fprintf(tw, "pool php\t%s version %s (%s)\n", pool.Name, pool.Version, orValue(pool.Preset, "medium"))
+					fmt.Fprintf(tw, "pool php\t%s version %s (%s)\n", pool.Name, pool.Version, app.poolPreset(p, pool))
 				}
 			}))
 		},

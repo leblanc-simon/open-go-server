@@ -21,6 +21,7 @@ import (
 	appprov "leblanc.io/open-go-server/internal/provider/app"
 	"leblanc.io/open-go-server/internal/provider/firewall"
 	"leblanc.io/open-go-server/internal/provider/mail"
+	"leblanc.io/open-go-server/internal/provider/php"
 	"leblanc.io/open-go-server/internal/provider/removal"
 	"leblanc.io/open-go-server/internal/provider/unit"
 	"leblanc.io/open-go-server/internal/provider/web"
@@ -109,6 +110,11 @@ func (a *App) buildPlan(ctx context.Context, provs *providers, p *model.Project)
 			var owned *fs.OwnerError
 			if errors.As(err, &owned) {
 				return nil, wrap(CodeConflict, a.ownerGone(err))
+			}
+			// Une déclaration de pool refusée (D103) est une erreur de validation.
+			var refused *php.DeclarationError
+			if errors.As(err, &refused) {
+				return nil, wrap(CodeValidation, err)
 			}
 			return nil, wrap(CodeDependency, err)
 		}
@@ -626,6 +632,9 @@ func (a *App) checkFleetUniqueness(projects ...*model.Project) error {
 	for _, p := range projects {
 		if err := validate.CertificateNames(p); err != nil {
 			return exitf(CodeValidation, "projet %s :\n%v", p.ID(), err)
+		}
+		if err := a.checkPoolDeclarations(p); err != nil {
+			return err
 		}
 	}
 	fleet, err := a.loadProjects()

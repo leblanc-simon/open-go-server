@@ -188,13 +188,65 @@ type PHP struct {
 
 // Pool est un pool PHP-FPM.
 type Pool struct {
-	Name     string            `yaml:"name"`
-	Version  string            `yaml:"version"`
-	Preset   string            `yaml:"preset,omitempty"`
-	Listen   string            `yaml:"listen,omitempty"` // unix | tcp
-	Number   string            `yaml:"number,omitempty"` // « auto » ou un numéro imposé
-	Settings map[string]string `yaml:"settings,omitempty"`
-	Env      map[string]string `yaml:"env,omitempty"`
+	Name    string `yaml:"name"`
+	Version string `yaml:"version"`
+	// Preset est le dimensionnement **déclaré**. Vide, le pool suit le preset
+	// par défaut de la machine (« php.pool.defaultPreset » de config.yaml, D103),
+	// descendu d'un cran en préproduction si l'environnement le demande. La
+	// normalisation n'y écrit plus rien : un défaut recopié dans la déclaration
+	// ne se distinguerait plus d'un choix, et un changement de config.yaml ne
+	// toucherait jamais les projets créés avant lui. Les déclarations écrites
+	// avant D103 portent « medium » en toutes lettres : elles le gardent.
+	Preset   string       `yaml:"preset,omitempty"`
+	Listen   string       `yaml:"listen,omitempty"` // unix | tcp
+	Number   string       `yaml:"number,omitempty"` // « auto » ou un numéro imposé
+	Settings PoolSettings `yaml:"settings,omitempty"`
+	// AllowFunctions rouvre des fonctions de la liste disable_functions que le
+	// pool hérite (D103), sans recopier la liste.
+	AllowFunctions []string          `yaml:"allowFunctions,omitempty"`
+	Env            map[string]string `yaml:"env,omitempty"`
+}
+
+// PresetLabel nomme le preset déclaré, ou dit que le pool suit celui de la
+// machine.
+func (p Pool) PresetLabel() string {
+	if p.Preset == "" {
+		return "preset de la machine"
+	}
+	return p.Preset
+}
+
+// PoolSettings porte des réglages FPM. Une valeur nulle (« ~ » en YAML) retire
+// la clé : la valeur héritée des couches inférieures — socle d'ogs, défauts de
+// la machine, preset, type d'application — disparaît du pool rendu (D103). Une
+// chaîne vide, elle, est une valeur.
+type PoolSettings map[string]*string
+
+// Value rend l'adresse d'une valeur de réglage, pour écrire une table littérale.
+func Value(v string) *string { return &v }
+
+// Clone duplique la table : les valeurs pointées sont copiées, pas partagées.
+func (s PoolSettings) Clone() PoolSettings {
+	if s == nil {
+		return nil
+	}
+	out := make(PoolSettings, len(s))
+	for k, v := range s {
+		if v != nil {
+			v = Value(*v)
+		}
+		out[k] = v
+	}
+	return out
+}
+
+// Get rend la valeur d'une clé, et faux si elle est absente ou retirée.
+func (s PoolSettings) Get(key string) (string, bool) {
+	v, ok := s[key]
+	if !ok || v == nil {
+		return "", false
+	}
+	return *v, true
 }
 
 // Web décrit les vhosts.
@@ -587,20 +639,15 @@ func (p *Project) Normalize(homeRoot, prepDomain string, opts ...NormalizeOption
 
 	// Un type d'application PHP implique un pool : le déclarer par défaut évite
 	// d'exiger de l'administrateur une saisie qui n'a qu'une réponse sensée.
+	//
+	// Le preset n'y est pas écrit (D103) : le pool suit celui de la machine,
+	// que la préproduction descend d'un cran (environments.prep.presetDowngrade).
 	if at.NeedsPHP && len(p.Spec.PHP.Pools) == 0 {
-		preset := "medium"
-		if p.IsPrep() {
-			// La préproduction n'a pas à dimensionner comme la production.
-			preset = "small"
-		}
-		p.Spec.PHP.Pools = []Pool{{Name: MainPoolName, Version: DefaultPHPVersion, Preset: preset}}
+		p.Spec.PHP.Pools = []Pool{{Name: MainPoolName, Version: DefaultPHPVersion}}
 	}
 	for i := range p.Spec.PHP.Pools {
 		if p.Spec.PHP.Pools[i].Version == "" {
 			p.Spec.PHP.Pools[i].Version = DefaultPHPVersion
-		}
-		if p.Spec.PHP.Pools[i].Preset == "" {
-			p.Spec.PHP.Pools[i].Preset = "medium"
 		}
 		if p.Spec.PHP.Pools[i].Listen == "" {
 			p.Spec.PHP.Pools[i].Listen = "unix"

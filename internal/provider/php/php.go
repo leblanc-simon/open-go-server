@@ -43,6 +43,9 @@ type Provider struct {
 	// PortsInUse rend les ports TCP en écoute sur la machine ; un pool en écoute
 	// TCP n'en reçoit jamais un (D94). Nil, rien n'est écarté.
 	PortsInUse func() map[int]bool
+	// Config porte les couches de la machine (« php.pool », D103) et la descente
+	// du preset par environnement. Nil, la configuration livrée.
+	Config *config.Config
 
 	recovered   sync.Once
 	recoveryErr error
@@ -100,6 +103,9 @@ type PoolPlan struct {
 	Fixed bool
 	// Project est l'identifiant du projet, pour l'inscription du numéro.
 	Project string
+	// Resolved porte les réglages rendus, toutes couches fusionnées, et ce qui
+	// en a été écarté.
+	Resolved Resolved
 }
 
 // Observed est l'état réel des pools d'un projet.
@@ -310,9 +316,19 @@ func (p *Provider) Build(proj *model.Project, pool model.Pool) (*PoolPlan, error
 	if err != nil {
 		return nil, err
 	}
-	preset, err := LookupPreset(pool.Preset)
-	if err != nil {
-		return nil, err
+	resolved := Resolve(p.Config, proj, pool, at)
+	// php.ini l'emporte sur le pool : une fonction qu'il ferme reste fermée,
+	// allowFunctions compris (éprouvé sous un vrai FPM, D103).
+	if len(pool.AllowFunctions) > 0 {
+		ini := iniDisabledFunctions(filepath.Join(p.Paths.PHPRoot(), pool.Version, "fpm", "php.ini"))
+		for _, fn := range pool.AllowFunctions {
+			if ini[strings.ToLower(fn)] {
+				resolved.Problems = append(resolved.Problems, Problem{
+					Field: fmt.Sprintf("spec.php.pools[%s].allowFunctions", pool.Name),
+					Message: fmt.Sprintf("%s est fermée par le php.ini de FPM %s, qu'un pool ne rouvre pas",
+						fn, pool.Version)})
+			}
+		}
 	}
 
 	unix := pool.Listen != "tcp"
@@ -320,23 +336,7 @@ func (p *Provider) Build(proj *model.Project, pool model.Pool) (*PoolPlan, error
 	if !unix {
 		listen = fmt.Sprintf("127.0.0.1:%d", num)
 	}
-
-	env := map[string]string{}
-	if at.EnvVar != "" {
-		// « prod » en préproduction aussi (D96) : le site y est public, et un code
-		// installé sans les dépendances de dev ne démarre pas en « dev ».
-		env[at.EnvVar] = "prod"
-	}
-	for k, v := range pool.Env {
-		env[k] = v
-	}
-
-	settings := mergeSettings(
-		baseSettings(proj.Spec.Layout.Root, proj.Spec.Layout.LogDir),
-		preset.Settings,
-		at.PHPSettings,
-		pool.Settings,
-	)
+	settings, env := resolved.Settings, resolved.Env
 
 	body, err := p.Templates.Render("php/pool.conf", map[string]any{
 		"Project":    proj.ID(),
@@ -370,6 +370,7 @@ func (p *Provider) Build(proj *model.Project, pool model.Pool) (*PoolPlan, error
 		Pool: pool, Name: name, Number: num, Path: path, Listen: listen,
 		Unix: unix, Content: content, State: state, Version: pool.Version,
 		Fixed: pool.Number != "" && pool.Number != "auto", Project: proj.ID(),
+		Resolved: resolved,
 	}, nil
 }
 
@@ -380,6 +381,12 @@ func (p *Provider) Plan(_ context.Context, proj *model.Project, obs Observed) ([
 		bp, err := p.Build(proj, pool)
 		if err != nil {
 			return nil, err
+		}
+		// Une déclaration qui injecterait une directive, ou qui nomme un preset
+		// inconnu, est refusée au plan du projet — jamais au chargement, qui
+		// arrêterait tout le parc (D103).
+		if blocking := bp.Resolved.Blocking(); len(blocking) > 0 {
+			return nil, &DeclarationError{Project: proj.ID(), Pool: pool.Name, Problems: blocking}
 		}
 		// Le pool d'un autre projet n'est jamais réécrit, --force compris : le pool
 		// « api » de shop s'écrirait dans shop_api.conf, le pool principal du projet
@@ -402,8 +409,76 @@ func (p *Provider) Plan(_ context.Context, proj *model.Project, obs Observed) ([
 			}
 		}
 		steps = append(steps, p.poolStep(proj, bp))
+		// Ce qui a été écarté du rendu est nommé par une étape non critique : le
+		// pool est servi sans, et l'apply rend le code 6 tant que la déclaration —
+		// ou config.yaml — n'est pas corrigée.
+		if warnings := bp.Resolved.Warnings(); len(warnings) > 0 {
+			steps = append(steps, discardedStep(bp, warnings))
+		}
 	}
 	return steps, nil
+}
+
+// DeclarationError est le refus d'une déclaration de pool que le plan ne peut
+// pas rendre.
+type DeclarationError struct {
+	Project  string
+	Pool     string
+	Problems []Problem
+}
+
+func (e *DeclarationError) Error() string {
+	lines := make([]string, len(e.Problems))
+	for i, pb := range e.Problems {
+		lines[i] = pb.String()
+	}
+	return fmt.Sprintf("pool « %s » de %s refusé :\n%s", e.Pool, e.Project, strings.Join(lines, "\n"))
+}
+
+// discardedStep nomme les réglages écartés du rendu d'un pool, ou sans effet.
+// Elle échoue à l'application, sans rien écrire : c'est ce qui la fait compter
+// dans le code 6. La liste n'est portée que par l'erreur : le résumé et l'erreur
+// s'affichent sur la même ligne.
+func discardedStep(bp *PoolPlan, warnings []Problem) *engine.Step {
+	lines := make([]string, len(warnings))
+	for i, pb := range warnings {
+		lines[i] = pb.String()
+	}
+	s := engine.NewStep("php/pool/"+bp.Name+"/settings", engine.Update,
+		fmt.Sprintf("pool php %s %s — %d réglage(s) à revoir : %s",
+			bp.Version, bp.Name, len(warnings), strings.Join(lines, " ; ")))
+	s.Critical = false
+	s.Apply = func(context.Context) error {
+		// Chaque réglage porte son effet dans le résumé — écarté, sans effet,
+		// rien à retirer — : l'erreur ne fait que demander la correction.
+		return fmt.Errorf("déclaration du pool %s à corriger", bp.Name)
+	}
+	return s
+}
+
+// iniDisabledFunctions lit la directive disable_functions d'un php.ini. Un
+// fichier illisible ne ferme rien.
+func iniDisabledFunctions(path string) map[string]bool {
+	out := map[string]bool{}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return out
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		key, value, ok := strings.Cut(line, "=")
+		if !ok || strings.TrimSpace(key) != "disable_functions" {
+			continue
+		}
+		if i := strings.Index(value, ";"); i >= 0 {
+			value = value[:i]
+		}
+		for _, fn := range strings.Split(strings.Trim(strings.TrimSpace(value), `"'`), ",") {
+			if fn = strings.TrimSpace(fn); fn != "" {
+				out[strings.ToLower(fn)] = true
+			}
+		}
+	}
+	return out
 }
 
 // PlanStale renvoie les suppressions de pools devenus inutiles. Elles sont

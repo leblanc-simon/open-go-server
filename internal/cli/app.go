@@ -374,6 +374,7 @@ func (a *App) buildProviders() (*providers, error) {
 		Templates: tmpl,
 		Store:     a.Store,
 		Force:     a.Force,
+		Config:    a.Cfg,
 	}
 	eng, err := a.webEngine()
 	if err != nil {

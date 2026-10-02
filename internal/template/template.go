@@ -146,7 +146,23 @@ func Funcs() texttemplate.FuncMap {
 		"hasSuffix":  strings.HasSuffix,
 		"contains":   strings.Contains,
 		"systemdEnv": systemdEnv,
+		"fpmValue":   fpmValue,
 	}
+}
+
+// fpmValue rend la valeur d'une directive de pool PHP-FPM. L'analyseur d'ini de
+// FPM lit « ; » comme l'ouverture d'un commentaire et développe « ${VAR} » depuis
+// l'environnement du maître : une telle valeur est rendue entre apostrophes,
+// qu'il lit littéralement. Les autres restent nues et gardent leur rendu — un
+// guillemet compris : « "/usr/sbin/sendmail -t -i" » est une citation de
+// l'exploitant, que des apostrophes changeraient de sens. Une valeur à citer qui
+// porte une apostrophe ou un guillemet est refusée en amont
+// (validate.PoolValueProblem, dont c'est la règle).
+func fpmValue(value string) string {
+	if strings.Contains(value, ";") || strings.Contains(value, "${") {
+		return "'" + value + "'"
+	}
+	return value
 }
 
 // systemdEnv rend l'affectation d'une directive Environment=. systemd découpe

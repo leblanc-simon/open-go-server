@@ -38,6 +38,87 @@ type Config struct {
 	Hardening    Hardening              `yaml:"hardening"`
 	Monitoring   Monitoring             `yaml:"monitoring"`
 	Mail         Mail                   `yaml:"mail"`
+	PHP          PHP                    `yaml:"php,omitempty"`
+}
+
+// PHP paramètre ce que la machine impose ou propose aux pools PHP-FPM (D103).
+type PHP struct {
+	Pool PHPPool `yaml:"pool,omitempty"`
+}
+
+// PHPPool porte les couches de la machine dans le calcul d'un pool. L'ordre
+// complet est : socle d'ogs → Defaults → preset → type d'application →
+// environnement → déclaration du projet, chaque couche redéfinissant la
+// précédente.
+//
+// Contrairement au shell (D62), ces valeurs sont **vivantes** : elles ne sont
+// recopiées dans aucune déclaration, et les changer réécrit, au prochain apply,
+// tous les pools qu'elles touchent — rechargement de FPM groupé, une fois par
+// version.
+//
+// Rien ici n'est contrôlé au chargement de la configuration : une clé
+// verrouillée ou illisible, un preset par défaut inconnu, sont nommés par
+// « doctor » et au plan de chaque pool — étape non critique, code 6 —, le pool
+// étant rendu sans eux. Refuser au chargement arrêterait toutes les commandes,
+// « cert renew » du minuteur comprise, pour un réglage de dimensionnement.
+type PHPPool struct {
+	// Defaults sont les réglages de la machine, posés après le socle d'ogs. Une
+	// valeur nulle retire une clé du socle.
+	Defaults model.PoolSettings `yaml:"defaults,omitempty"`
+	// DefaultPreset est le preset d'un pool qui n'en déclare pas ; vide,
+	// DefaultPoolPreset.
+	DefaultPreset string `yaml:"defaultPreset,omitempty"`
+	// Presets redéfinit un preset livré, clé par clé — une valeur nulle en retire
+	// une —, ou en ajoute un.
+	Presets map[string]model.PoolSettings `yaml:"presets,omitempty"`
+	// DisableFunctions est la liste posée en disable_functions dans les pools
+	// des types qui la demandent (php-plain). Absente, DefaultDisableFunctions ;
+	// vide (« [] »), rien n'est posé.
+	DisableFunctions *[]string `yaml:"disableFunctions,omitempty"`
+	// CapacityWarnPercent est le seuil, en pourcentage de la mémoire totale, au-delà
+	// duquel « doctor » avertit que la somme des pm.max_children × memory_limit
+	// d'une version (ou de toutes) dépasse ce que la machine peut servir. Absent,
+	// DefaultCapacityWarnPercent ; 0 ou moins, jamais d'avertissement — le chiffre
+	// reste affiché.
+	CapacityWarnPercent *int `yaml:"capacityWarnPercent,omitempty"`
+}
+
+// DefaultCapacityWarnPercent est le seuil livré de « php.pool.capacityWarnPercent ».
+// La somme est un pire cas — tous les workers présents, chacun à sa limite —
+// qu'un parc n'atteint presque jamais : un seuil à 100 % avertirait la plupart des
+// machines chargées sans motif.
+const DefaultCapacityWarnPercent = 200
+
+// CapacityWarn rend le seuil d'avertissement de capacité, défaut livré appliqué.
+func (p PHPPool) CapacityWarn() int {
+	if p.CapacityWarnPercent == nil {
+		return DefaultCapacityWarnPercent
+	}
+	return *p.CapacityWarnPercent
+}
+
+// DefaultPoolPreset est le preset d'un pool qui n'en déclare pas, faute de
+// « php.pool.defaultPreset » (D103).
+const DefaultPoolPreset = "ondemand"
+
+// DefaultDisableFunctions est la liste livrée de « php.pool.disableFunctions » :
+// tout ce qui lance un processus depuis un worker.
+var DefaultDisableFunctions = []string{"exec", "passthru", "shell_exec", "system", "proc_open", "popen", "pcntl_exec"}
+
+// PresetName rend le preset par défaut des pools, défaut livré appliqué.
+func (p PHPPool) PresetName() string {
+	if p.DefaultPreset == "" {
+		return DefaultPoolPreset
+	}
+	return p.DefaultPreset
+}
+
+// DisabledFunctions rend la liste de disable_functions, défaut livré appliqué.
+func (p PHPPool) DisabledFunctions() []string {
+	if p.DisableFunctions == nil {
+		return DefaultDisableFunctions
+	}
+	return *p.DisableFunctions
 }
 
 // Mail paramètre la signature DKIM du courrier des projets (D69). ogs n'installe
@@ -316,6 +397,10 @@ type User struct {
 }
 
 // Environment décrit un environnement (prod, prep).
+//
+// PresetDowngrade descend d'un cran le preset **par défaut** des pools de
+// l'environnement (D103) : large → medium → small → micro, ondemand → micro. Un
+// preset déclaré par le projet n'est jamais descendu : il est un choix.
 type Environment struct {
 	Domain          string            `yaml:"domain"`
 	HostTemplate    string            `yaml:"hostTemplate"`

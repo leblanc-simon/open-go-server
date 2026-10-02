@@ -227,9 +227,12 @@ spec:
     pools:
       - name: web
         version: "8.4"
-        preset: large                    # micro, small, medium, large ou custom
+        preset: large                    # ondemand, micro, small, medium, large, custom, ou un preset
+                                         # de config.yaml ; absent, celui de la machine (D103)
         settings:
           php_admin_value[upload_max_filesize]: 64M
+          request_terminate_timeout: ~   # valeur nulle : la clé héritée disparaît du pool
+        allowFunctions: [proc_open]      # rouvre une fonction de php.pool.disableFunctions
 
   databases:
     - engine: mysql
@@ -280,6 +283,16 @@ spec:
 
 Ce qui est absent reste déduit : utilisateur, home, docroot `www/public`, vhosts principal et de
 redirection, certificat couvrant `boutique.fr`, `www.boutique.fr` et la redirection `ancienne-boutique.fr`.
+
+Le pool reçoit, sous la déclaration du projet, le socle d'ogs, les défauts de la machine
+(`php.pool` de `/etc/ogs/config.yaml`), le preset et les réglages du type (D103). Quelques clés ne se
+surchargent pas, quelle que soit leur casse — `user`, `group`, `listen` et les `listen.*` d'accès,
+`slowlog`, `access.log`, `php_admin_value[error_log]`, `include`, `prefix` — : déclarées, elles sont
+écartées et l'apply rend le code 6. Une valeur nulle (`~`, ou `clé:` sans valeur) **retire** la clé
+héritée : avant D103, `clé:` valait une chaîne vide, qui s'écrit désormais `""`. Une clé ou une
+valeur sur plusieurs lignes est refusée au plan du projet (code 3). Un site `php-plain` reçoit
+`disable_functions` (exec, system, proc_open…), que `allowFunctions` rouvre fonction par fonction ; la liste
+ne vaut que pour FPM, pas pour les tâches planifiées ni les services, qui lancent PHP en ligne de commande.
 
 Ajouter un alias à un site en HTTPS ne lui retire jamais son HTTPS : le vhost garde le certificat en place
 pour les noms qu'il couvre, et le nouveau nom, déclaré aussitôt, attend le sien — le port 80 sert son

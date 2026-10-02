@@ -45,6 +45,13 @@ type AppType struct {
 	// défaut et surchargeables. Prestashop, par exemple, ne fonctionne pas avec
 	// les valeurs par défaut de PHP.
 	PHPSettings map[string]string
+	// DisableFunctions fait recevoir aux pools du type la liste
+	// « php.pool.disableFunctions » de config.yaml, en
+	// php_admin_value[disable_functions] (D103). Seul php-plain la reçoit : c'est
+	// le type qui sert un code sans cadre, déposé tel quel, où rien ne justifie
+	// d'ouvrir un shell — là où Prestashop et Symfony en ont l'emploi, par leurs
+	// modules ou par Process. Le reste du parc l'obtient par « defaults ».
+	DisableFunctions bool
 	// Config énumère, relatifs à www, les fichiers où le type range par
 	// convention la configuration d'un environnement : les identifiants et les
 	// adresses de ses bases et de son transport, mais aussi ses secrets — clé
@@ -74,7 +81,7 @@ var dotenvConfig = []string{".env", ".env.local", ".env.*.local", ".env.producti
 // appTypes est la table par défaut, surchargeable par /etc/ogs/apptypes.yaml.
 var appTypes = map[AppKind]AppType{
 	KindStatic:   {Kind: KindStatic, Docroot: "www", VHostTemplate: "static"},
-	KindPHPPlain: {Kind: KindPHPPlain, Docroot: "www", VHostTemplate: "php-fpm", NeedsPHP: true},
+	KindPHPPlain: {Kind: KindPHPPlain, Docroot: "www", VHostTemplate: "php-fpm", NeedsPHP: true, DisableFunctions: true},
 	KindPrestashop: {
 		Kind: KindPrestashop, Docroot: "www", FrontController: "index.php",
 		VHostTemplate: "php-fpm", NeedsPHP: true,

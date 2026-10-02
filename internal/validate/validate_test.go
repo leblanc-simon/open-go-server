@@ -39,11 +39,39 @@ func TestNormalizeProvidesDefaultPool(t *testing.T) {
 	}
 }
 
-func TestNormalizeDowngradesPresetForPrep(t *testing.T) {
+// La normalisation n'écrit plus de preset (D103) : un défaut recopié dans la
+// déclaration ne se distinguerait plus d'un choix, et ne suivrait jamais
+// config.yaml. La descente de la préproduction se fait au calcul du pool
+// (provider php, presetDowngrade).
+func TestNormalizeNEcritPasDePreset(t *testing.T) {
 	prod := newProject(t, "shop.fr", naming.EnvProd, model.KindSymfony)
 	prep := newProject(t, "shop.fr", naming.EnvPrep, model.KindSymfony)
-	if prod.Spec.PHP.Pools[0].Preset != "medium" || prep.Spec.PHP.Pools[0].Preset != "small" {
-		t.Errorf("presets : prod=%q prep=%q", prod.Spec.PHP.Pools[0].Preset, prep.Spec.PHP.Pools[0].Preset)
+	if prod.Spec.PHP.Pools[0].Preset != "" || prep.Spec.PHP.Pools[0].Preset != "" {
+		t.Errorf("presets : prod=%q prep=%q, attendus vides", prod.Spec.PHP.Pools[0].Preset, prep.Spec.PHP.Pools[0].Preset)
+	}
+	// Un preset déclaré est gardé tel quel, celui qu'une déclaration antérieure
+	// porte en toutes lettres compris.
+	prod.Spec.PHP.Pools[0].Preset = "medium"
+	if err := prod.Normalize("/home", "preprod-pp.net"); err != nil {
+		t.Fatal(err)
+	}
+	if prod.Spec.PHP.Pools[0].Preset != "medium" {
+		t.Errorf("le preset déclaré a été réécrit : %q", prod.Spec.PHP.Pools[0].Preset)
+	}
+}
+
+// Un preset inconnu de la table livrée peut venir de config.yaml : le
+// chargement n'en juge que la forme, pour qu'un preset retiré de la
+// configuration n'arrête pas tout le parc (D103).
+func TestPresetInconnuToléréAuChargement(t *testing.T) {
+	p := newProject(t, "shop.fr", naming.EnvProd, model.KindSymfony)
+	p.Spec.PHP.Pools[0].Preset = "maison"
+	if err := Project(p, "/home"); err != nil {
+		t.Errorf("un preset de config.yaml doit passer le chargement : %v", err)
+	}
+	p.Spec.PHP.Pools[0].Preset = "Mai son"
+	if err := Project(p, "/home"); err == nil {
+		t.Error("un nom de preset hors grammaire doit être refusé")
 	}
 }
 

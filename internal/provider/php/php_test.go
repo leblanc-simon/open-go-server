@@ -183,9 +183,9 @@ func TestBuildAppliesPresetAndAppSettings(t *testing.T) {
 		t.Fatal(err)
 	}
 	content := string(bp.Content)
-	// Preset medium.
-	if !strings.Contains(content, "pm.max_children = 20") {
-		t.Error("le preset medium doit fixer pm.max_children à 20")
+	// Preset par défaut de la machine : ondemand (D103).
+	if !strings.Contains(content, "pm.max_children = 12") || !strings.Contains(content, "pm = ondemand") {
+		t.Error("le preset par défaut, ondemand, doit fixer pm.max_children à 12")
 	}
 	// Réglages propres à Prestashop, qui redéfinissent la mémoire du preset.
 	for _, want := range []string{
@@ -205,7 +205,7 @@ func TestBuildAppliesPresetAndAppSettings(t *testing.T) {
 func TestBuildProjectSettingsWinOverPreset(t *testing.T) {
 	prov, _, _ := fixture(t, "8.5")
 	p := project(t, "shop.fr", model.KindSymfony, "6.4", "8.5")
-	p.Spec.PHP.Pools[0].Settings = map[string]string{"pm.max_children": "99"}
+	p.Spec.PHP.Pools[0].Settings = model.PoolSettings{"pm.max_children": model.Value("99")}
 	bp, err := prov.Build(p, p.Spec.PHP.Pools[0])
 	if err != nil {
 		t.Fatal(err)
@@ -656,7 +656,7 @@ func TestSurchargeDuStatutResteAuProjet(t *testing.T) {
 	// déplacer, comme n'importe quel autre.
 	prov, _, _ := fixture(t, "8.5")
 	p := project(t, "shop.fr", model.KindSymfony, "6.4", "8.5")
-	p.Spec.PHP.Pools[0].Settings = map[string]string{"pm.status_path": "/ailleurs"}
+	p.Spec.PHP.Pools[0].Settings = model.PoolSettings{"pm.status_path": model.Value("/ailleurs")}
 	bp, err := prov.Build(p, p.Spec.PHP.Pools[0])
 	if err != nil {
 		t.Fatal(err)

@@ -618,10 +618,12 @@ func validatePHP(p *model.Project, add func(string, string, ...any)) {
 		default:
 			add(f+".listen", "attendu unix ou tcp, obtenu %q", pool.Listen)
 		}
-		switch pool.Preset {
-		case "", "micro", "small", "medium", "large", "custom":
-		default:
-			add(f+".preset", "preset %q inconnu", pool.Preset)
+		// Seule la forme se juge au chargement : les presets connus dépendent de
+		// config.yaml (D103), et un preset retiré de la configuration ne doit pas
+		// arrêter tout le parc. Qu'il existe est éprouvé au plan du projet visé et
+		// par « doctor ».
+		if pool.Preset != "" && !PresetName(pool.Preset) {
+			add(f+".preset", "nom de preset %q invalide", pool.Preset)
 		}
 		if pool.Number != "" && pool.Number != "auto" {
 			n, err := strconv.Atoi(pool.Number)

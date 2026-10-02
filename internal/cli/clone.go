@@ -288,12 +288,16 @@ func reviewDeclared(p, source *model.Project, values []fs.GuardValue) declaredRe
 		}
 	}
 	always := func(string) bool { return true }
-	never := func(string) bool { return false }
 	table("spec.app.env", always, p.Spec.App.Env)
 	field("spec.app.command", false, &p.Spec.App.Command)
 	for _, pool := range p.Spec.PHP.Pools {
 		table(fmt.Sprintf("spec.php.pools[%s].env", pool.Name), always, pool.Env)
-		table(fmt.Sprintf("spec.php.pools[%s].settings", pool.Name), never, pool.Settings)
+		// Une valeur nulle retire une clé (D103) : il n'y a rien à masquer.
+		for _, k := range slices.Sorted(maps.Keys(pool.Settings)) {
+			if v := pool.Settings[k]; v != nil {
+				field(fmt.Sprintf("spec.php.pools[%s].settings.%s", pool.Name, k), false, v)
+			}
+		}
 	}
 	for _, svc := range p.Spec.Services {
 		// Les paramètres env.* deviennent des variables de l'unité ; les autres

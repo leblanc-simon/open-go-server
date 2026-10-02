@@ -185,6 +185,7 @@ Décisions arbitrées et figées pour la v1. Toute remise en cause est une évol
 | D100 | Ce que la suppression et l'apply laissaient derrière eux | (1) **Numéros** : un numéro de pool ou un port applicatif n'est inscrit qu'à l'apply — `plan`, `diff`, `status`, l'aperçu de la TUI et `--dry-run` le calculent sans écrire (`Store.PreviewAllocations`), un apply refusé à la confirmation ou déroulé rend ce qu'il avait réservé (`CancelAllocations`) ; il est **libéré quand son fichier quitte le disque** — pool retiré, renommé ou changé de version, unité d'une application quittée, runtime changé, projet supprimé —, jamais avant, et rendu si une compensation rend le fichier ; un numéro **imposé** (`number:`) est inscrit par l'étape qui écrit le pool, à la place de celui qu'il tenait — tenu par une autre ressource, il est employé sans être repris ; le plan global (vhost d'état, Telegraf) ne réserve rien. (2) **Unités** : le modèle d'un service retiré ou renommé part une fois ses instances arrêtées, la cible et son `.wants` quand plus rien ne la demande, l'unité applicative d'un projet passé à un type sans runtime ; attribution par l'en-tête (D76), retrait sous les cinq états (`removal.File`) ; `project delete` emporte toute unité que l'en-tête lui attribue. (3) **Certificats** : `project delete` scelle dans l'archive les fichiers des certificats du projet, clé privée comprise, puis les retire après le rechargement du serveur web — l'implicite et les déclarés, jamais un partagé ni un nom qu'un autre projet déclare (parc antérieur à D94), laissé et nommé ; la restauration les rend au magasin avant l'apply ; ni révocation ni effacement des échecs ACME ; `doctor` nomme un certificat qu'aucun projet ne déclare, avec `ogs cert delete`. (4) **Secrets** : hors `--keep-data`, les secrets du projet quittent le keystore en fin de suppression — l'archive en garde la copie, `--purge` aucune —, sauf les **preuves de propriété** (`mysql/`, `mariadb/`, `postgres/`, `amqp/`, `amqp-vhost/`, `amqp-declared/`), que chaque provider retire avec sa ressource et garde tant qu'elle reste, et les clés DKIM dont les fichiers n'ont pas pu partir ; ce qui reste est nommé, `--keep-data` compris. **La restauration ne réinjecte que les preuves de ce que la déclaration restaurée nomme** : l'archive, faite avant les retraits, porte celles de ressources que la suppression a ensuite détruites, et un homonyme créé depuis par l'administrateur serait devenu une ressource d'ogs, retirée par l'apply de la restauration ; ce que la suppression a laissé en place a gardé sa preuve au keystore. (5) **Bases** : un compte scellé qu'aucune déclaration ne nomme plus est retiré à l'apply, étape non critique, son secret après lui (PostgreSQL : `REASSIGN OWNED`, `DROP OWNED`, `DROP ROLE`) ; restent, nommés, un compte réservé, un moteur injoignable, plusieurs homonymes, un compte qui a ses droits sur une base présente non déclarée, et le compte d'un projet adopté — jamais retiré par l'apply, `--force` compris, seulement par `project delete --force`, qui le nomme avant la confirmation (D77) ; un hôte changé recrée le compte sous le nouvel hôte avec le même mot de passe — **jamais pour un projet adopté**, dont le mot de passe scellé n'est pas celui que le compte porte : le refus de D78 y demeure —, en scellant une marque (`<moteur>-moved/<compte>`) qui porte les hôtes sous lesquels ogs a tenu le compte — elle lève le refus de D78 pour ces seuls hôtes (hôte changé deux fois), fait retirer à l'apply suivant tout compte d'un hôte quitté, l'hôte d'origine retrouvé compris, et `project delete` emporte tous ceux qu'elle prouve, et un déroulage rend la marque d'avant au lieu de l'effacer ; un autre compte à ogs du projet prouve la base (D91), et PostgreSQL lui en donne la propriété ; `project delete` applique les mêmes règles. **Un ancien compte remplacé — utilisateur renommé, hôte changé — ne part que si son remplaçant existait à l'observation**, donc à l'apply suivant, que le plan annonce : l'apply qui crée le remplaçant le compenserait en cas de déroulage, et la base resterait sans aucun compte, tenue ensuite pour étrangère. (6) **AMQP** : ogs scelle la trace de ce qu'il déclare dans le vhost (`amqp-declared/<vhost>`) ; ce qui y figure et quitte la déclaration est retiré — une file seulement vide et sans consommateur, sinon nommée, code 6 ; un vhost ou un compte prouvés que la déclaration ne désigne plus partent à l'apply — seulement si le vhost ou le compte déclarés existaient à l'observation, même règle que pour les bases —, le vhost seulement vide, et jamais s'il est déclaré ou marqué par un autre projet du parc ; une lecture du vhost en échec — exchanges, files, bindings, policies — n'est pas une absence : aucune création ni aucun retrait ne s'y fonde, la trace reste telle quelle, et une étape non critique nomme la lecture (code 6, Q-20) ; poser la trace n'est pas un écart (`Step.Bookkeeping`) : `diff` et `status` ne la comptent pas ; un broker injoignable alors que `spec.amqp` n'existe plus ne produit aucune étape en échec ; `project delete` juge chacun sur sa preuve et retire les vhosts avec leurs messages. (7) **Fichier d'environnement** (D75) : il reste sous `--keep-data`, et la purge le nomme avant la saisie de l'identifiant | Rien de cela n'était dangereux sur l'instant, mais tout s'accumulait : la plage d'une version PHP se saturait de numéros que rien ne servait, réservés dès un `plan` (R1-20) ; un projet recréé sous le même identifiant héritait des secrets de l'ancien — sa clé DKIM, qu'il aurait publiée sans le savoir (R1-21) ; doctor avertissait à vie d'un certificat dont la clé privée restait sur le disque (R1-22) ; un compte SGBD retiré gardait ses droits (R1-30), une file, un vhost ou un compte AMQP retirés restaient sur le broker (R1-31), des modèles d'unité orphelins survivaient au projet (R1-74), et `--keep-data` effaçait le contenu de l'exploitant qu'est le fichier d'environnement (R1-76). **Pourquoi libérer seulement un fichier parti** : un fichier laissé — non écrit par ogs, retrait en échec — sert encore son numéro, que l'attribution suivante donnerait à un autre projet, dont le vhost relaierait vers ce qui tourne encore (D94). **Pourquoi annuler plutôt qu'inscrire dans l'étape** : deux pools neufs d'un même plan doivent recevoir deux numéros, et le rendu de chaque fichier porte le sien ; l'aperçu les tient en mémoire, l'apply les inscrit sous le verrou et les rend s'il renonce. **Pourquoi garder les preuves** : retirée avant sa ressource, une preuve fait de celle-ci une étrangère qu'ogs ne reprendra plus jamais (D91, D93) ; sous `--keep-data`, tous les secrets restent avec ce qu'ils servent, et un projet recréé sous le même identifiant les reprend avec ses bases. **Pourquoi une trace AMQP** : l'application crée elle-même files et exchanges, et retirer sur l'observation seule la casserait ou ferait osciller l'apply ; **pas de `--force` pour une file pleine** : ses messages sont des données qu'aucune archive ne garde. **Pourquoi garder le compte d'une base retirée** : `db remove` ne détruit aucune donnée, et sans son compte la base serait refusée comme étrangère à une redéclaration. **Pourquoi archiver le certificat** : il se réémet, mais la restauration d'un site n'a pas à attendre l'autorité, ni à consommer son quota ; la clé y est scellée, jamais en clair. **Pourquoi garder le fichier d'environnement sous `--keep-data`** : ogs n'en écrit jamais le contenu, et rien ne le reproduit ; sous `--purge`, l'exploitant a demandé l'effacement sans recours. **Pourquoi attendre l'apply suivant pour l'ancien compte** : le retirer dans la foulée, sans compensation possible, puis voir la saga déroulée retirer le remplaçant, laissait la base ou le vhost sans compte ni secret, refusés ensuite comme étrangers, pendant que la CLI annonçait le retour à l'état initial ; et l'application gagne un apply pour se reconfigurer. **Pourquoi l'apply ne retire jamais le compte d'un projet adopté** : son `--force` reprend un fichier retouché, il ne vaut pas consentement à supprimer un compte — le couplage que D86 a refusé pour le pare-feu ; `project delete --force` est ce consentement. **Arbitrages validés** : l'ancien compte part à l'apply suivant ; `--keep-data` garde tous les secrets, et le dit ; les bases retirées par `db remove` survivent à la suppression, nommées, code 6 ; `--purge` efface le fichier d'environnement sans copie, nommé avant la saisie ; la trace AMQP reste au keystore. **Limites** (§20) : les restes des suppressions antérieures — numéros, secrets — ne sont pas repris ; un parc antérieur ne porte pas de trace AMQP ; un ancien compte remplacé est retiré à l'apply suivant même si l'application, non reconfigurée, s'en sert encore |
 | D101 | Surface CLI : codes, canaux, clés inconnues | (1) **Une sous-commande inconnue rend le code 2** avec les suggestions de cobra — « ogs db dmup shopfr > dump.sql » écrivait l'aide dans la sauvegarde et rendait 0 ; un groupe sans argument affiche toujours son aide en code 0, sans exiger root. **Toute commande feuille refuse en code 2 un argument que sa ligne d'utilisation n'annonce pas** (`cobra.NoArgs` posé par défaut, `[id...]` reste libre), message français ; `TestChaqueCommandeRefuseLesArgumentsEnTrop` parcourt l'arbre. (2) **Avertissements, échecs d'étape (une seule ligne : « ⚠ » pour une étape non critique, « ✗ » pour une critique), rollback et annonce du retour automatique d'ufw ne se taisent jamais** (`warnf`) : en mode table ils suivent le fil de la sortie, sous `--quiet` ou `-o json|yaml` ils passent sur stderr, la sortie standard restant au seul document. (3) **Une clé inconnue de `config.yaml` est nommée par son chemin** (`config.UnknownKeys`) : une commande qui écrit est refusée en code 3 ; une consultation, `cert renew`, `init`, `my start|stop|restart` et `service start|stop|restart` l'annoncent sur stderr et continuent ; `doctor` la compte en échec. Une clé retirée (`environments.*.basicAuth`) est nommée, jamais refusée. Une clé inconnue d'`amqp.yaml` ou d'un jeu DNS est un avertissement de `doctor` (et, pour `amqp.yaml`, de chaque commande qui le lit), le fichier restant lu. (4) **`service logs` écrit le flux de journalctl au fil de l'eau** (`exec.Command.Stdout/Stderr`), `--no-pager`, pour un service déclaré ou l'application supervisée seulement ; un Ctrl-C rend 9, un journalctl introuvable 5. (5) **Le clone dont la copie des données a échoué rend 6** et l'audit l'enregistre « avertissement ». (6) **Cron : seul le premier mot d'une commande relative est résolu**, ses arguments jamais (§7.8) ; un nom nu reste au `PATH`, sauf homonyme d'une entrée du répertoire de travail — ou répertoire non vérifiable, lien ou accès refusé —, gardé par compatibilité et signalé (étape non critique, `doctor`) ; les affectations de tête passent devant `flock`. (7) Un groupe sous `--dry-run` reste une consultation (aide, code 0) ; « ogs » seul hors terminal tolère une clé inconnue comme une consultation, mais **`ogs tui` et « ogs » sur un terminal sont refusés en code 3** : on peut appliquer depuis l'inspecteur. Une clé qui ne diffère que par la casse est proposée (« maxRetry » ?) | Q-04, Q-34, Q-66, Q-68, Q-69, Q-110 de la revue. **Pourquoi un nom nu n'est plus préfixé, sauf homonyme** : `curl …` devenait `<www>/curl …` ; mais les seules déclarations à nom nu qui fonctionnaient étaient justement celles d'un script de `www/` — les envoyer au `PATH` les aurait fait échouer à chaque exécution, apply en 0. **Pourquoi pas un refus strict au chargement de `config.yaml`** : il arrêterait tout le parc, le renouvellement des certificats du timer compris — le piège de D91 et D98 ; une commande qui écrit, elle, appliquerait un réglage que l'administrateur croit posé. **Pourquoi le code 6 et non 1 pour le clone** : le projet est créé, sa base existe, vide — un succès partiel comme un contenu non recopié (D84). **Pourquoi 9 au Ctrl-C de `logs -f`** : c'est une interruption, que §10.3 range sous 9 ; 5 disait une dépendance absente. **Pourquoi les avertissements restent sur la sortie standard en mode table** : ils y suivent l'étape qui les a produits ; une lecture machine passe par `-o json`. **Contrepartie** : `ogs completion` est désormais créé dès la construction de l'arbre — il échappait à la traduction et `ogs completion bash` exigeait root |
 | D102 | Certificat servi par un vhost | **Chaque vhost sert le certificat qu'il désigne**, pourvu que sa demande couvre l'un de ses noms : `spec.web.vhosts[].tls.certificate`, sinon `spec.web.tls.certificate` — qui vaut pour chaque vhost qui ne désigne rien —, le nom d'un certificat du projet (`spec.certificates[].name`, l'identifiant pour le certificat implicite) ou `@<nom>` pour un certificat de portée serveur de `config.yaml` (D26). **Choix par défaut** : le wildcard de la préproduction quand il la couvre, puis le certificat du projet dont le **matériel présent** couvre l'un des noms du vhost, puis le premier dont la **demande** le couvre, puis le premier tout court. **Jamais de HTTPS retiré** (D79) : une référence que rien ne porte, ou qui ne couvre aucun nom du vhost, retombe sur le choix par défaut et le plan du projet la signale par une étape non critique en échec (`tls/reference/<id>`, code 6), `doctor` par un avertissement ; tant que le certificat désigné ne couvre pas réellement le vhost — jamais émis, expiré —, le certificat présent qui le couvre reste servi (`Coverage.Pending`), et l'étape de bascule de `PlanTLS` (« bascule du vhost … sur le certificat … ») le remplace après l'émission, dans le même apply. Une préproduction couverte par le wildcard **le sert quelle que soit la référence** que `site clone` a recopiée de la production, sans rien signaler ni émettre. Un `@<nom>` désigné qui couvre le vhost s'émet avec le projet (`tls.Provider.DesignatedShared`) et se renouvelle avec lui — `cert renew <id>` et la TUI comme `cert renew --all`. Rien n'est refusé au chargement ni à l'apply. `cert delete` refuse un certificat qu'un vhost sert ou attend (`tls.Provider.Users`) | Le champ était accepté, documenté (§3.2), puis ignoré : chaque vhost recevait le premier certificat déclaré, le vhost d'un second restait en HTTP seul sans un mot, et son certificat se renouvelait à vie sans servir (Q-30). La première correction retenait la référence dès qu'elle existait : `spec.web.tls.certificate`, jusque-là sans effet, désignant un certificat qui ne couvrait pas le site lui retirait son bloc 443 en code 0, HSTS actif, et une préproduction clonée d'une production qui désignait un partagé perdait le wildcard (relecture de Q-30). **Pourquoi la couverture et le matériel présent** : c'est la règle de D79 — une désignation, comme une demande, ne fait jamais redescendre un vhost servi. **Pourquoi le présent avant la demande dans le choix par défaut** : un certificat ajouté en tête de `spec.certificates`, pas encore émis, aurait sinon pris la place de celui qui sert. **Pourquoi ne pas refuser** : une référence sans objet était sans effet ; la refuser couperait un HTTPS qui fonctionnait, et la refuser au chargement arrêterait le parc entier, `cert renew` du timer compris (D94). Limites (§20) : `status` et la TUI ne nomment que le certificat principal ; un partagé émis avec un projet reste, et se renouvelle par `renew --all`, après la suppression du projet |
+| D103 | Pools PHP-FPM : défauts de la machine, surcharges par projet | (1) **Section `php.pool` de config.yaml** : `defaults` (réglages de la machine), `defaultPreset` (preset d'un pool qui n'en déclare pas, **`ondemand`** par défaut : pm ondemand, 12 enfants, `pm.process_idle_timeout` 30s, `memory_limit` 256M), `presets` (redéfinit un preset livré clé par clé, ou en ajoute un), `disableFunctions` (défaut : exec, passthru, shell_exec, system, proc_open, popen, pcntl_exec). Ordre : socle d'ogs → `defaults` → preset → type d'application → environnement → projet, puis `allowFunctions`. Ces valeurs sont **vivantes** : les changer réécrit tous les pools touchés au prochain apply, FPM rechargé une fois par version. (2) **Preset déclaré ou hérité** : la normalisation n'écrit plus de preset ; un pool qui en porte un — les déclarations antérieures portent `medium` en toutes lettres — le garde, un pool sans preset suit `defaultPreset`. L'environnement (`presetDowngrade`, vrai en `prep`) descend d'un cran **le seul preset hérité** : large → medium → small → micro, ondemand → micro. (3) **`spec.php.pools[].settings`** : une valeur nulle (`~`) retire la clé héritée, une chaîne vide est une valeur ; **`allowFunctions`** rouvre une fonction de la liste sans la recopier. (4) **`disable_functions` au seul type `php-plain`** (`AppType.DisableFunctions`), en `php_admin_value` ; le reste du parc l'obtient par `defaults`. La valeur du pool **s'ajoute** à celle du php.ini de la distribution, et ne vaut que pour FPM — ni les crons ni les unités, qui lancent PHP en ligne de commande. (5) **Clés verrouillées**, jugées **sans casse** comme FPM les lit (une directive n'est rendue qu'une fois, la dernière couche l'emportant) : `user`, `group`, `listen`, `listen.owner`, `listen.group`, `listen.mode`, `listen.acl_users`, `listen.acl_groups`, `listen.allowed_clients`, `slowlog`, `access.log`, `php_admin_value[error_log]`, `include` et `prefix` — écartées du rendu, étape non critique qui les nomme (code 6) ; `listen.backlog`, `listen.setfib`, `chroot`, `chdir`, `process.priority` et les `rlimit_*` restent libres, ne donnant rien au-delà de l'identité du pool ; `pm.status_path` et `ping.path` ne se retirent pas (D66), une autre valeur restant admise. (6) **Grammaire** : clé en lettres, chiffres, `._-` (crochets pour `php_value`, `php_flag`, `php_admin_value`, `php_admin_flag`, `env`), aucune fin de ligne ni NUL dans clé ou valeur, `env` compris ; une valeur portant `;` ou `${` est rendue entre apostrophes, que l'analyseur d'ini lit littéralement — elle ne peut alors porter ni apostrophe ni guillemet (code 3) — ; un guillemet seul ne déclenche jamais la citation : la valeur est rendue nue, lue par FPM comme avant D103 (`"/usr/sbin/sendmail -t -i"`, `"a" "b"` → `ab`, `"a\"b"` → `a"b`), et un guillemet non apparié, que FPM refuserait au démarrage, est refusé (code 3). Une valeur nulle YAML **retire** la clé : `clé:` sans valeur, qui valait une chaîne vide avant D103, change de sens, et le plan nomme celle qui n'a rien à retirer. (7) `security.limit_extensions = .php` au socle. (8) `doctor` affiche toujours, par version et toutes versions, la somme des `pm.max_children × memory_limit` rapportée à la mémoire totale (information, code 0), et n'avertit (code 6) qu'au-delà de `php.pool.capacityWarnPercent` — 200 % par défaut, 0 ou moins pour ne jamais avertir | Une clé verrouillée, une valeur sur deux lignes ou un preset inconnu ne sont **jamais refusés au chargement** — d'un projet comme de config.yaml — : le refus porte sur le plan et l'apply du projet visé (code 3 pour une déclaration du projet qui injecterait une directive ou nommerait un preset inconnu), aux points d'écriture d'une déclaration et dans `doctor`. Avant D103, `settings: {user: root}` — ou `User: root`, FPM ne distinguant pas la casse — rendait une seconde ligne `user` après celle du template — FPM retient la dernière, le pool tournait en root —, et une valeur contenant une fin de ligne injectait une directive. `slowlog` et `access.log` sont ouverts par le maître, en root, au chemin donné. Le seuil de capacité est à 200 % : la somme est un pire cas — tous les workers présents, chacun à sa limite — qu'un parc n'atteint presque jamais, et un seuil à 100 % avertirait la plupart des machines chargées sans motif |
 
 ---
 
@@ -459,7 +460,7 @@ environments:
     idSuffix: prep                                   # → shopfrprep
     certificate: "@wildcard-prep"                    # certificat partagé (§7.7.4)
     robotsNoindex: true
-    presetDowngrade: true                            # medium → small
+    presetDowngrade: true                            # preset hérité descendu d'un cran (D103)
 ```
 
 Points à noter :
@@ -1572,13 +1573,127 @@ un Prestashop en 7.4 à côté d'un Symfony 8 en 8.5 sur la même machine.
 
 | Preset | pm | max_children | start | min/max spare | memory_limit | usage visé |
 |---|---|---|---|---|---|---|
-| `micro` | ondemand | 5 | — | — | 128M | site vitrine, faible trafic |
+| `ondemand` | ondemand | 12 | — | — (idle 30s) | 256M | **défaut** (D103) : aucun worker tant que rien n'est servi |
+| `micro` | ondemand | 5 | — | — (idle 10s) | 128M | site vitrine, faible trafic |
 | `small` | dynamic | 10 | 2 | 1 / 3 | 192M | petit site dynamique |
 | `medium` | dynamic | 20 | 4 | 2 / 6 | 256M | application standard |
 | `large` | dynamic | 50 | 10 | 5 / 15 | 512M | trafic élevé |
 | `custom` | — | — | — | — | — | tout fourni par `settings` |
 
 Tout paramètre du preset est surchargeable individuellement par `settings`.
+
+**Couches d'un pool** (D103). Le rendu empile, chaque couche redéfinissant la précédente :
+
+1. le **socle d'ogs** — journaux, `open_basedir`, répertoires temporaires, garde-fous de durée, points
+   d'état (D66), `security.limit_extensions = .php` ;
+2. les **défauts de la machine**, `php.pool.defaults` de `/etc/ogs/config.yaml` ;
+3. le **preset** : celui que le pool déclare, sinon `php.pool.defaultPreset` (`ondemand` faute de mieux),
+   descendu d'un cran si l'environnement porte `presetDowngrade` — large → medium → small → micro,
+   ondemand → micro, un preset ajouté par la machine restant tel quel. `php.pool.presets` redéfinit un
+   preset livré clé par clé, ou en ajoute un ;
+4. les réglages du **type d'application** (Prestashop : mémoire, `max_input_vars`…), et la liste
+   `php.pool.disableFunctions` pour les types qui la demandent — `php-plain` seul ;
+5. l'**environnement**, dont la seule part aujourd'hui est la descente du preset hérité ;
+6. la **déclaration du projet**, `spec.php.pools[].settings`, puis `allowFunctions`.
+
+```yaml
+# /etc/ogs/config.yaml
+php:
+  pool:
+    defaultPreset: ondemand          # preset d'un pool qui n'en déclare pas
+    defaults:                        # après le socle d'ogs, avant le preset
+      pm.max_requests: "1000"
+      request_slowlog_timeout: 5s
+    presets:
+      medium:                        # redéfini clé par clé : le reste de medium demeure
+        pm.max_children: "30"
+      batch:                         # un preset neuf, que les projets peuvent déclarer
+        pm: static
+        pm.max_children: "4"
+        php_admin_value[memory_limit]: 1G
+    disableFunctions: [exec, passthru, shell_exec, system, proc_open, popen, pcntl_exec]
+```
+
+```yaml
+# spec d'un projet
+php:
+  pools:
+    - name: web
+      version: "8.3"
+      preset: medium                 # déclaré : ne suit plus defaultPreset
+      settings:
+        pm.max_children: "40"
+        php_admin_value[open_basedir]: ~   # valeur nulle : la clé héritée disparaît
+        php_value[date.timezone]: ""       # chaîne vide : une valeur
+      allowFunctions: [proc_open]    # rouvre une fonction de la liste, sans la recopier
+```
+
+Règles qui ne se voient pas dans l'exemple :
+
+- **Preset déclaré ou hérité.** La normalisation n'écrit plus de preset dans la déclaration : un défaut
+  recopié ne se distinguerait plus d'un choix, et ne suivrait jamais la configuration. Les déclarations
+  écrites avant D103 portent `preset: medium` en toutes lettres — c'était le défaut que la normalisation y
+  posait, et toute commande qui enregistre la déclaration l'y a laissé — : elles le **gardent**, et aucun
+  pool du parc ne bascule sans un mot. Seul un pool sans preset écrit suit `defaultPreset` ; le plan d'un
+  apply montre alors la réécriture de son fichier. `project show` dit d'où vient le preset.
+- **Des défauts vivants.** Contrairement au shell (D62), rien de `php.pool` n'est recopié dans une
+  déclaration : changer `defaults`, `defaultPreset` ou un preset réécrit, au prochain apply, tous les pools
+  qu'ils touchent, FPM étant rechargé une fois par version.
+- **Clés verrouillées.** `user`, `group` (identité), `listen`, `listen.owner`, `listen.group`,
+  `listen.mode`, `listen.acl_users`, `listen.acl_groups`, `listen.allowed_clients` (socket et accès, D31),
+  `slowlog` et `access.log` (ouverts par le maître FPM en root, au chemin donné),
+  `php_admin_value[error_log]` (journal pré-créé, D71), `include` (le maître lit en root un fichier qui peut
+  déclarer un pool entier, `[autre] user = root`) et `prefix` (base des chemins relatifs, slowlog et listen
+  compris) ne se surchargent ni par la machine ni par un projet, valeur nulle comprise. Elles sont jugées
+  **sans casse** : FPM ne distingue pas `User` de `user`, et `User = root` après `user = alice` passe
+  `php-fpm -t`. Toute clé est ramenée à sa forme canonique — minuscules hors crochets — et une directive
+  n'est rendue qu'une fois, la dernière couche l'emportant ; deux clés d'une même couche qui ne diffèrent
+  que par la casse sont nommées. Restent libres `listen.backlog`, `listen.setfib`, `chroot`, `chdir`,
+  `process.priority` et les `rlimit_*` : ils ne donnent rien au-delà de l'identité du pool.
+  `pm.status_path` et `ping.path` ne se retirent pas — le vhost de supervision les relaie (D66) — mais une
+  autre valeur reste admise, et le vhost la suit. Une clé
+  verrouillée est écartée du rendu et nommée par une étape non critique : l'apply rend le code 6, le reste
+  du pool est servi. Avant D103, `user: root` rendait une seconde ligne `user` après celle du template, et
+  FPM retient la dernière.
+- **Grammaire.** Une clé s'écrit en lettres, chiffres, `.`, `_`, `-` ; les crochets ne suivent que
+  `php_value`, `php_flag`, `php_admin_value`, `php_admin_flag` et `env`. Aucune clé ni valeur — de
+  `settings` comme de `env` — ne porte de fin de ligne ni de NUL : la ligne suivante deviendrait une
+  directive du pool. Une valeur portant `;` (commentaire) ou `${` (variable de
+  l'environnement du maître) est rendue entre apostrophes, que l'analyseur d'ini lit littéralement —
+  éprouvé sous un vrai FPM —, et ne peut alors porter ni apostrophe ni guillemet (code 3). Les autres
+  restent nues, **guillemets compris**, exactement comme avant D103 : `E_ALL & ~E_DEPRECATED` s'évalue,
+  `"/usr/sbin/sendmail -t -i"` reste une citation de l'exploitant — recouverte d'apostrophes, elle ne
+  commencerait plus par « / » et FPM la préfixerait (`/usr/"/usr/sbin/sendmail -t -i"`) —, `"a" "b"` se
+  lit `ab` et `"a\"b"` se lit `a"b`. Un guillemet non apparié (`a"`), que FPM refuserait au démarrage du
+  pool, est refusé au plan (code 3). Une valeur **nulle** retire la clé : `clé:` sans valeur, qui valait une
+  chaîne vide avant D103, change de sens — le plan le montre par la réécriture du pool, et nomme une valeur
+  nulle qui n'a rien à retirer (code 6). Une déclaration de projet fautive, ou un preset déclaré inconnu, sont **refusés au
+  plan et à l'apply du projet visé** (code 3), aux points d'écriture d'une déclaration (`project create`,
+  `site create`, `site clone`, l'import) et par `doctor` — **jamais au chargement**, où un seul projet
+  arrêterait tout le parc, `cert renew` du minuteur compris. Dans config.yaml, ce qui ne peut pas être
+  rendu est écarté de chaque pool et nommé au plan (code 6) et par `doctor`, sans empêcher la configuration
+  de se charger ; un `defaultPreset` inconnu retombe sur `ondemand`.
+- **`disable_functions`.** Rendue en `php_admin_value[disable_functions]` — un script ne la relève pas par
+  `ini_set` —, pour le seul type `php-plain` (`AppType.DisableFunctions`) : c'est le type qui sert un code
+  sans cadre, déposé tel quel ; Prestashop et Symfony ont l'emploi de `proc_open` (modules, composant
+  Process). Le reste du parc l'obtient par `defaults`, où `allowFunctions` s'applique aussi. Une liste
+  `[]` ne pose rien. Une fonction d'`allowFunctions` que le pool ne fermait pas, ou que le php.ini de FPM
+  ferme, est nommée au plan (code 6) : elle ne rouvre rien. Éprouvé sous un vrai FPM (scénario `site-complet`) : la valeur du pool **s'ajoute**
+  à celle que le `php.ini` de la distribution fixe pour FPM, sans la remplacer — une fonction fermée par
+  php.ini le reste, `allowFunctions` compris —, alors même que `ini_get('disable_functions')` ne rend que la
+  valeur du pool (PHP 8.4 de Debian 13, dont le php.ini de FPM ne ferme rien : le scénario lui en donne une). Elle n'agit que sur FPM : les tâches planifiées et les
+  unités lancent PHP en ligne de commande, sous le `php.ini` de la CLI, et ne la reçoivent pas.
+- **`security.limit_extensions = .php`.** Le défaut de FPM admet aussi `.php3` à `.php7` : un fichier
+  téléversé sous l'un de ces noms, que les vhosts d'ogs ne routent pas vers FPM, le serait par un vhost
+  adopté ou une surcharge (D63). Les points d'état (`pm.status_path`, `ping.path`) ne sont pas des
+  scripts et restent servis — scénarios `site-complet` et `supervision`.
+- **Capacité.** `doctor` additionne, par version puis toutes versions, `pm.max_children × memory_limit`
+  (`php_admin_value`, sinon `php_value`, sinon les 128M de PHP) et le rapporte à `MemTotal` : la ligne est
+  toujours affichée, en information (code 0), et ne devient un avertissement (code 6) qu'au-delà de
+  `php.pool.capacityWarnPercent` — **200 %** par défaut, 0 ou moins pour ne jamais avertir. La somme est un
+  pire cas — tous les workers présents, chacun à sa limite — qu'un parc n'atteint presque jamais : un seuil
+  à 100 % avertirait la plupart des machines chargées sans motif. Un `memory_limit` à `-1` est signalé à part ; à `0`, que PHP refuse en gardant la valeur
+  précédente, le pool n'est pas compté et le contrôle le dit.
 
 **Numéro de pool** — norme `1{version sans point}{incrément sur 2 chiffres}` :
 
@@ -1636,11 +1751,9 @@ listen = /run/php/php8.5-fpm-18501-shopfr.sock
 listen.owner = www-data
 listen.group = shopfr
 listen.mode = 0660
-pm = dynamic
-pm.max_children = 20
-pm.start_servers = 4
-pm.min_spare_servers = 2
-pm.max_spare_servers = 6
+pm = ondemand
+pm.max_children = 12
+pm.process_idle_timeout = 30s
 pm.max_requests = 500
 php_admin_value[memory_limit] = 256M
 php_admin_value[open_basedir] = /home/shop.fr:/tmp:/usr/share/php
@@ -1653,6 +1766,7 @@ slowlog = /var/log/ogs-projects/shopfr/php-slow.log
 request_slowlog_timeout = 10s
 request_terminate_timeout = 300s
 catch_workers_output = yes
+security.limit_extensions = .php
 ```
 
 **Interpréteur CLI : le lien `/home/<host>/.local/bin/php`**
@@ -4360,3 +4474,22 @@ Limites connues, laissées en l'état :
   sur `warnf` comme ceux de l'apply. La TUI garde son propre tampon. Les clés inconnues de `config.yaml` sont
   nommées par chemin, sans numéro de ligne. Une affectation de tête citée (`FOO='a b' cmd`) d'une tâche
   planifiée reste derrière `flock`, qui la prend pour le programme : il faudrait analyser le shell.
+
+**Points ouverts** (D103) :
+
+- **`environments.<env>.phpEnv` n'est lu nulle part** : D96 en a retiré le défaut, et la couche
+  « environnement » des pools ne porte que la descente du preset hérité. La clé est tolérée à la lecture ;
+  la câbler ramènerait `APP_ENV=dev` à toute configuration copiée d'un exemple antérieur à D96.
+- **`apptypes.yaml` n'est pas chargé** : `AppType.DisableFunctions` n'est réglable que dans le code. Un type
+  qui voudrait la liste l'obtient par `php.pool.defaults` (`php_admin_value[disable_functions]`), que
+  `allowFunctions` rouvre projet par projet.
+- **Les tâches planifiées et les unités ne reçoivent pas `disable_functions`** : elles lancent PHP en ligne
+  de commande. Fermer la CLI demanderait un `-d disable_functions=…` sur chaque ligne, que la commande
+  déclarée peut contourner en lançant son propre interpréteur.
+- **Le contrôle de capacité ne compte que les workers** : ni la mémoire partagée de l'opcache, ni le maître,
+  ni les bases et services de la machine.
+- **Journal d'accès des pools** : `access.log` reste verrouillée — le maître FPM l'ouvre en root au chemin
+  donné. Un journal d'accès posé par ogs lui-même, pré-créé sous `/var/log/ogs-projects/<id>/` comme les
+  autres (D71), pourra venir plus tard.
+- **Un pool retouché à la main** reste refusé sans `--force` quand `php.pool` change (régime des cinq
+  états) : un changement de la machine ne passe pas outre le travail d'un exploitant.

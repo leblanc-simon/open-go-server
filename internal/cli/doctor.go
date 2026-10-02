@@ -750,6 +750,8 @@ func (a *App) runChecks(ctx context.Context) []check {
 			}
 		}
 	}
+	// Pools PHP-FPM (D103) : réglages écartés ou refusés, capacité mémoire.
+	a.phpPoolChecks(projects, add)
 	a.monitoringChecks(add)
 	a.mailChecks(ctx, projects, add)
 	a.firewallChecks(ctx, add)

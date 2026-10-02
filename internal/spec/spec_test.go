@@ -163,3 +163,69 @@ func TestLoadAllIgnoresNonYAMLAndArchived(t *testing.T) {
 		t.Errorf("%d projets chargés, 1 attendu (les archives et les autres fichiers sont ignorés)", len(list))
 	}
 }
+
+// Une valeur nulle retire une clé du pool, une chaîne vide est une valeur
+// (D103) : la relecture et la réécriture d'ogs — import, clone, toute commande
+// qui enregistre la déclaration — doivent garder la différence, et lire comme
+// avant les déclarations qui n'en portent pas.
+func TestReglagesDePoolNulsRelusEtReecrits(t *testing.T) {
+	doc := `
+apiVersion: ogs/v1
+kind: Project
+metadata:
+  name: shopfr
+  host: shop.fr
+spec:
+  app:
+    kind: php-symfony
+  php:
+    pools:
+      - name: web
+        version: "8.3"
+        preset: medium
+        settings:
+          pm.max_children: 30
+          request_terminate_timeout: ~
+          php_value[date.timezone]: ""
+          php_admin_value[open_basedir]: null
+        allowFunctions: [exec]
+`
+	p, err := Decode([]byte(doc))
+	if err != nil {
+		t.Fatal(err)
+	}
+	check := func(p *model.Project) {
+		t.Helper()
+		s := p.Spec.PHP.Pools[0].Settings
+		if v, ok := s.Get("pm.max_children"); !ok || v != "30" {
+			t.Errorf("pm.max_children = %q (%v)", v, ok)
+		}
+		for _, k := range []string{"request_terminate_timeout", "php_admin_value[open_basedir]"} {
+			if v, present := s[k]; !present || v != nil {
+				t.Errorf("%s doit être présent et nul : %v %v", k, present, v)
+			}
+		}
+		if v, ok := s.Get("php_value[date.timezone]"); !ok || v != "" {
+			t.Errorf("chaîne vide perdue : %q %v", v, ok)
+		}
+		if p.Spec.PHP.Pools[0].Preset != "medium" {
+			t.Errorf("preset déclaré perdu : %q", p.Spec.PHP.Pools[0].Preset)
+		}
+		if got := p.Spec.PHP.Pools[0].AllowFunctions; len(got) != 1 || got[0] != "exec" {
+			t.Errorf("allowFunctions : %v", got)
+		}
+	}
+	check(p)
+	data, err := Encode(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	again, err := Decode(data)
+	if err != nil {
+		t.Fatalf("relecture de la réécriture : %v\n%s", err, data)
+	}
+	check(again)
+	if !strings.Contains(string(data), "request_terminate_timeout: null") {
+		t.Errorf("la valeur nulle doit être réécrite nulle :\n%s", data)
+	}
+}

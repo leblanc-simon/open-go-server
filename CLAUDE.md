@@ -472,6 +472,17 @@ Ils ont tous coûté un défaut réel ; les tests unitaires ne les voyaient pas.
   il **démarre et active** une unité arrêtée qui a des pools, **arrête et désactive** celle qui n'en a plus —
   recharger un maître sans pool le tue. Le critère est tout `pool.d/*.conf`, pas seulement ceux d'ogs. Le
   substitut `systemctl` démarrait l'unité sur `disable --now` : le scénario `fpm-sans-pool` l'a révélé.
+- **FPM retient la dernière occurrence d'une directive, sans tenir compte de la casse, et lit son pool en
+  root** (D103) : `spec.php.pools[].settings: {user: root}` — ou `User: root` — rendait une seconde ligne
+  après celle du template, et le pool tournait en root ; `include` lui fait lire un pool entier ; une valeur portant une fin de ligne y injectait une directive. D'où les clés
+  verrouillées (`validate.LockedPoolKey`, sur la clé canonique `validate.CanonicalPoolKey` : identité,
+  `listen*` d'accès, `slowlog`, `access.log`, `error_log`, `include`, `prefix`),
+  écartées du rendu en code 6, et la grammaire des clés et valeurs (`validate.PoolKeyProblem`), refusée au
+  plan du projet visé (code 3) — ni l'une ni l'autre au chargement. Les couches de la machine
+  (`php.pool` de config.yaml) sont **vivantes**, à l'inverse du shell : rien n'en est recopié dans une
+  déclaration, et la normalisation n'écrit plus de preset — un pool sans preset écrit suit
+  `defaultPreset`, une déclaration antérieure garde le `medium` qu'elle porte. `php.Resolve` est le seul
+  calcul des réglages : le vhost de supervision lit `PoolPlan.Resolved.Settings`, jamais la déclaration.
 - **Le shell des comptes de projet est ouvert** — `/bin/bash` (D62), réglable par `user.shell` dans
   `/etc/ogs/config.yaml` et par `spec.user.shell`. Trois points à ne pas défaire : le défaut de la
   configuration est un défaut **de création**, le fichier du projet faisant autorité ensuite — le propager

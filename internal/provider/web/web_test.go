@@ -2197,9 +2197,9 @@ func TestVHostDeSupervisionSuitLeStatutDeChaquePool(t *testing.T) {
 			// surcharge. FPM compare SCRIPT_NAME à la valeur qu'il a retenue : le
 			// vhost, qui force cette variable, doit forcer celle du pool.
 			shop := project(t, "shop.fr", model.KindSymfony, "6.4", "8.5")
-			shop.Spec.PHP.Pools[0].Settings = map[string]string{
-				"pm.status_path": "/ailleurs",
-				"ping.path":      "/ailleurs-ping",
+			shop.Spec.PHP.Pools[0].Settings = model.PoolSettings{
+				"pm.status_path": model.Value("/ailleurs"),
+				"ping.path":      model.Value("/ailleurs-ping"),
 			}
 			blog := project(t, "blog.fr", model.KindSymfony, "6.4", "8.5")
 
@@ -2235,8 +2235,8 @@ func TestVHostDeSupervisionRefuseUnStatutInjectable(t *testing.T) {
 	// une directive glissée là serait chargée en root, et une directive dupliquée
 	// est fatale à nginx. Une valeur impossible à écrire sans risque retombe sur
 	// le défaut du parc — une métrique manquante, jamais un moteur à terre.
-	shop.Spec.PHP.Pools[0].Settings = map[string]string{
-		"pm.status_path": "/x;\n    deny all",
+	shop.Spec.PHP.Pools[0].Settings = model.PoolSettings{
+		"pm.status_path": model.Value("/x;\n    deny all"),
 	}
 	c := rendStatus(t, prov, []*model.Project{shop})
 	bloc := blocDePool(t, c, "shopfr")

@@ -529,6 +529,193 @@ ogs project delete boutiquetest --yes >/dev/null 2>&1
 kill -USR2 "$(cat "/run/php/php$version-fpm.pid")" 2>/dev/null || true
 echo "le .htaccess est ignoré, les règles du template servent le site, les répertoires protégés sont refusés"
 
+echo "--- disable_functions et security.limit_extensions sous un vrai FPM (D103) ---"
+# Le rendu ne prouve rien : seul le maître FPM dit si la valeur d'un pool est
+# effective, et comment elle se combine avec celle du php.ini de la distribution.
+pool="/etc/php/$version/fpm/pool.d/phptest.conf"
+grep -E '^(php_admin_value\[disable_functions\]|security\.limit_extensions) ' "$pool" | sed 's/^/  /'
+phpini="/etc/php/$version/fpm/php.ini"
+distribution=$(sed -n 's/^disable_functions *= *//p' "$phpini" | tr -d ' ')
+echo "  php.ini de la distribution : disable_functions = ${distribution:-(vide)}"
+# Debian 13 n'y ferme rien : sans une valeur, la combinaison ne serait pas
+# éprouvée. php.ini en reçoit une, rendue à la fin de l'épreuve.
+cp "$phpini" /tmp/php.ini.dist
+if [ -z "$distribution" ]; then
+    sed -i 's/^disable_functions *=.*/disable_functions = phpinfo,getmypid/' "$phpini"
+    distribution=phpinfo,getmypid
+fi
+pkill -f "php-fpm: master" || true
+sleep 1
+"/usr/sbin/php-fpm$version" --daemonize
+sleep 1
+# Un script écrit une fois pour toutes (opcache, revalidate_freq=2) : il dit
+# l'état de chaque fonction et l'effet d'un appel.
+cat > /home/php.test/www/fonctions.php <<'PHP'
+<?php
+echo "valeur=", ini_get('disable_functions'), "\n";
+echo "include_path=", ini_get('include_path'), "\n";
+echo "user_agent=", ini_get('user_agent'), "\n";
+echo "sendmail_path=", ini_get('sendmail_path'), "\n";
+foreach (explode(',', $_GET['f'] ?? '') as $f) {
+    if ($f !== '') { echo $f, "=", function_exists($f) ? "ouverte" : "fermée", "\n"; }
+}
+try { exec('id -un', $sortie); echo "appel=", implode('', $sortie), "\n"; }
+catch (\Error $e) { echo "appel=refusé ", get_class($e), "\n"; }
+PHP
+chown phptest:phptest /home/php.test/www/fonctions.php
+liste_pool="exec,passthru,shell_exec,system,proc_open,popen,pcntl_exec"
+reponse=$(curl -s -H 'Host: php.test' "http://127.0.0.1/fonctions.php?f=$liste_pool,$distribution")
+echo "$reponse" | sed 's/^/  /'
+for f in exec passthru shell_exec system proc_open popen; do
+    if ! grep -qx "$f=fermée" <<<"$reponse"; then
+        echo "ÉCHEC : $f reste ouverte sous php-plain"
+        exit 1
+    fi
+done
+if ! grep -q "^appel=refusé" <<<"$reponse"; then
+    echo "ÉCHEC : exec() s'exécute encore"
+    exit 1
+fi
+# La valeur du pool s'ajoute à celle de php.ini, elle ne la remplace pas : une
+# fonction que la distribution ferme reste fermée — alors même que
+# ini_get('disable_functions') ne rend que la valeur du pool.
+for f in ${distribution//,/ }; do
+    if ! grep -qx "$f=fermée" <<<"$reponse"; then
+        echo "ÉCHEC : $f, fermée par php.ini, a été rouverte par le pool"
+        exit 1
+    fi
+done
+echo "  les fonctions de la liste sont fermées, celles de php.ini le restent"
+cp /tmp/php.ini.dist "$phpini"
+
+# allowFunctions rouvre une fonction sans recopier la liste. Dans le même
+# apply : FPM ne distingue pas la casse des directives — « User: root » doit être
+# écarté comme « user » —, un include ferait lire au maître root un pool entier,
+# et une valeur portant « ; » ou « ${ » est citée pour être lue telle qu'écrite.
+cat > /tmp/evil.conf <<'CONF'
+[evil]
+user = root
+group = root
+listen = /run/php/evil.sock
+pm = static
+pm.max_children = 1
+CONF
+sed -i 's/^        number: auto$/        number: auto\n        allowFunctions: [exec]\n        settings:\n          User: root\n          PM.max_children: "3"\n          include: \/tmp\/evil.conf\n          php_value[include_path]: ".:\/a;\/b"\n          php_value[user_agent]: "${HOME}x"\n          php_admin_value[sendmail_path]: \x27"\/usr\/sbin\/sendmail -t -i"\x27/' /etc/ogs/projects/phptest.yaml
+if ! grep -q 'allowFunctions: \[exec\]' /etc/ogs/projects/phptest.yaml; then
+    echo "ÉCHEC : le scénario n'a pas pu déclarer allowFunctions"
+    exit 1
+fi
+ogs apply phptest --yes >/dev/null 2>&1
+grep -E '^php_admin_value\[disable_functions\] ' "$pool" | sed 's/^/  /'
+# Sans init, le substitut recharge FPM par un signal que le titre réécrit du
+# maître peut faire manquer : le maître est relancé, pour que la réponse dise
+# ce que le pool écrit produit, et non ce qu'un rechargement manqué a laissé.
+pkill -f "php-fpm: master" || true
+sleep 1
+"/usr/sbin/php-fpm$version" --daemonize
+sleep 1
+reponse=$(curl -s -H 'Host: php.test' "http://127.0.0.1/fonctions.php?f=exec,system")
+echo "$reponse" | sed 's/^/  /'
+if ! grep -qx "exec=ouverte" <<<"$reponse" || ! grep -qx "system=fermée" <<<"$reponse" ||
+    ! grep -qx "appel=phptest" <<<"$reponse"; then
+    echo "ÉCHEC : allowFunctions n'a pas rouvert exec seule"
+    exit 1
+fi
+echo "  allowFunctions: [exec] rouvre exec, et elle seule"
+if grep -qiE '^(user = root|include)' "$pool" || [ "$(grep -ci '^pm.max_children = ' "$pool")" != 1 ]; then
+    echo "ÉCHEC : le pool porte une directive verrouillée, ou deux fois la même :"
+    grep -iE '^(user|include|pm.max_children) ' "$pool" | sed 's/^/  /'
+    exit 1
+fi
+if [ -S /run/php/evil.sock ] || pgrep -f "pool evil" >/dev/null; then
+    echo "ÉCHEC : le pool inclus a été chargé par le maître"
+    exit 1
+fi
+if ! grep -qx "include_path=.:/a;/b" <<<"$reponse" || ! grep -qx 'user_agent=${HOME}x' <<<"$reponse"; then
+    echo "ÉCHEC : une valeur portant « ; » ou « \${ » n'est pas lue telle qu'écrite"
+    grep -E '^php_value' "$pool" | sed 's/^/  /'
+    exit 1
+fi
+# Une valeur déjà citée à la manière de FPM se rend telle quelle : recouverte
+# d'apostrophes, FPM la préfixait (« /usr/"/usr/sbin/sendmail -t -i" »).
+if ! grep -qx "sendmail_path=/usr/sbin/sendmail -t -i" <<<"$reponse"; then
+    echo "ÉCHEC : sendmail_path cité à la manière de FPM n'est pas lu tel quel"
+    grep -E 'sendmail' "$pool" | sed 's/^/  /'
+    exit 1
+fi
+echo "  User: root et include écartés, une seule pm.max_children, « ; », « \${ » et sendmail_path cité lus tels qu'écrits"
+rm -f /tmp/evil.conf
+
+# security.limit_extensions : un fichier qui n'est pas un .php n'est pas
+# exécuté, même nommé à FPM. Le vhost ne lui en route aucun : on parle donc au
+# socket, comme le ferait une configuration adoptée ou une surcharge (D63).
+socket=$(sed -n 's/^listen = //p' "$pool")
+cat > /tmp/fcgi.py <<'PY'
+import socket, struct, sys
+
+def record(kind, content):
+    return struct.pack("!BBHHBx", 1, kind, 1, len(content), 0) + content
+
+def pair(k, v):
+    k, v = k.encode(), v.encode()
+    size = lambda n: struct.pack("!B", n) if n < 128 else struct.pack("!I", n | 0x80000000)
+    return size(len(k)) + size(len(v)) + k + v
+
+def recv_exact(s, n):
+    data = b""
+    while len(data) < n:
+        chunk = s.recv(n - len(data))
+        if not chunk:
+            break
+        data += chunk
+    return data
+
+path, script, name = sys.argv[1], sys.argv[2], sys.argv[3]
+params = {"SCRIPT_FILENAME": script, "SCRIPT_NAME": name, "REQUEST_URI": name,
+          "REQUEST_METHOD": "GET", "QUERY_STRING": "", "SERVER_PROTOCOL": "HTTP/1.1",
+          "GATEWAY_INTERFACE": "CGI/1.1", "SERVER_NAME": "php.test", "SERVER_PORT": "80",
+          "REMOTE_ADDR": "127.0.0.1"}
+s = socket.socket(socket.AF_UNIX)
+s.connect(path)
+body = b"".join(pair(k, v) for k, v in params.items())
+s.sendall(record(1, struct.pack("!HB5x", 1, 0)) + record(4, body) + record(4, b"") + record(5, b""))
+out = b""
+while True:
+    head = recv_exact(s, 8)
+    if len(head) < 8:
+        break
+    _, kind, _, length, pad = struct.unpack("!BBHHBx", head)
+    content = recv_exact(s, length + pad)[:length]
+    if kind in (6, 7):
+        out += content
+    if kind == 3:
+        break
+sys.stdout.write(out.decode("utf-8", "replace"))
+PY
+echo '<?php echo "exécuté-php5\n";' > /home/php.test/www/essai.php5
+echo '<?php echo "exécuté-php\n";' > /home/php.test/www/essai.php
+chown phptest:phptest /home/php.test/www/essai.php5 /home/php.test/www/essai.php
+php5=$(python3 /tmp/fcgi.py "$socket" /home/php.test/www/essai.php5 /essai.php5)
+temoin=$(python3 /tmp/fcgi.py "$socket" /home/php.test/www/essai.php /essai.php)
+etat=$(python3 /tmp/fcgi.py "$socket" /home/php.test/www/ogs-fpm-status /ogs-fpm-status)
+echo "  .php5 : $(echo "$php5" | grep -iE 'status|denied|exécuté' | tr '\n' ' ')"
+echo "  .php (témoin) : $(echo "$temoin" | grep 'exécuté' | tr '\n' ' ')"
+if ! grep -q "exécuté-php" <<<"$temoin"; then
+    echo "ÉCHEC : le témoin .php n'est pas exécuté par le socket — l'épreuve ne prouve rien"
+    exit 1
+fi
+if grep -q "exécuté-php5" <<<"$php5"; then
+    echo "ÉCHEC : un fichier .php5 est exécuté malgré security.limit_extensions"
+    exit 1
+fi
+if ! grep -qi "^pool:" <<<"$etat"; then
+    echo "ÉCHEC : le point d'état du pool ne répond plus sous security.limit_extensions"
+    echo "$etat" | head -5 | sed 's/^/  /'
+    exit 1
+fi
+echo "  .php5 refusé, .php exécuté, point d'état servi"
+rm -f /home/php.test/www/essai.php5 /home/php.test/www/essai.php /tmp/fcgi.py
+
 echo
 echo "--- les fichiers cachés et les métadonnées du dépôt ne sont pas servis ---"
 # php-plain sert www/, la racine même du dépôt qu'un « git pull » y tire :
