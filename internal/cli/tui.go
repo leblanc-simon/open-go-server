@@ -166,7 +166,9 @@ func (b *tuiBackend) Apply(ctx context.Context, p *model.Project) (string, error
 	}
 	report, err := engine.Execute(ctx, plan, engine.Options{
 		OnStep: func(s *engine.Step, stepErr error) {
-			fmt.Fprintln(&buf, issueDÉtape(s, stepErr))
+			if annonceÉtape(s, stepErr) {
+				fmt.Fprintln(&buf, issueDÉtape(s, stepErr))
+			}
 		},
 		OnWarning: func(s *engine.Step, stepErr error) {
 			fmt.Fprintf(&buf, "⚠ %s : %v\n", s.Summary, stepErr)

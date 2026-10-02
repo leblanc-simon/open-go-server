@@ -4471,7 +4471,10 @@ Limites connues, laissées en l'état :
   pour les autres outils de la machine ; monter `/proc` en `hidepid=2` n'est ni exigé ni contrôlé par
   `doctor`.
 
-- **Surface CLI** (D101) : la TUI garde son propre tampon, hors de `warnf`. Les clés inconnues de
+- **Surface CLI** (D101) : la TUI garde son propre tampon, hors de `warnf` — elle suit toutefois la même
+  règle d'annonce (`annonceÉtape`) : une étape non critique en échec n'y figure qu'une fois, par sa ligne « ⚠ ».
+  Les incertitudes d'`import scan` et d'`import adopt` passent par `warnf` ; sous `--quiet`, celles du scan
+  nomment leur candidat. Les clés inconnues de
   `config.yaml` sont nommées par chemin, sans numéro de ligne. Une affectation de tête citée
   (`FOO='a b' cmd`) d'une tâche planifiée reste derrière `flock`, qui la prend pour le programme : il
   faudrait analyser le shell.

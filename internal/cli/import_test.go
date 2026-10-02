@@ -151,3 +151,40 @@ func TestAdoptionEcarteLesBasesAuCompteReserve(t *testing.T) {
 		}
 	}
 }
+
+// Les incertitudes d'un candidat ne sont jamais tues (D101) : sous --quiet, le
+// rapport du scan se tait, et l'adoption écrivait une déclaration dont personne
+// n'avait vu ce qui restait à confirmer.
+func TestLesIncertitudesDeLImportNeSontJamaisTues(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	h.legacyServer(t)
+	if err := os.MkdirAll(h.path("var", "www", "vitrine"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(h.path("etc", "apache2", "sites-available", "vitrine.conf"),
+		[]byte("<VirtualHost *:80>\n    ServerName vitrine.fr\n    DocumentRoot /var/www/vitrine\n</VirtualHost>\n"),
+		0o644); err != nil {
+		t.Fatal(err)
+	}
+	const incertain = "aucun utilisateur système repéré"
+
+	stdout, stderr, code := h.runSplit("import", "scan", "-q")
+	if code != 0 {
+		t.Fatalf("scan -q : code %d\n%s%s", code, stdout, stderr)
+	}
+	if !strings.Contains(stderr, "⚠ vitrinefr : "+incertain) {
+		t.Errorf("scan -q : l'incertitude doit atteindre la sortie d'erreur, nommant le candidat :\n%s", stderr)
+	}
+	if strings.Contains(stdout, "⚠") {
+		t.Errorf("scan -q : rien sur la sortie standard :\n%s", stdout)
+	}
+
+	stdout, stderr, code = h.runSplit("import", "adopt", "vitrinefr", "--yes", "-q")
+	if code != 0 && code != CodePartial {
+		t.Fatalf("adopt -q : code %d\n%s%s", code, stdout, stderr)
+	}
+	if !strings.Contains(stderr, "⚠ "+incertain) {
+		t.Errorf("adopt -q : l'incertitude doit atteindre la sortie d'erreur :\n%s", stderr)
+	}
+}

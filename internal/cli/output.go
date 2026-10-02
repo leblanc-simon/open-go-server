@@ -87,18 +87,17 @@ func (a *App) warnf(format string, args ...any) {
 
 // stepf annonce l'issue d'une étape : une étape critique en échec est un
 // avertissement, les autres de la progression. Une étape non critique en échec
-// ne dit rien ici : le moteur la remonte aussi par OnWarning, dont la ligne « ⚠ »
-// est la seule — sans quoi chaque avertissement s'affichait deux fois, « ✗ »
-// puis « ⚠ » du même message.
+// ne dit rien ici (annonceÉtape) : sa ligne est celle d'OnWarning.
 func (a *App) stepf(indent string, s *engine.Step, stepErr error) {
-	line := indent + issueDÉtape(s, stepErr) + "\n"
-	partial := (*engine.PartialError)(nil)
-	switch {
-	case stepErr == nil, errors.As(stepErr, &partial):
-		a.printf("%s", line)
-	case s.Critical:
-		a.warnf("%s", line)
+	if !annonceÉtape(s, stepErr) {
+		return
 	}
+	line := indent + issueDÉtape(s, stepErr) + "\n"
+	if stepErr != nil && s.Critical && !errors.As(stepErr, new(*engine.PartialError)) {
+		a.warnf("%s", line)
+		return
+	}
+	a.printf("%s", line)
 }
 
 // confirm demande une confirmation. En mode non interactif, l'absence de --yes

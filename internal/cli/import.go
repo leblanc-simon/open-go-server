@@ -130,8 +130,15 @@ func newImportScanCommand(app *App) *cobra.Command {
 				for _, r := range c.Resources {
 					app.printf("    · %s\n", r.String())
 				}
+				// Un point incertain n'est jamais tu (D101) : sous --quiet, où le
+				// rapport se tait, il passe sur la sortie d'erreur avec le nom du
+				// candidat qu'il concerne.
 				for _, u := range c.Uncertain {
-					app.printf("    ⚠ %s\n", u)
+					if app.Quiet {
+						app.warnf("⚠ %s : %s\n", orValue(c.ID, "?"), u)
+					} else {
+						app.warnf("    ⚠ %s\n", u)
+					}
 				}
 				app.printf("  adopter : ogs import adopt %s\n\n", c.ID)
 			}
@@ -230,7 +237,7 @@ func newImportAdoptCommand(app *App) *cobra.Command {
 				app.printf("  base        %s %s (compte %s)\n", d.Engine, d.Name, compte)
 			}
 			for _, u := range chosen.Uncertain {
-				app.printf("  ⚠ %s\n", u)
+				app.warnf("  ⚠ %s\n", u)
 			}
 			if diffs := importer.Diverges(p, app.homeRoot(), app.Cfg.PrepDomain()); len(diffs) > 0 {
 				// L'écart est annoncé maintenant : un « apply » normaliserait sans
@@ -241,7 +248,7 @@ func newImportAdoptCommand(app *App) *cobra.Command {
 				}
 			}
 			for _, n := range notes {
-				app.printf("  ⚠ %s\n", n)
+				app.warnf("  ⚠ %s\n", n)
 			}
 			if app.DryRun {
 				data, err := spec.Encode(p)

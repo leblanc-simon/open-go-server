@@ -1104,6 +1104,16 @@ func (a *App) reloadWarning(target string, err error) {
 // l'autorité a acceptés — a produit son effet : le certificat est écrit, le
 // serveur le rechargera. La marquer « ✗ » ferait croire à un échec, et
 // l'avertissement qui la suit dit déjà ce qui manque.
+// annonceÉtape dit si l'issue d'une étape s'annonce à sa fin. Une étape non
+// critique en échec ne s'y annonce pas : le moteur la remonte aussi par
+// OnWarning, dont la ligne « ⚠ » est la seule — sans quoi chaque avertissement
+// s'affichait deux fois, « ✗ » puis « ⚠ » du même message. La ligne de commande
+// et la TUI suivent la même règle.
+func annonceÉtape(s *engine.Step, stepErr error) bool {
+	partial := (*engine.PartialError)(nil)
+	return stepErr == nil || errors.As(stepErr, &partial) || s.Critical
+}
+
 func issueDÉtape(s *engine.Step, stepErr error) string {
 	partial := (*engine.PartialError)(nil)
 	switch {
