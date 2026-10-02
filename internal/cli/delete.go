@@ -184,7 +184,7 @@ func newDeleteCommand(app *App) *cobra.Command {
 			warnings := 0
 			warn := func(format string, args ...any) {
 				warnings++
-				app.printf("⚠ "+format+"\n", args...)
+				app.warnf("⚠ "+format+"\n", args...)
 			}
 
 			// 1. Arrêt des services et retrait des tâches : rien ne doit plus
@@ -487,7 +487,7 @@ func (a *App) refreshGlobal(ctx context.Context, provs *providers) error {
 			}
 		},
 		OnWarning: func(s *engine.Step, stepErr error) {
-			a.printf("  ⚠ %s : %v\n", s.Summary, stepErr)
+			a.warnf("  ⚠ %s : %v\n", s.Summary, stepErr)
 		},
 		Reload:          a.reloadFunc(provs),
 		OnReloadWarning: a.reloadWarning,
@@ -940,7 +940,7 @@ func (a *App) keptFilesRefusal(provs *providers, p *model.Project) *refusal {
 func (a *App) restartServices(ctx context.Context, provs *providers, p *model.Project) {
 	a.printf("redémarrage des services de %s : rien n'a été supprimé\n", p.ID())
 	if err := provs.Unit.Control(context.WithoutCancel(ctx), p, "start"); err != nil {
-		a.printf("⚠ redémarrage des services : %v — les relancer : systemctl start %s\n",
+		a.warnf("⚠ redémarrage des services : %v — les relancer : systemctl start %s\n",
 			err, unit.TargetName(p.ID()))
 	}
 }
@@ -1118,7 +1118,7 @@ func (a *App) removeUser(cmd *cobra.Command, provs *providers, p *model.Project)
 			if _, err := a.Exec.Run(cmd.Context(), exec.Command{
 				Name: "groupdel", Args: []string{p.Spec.User.Group},
 			}); err != nil {
-				a.printf("⚠ suppression du groupe : %v\n", err)
+				a.warnf("⚠ suppression du groupe : %v\n", err)
 			}
 		}
 	}
@@ -1870,7 +1870,7 @@ func newRestoreCommand(app *App) *cobra.Command {
 				if app.Keys != nil {
 					for name, pair := range secrets {
 						if _, err := app.Keys.Open(p.ID(), name, pair[0], pair[1]); err != nil {
-							app.printf("⚠ %s est illisible avec la clé maître actuelle : "+
+							app.warnf("⚠ %s est illisible avec la clé maître actuelle : "+
 								"l'archive vient-elle d'un autre serveur ?\n", name)
 							break
 						}
@@ -1902,7 +1902,7 @@ func newRestoreCommand(app *App) *cobra.Command {
 			// lui qui migre l'ancien ~/logs d'une archive antérieure à D71, rendu à
 			// root comme il l'était.
 			if err := app.restoreTree(path, p, archived, manifest); err != nil {
-				app.printf("⚠ restauration de l'arborescence : %v\n", err)
+				app.warnf("⚠ restauration de l'arborescence : %v\n", err)
 				if partial == nil {
 					partial = exitf(CodePartial, "l'arborescence n'a pas été entièrement restaurée")
 				}
@@ -1920,7 +1920,7 @@ func newRestoreCommand(app *App) *cobra.Command {
 			}
 			_ = app.Audit.Record(p.ID(), "project", "project.restore", "ok", path)
 			if partial != nil {
-				app.printf("\n⚠ %s restauré en partie\n", p.ID())
+				app.warnf("\n⚠ %s restauré en partie\n", p.ID())
 			} else {
 				app.printf("\n✓ %s restauré\n", p.ID())
 			}
@@ -1940,16 +1940,16 @@ func (a *App) restoreEnvFile(p *model.Project, secrets map[string][2][]byte) {
 	}
 	path := a.Paths.EnvFile(p.ID())
 	if a.Keys == nil {
-		a.printf("⚠ clé maître illisible : %s n'est pas restauré\n", path)
+		a.warnf("⚠ clé maître illisible : %s n'est pas restauré\n", path)
 		return
 	}
 	data, err := a.Keys.Open(p.ID(), appprov.EnvFileSecret, pair[0], pair[1])
 	if err != nil {
-		a.printf("⚠ %s illisible avec la clé maître actuelle : non restauré\n", path)
+		a.warnf("⚠ %s illisible avec la clé maître actuelle : non restauré\n", path)
 		return
 	}
 	if err := appprov.CreateEnvFile(path, data); err != nil {
-		a.printf("⚠ restauration de %s : %v\n", path, err)
+		a.warnf("⚠ restauration de %s : %v\n", path, err)
 		return
 	}
 	_ = a.Store.DeleteSecret(p.ID(), appprov.EnvFileSecret)
@@ -1996,13 +1996,13 @@ func (a *App) restoreTree(path string, p *model.Project, archived []model.Dir, m
 func (a *App) restoreDumps(cmd *cobra.Command, path string, p *model.Project, manifest archive.Manifest) (bool, error) {
 	provs, err := a.buildProviders()
 	if err != nil {
-		a.printf("⚠ %v\n", err)
+		a.warnf("⚠ %v\n", err)
 		return false, nil
 	}
 	defer provs.close()
 	dir, err := a.dumpWorkDir()
 	if err != nil {
-		a.printf("⚠ %v\n", err)
+		a.warnf("⚠ %v\n", err)
 		return false, nil
 	}
 	ok := true
@@ -2013,13 +2013,13 @@ func (a *App) restoreDumps(cmd *cobra.Command, path string, p *model.Project, ma
 		}
 		data, err := archive.ReadFile(path, entry.Name)
 		if err != nil {
-			a.printf("⚠ %s : %v\n", entry.Name, err)
+			a.warnf("⚠ %s : %v\n", entry.Name, err)
 			ok = false
 			continue
 		}
 		tmp := filepath.Join(dir, filepath.Base(entry.Name))
 		if err := os.WriteFile(tmp, data, 0o600); err != nil {
-			a.printf("⚠ %s : %v\n", entry.Name, err)
+			a.warnf("⚠ %s : %v\n", entry.Name, err)
 			ok = false
 			continue
 		}
@@ -2031,7 +2031,7 @@ func (a *App) restoreDumps(cmd *cobra.Command, path string, p *model.Project, ma
 			}
 		}
 		if decl == nil {
-			a.printf("⚠ aucune base %s déclarée : sauvegarde ignorée\n", name)
+			a.warnf("⚠ aucune base %s déclarée : sauvegarde ignorée\n", name)
 			_ = os.Remove(tmp)
 			ok = false
 			continue
@@ -2042,7 +2042,7 @@ func (a *App) restoreDumps(cmd *cobra.Command, path string, p *model.Project, ma
 			return false, exitf(CodeCancelled, "restauration interrompue à la demande — la base %s n'est que "+
 				"partiellement chargée : %v", name, err)
 		} else if err != nil {
-			a.printf("⚠ restauration de %s : %v\n", name, err)
+			a.warnf("⚠ restauration de %s : %v\n", name, err)
 			ok = false
 		} else {
 			a.printf("✓ base %s restaurée\n", name)

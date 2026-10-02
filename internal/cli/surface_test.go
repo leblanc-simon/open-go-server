@@ -13,7 +13,10 @@ import (
 
 	"leblanc.io/open-go-server/internal/config"
 	"leblanc.io/open-go-server/internal/engine"
+	"leblanc.io/open-go-server/internal/model"
+	appprov "leblanc.io/open-go-server/internal/provider/app"
 	"leblanc.io/open-go-server/internal/provider/firewall"
+	tlsprov "leblanc.io/open-go-server/internal/provider/tls"
 )
 
 // runSplit exécute une commande et rend séparément ses deux sorties : ce qui
@@ -334,5 +337,59 @@ func TestUneEtapeNonCritiqueNeSAnnonceQuUneFois(t *testing.T) {
 	app.stepf("  ", s, errors.New("souci"))
 	if !strings.Contains(out.String(), "✗ étape : souci") {
 		t.Errorf("critique : %q", out.String())
+	}
+}
+
+// D101, à l'intégration de D100 : les avertissements de « project delete » et de
+// « project restore » ne sont jamais tus. Sous --quiet comme sous -o json, ils
+// passent sur la sortie d'erreur ; une base laissée sur un moteur injoignable ne
+// se voyait sinon que par le code 6.
+func TestLesAvertissementsDeLaSuppressionNeSontJamaisTus(t *testing.T) {
+	for _, opts := range [][]string{{"-q"}, {"-o", "json"}, {}} {
+		h := newHarness(t)
+		h.mustRun("init")
+		// Le mode préfixé n'a pas de moteur MySQL : la base reste, et le dit.
+		h.mustRunPartial("project", "create", "shop.fr", "--db", "mysql")
+		stdout, stderr, code := h.runSplit(append([]string{"project", "delete", "shopfr", "--yes", "--no-dump"},
+			opts...)...)
+		if code != CodePartial {
+			t.Fatalf("%v : code %d, 6 attendu\n%s%s", opts, code, stdout, stderr)
+		}
+		const avertissement = "⚠ base shopfr conservée"
+		if len(opts) == 0 {
+			if !strings.Contains(stdout, avertissement) {
+				t.Errorf("en mode table, l'avertissement suit la sortie :\n%s", stdout)
+			}
+			continue
+		}
+		if !strings.Contains(stderr, avertissement) {
+			t.Errorf("%v : l'avertissement doit atteindre la sortie d'erreur :\n%s", opts, stderr)
+		}
+		if strings.Contains(stdout, "⚠") {
+			t.Errorf("%v : l'avertissement ne doit pas polluer la sortie standard :\n%s", opts, stdout)
+		}
+	}
+
+	// La restauration : une clé maître illisible ne rend ni le fichier
+	// d'environnement ni les certificats, et le dit.
+	for _, app := range []*App{{Quiet: true, Format: "table"}, {Format: "json"}} {
+		var out, errBuf bytes.Buffer
+		app.Out, app.Err = &out, &errBuf
+		app.Paths = config.NewPaths(t.TempDir())
+		p := &model.Project{}
+		p.Metadata.Name = "shopfr"
+		secrets := map[string][2][]byte{
+			appprov.EnvFileSecret:                          {[]byte("n"), []byte("c")},
+			certSecretPrefix + "shopfr/" + tlsprov.FileKey: {[]byte("n"), []byte("c")},
+		}
+		app.restoreEnvFile(p, secrets)
+		app.restoreCertificates(p, secrets)
+		if got := errBuf.String(); strings.Count(got, "⚠ clé maître illisible") != 2 {
+			t.Errorf("quiet=%v format=%s : les deux refus doivent atteindre la sortie d'erreur : %q",
+				app.Quiet, app.Format, got)
+		}
+		if out.Len() != 0 {
+			t.Errorf("format=%s : la sortie standard doit rester au document : %q", app.Format, out.String())
+		}
 	}
 }

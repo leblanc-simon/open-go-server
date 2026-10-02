@@ -224,3 +224,41 @@ func TestCapaciteDesPools(t *testing.T) {
 		t.Error("une valeur illisible n'est pas comptée")
 	}
 }
+
+// D101 × D103 : les réglages écartés ou sans effet d'un pool — clé verrouillée,
+// allowFunctions qui ne rouvre rien, valeur nulle sans rien à retirer — sont
+// annoncés une fois, par warnf : sur la sortie d'erreur sous -q et -o json, dans
+// le fil de la sortie en mode table, jamais en double.
+func TestLesReglagesEcartesDUnPoolSAnnoncentUneFois(t *testing.T) {
+	for _, opts := range [][]string{{}, {"-q"}, {"-o", "json"}} {
+		h := deuxSitesPHP(t)
+		h.modifierDéclaration(t, "shopfr", func(p *model.Project) {
+			p.Spec.PHP.Pools[0].Settings = model.PoolSettings{
+				"user":                  model.Value("root"),
+				"php_value[inexistant]": nil,
+			}
+			p.Spec.PHP.Pools[0].AllowFunctions = []string{"strlen"}
+		})
+		stdout, stderr, code := h.runSplit(append([]string{"apply", "shopfr", "--yes"}, opts...)...)
+		if code != CodePartial {
+			t.Fatalf("%v : code %d, attendu %d\n%s%s", opts, code, CodePartial, stdout, stderr)
+		}
+		visible, tue := stderr, stdout
+		if len(opts) == 0 {
+			visible, tue = stdout, ""
+		}
+		// Le plan, affiché en mode table, la liste aussi : seule compte l'annonce
+		// de l'étape en échec.
+		if n := len(regexp.MustCompile(`(?m)^\s*⚠ pool php .*réglage\(s\) à revoir`).FindAllString(visible, -1)); n != 1 {
+			t.Errorf("%v : l'étape doit s'annoncer une fois, %d fois :\n%s", opts, n, visible)
+		}
+		for _, mot := range []string{"settings.user", "rien à rouvrir", "rien à retirer"} {
+			if !strings.Contains(visible, mot) {
+				t.Errorf("%v : « %s » doit être nommé :\n%s", opts, mot, visible)
+			}
+		}
+		if strings.Contains(tue, "⚠") {
+			t.Errorf("%v : l'avertissement ne doit pas polluer la sortie standard :\n%s", opts, tue)
+		}
+	}
+}

@@ -157,12 +157,12 @@ func (a *App) restoreCertificates(p *model.Project, secrets map[string][2][]byte
 			continue
 		}
 		if a.Keys == nil {
-			a.printf("⚠ clé maître illisible : le certificat %s n'est pas restauré\n", cert)
+			a.warnf("⚠ clé maître illisible : le certificat %s n'est pas restauré\n", cert)
 			return
 		}
 		data, err := a.Keys.Open(p.ID(), name, pair[0], pair[1])
 		if err != nil {
-			a.printf("⚠ certificat %s illisible avec la clé maître actuelle : non restauré\n", cert)
+			a.warnf("⚠ certificat %s illisible avec la clé maître actuelle : non restauré\n", cert)
 			continue
 		}
 		if files[cert] == nil {
@@ -182,7 +182,7 @@ func (a *App) restoreCertificates(p *model.Project, secrets map[string][2][]byte
 			continue
 		}
 		if err := store.Write(cert, m); err != nil {
-			a.printf("⚠ restauration du certificat %s : %v\n", cert, err)
+			a.warnf("⚠ restauration du certificat %s : %v\n", cert, err)
 			continue
 		}
 		a.printf("✓ certificat restauré : %s\n", cert)

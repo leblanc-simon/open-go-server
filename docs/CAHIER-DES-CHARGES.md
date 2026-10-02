@@ -4387,9 +4387,9 @@ Limites connues, laissées en l'état :
   projet sous un même nom, ne sont refusés qu'au `plan` et à l'`apply` de ce projet ; le renouvellement du
   parc, qui ne passe pas par eux, réémet encore l'un sur l'autre deux certificats de même nom tant que la
   déclaration n'est pas corrigée — `doctor` la nomme.
-- **Complétion** : cobra crée la commande `completion` à l'exécution, si bien que l'annotation qui la
-  dispenserait de root et sa traduction restent sans effet — `ogs completion bash` exige root et répond en
-  anglais.
+- **Complétion** (D101) : **fermé**. cobra créait la commande `completion` à l'exécution, si bien que
+  l'annotation qui la dispensait de root et sa traduction restaient sans effet ; elle est désormais créée
+  d'avance, et `ogs completion bash` s'exécute sans root et répond en français.
 - **`.htaccess` sous Apache** (D99, constat S2R-01) : **fermé**. ogs n'active plus les `.htaccess`
   (`AllowOverride None`) et porte l'effet de ceux que livre Prestashop, branche par branche, sous les deux
   moteurs ; un `.htaccess` du projet ne peut donc plus détourner le serveur (socket FPM d'un voisin,
@@ -4416,10 +4416,12 @@ Limites connues, laissées en l'état :
   branche faite sans ogs laisse le vhost aux règles de l'ancienne jusqu'au prochain `apply`, ce que `doctor` signale ; une
   1.6 reçoit les règles de la 8, que ses `.htaccess` ne suivent pas toutes. Les écarts restants avec les
   `.htaccess` livrés sont tenus au §7.10.2.
-- **Majeurs de sécurité non traités** par les lots, reproduits par la revue :
-  - les secrets d'un projet autres que les mots de passe SGBD et AMQP (retirés depuis D91 et D93) restent
-    au keystore après `project delete`, `--purge` et la purge des archives comprises, et un projet recréé
-    sous le même identifiant en hérite (constat R1-21).
+- **Secrets d'un projet supprimé** (constat R1-21, D100 (4)) : **fermé** hors `--keep-data`. Ses secrets
+  quittent le keystore en fin de suppression — l'archive en garde la copie scellée, `--purge` aucune.
+  Restent, nommés par la suppression, les preuves de propriété d'une ressource restée en place (moteur
+  injoignable, retrait en échec), les clés DKIM dont les fichiers n'ont pas pu partir, et tout le keystore
+  du projet sous `--keep-data` : un projet recréé sous le même identifiant les reprend, ce qui est voulu
+  pour une ressource conservée.
 - **Prestashop sous nginx n'a pas de back-office** (majeur, non traité) : le vhost n'exécute que le front
   controller racine — `location ~ ^/index.php(/|$) { … internal; }`, puis `location ~ \.php$ { return 404; }`
   —, si bien que répondent 404 là où Apache les exécute : `index.php` en accès direct (`/index.php`,
@@ -4469,11 +4471,10 @@ Limites connues, laissées en l'état :
   pour les autres outils de la machine ; monter `/proc` en `hidepid=2` n'est ni exigé ni contrôlé par
   `doctor`.
 
-- **Avertissements de `project delete` et `project restore`** (D101) : ils passent encore par la sortie de
-  progression, que `--quiet` et `-o json` font taire — `delete.go` était repris en parallèle (D100) ; à porter
-  sur `warnf` comme ceux de l'apply. La TUI garde son propre tampon. Les clés inconnues de `config.yaml` sont
-  nommées par chemin, sans numéro de ligne. Une affectation de tête citée (`FOO='a b' cmd`) d'une tâche
-  planifiée reste derrière `flock`, qui la prend pour le programme : il faudrait analyser le shell.
+- **Surface CLI** (D101) : la TUI garde son propre tampon, hors de `warnf`. Les clés inconnues de
+  `config.yaml` sont nommées par chemin, sans numéro de ligne. Une affectation de tête citée
+  (`FOO='a b' cmd`) d'une tâche planifiée reste derrière `flock`, qui la prend pour le programme : il
+  faudrait analyser le shell.
 
 **Points ouverts** (D103) :
 

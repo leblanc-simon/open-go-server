@@ -402,3 +402,39 @@ func TestSectionPHPPool(t *testing.T) {
 		t.Errorf("preset ajouté : %v", p.Presets)
 	}
 }
+
+// D101 × D103 : la section php.pool passe le contrôle des clés inconnues. Ses
+// clés scalaires sont reconnues, ses tables de réglages FPM — defaults et
+// chaque preset — sont libres, et une faute de frappe y est nommée.
+func TestUnknownKeysSectionPHPPool(t *testing.T) {
+	doc := []byte(`
+php:
+  pool:
+    defaultPreset: small
+    capacityWarnPercent: 80
+    disableFunctions: [exec]
+    defaults:
+      pm.max_requests: 1000
+      php_admin_value[open_basedir]: ~
+      n_importe_quelle_directive: x
+    presets:
+      maison:
+        pm: static
+        pm.max_children: 4
+`)
+	unknown, retired, err := UnknownKeys(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(unknown)+len(retired) > 0 {
+		t.Errorf("la section php.pool ne doit porter aucune clé inconnue : %v %v", unknown, retired)
+	}
+	unknown, _, err = UnknownKeys([]byte("php:\n  pool:\n    capacityWarnPercnt: 80\n    defaultpreset: small\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"php.pool.capacityWarnPercnt", "php.pool.defaultpreset (« defaultPreset » ?)"}
+	if strings.Join(unknown, " ") != strings.Join(want, " ") {
+		t.Errorf("clés inconnues : %v\nattendu      : %v", unknown, want)
+	}
+}
