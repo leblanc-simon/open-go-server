@@ -4546,11 +4546,12 @@ Limites connues, laissées en l'état :
   (`app/envfile.gardé`) ; celle-ci n'est plus que dans l'archive, ce que la restauration dit.
 - **`db.Provider.Restore` lit la sauvegarde entière en mémoire**, pour en retirer les clauses que le
   confinement refuse (D92) : la recopie depuis l'archive est en flux, le chargement ne l'est pas.
-- **Après un rollback, le moteur ne recharge rien** : une étape compensée après qu'un `FlushReloads`
-  intermédiaire a fait charger sa version neuve — un vhost réécrit avant le challenge HTTP-01 — est rendue
-  sur le disque, mais le serveur sert la version neuve jusqu'au rechargement suivant. Rejouer les intentions
-  des étapes compensées et déjà vidées le corrigerait ; ce n'est pas fait, un rechargement pendant le
-  déroulage pouvant relancer des services (`systemd:restart-target`) que le déroulage vient d'arrêter.
+- **Après un rollback, seuls les rechargements déjà exécutés sont rejoués** (D105) : une étape compensée
+  après qu'un `FlushReloads` intermédiaire a fait charger sa version neuve — un vhost réécrit avant le
+  challenge HTTP-01 — voit son intention rejouée dès sa compensation. Un redémarrage de cible rejoué relance
+  les services sous la définition que la compensation a rendue ; une cible qu'elle a retirée n'a rien à
+  redémarrer. L'étape en échec, que rien ne compense, ne rejoue rien : si elle laisse un changement non
+  défait (`ResidualError`), il prend effet au rechargement suivant, comme son erreur le dit (D104).
 - **Le même motif subsiste hors de `removal`** : l'écriture d'un pool PHP, d'un vhost de projet et du vhost
   de statut rend le contenu précédent si le moteur refuse la configuration neuve (`writeVHost`,
   `php.Provider`, `PlanStatus`), et l'échec de ce rétablissement est jeté — le fichier refusé reste en place,
