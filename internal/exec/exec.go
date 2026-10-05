@@ -73,6 +73,10 @@ func ShellLine(argv ...string) string {
 	return strings.Join(parts, " ")
 }
 
+// Missing dit qu'une commande a échoué faute d'exécutable : l'outil n'est pas
+// installé. Un appelant pour qui l'outil est facultatif — at, cron — s'en tait.
+func Missing(err error) bool { return errors.Is(err, osexec.ErrNotFound) }
+
 // Result porte la sortie d'une commande.
 type Result struct {
 	Stdout   string

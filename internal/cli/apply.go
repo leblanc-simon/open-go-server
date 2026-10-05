@@ -645,6 +645,9 @@ func (a *App) checkFleetUniqueness(projects ...*model.Project) error {
 		if err := a.checkPoolDeclarations(p); err != nil {
 			return err
 		}
+		if err := checkWebAccess(p); err != nil {
+			return err
+		}
 	}
 	fleet, err := a.loadProjects()
 	if err != nil {

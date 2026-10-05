@@ -73,6 +73,9 @@ func newDeleteCommand(app *App) *cobra.Command {
 			"avec ce qui le lève. Seuls partent les fichiers qu'ogs a écrits pour ce projet ;\n" +
 			"sous --keep-data, l'archive ne recopie pas une arborescence qui n'est pas au seul\n" +
 			"projet.\n\n" +
+			"Le compte emporte sa crontab personnelle et ses tâches at, recopiées dans l'archive,\n" +
+			"son linger, et les fichiers de son UID dans /tmp, /var/tmp et /dev/shm ; son groupe\n" +
+			"ne part que si personne d'autre ne le tient.\n\n" +
 			"Une interruption reçue avant le premier retrait abandonne la suppression et relance\n" +
 			"les services arrêtés ; reçue après, elle laisse la suppression aller à son terme.",
 		Args: cobra.ExactArgs(1),
@@ -141,6 +144,11 @@ func newDeleteCommand(app *App) *cobra.Command {
 			if keepData && !purge {
 				scope.skipTree, scope.skipLogs = app.archiveExclusions(p)
 			}
+			// Ce que le compte a posé hors d'ogs — crontab, tâches at, linger — est
+			// relu avant l'archive, qui en garde la copie, puis retiré avec le compte
+			// (D107). Sous --keep-data, le compte reste, et tout cela avec lui.
+			jobs := app.userJobs(cmd, provs, p, opts)
+			scope.jobs = jobs
 
 			if purge {
 				// Ce qui part sans copie est nommé avant la saisie : le fichier
@@ -149,6 +157,9 @@ func newDeleteCommand(app *App) *cobra.Command {
 				if _, err := os.Lstat(app.Paths.EnvFile(p.ID())); err == nil && !keepData {
 					app.printf("= --purge : %s (contenu de l'exploitant) sera effacé sans copie\n",
 						app.Paths.EnvFile(p.ID()))
+				}
+				if names := describeJobs(jobs); len(names) > 0 {
+					app.printf("= --purge : %s seront retirés sans copie\n", strings.Join(names, ", "))
 				}
 				// La purge ne laisse aucun recours : la confirmation exige de saisir
 				// l'identifiant, ce qui rend l'erreur de frappe improbable.
@@ -387,11 +398,16 @@ func newDeleteCommand(app *App) *cobra.Command {
 			// sous cette identité.
 			signalInterruption()
 			if !keepData {
-				if err := app.removeUser(cmd, provs, p); err != nil {
+				if err := app.removeUser(cmd, provs, p, jobs, &removed, warn); err != nil {
 					warn("suppression du compte : %v", err)
 				} else {
 					removed = append(removed, "utilisateur "+p.Spec.User.Name)
 				}
+			} else {
+				// Le compte reste, et l'UID avec lui : ce qu'il a posé hors d'ogs et ce
+				// qu'il tient dans les répertoires temporaires restent à lui (D107).
+				app.printf("= --keep-data : compte %s conservé, avec sa crontab, ses tâches at, son linger "+
+					"et ses fichiers temporaires\n", p.Spec.User.Name)
 			}
 
 			// 6. Le projet quitte l'inventaire actif, et ses numéros de pool et de
@@ -1025,7 +1041,10 @@ type archiveScope struct {
 	files []string
 	// certs nomme les certificats que la suppression retire, scellés dans
 	// l'archive (D100).
-	certs              []string
+	certs []string
+	// jobs est ce que le compte a posé hors d'ogs (D107), recopié en clair sous
+	// user/ : rien n'y est scellé, comme l'arborescence.
+	jobs               system.UserJobs
 	dumps              []model.Database
 	strict             bool
 	skipTree, skipLogs bool
@@ -1081,7 +1100,8 @@ func (a *App) checkArchiveSize(p *model.Project, scope archiveScope) error {
 }
 
 // removeUser supprime le compte système et l'arborescence.
-func (a *App) removeUser(cmd *cobra.Command, provs *providers, p *model.Project) error {
+func (a *App) removeUser(cmd *cobra.Command, provs *providers, p *model.Project, jobs system.UserJobs,
+	removed *[]string, warn func(format string, args ...any)) error {
 	u, err := provs.System.Identity.LookupUser(p.Spec.User.Name)
 	if err != nil {
 		return err
@@ -1090,6 +1110,9 @@ func (a *App) removeUser(cmd *cobra.Command, provs *providers, p *model.Project)
 		return fmt.Errorf("l'utilisateur %s n'a pas été créé par ogs : le supprimer exige --force",
 			p.Spec.User.Name)
 	}
+	// Le groupe est observé avant userdel, qui l'emporte parfois : c'est le
+	// compte encore présent qui dit s'il est le sien (D107).
+	group, groupErr := provs.System.Identity.LookupGroup(p.Spec.User.Group)
 	// Le rempart de l'arborescence est éprouvé avant userdel, et non après : il
 	// compare le propriétaire de la racine au compte du projet, qui n'existera
 	// plus ensuite — un home orphelin et celui d'un voisin ne se distingueraient
@@ -1099,7 +1122,30 @@ func (a *App) removeUser(cmd *cobra.Command, provs *providers, p *model.Project)
 	// quand même. Laisser le home d'un projet dont la suppression vient d'être
 	// annoncée — définitive, qui plus est — serait le pire des deux états.
 	var accountErr error
-	if !a.Exec.Simulated() {
+	if u != nil {
+		// Ce que le compte a posé hors d'ogs s'exécute sous son nom, et cron comme
+		// atd le relisent par le nom : un compte recréé sous ce nom le reprenait
+		// (D107, R4-18). L'archive en a gardé la copie ; ce qui n'a pas pu être
+		// relu n'y est pas, et reste.
+		list, err := provs.System.RemoveUserJobs(cmd.Context(), jobs, u.UID)
+		*removed = append(*removed, list...)
+		for _, r := range list {
+			a.printf("✓ retiré : %s\n", r)
+		}
+		if err != nil {
+			warn("%v", err)
+		}
+		// useradd redonne l'UID libéré au compte suivant, qui recevait ce que
+		// l'ancien laissait dans les répertoires temporaires communs (D107, R4-19).
+		purged, err := provs.System.PurgeUID(cmd.Context(), u.UID)
+		if len(purged) > 0 {
+			a.printf("✓ fichiers de l'UID %d retirés : %s\n", u.UID, strings.Join(purged, ", "))
+			*removed = append(*removed, fmt.Sprintf("fichiers temporaires de l'UID %d", u.UID))
+		}
+		if err != nil {
+			warn("fichiers de l'UID %d laissés en place, que le prochain compte de cet UID recevra : %v",
+				u.UID, err)
+		}
 		if _, err := a.Exec.Run(cmd.Context(), exec.Command{
 			Name: "userdel", Args: []string{p.Spec.User.Name},
 		}); err != nil {
@@ -1107,30 +1153,20 @@ func (a *App) removeUser(cmd *cobra.Command, provs *providers, p *model.Project)
 			// userdel ne dit pas ce qui tient le compte, et « currently used by
 			// process 3418 » sans le nom du processus n'apprend rien : la liste est
 			// lue directement dans /proc, d'où la commande à passer pour finir.
-			if u != nil {
-				if procs := processesOfUID(u.UID); len(procs) > 0 {
-					accountErr = fmt.Errorf("%w\n  processus encore actifs sous %s : %s\n"+
-						"  les arrêter puis : userdel %s && groupdel %s",
-						err, p.Spec.User.Name, strings.Join(procs, ", "),
-						p.Spec.User.Name, p.Spec.User.Group)
-				}
+			if procs := processesOfUID(u.UID); len(procs) > 0 {
+				accountErr = fmt.Errorf("%w\n  processus encore actifs sous %s : %s\n"+
+					"  les arrêter puis : userdel %s && groupdel %s",
+					err, p.Spec.User.Name, strings.Join(procs, ", "),
+					p.Spec.User.Name, p.Spec.User.Group)
 			}
 		} else {
-			// Le serveur web est membre du groupe du projet quand webAccess vaut
-			// « group » : sans l'en retirer, groupdel refuse — « group has other
-			// members » — et le groupe survit à chaque suppression. Le retrait est
-			// tenté sans condition : un gpasswd sur un non-membre échoue sans rien
-			// casser, et l'observation de l'appartenance coûterait plus qu'elle
-			// n'apporte.
-			_, _ = a.Exec.Run(cmd.Context(), exec.Command{
-				Name: "gpasswd", Args: []string{"-d", system.WebUser, p.Spec.User.Group},
-			})
-			if _, err := a.Exec.Run(cmd.Context(), exec.Command{
-				Name: "groupdel", Args: []string{p.Spec.User.Group},
-			}); err != nil {
-				a.warnf("⚠ suppression du groupe : %v\n", err)
-			}
+			a.removeGroup(cmd, provs, p, u, group, groupErr, removed, warn)
 		}
+	} else if group != nil {
+		// Sans compte, rien ne dit que le groupe homonyme est celui du projet :
+		// il reste, nommé, et un projet recréé sous ce nom le verrait (D107).
+		warn("groupe %s conservé : le compte %s n'existe plus, rien ne dit que ce groupe est le sien ; "+
+			"s'il l'est : groupdel %s", p.Spec.User.Group, p.Spec.User.Name, p.Spec.User.Group)
 	}
 	// L'arborescence part en dernier : tout ce qui précède a pu avoir besoin de la lire.
 	if treeErr == nil {
@@ -1156,6 +1192,75 @@ func (a *App) removeUser(cmd *cobra.Command, provs *providers, p *model.Project)
 		return errors.Join(accountErr, treeErr, logsErr, err)
 	}
 	return errors.Join(accountErr, treeErr, logsErr)
+}
+
+// removeGroup retire le groupe du projet après son compte, s'il est à ogs et à
+// personne d'autre (D107). groupdel partait sans condition : le groupe homonyme
+// d'un compte adopté, que d'autres comptes partageaient, disparaissait sous eux
+// (R1-25), et son échec n'était qu'affiché — « ✓ supprimé », code 0 (R1-18).
+//
+// Le groupe est à ogs s'il était le groupe primaire du compte qu'ogs vient de
+// supprimer : il l'a créé avec lui (§7.1.1), ou, pour un compte adopté que
+// --force a supprimé, c'est son groupe privé, que userdel emporte de lui-même
+// quand il est seul. Il est à quelqu'un d'autre s'il a un membre autre que
+// www-data, ou s'il est le groupe primaire d'un autre compte : il reste alors,
+// nommé, code 6 — un projet recréé sous ce nom se le verrait refuser (D107).
+// Le groupe observé l'a été avant userdel ; il est relu après, userdel l'ayant
+// peut-être emporté.
+func (a *App) removeGroup(cmd *cobra.Command, provs *providers, p *model.Project, u *system.UserInfo,
+	g *system.GroupInfo, lookupErr error, removed *[]string, warn func(format string, args ...any)) {
+	name := p.Spec.User.Group
+	switch {
+	case lookupErr != nil:
+		warn("groupe %s illisible, laissé en place : %v", name, lookupErr)
+		return
+	case g == nil:
+		return
+	case g.GID != u.GID:
+		warn("groupe %s conservé : ce n'est pas le groupe primaire du compte %s, ogs ne l'a pas créé avec lui",
+			name, u.Name)
+		return
+	}
+	strangers, err := provs.System.GroupStrangers(g, u.Name)
+	if err != nil {
+		warn("groupe %s laissé en place, ses membres sont illisibles : %v", name, err)
+		return
+	}
+	if len(strangers) > 0 {
+		warn("groupe %s conservé : d'autres comptes le tiennent — %s ; une fois qu'ils n'en ont plus "+
+			"besoin : gpasswd -d <compte> %s, puis groupdel %s", name, strings.Join(strangers, ", "), name, name)
+		return
+	}
+	after, err := provs.System.Identity.LookupGroup(name)
+	if err != nil {
+		warn("groupe %s illisible, laissé en place : %v", name, err)
+		return
+	}
+	if after == nil {
+		// userdel l'a emporté : il était seul.
+		*removed = append(*removed, "groupe "+name)
+		return
+	}
+	// Le serveur web est membre du groupe quand webAccess vaut « group » : sans
+	// l'en retirer, groupdel refuse — « group has other members ».
+	if slices.Contains(after.Members, system.WebUser) {
+		if _, err := a.Exec.Run(cmd.Context(), exec.Command{
+			Name: "gpasswd", Args: []string{"-d", system.WebUser, name},
+		}); err != nil {
+			warn("groupe %s laissé en place, %s n'a pas pu en être retiré : %v", name, system.WebUser, err)
+			return
+		}
+	}
+	// Le code 6 de groupdel dit que le groupe n'existe plus : un autre l'a retiré
+	// entre-temps, c'est le résultat voulu.
+	const groupdelNoSuchGroup = 6
+	if res, err := a.Exec.Run(cmd.Context(), exec.Command{
+		Name: "groupdel", Args: []string{name},
+	}); err != nil && res.ExitCode != groupdelNoSuchGroup {
+		warn("suppression du groupe %s : %v", name, err)
+		return
+	}
+	*removed = append(*removed, "groupe "+name)
 }
 
 // checkRemovableRoot est le rempart devant un geste sans retour. La racine vient
@@ -1744,6 +1849,11 @@ func (a *App) archiveProject(cmd *cobra.Command, provs *providers, p *model.Proj
 	if err := a.archiveCertificates(w, provs, p, scope.certs); err != nil {
 		return "", nil, wrap(CodeError, err)
 	}
+	// La crontab personnelle et les tâches at du compte (D107) : la suppression
+	// les retire, l'archive en garde la seule copie.
+	if err := archiveUserJobs(w, scope.jobs); err != nil {
+		return "", nil, wrap(CodeError, err)
+	}
 	if err := a.archiveEnvFile(w, p); err != nil {
 		return "", nil, err
 	}
@@ -1881,6 +1991,12 @@ func newRestoreCommand(app *App) *cobra.Command {
 			archived := append([]model.Dir(nil), p.Spec.Layout.Dirs...)
 			if err := app.prepare(p); err != nil {
 				return err
+			}
+			// Une archive qui déclare « webAccess: acl » serait refusée par l'apply,
+			// après le dépôt de la déclaration : le refus vient avant tout (D107).
+			if p.Spec.User.WebAccess == webAccessACL {
+				return exitf(CodeValidation, "l'archive de %s déclare spec.user.webAccess « acl », qu'ogs "+
+					"n'implémente pas : rien n'a été restauré.\n  remède : %s", p.ID(), webAccessArchiveFix)
 			}
 			// Une archive d'avant D91 peut déclarer un compte réservé : la restaurer
 			// l'écrirait de nouveau au parc.
@@ -2356,5 +2472,45 @@ func storeStatus(st *store.Store, id string) string {
 	return row.Status
 }
 
-var _ = context.Background
-var _ = system.WebUser
+// userJobs relit ce que le compte du projet a posé hors d'ogs (D107) : rien
+// sous --keep-data, qui garde le compte, ni sans compte.
+func (a *App) userJobs(cmd *cobra.Command, provs *providers, p *model.Project, o deleteOptions) system.UserJobs {
+	if o.keepData {
+		return system.UserJobs{}
+	}
+	u, err := provs.System.Identity.LookupUser(p.Spec.User.Name)
+	if err != nil || u == nil {
+		return system.UserJobs{}
+	}
+	return provs.System.ReadUserJobs(cmd.Context(), u.Name)
+}
+
+// describeJobs nomme ce que la suppression retirera du compte.
+func describeJobs(j system.UserJobs) []string {
+	var out []string
+	if len(j.Crontab) > 0 {
+		out = append(out, "la crontab personnelle de "+j.Account)
+	}
+	if ids := j.AtIDs(); len(ids) > 0 {
+		out = append(out, fmt.Sprintf("les tâches at %s de %s", strings.Join(ids, ", "), j.Account))
+	}
+	if j.Linger {
+		out = append(out, "le linger de "+j.Account)
+	}
+	return out
+}
+
+// archiveUserJobs recopie la crontab et les tâches at du compte sous user/.
+func archiveUserJobs(w *archive.Writer, j system.UserJobs) error {
+	if len(j.Crontab) > 0 {
+		if err := w.AddBytes("user", "user/crontab", "crontab -l -u "+j.Account, j.Crontab, 0o600); err != nil {
+			return err
+		}
+	}
+	for _, id := range j.AtIDs() {
+		if err := w.AddBytes("user", "user/at/"+id, "at -c "+id, j.AtJobs[id], 0o600); err != nil {
+			return err
+		}
+	}
+	return nil
+}

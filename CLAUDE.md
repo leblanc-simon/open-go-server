@@ -467,6 +467,17 @@ Ils ont tous coûté un défaut réel ; les tests unitaires ne les voyaient pas.
   déclaration, et `project delete` applique le même critère. Sous préfixe, le compte n'existe jamais : le
   contrôle s'y tait. Et **aucun registre ne remplace l'état réel** : les ressources laissées de côté par
   l'import ne sont pas mémorisées, chaque garde lit le système.
+- **Ce que le compte laisse hors du home passe à son successeur** (D107) : cron et atd relisent la crontab et
+  les tâches at **par le nom**, useradd redonne l'**UID** libéré au compte suivant, et un groupe homonyme
+  préexistant était repris avec ses membres — qui recevaient le socket FPM du projet. La suppression archive
+  puis retire crontab, tâches at et linger, purge les fichiers de l'UID de `/tmp`, `/var/tmp` et `/dev/shm`
+  par descripteur (`system.Provider.PurgeUID`, sans lien ni montage franchi), et ne retire le groupe que s'il
+  était le groupe primaire du compte et que personne d'autre ne le tient ; la création refuse un groupe que
+  d'autres tiennent (`PreexistingGroup`). Le linger garde `user@<uid>.service`, dont les processus font
+  refuser userdel : il est arrêté avant. La purge lit `/proc/self/mountinfo` : un montage lié du **même**
+  système de fichiers garde le `st_dev` de sa source, et la purge l'a traversé, effaçant la source. Et
+  `webAccess: none` ne retire jamais `www-data` du groupe : un site à docroot (0710) passé de `group` à `none`
+  répondait 403 après un apply en code 0.
 - `userdel` **refuse un compte dont un processus tourne encore**. À la suppression d'un projet, les
   rechargements de PHP-FPM et du serveur web doivent donc précéder la suppression du compte : ce sont eux
   qui libèrent les workers du pool. L'ordre inverse laissait compte, groupe et home en place — en annonçant

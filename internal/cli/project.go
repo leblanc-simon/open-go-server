@@ -301,7 +301,7 @@ func orValue(v, fallback string) string {
 }
 
 // preexistingHome oppose, avant tout dépôt, le refus que le plan du provider
-// système opposerait au home d'un compte à créer (D95). Sans lui, « site
+// système opposerait au home d'un compte à créer (D95), ou à son groupe (D107). Sans lui, « site
 // create », « site clone » et « project create » déposaient la déclaration, que
 // le plan refusait ensuite : elle restait, et arrêtait tout « ogs apply » du parc.
 func (a *App) preexistingHome(ctx context.Context, p *model.Project) error {
@@ -311,6 +311,10 @@ func (a *App) preexistingHome(ctx context.Context, p *model.Project) error {
 		return wrap(CodeError, err)
 	}
 	if err := prov.PreexistingHome(p, obs); err != nil {
+		return wrap(CodeConflict, err)
+	}
+	// Le groupe d'un compte à créer, de même (D107).
+	if err := prov.PreexistingGroup(p, obs); err != nil {
 		return wrap(CodeConflict, err)
 	}
 	return nil

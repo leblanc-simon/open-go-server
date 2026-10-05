@@ -92,6 +92,10 @@ func newApp() *App {
 	}
 }
 
+// newPrefixRecorder fournit l'exécuteur simulé du mode préfixé. Les essais le
+// remplacent pour donner aux commandes simulées la sortie d'un vrai système.
+var newPrefixRecorder = exec.NewRecorder
+
 // setup applique les options globales : préfixe, configuration, root-strict.
 func (a *App) setup() error {
 	a.Paths = config.NewPaths(a.Prefix)
@@ -111,7 +115,7 @@ func (a *App) setup() error {
 		// Mode préfixé : aucune commande système n'est exécutée. Les comptes ne sont
 		// pas créés, les répertoires le sont sous le préfixe. C'est un mode d'essai
 		// et de développement, pas un mode d'exploitation.
-		a.Exec = exec.NewRecorder()
+		a.Exec = newPrefixRecorder()
 		if !a.Quiet && a.Format == "table" {
 			fmt.Fprintf(a.Err, "mode préfixé %s : les commandes système sont simulées\n", a.Prefix)
 		}
@@ -558,6 +562,9 @@ func (a *App) systemProvider() *system.Provider {
 	// Par la variable du paquet, que les essais substituent.
 	prov.AccountOfUID = func(uid int) (string, error) { return accountOfUID(uid) }
 	prov.KnownHome = a.knownHome
+	if a.Prefix != "" {
+		prov.AccountsOfGID = system.AccountsOfGIDIn(ident.PasswdPath)
+	}
 	if a.Prefix != "" {
 		prov.SkipWebUser = true
 	} else if u, err := ident.LookupUser(system.WebUser); err == nil && u == nil {

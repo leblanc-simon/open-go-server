@@ -54,6 +54,12 @@ type Provider struct {
 	// home non vide à un UID orphelin est alors le sien, compte supprimé à la
 	// main (D95). nil : aucun home n'est connu.
 	KnownHome func(proj *model.Project) bool
+	// AccountsOfGID nomme les comptes dont un GID est le groupe primaire ; nil
+	// lit /etc/passwd. Substituable en test.
+	AccountsOfGID AccountsOfGIDFunc
+	// TempDirs remplace, en test, les répertoires temporaires communs que la
+	// suppression purge des fichiers de l'UID (D107).
+	TempDirs []string
 }
 
 // Name identifie le provider.
@@ -165,6 +171,10 @@ func (p *Provider) Plan(_ context.Context, proj *model.Project, obs Observed) ([
 
 	// 0. Le home d'un compte à créer doit être vierge (§7.1.7, D95).
 	if err := p.PreexistingHome(proj, obs); err != nil {
+		return nil, err
+	}
+	// Son groupe aussi, s'il existe déjà : à personne d'autre (D107).
+	if err := p.PreexistingGroup(proj, obs); err != nil {
 		return nil, err
 	}
 

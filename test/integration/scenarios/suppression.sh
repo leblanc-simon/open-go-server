@@ -118,11 +118,38 @@ if [ "$pose" = 1 ]; then
     rm -f "$tache"
 fi
 
+# Ce que le compte pose hors d'ogs survivait à la suppression (D107) : cron et
+# atd relisent par le nom, et un compte recréé sous ce nom reprenait la crontab ;
+# useradd redonne l'UID libéré au compte suivant, qui recevait ce que l'ancien
+# laissait dans /tmp, /var/tmp et /dev/shm. Le linger garde un gestionnaire
+# systemd sous l'UID, qui ferait refuser userdel.
+uid=$(id -u phptest)
+echo "*/5 * * * * true" | crontab -u phptest -
+if ! crontab -l -u phptest >/dev/null 2>&1; then
+    echo "ÉCHEC : la crontab personnelle de phptest n'a pas été posée, le scénario n'éprouve rien"
+    exit 1
+fi
+# L'image n'a pas D-Bus : loginctl n'y joint pas logind. Le linger n'est alors
+# que son fichier, que la suppression retire elle-même.
+lingered=1
+if ! loginctl enable-linger phptest 2>/dev/null; then
+    echo "(logind injoignable : le linger est posé par son seul fichier)"
+    mkdir -p /var/lib/systemd/linger
+    touch /var/lib/systemd/linger/phptest
+fi
+runuser -u phptest -- mkdir -p /tmp/phptest-cache/sous
+runuser -u phptest -- sh -c 'echo x > /tmp/phptest-cache/sous/f; echo s > /tmp/sess_phptest; echo v > /var/tmp/phptest.v; echo m > /dev/shm/phptest.m'
+# Un lien de l'UID est retiré comme lien : sa cible n'est jamais touchée.
+echo "à root" > /root/cible-du-lien
+runuser -u phptest -- ln -s /root/cible-du-lien /tmp/phptest-lien
+# Un fichier de root n'est pas à l'UID : il reste.
+echo "à root" > /tmp/root-garde
+
 # La suppression par défaut, avec archive : --purge exige une confirmation
 # interactive et ne se prête pas à un scénario.
 sortie=$(ogs project delete phptest --no-dump --yes 2>&1)
 code=$?
-echo "$sortie" | tail -8
+echo "$sortie" | tail -12
 echo "code de retour : $code"
 
 echecs=0
@@ -145,6 +172,37 @@ if [ -f "/etc/php/$version/fpm/pool.d/phptest.conf" ]; then
 fi
 if [ -f /etc/apache2/sites-available/phptest.conf ]; then
     echo "ÉCHEC : le vhost existe encore"
+    echecs=1
+fi
+if [ -e /var/spool/cron/crontabs/phptest ]; then
+    echo "ÉCHEC : la crontab personnelle de phptest a survécu au compte"
+    echecs=1
+fi
+if ! grep -qF "crontab personnelle de phptest" <<<"$sortie"; then
+    echo "ÉCHEC : la sortie ne nomme pas la crontab retirée"
+    echecs=1
+fi
+if [ "$lingered" = 1 ] && { [ -e /var/lib/systemd/linger/phptest ] || ! grep -qF "linger de phptest" <<<"$sortie"; }; then
+    echo "ÉCHEC : le linger de phptest a survécu, ou n'est pas nommé"
+    echecs=1
+fi
+for f in /tmp/phptest-cache /tmp/sess_phptest /var/tmp/phptest.v /dev/shm/phptest.m /tmp/phptest-lien; do
+    if [ -e "$f" ] || [ -L "$f" ]; then
+        echo "ÉCHEC : $f, à l'UID $uid, a survécu au compte"
+        echecs=1
+    fi
+done
+if ! grep -qF "fichiers de l'UID $uid retirés" <<<"$sortie" || ! grep -qF "/tmp/phptest-cache" <<<"$sortie"; then
+    echo "ÉCHEC : la sortie ne nomme pas les fichiers de l'UID retirés"
+    echecs=1
+fi
+if [ "$(cat /root/cible-du-lien 2>/dev/null)" != "à root" ] || [ ! -f /tmp/root-garde ]; then
+    echo "ÉCHEC : la purge a touché la cible d'un lien ou un fichier de root"
+    echecs=1
+fi
+rm -f /root/cible-du-lien /tmp/root-garde
+if grep -qiE "atq|tâches at" <<<"$sortie" && ! command -v atq >/dev/null; then
+    echo "ÉCHEC : at n'est pas installé, la suppression ne doit pas en parler"
     echecs=1
 fi
 # Le numéro du pool revient à la plage (D100) : il restait attribué à jamais.
@@ -277,6 +335,94 @@ if ! grep -qF ".bashrc-alice" <<<"$refus" || [ ! -f "$home/.bashrc-alice" ]; the
     exit 1
 fi
 echo "la suppression refuse d'effacer un home où un autre compte a laissé des entrées"
+
+# Un groupe que d'autres comptes tiennent n'est pas repris par le compte à créer
+# (D107) : ses membres recevraient le socket FPM du projet.
+groupadd groupetest
+useradd -M -s /usr/sbin/nologin erin
+gpasswd -a erin groupetest >/dev/null
+if refus=$(ogs site create groupe.test --kind static --tls=false --yes 2>&1) || [ -e /etc/ogs/projects/groupetest.yaml ]; then
+    echo "ÉCHEC : la création a repris le groupe dont erin est membre :"
+    echo "$refus" | tail -5
+    exit 1
+fi
+if ! grep -qF "erin" <<<"$refus"; then
+    echo "ÉCHEC : le refus ne nomme pas erin :"
+    echo "$refus" | tail -5
+    exit 1
+fi
+echo "la création refuse un groupe que d'autres comptes tiennent"
+
+# À la suppression, le groupe d'un projet que d'autres tiennent reste, nommé, et
+# la purge ne franchit pas un point de montage sous un répertoire de l'UID :
+# deux restes, donc le code 6 — et le compte part quand même.
+useradd -M -s /usr/sbin/nologin dave
+gpasswd -a dave relutest >/dev/null
+monte=0
+partage=$(mktemp -d /srv/partage-uid.XXXXXX)
+echo "à garder" > "$partage/commun.txt"
+chown relutest "$partage/commun.txt"
+runuser -u relutest -- mkdir -p /tmp/relutest-dir/monte
+if mount --bind "$partage" /tmp/relutest-dir/monte 2>/dev/null; then
+    monte=1
+fi
+# Un montage lié issu du MÊME système de fichiers garde le st_dev de sa source :
+# seule la table des montages le révèle, et la purge le traversait, effaçant la
+# source (relecture de D107). /tmp peut être un tmpfs : /var/tmp et /srv
+# partagent le système de fichiers racine.
+lie=0
+source_lie=$(mktemp -d /srv/lie-uid.XXXXXX)
+echo "à garder" > "$source_lie/f"
+chown relutest "$source_lie/f"
+runuser -u relutest -- mkdir -p /var/tmp/relutest-mt/monte
+if [ "$(stat -c %d "$source_lie")" = "$(stat -c %d /var/tmp/relutest-mt)" ] &&
+    mount --bind "$source_lie" /var/tmp/relutest-mt/monte 2>/dev/null; then
+    lie=1
+fi
+sortie=$(ogs project delete relutest --no-dump --yes 2>&1)
+code=$?
+if [ "$monte" = 1 ]; then
+    umount /tmp/relutest-dir/monte
+fi
+if [ "$lie" = 1 ]; then
+    umount /var/tmp/relutest-mt/monte
+    if [ ! -f "$source_lie/f" ] || ! grep -qF "/var/tmp/relutest-mt/monte" <<<"$sortie"; then
+        echo "ÉCHEC : la purge a franchi un montage lié du même système de fichiers, ou ne le nomme pas :"
+        echo "$sortie" | tail -10
+        exit 1
+    fi
+    echo "la purge ne franchit pas un montage lié du même système de fichiers, et le nomme"
+else
+    echo "(montage lié sur le même système de fichiers impossible : cas non éprouvé)"
+fi
+rm -rf "$source_lie" /var/tmp/relutest-mt
+if [ "$code" -ne 6 ]; then
+    echo "ÉCHEC : un groupe conservé est un succès partiel, code 6 attendu, obtenu $code :"
+    echo "$sortie" | tail -10
+    exit 1
+fi
+if getent passwd relutest >/dev/null || ! getent group relutest | grep -q dave; then
+    echo "ÉCHEC : le compte devait partir, et le groupe de dave rester :"
+    getent passwd relutest; getent group relutest
+    exit 1
+fi
+if ! grep -qF "groupe relutest conservé" <<<"$sortie" || ! grep -qF "dave" <<<"$sortie"; then
+    echo "ÉCHEC : la sortie ne nomme pas le groupe conservé ni dave :"
+    echo "$sortie" | tail -10
+    exit 1
+fi
+if [ "$monte" = 1 ]; then
+    if [ ! -f "$partage/commun.txt" ] || ! grep -qF "point de montage" <<<"$sortie"; then
+        echo "ÉCHEC : la purge a franchi un point de montage, ou ne le nomme pas :"
+        echo "$sortie" | tail -10
+        exit 1
+    fi
+    echo "la purge des fichiers de l'UID ne franchit pas un point de montage, et le nomme"
+else
+    echo "(montage impossible : la garde des points de montage de la purge n'est pas éprouvée)"
+fi
+rm -rf "$partage" /tmp/relutest-dir
+echo "la suppression garde, en le nommant, un groupe que d'autres comptes tiennent"
 
 echo "RÉSULTAT : compte, groupe, home, pool et vhost ont tous disparu, et aucun home d'un autre compte n'est repris ni effacé."
 exit 0

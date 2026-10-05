@@ -628,6 +628,14 @@ place, qui partiront avec eux. Le **fichier d'environnement** `/etc/ogs/env/<id>
 scellée dans l'archive ; sous `--purge`, il n'en reste rien, et la confirmation le nomme. `--keep-data`, qui
 garde données et contenu, le laisse en place, comme tous les secrets du projet.
 
+Le **compte** emporte ce qu'il avait posé hors d'`ogs` : sa crontab personnelle et ses tâches at, recopiées
+dans l'archive (`user/crontab`, `user/at/<n>`) puis retirées, son linger, et les fichiers que son UID tient
+dans `/tmp`, `/var/tmp` et `/dev/shm` — `useradd` redonne l'UID libéré au compte suivant, qui les aurait
+reçus. Chaque retrait est nommé ; ce qui reste — un point de montage, une crontab illisible — l'est aussi,
+code 6. Le **groupe** ne part que s'il est celui du compte et que personne d'autre n'en est membre : sinon il
+reste, nommé, code 6. Sous `--keep-data`, le compte et tout cela restent. La restauration ne repose ni la
+crontab ni les tâches at : elles sont dans l'archive.
+
 La restauration recrée le projet — refusée s'il existe déjà —, applique sa déclaration, puis remet son home
 tel que l'utilisateur l'avait laissé, chaque fichier rendu à qui le possédait ; ce qui n'était pas à
 l'utilisateur revient à root. Un `authorized_keys` qu'il avait posé, un script à la place du lien `php`
