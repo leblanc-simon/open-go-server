@@ -668,7 +668,7 @@ func TestLeCloneDitLaCopieDesDonneesEnEchec(t *testing.T) {
 		t.Errorf("le motif du code 6 doit nommer la base non copiée : %q", motif)
 	}
 	for _, ligne := range strings.Split(h.read(t, filepath.Join("var", "log", "ogs", "audit.log")), "\n") {
-		if strings.Contains(ligne, "site.clone") && strings.Contains(ligne, "\tok\t") {
+		if strings.Contains(ligne, "site.clone") && strings.Contains(ligne, " résultat=ok ") {
 			t.Errorf("un clone sans ses données ne s'enregistre pas « ok » : %q", ligne)
 		}
 	}

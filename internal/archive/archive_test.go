@@ -1014,3 +1014,39 @@ func TestArchiveSuitLeContexteEntreDeuxEntrées(t *testing.T) {
 		t.Fatalf("un contexte annulé doit arrêter le parcours : %v", err)
 	}
 }
+
+// ReadEntry, qui rend en mémoire, est borné : une sauvegarde — ou une bombe
+// zstd — se recopie en flux par CopyEntry, qui ne l'est pas. Une entrée qui
+// n'est pas un fichier ordinaire est refusée par l'un comme par l'autre.
+func TestReadEntryBorneEtCopyEntryRecopieEnFlux(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "x"+Extension)
+	w, err := Create(path, Manifest{Project: "x"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gros := make([]byte, maxReadEntry+1)
+	if err := w.AddBytes("dump", "dumps/x.sql", "", gros, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.tar.WriteHeader(&tar.Header{Name: "dumps/lien.sql", Linkname: "/etc/shadow", Typeflag: tar.TypeSymlink}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if _, err := ReadEntry(f, "dumps/x.sql"); err == nil {
+		t.Error("DÉFAUT : ReadEntry doit refuser une entrée au-delà de sa borne")
+	}
+	n, err := CopyFile(path, "dumps/x.sql", io.Discard)
+	if err != nil || n != int64(len(gros)) {
+		t.Errorf("CopyFile : %d octets, %v ; %d attendus", n, err, len(gros))
+	}
+	if _, err := CopyFile(path, "dumps/lien.sql", io.Discard); err == nil {
+		t.Error("DÉFAUT : un lien symbolique n'est pas une entrée")
+	}
+}

@@ -588,6 +588,18 @@ sudo ogs project delete shopfr --keep-data  # retire la configuration, garde bas
 sudo ogs project restore /var/lib/ogs/archives/shopfr-20260823-143000.tar.zst
 ```
 
+Une restauration qui ne rend pas tout ce que l'archive porte — une base non rechargée, le fichier
+d'environnement, un certificat — rend le code 6 et nomme chaque manque avec son remède. Une base se recharge
+ensuite depuis l'archive, sans outil à installer :
+
+```sh
+sudo ogs db restore shopfr shopfr --from-archive /var/lib/ogs/archives/shopfr-20260823-143000.tar.zst
+```
+
+Un fichier d'environnement que la restauration n'a pas pu écrire reste scellé au keystore ;
+`sudo sh -c 'umask 077 && ogs secrets show shopfr app/envfile > /etc/ogs/env/shopfr.env'` le rend tel quel,
+en 0600.
+
 **Avant la confirmation**, la suppression énumère ensemble tout ce qui la refuse, chaque refus avec ce qui le
 lève ; le code est celui du premier :
 

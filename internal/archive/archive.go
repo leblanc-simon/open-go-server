@@ -4,6 +4,7 @@ package archive
 
 import (
 	"archive/tar"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -707,24 +708,94 @@ func ReadFile(path, name string) ([]byte, error) {
 		return nil, err
 	}
 	defer f.Close()
-	dec, err := zstd.NewReader(f)
+	return ReadEntry(f, name)
+}
+
+// maxReadEntry borne ce que ReadEntry rend en mémoire : une déclaration, un
+// manifeste. Une sauvegarde, qui peut peser des gigaoctets — ou être une bombe
+// zstd fabriquée —, se recopie en flux (CopyEntry).
+const maxReadEntry = 16 << 20
+
+// ReadEntry relit une entrée d'une archive déjà ouverte — par un descripteur
+// obtenu sans suivre de lien, quand le chemin vient de l'exploitant (D83). Le
+// lecteur est consommé.
+func ReadEntry(r io.Reader, name string) ([]byte, error) {
+	var buf bytes.Buffer
+	_, err := CopyEntry(r, name, &limitedWriter{w: &buf, left: maxReadEntry})
 	if err != nil {
 		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// FindEntry dit si l'archive porte l'entrée, fichier ordinaire, sans en lire le
+// contenu.
+func FindEntry(r io.Reader, name string) error {
+	return withEntry(r, name, func(io.Reader) error { return nil })
+}
+
+// CopyEntry recopie en flux une entrée de l'archive vers w.
+func CopyEntry(r io.Reader, name string, w io.Writer) (int64, error) {
+	var n int64
+	err := withEntry(r, name, func(body io.Reader) error {
+		var err error
+		n, err = io.Copy(w, body)
+		return err
+	})
+	return n, err
+}
+
+// CopyFile recopie en flux l'entrée d'une archive désignée par son chemin.
+func CopyFile(path, name string, w io.Writer) (int64, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+	return CopyEntry(f, name, w)
+}
+
+// withEntry cherche l'entrée et passe son contenu à use. Seul un fichier
+// ordinaire est une entrée : un lien symbolique ou un répertoire au même nom,
+// dans une archive fabriquée, rendait un contenu vide qu'une restauration
+// chargeait en annonçant « ✓ base restaurée ».
+func withEntry(r io.Reader, name string, use func(io.Reader) error) error {
+	dec, err := zstd.NewReader(r)
+	if err != nil {
+		return err
 	}
 	defer dec.Close()
 	tr := tar.NewReader(dec)
 	for {
 		header, err := tr.Next()
 		if err == io.EOF {
-			return nil, fmt.Errorf("%s absent de l'archive", name)
+			return fmt.Errorf("%s absent de l'archive", name)
 		}
 		if err != nil {
-			return nil, err
+			return err
 		}
-		if header.Name == name {
-			return io.ReadAll(tr)
+		if header.Name != name {
+			continue
 		}
+		if header.Typeflag != tar.TypeReg && header.Typeflag != tar.TypeRegA {
+			return fmt.Errorf("%s n'est pas un fichier ordinaire dans l'archive", name)
+		}
+		return use(tr)
 	}
+}
+
+// limitedWriter refuse d'écrire au-delà de left octets.
+type limitedWriter struct {
+	w    io.Writer
+	left int64
+}
+
+func (l *limitedWriter) Write(p []byte) (int, error) {
+	if int64(len(p)) > l.left {
+		return 0, fmt.Errorf("entrée de l'archive trop grande (plus de %d octets)", maxReadEntry)
+	}
+	l.left -= int64(len(p))
+	return l.w.Write(p)
 }
 
 // Secrets relit les secrets scellés d'une archive.

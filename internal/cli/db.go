@@ -2,15 +2,19 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"text/tabwriter"
 
 	"github.com/spf13/cobra"
 
+	"leblanc.io/open-go-server/internal/archive"
 	"leblanc.io/open-go-server/internal/model"
 	"leblanc.io/open-go-server/internal/provider/db"
 	"leblanc.io/open-go-server/internal/spec"
@@ -269,23 +273,30 @@ func newDBDumpCommand(app *App) *cobra.Command {
 }
 
 func newDBRestoreCommand(app *App) *cobra.Command {
-	var input string
+	var input, fromArchive string
 	cmd := &cobra.Command{
 		Use:   "restore <id> [base]",
 		Short: "Restaurer une base depuis une sauvegarde",
-		Args:  cobra.RangeArgs(1, 2),
+		Long: "Recharge une sauvegarde dans une base déclarée, sous le compte de la base (D92).\n" +
+			"--input désigne un fichier de sauvegarde ; --from-archive, l'archive d'un projet\n" +
+			"supprimé, dont la sauvegarde de la base est relue directement — sans tar ni zstd.",
+		Args: cobra.RangeArgs(1, 2),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if input == "" {
-				return exitf(CodeUsage, "préciser le fichier à restaurer avec --input")
+			if (input == "") == (fromArchive == "") {
+				return exitf(CodeUsage, "préciser le fichier à restaurer avec --input, ou l'archive avec --from-archive")
+			}
+			source := input
+			if fromArchive != "" {
+				source = fromArchive
 			}
 			// Le contrôle de la restauration elle-même, avant la confirmation : un
 			// lien ou un fichier spécial est refusé avant qu'on ne demande d'écraser
 			// la base. Un os.Stat suivait le lien.
-			f, err := db.OpenInput(input)
+			f, err := db.OpenInput(source)
 			if err != nil {
 				return exitf(CodeUsage, "%v", err)
 			}
-			f.Close()
+			defer f.Close()
 			p, err := app.loadProject(args[0])
 			if err != nil {
 				return err
@@ -294,8 +305,15 @@ func newDBRestoreCommand(app *App) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			if fromArchive != "" {
+				if err := checkArchivedDump(f, fromArchive, p.ID(), decl.Name); err != nil {
+					return err
+				}
+			} else {
+				f.Close()
+			}
 			if err := app.confirm(fmt.Sprintf(
-				"restaurer %s dans la base %s (le contenu actuel peut être écrasé) ?", input, decl.Name)); err != nil {
+				"restaurer %s dans la base %s (le contenu actuel peut être écrasé) ?", source, decl.Name)); err != nil {
 				return err
 			}
 			if err := app.openStore(); err != nil {
@@ -306,18 +324,91 @@ func newDBRestoreCommand(app *App) *cobra.Command {
 				return err
 			}
 			defer provs.close()
-			if err := provs.DB.Restore(cmd.Context(), p, decl, input); err != nil {
+			path := input
+			if fromArchive != "" {
+				// La sauvegarde relue de l'archive passe par un fichier du répertoire
+				// de travail, à root et en 0700 : Restore la relit comme une autre.
+				dir, err := app.dumpWorkDir()
+				if err != nil {
+					return wrap(CodeError, err)
+				}
+				defer os.RemoveAll(dir)
+				path = filepath.Join(dir, decl.Name+".sql")
+				// Recopiée en flux, par le descripteur ouvert avant la confirmation :
+				// une sauvegarde pèse ce que pèse la base — une archive fabriquée,
+				// ce qu'elle veut —, et n'a pas à passer en entier par la mémoire.
+				if err := copyArchivedDump(f, decl.Name, path); err != nil {
+					return wrap(CodeError, fmt.Errorf("%s : %w", fromArchive, err))
+				}
+			}
+			if err := provs.DB.Restore(cmd.Context(), p, decl, path); err != nil {
 				if errors.Is(err, context.Canceled) {
 					return wrap(CodeCancelled, err)
 				}
 				return wrap(CodeError, err)
 			}
-			app.printf("✓ base %s restaurée depuis %s\n", decl.Name, input)
+			app.printf("✓ base %s restaurée depuis %s\n", decl.Name, source)
 			return nil
 		},
 	}
 	cmd.Flags().StringVarP(&input, "input", "i", "", "fichier de sauvegarde à restaurer")
+	cmd.Flags().StringVar(&fromArchive, "from-archive", "", "archive de projet dont recharger la sauvegarde de la base")
 	return cmd
+}
+
+// checkArchivedDump contrôle, par le descripteur déjà ouvert, l'archive d'un
+// projet avant la confirmation : elle doit être celle de ce projet, d'un format
+// que cet ogs relit, et porter la sauvegarde de cette base, fichier ordinaire.
+// Le remède d'une restauration partielle (D104) la désigne : il ne demande ainsi
+// ni tar ni zstd, que Debian n'installe pas.
+func checkArchivedDump(f *os.File, path, id, base string) error {
+	data, err := archive.ReadEntry(f, archive.ManifestName)
+	if err != nil {
+		return exitf(CodeUsage, "%s : %v", path, err)
+	}
+	var manifest archive.Manifest
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		return exitf(CodeUsage, "%s : manifeste illisible : %v", path, err)
+	}
+	if manifest.Project != id {
+		return exitf(CodeUsage, "%s est l'archive du projet %s, non de %s", path, manifest.Project, id)
+	}
+	if manifest.Version > archive.Version {
+		return exitf(CodeUsage, "%s : archive au format %d, cet ogs ne relit que le format %d",
+			path, manifest.Version, archive.Version)
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return wrap(CodeError, err)
+	}
+	if err := archive.FindEntry(f, "dumps/"+base+".sql"); err != nil {
+		return exitf(CodeUsage, "%s : aucune sauvegarde de la base %s (%v)", path, base, err)
+	}
+	return nil
+}
+
+// copyArchivedDump recopie en flux la sauvegarde de la base vers dest, créé en
+// 0600 sans jamais remplacer un fichier.
+func copyArchivedDump(f *os.File, base, dest string) error {
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	return copyEntryTo(dest, func(w io.Writer) (int64, error) {
+		return archive.CopyEntry(f, "dumps/"+base+".sql", w)
+	})
+}
+
+// copyEntryTo crée dest en 0600, exclusif, et y recopie une entrée d'archive.
+func copyEntryTo(dest string, copy func(io.Writer) (int64, error)) error {
+	out, err := os.OpenFile(dest, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := copy(out); err != nil {
+		_ = out.Close()
+		_ = os.Remove(dest)
+		return err
+	}
+	return out.Close()
 }
 
 func newDBUserAddCommand(app *App) *cobra.Command {

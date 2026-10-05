@@ -45,7 +45,7 @@ func TestUneBaseNonRestaureeNEstPasUnSucces(t *testing.T) {
 	}
 	cmd := &cobra.Command{}
 	cmd.SetContext(context.Background())
-	if ok, err := a.restoreDumps(cmd, path, p, manifest); ok || err != nil {
+	if missing, err := a.restoreDumps(cmd, path, p, manifest); len(missing) != 1 || err != nil {
 		t.Errorf("DÉFAUT : une restauration refusée compte comme réussie :\n%s", out.String())
 	}
 	if !strings.Contains(out.String(), "« all »") {
@@ -81,6 +81,8 @@ func projetAvecBase(t *testing.T, a *App, env naming.Env) *model.Project {
 func TestUneRestaurationDArchiveInterrompueRendLeCode9(t *testing.T) {
 	a, cmd, out := appAnnulee(t)
 	p := projetAvecBase(t, a, naming.EnvProd)
+	p.Spec.Databases = append(p.Spec.Databases, model.Database{Engine: "mysql", Name: "shopfr_z", User: p.ID(),
+		Privileges: "all"})
 	path := filepath.Join(a.Prefix, "archive.tar.zst")
 	w, err := archive.Create(path, archive.Manifest{Project: p.ID()})
 	if err != nil {
@@ -95,8 +97,8 @@ func TestUneRestaurationDArchiveInterrompueRendLeCode9(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ok, err := a.restoreDumps(cmd, path, p, manifest)
-	if ok || ExitCode(err) != CodeCancelled {
+	_, err = a.restoreDumps(cmd, path, p, manifest)
+	if ExitCode(err) != CodeCancelled {
 		t.Errorf("DÉFAUT : une interruption doit remonter en code %d, obtenu %v (%v) :\n%s",
 			CodeCancelled, ExitCode(err), err, out)
 	}

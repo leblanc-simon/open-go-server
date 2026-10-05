@@ -382,8 +382,8 @@ func TestLesAvertissementsDeLaSuppressionNeSontJamaisTus(t *testing.T) {
 			appprov.EnvFileSecret:                          {[]byte("n"), []byte("c")},
 			certSecretPrefix + "shopfr/" + tlsprov.FileKey: {[]byte("n"), []byte("c")},
 		}
-		app.restoreEnvFile(p, secrets)
-		app.restoreCertificates(p, secrets)
+		app.restoreEnvFile(p, "archive", secrets)
+		app.restoreCertificates(p, "archive", secrets)
 		if got := errBuf.String(); strings.Count(got, "⚠ clé maître illisible") != 2 {
 			t.Errorf("quiet=%v format=%s : les deux refus doivent atteindre la sortie d'erreur : %q",
 				app.Quiet, app.Format, got)

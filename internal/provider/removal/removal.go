@@ -11,12 +11,15 @@ package removal
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"leblanc.io/open-go-server/internal/engine"
+	"leblanc.io/open-go-server/internal/exec"
 	"leblanc.io/open-go-server/internal/fs"
 	"leblanc.io/open-go-server/internal/provider/system"
 )
@@ -232,15 +235,13 @@ func (f File) removeStep(summary string) *engine.Step {
 					continue
 				}
 				if err := os.Remove(l); err != nil && !os.IsNotExist(err) {
-					_ = relier(liens)
-					return err
+					return f.rétablir(err, liens)
 				}
 				liens = append(liens, lien{l, cible})
 			}
 		}
 		if err := os.Remove(f.Path); err != nil && !os.IsNotExist(err) {
-			_ = relier(liens)
-			return err
+			return f.rétablir(err, liens)
 		}
 		removed = true
 		return nil
@@ -253,24 +254,85 @@ func (f File) removeStep(summary string) *engine.Step {
 			return nil
 		}
 		if err := fs.WriteAtomic(f.Path, previous, mode, owner); err != nil {
-			return err
+			return f.perdu(err, previous, mode, liens)
 		}
-		return relier(liens)
+		if err := relier(liens); err != nil {
+			return f.horsLigne(err)
+		}
+		return nil
 	}
 	return s
+}
+
+// rétablir rend l'échec d'un retrait, joint à celui du rétablissement des liens
+// déjà retirés s'il a échoué : jeté, il laissait le fichier en place mais
+// désactivé — hors ligne au prochain rechargement du serveur —, sous une erreur
+// qui ne parlait que du retrait. L'étape en échec n'est pas compensée : rien
+// d'autre ne rétablira ces liens.
+func (f File) rétablir(cause error, liens []lien) error {
+	if err := relier(liens); err != nil {
+		return engine.Residual(errors.Join(cause, f.horsLigne(err)))
+	}
+	return cause
+}
+
+// horsLigne dit d'un rétablissement de liens en échec ce qu'il laisse : le
+// fichier présent mais plus activé, et comment le rétablir.
+func (f File) horsLigne(err error) error {
+	var remèdes []string
+	var echec *liensNonRétablis
+	if errors.As(err, &echec) {
+		for _, l := range echec.liens {
+			remèdes = append(remèdes, exec.ShellLine("ln", "-s", "--", l.cible, l.path))
+		}
+	}
+	return fmt.Errorf("%w — %s est en place mais n'est plus activé : hors ligne au prochain rechargement du "+
+		"serveur ; le rétablir : %s", err, f.Path, strings.Join(remèdes, " ; "))
+}
+
+// perdu dit d'une compensation qui n'a pas pu réécrire le fichier ce qu'elle
+// laisse : fichier et liens retirés, donc hors ligne. Les liens ne sont pas
+// rétablis — ils pointeraient dans le vide, ce que nginx tient pour fatal, tout
+// le parc avec lui —, et le contenu relevé à l'application est gardé dans les
+// sauvegardes, faute de quoi rien ne permettrait de le rendre.
+func (f File) perdu(cause error, previous []byte, mode os.FileMode, liens []lien) error {
+	copie, err := fs.BackupDataTo(filepath.Base(f.Path), previous, mode, f.Backups, f.now())
+	var remède string
+	if err != nil {
+		remède = fmt.Sprintf("son contenu n'a pas pu être gardé (%v)", err)
+	} else {
+		remède = "le rétablir : " + exec.ShellLine("cp", "--", copie, f.Path)
+	}
+	for _, l := range liens {
+		remède += " ; " + exec.ShellLine("ln", "-s", "--", l.cible, l.path)
+	}
+	return fmt.Errorf("%s non réécrit : %w — le fichier et ses liens d'activation restent retirés, la "+
+		"ressource est hors ligne ; %s", f.Path, cause, remède)
 }
 
 // relier rétablit des liens retirés. Une compensation en échec arrête tout le
 // déroulage : un lien déjà en place n'est pas une erreur.
 func relier(liens []lien) error {
-	var errs []string
+	echec := &liensNonRétablis{}
 	for _, l := range liens {
 		if err := os.Symlink(l.cible, l.path); err != nil && !os.IsExist(err) {
-			errs = append(errs, err.Error())
+			echec.liens = append(echec.liens, l)
+			echec.errs = append(echec.errs, err.Error())
 		}
 	}
-	if len(errs) > 0 {
-		return fmt.Errorf("liens non rétablis : %s", strings.Join(errs, " ; "))
+	if len(echec.liens) > 0 {
+		return echec
 	}
 	return nil
+}
+
+// liensNonRétablis porte les liens que relier n'a pas pu rétablir, pour que le
+// message dise lesquels et comment.
+type liensNonRétablis struct {
+	liens []lien
+	errs  []string
+}
+
+func (e *liensNonRétablis) Error() string {
+	return "liens non rétablis : " + strings.Join(e.errs, " ; ")
 }

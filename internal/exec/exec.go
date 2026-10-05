@@ -56,6 +56,23 @@ func shellQuote(argv []string) string {
 	return strings.Join(parts, " ")
 }
 
+// ShellLine compose une ligne de commande à afficher, que l'exploitant copiera
+// dans un shell root : un argument sans métacaractère reste nu, lisible ; tout
+// autre est cité comme shellQuote le fait. Un nom venu d'une archive ou d'une
+// déclaration — un fichier de vhost est libre — ne doit jamais faire exécuter
+// autre chose que la commande affichée.
+func ShellLine(argv ...string) string {
+	parts := make([]string, len(argv))
+	for i, a := range argv {
+		if a != "" && strings.Trim(a, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_./:@%+=,-") == "" {
+			parts[i] = a
+			continue
+		}
+		parts[i] = shellQuote([]string{a})
+	}
+	return strings.Join(parts, " ")
+}
+
 // Result porte la sortie d'une commande.
 type Result struct {
 	Stdout   string

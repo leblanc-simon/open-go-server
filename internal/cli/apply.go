@@ -1084,7 +1084,17 @@ func (a *App) reportRollback(report *engine.Report) {
 	if report == nil {
 		return
 	}
-	if report.RolledBack {
+	// « État initial » seulement quand rien ne le dément : une compensation en
+	// échec, ou l'étape en échec elle-même, que rien ne compense, laissant un
+	// changement qu'elle n'a pas pu défaire (D104).
+	residue := report.Residue()
+	switch {
+	case report.RollbackErr != nil:
+		a.warnf("↶ rollback interrompu : le système n'est pas revenu à son état initial.\n")
+	case residue != nil:
+		a.warnf("↶ rollback effectué, sauf l'étape en échec, qui n'a pas pu être défaite : %s — voir son "+
+			"erreur ci-dessus.\n", residue.Step.Summary)
+	case report.RolledBack:
 		a.warnf("↶ rollback effectué : le système est revenu à son état initial.\n")
 	}
 	if report.RollbackErr != nil {

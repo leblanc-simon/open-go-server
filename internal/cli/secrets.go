@@ -6,6 +6,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	appprov "leblanc.io/open-go-server/internal/provider/app"
 	"leblanc.io/open-go-server/internal/provider/monitoring"
 )
 
@@ -92,6 +93,13 @@ func newSecretsShowCommand(app *App) *cobra.Command {
 				return wrap(CodeError, err)
 			}
 			_ = app.Audit.Record(scope, "secret/"+name, "secrets.show", "ok", "")
+			// Le fichier d'environnement gardé par une restauration (D104) est
+			// rendu tel quel, octet pour octet : le remède le redirige vers son
+			// fichier, et un saut de ligne ajouté en ferait un autre fichier.
+			if name == appprov.EnvFileSecret {
+				_, err := app.Out.Write(plain)
+				return wrap(CodeError, err)
+			}
 			fmt.Fprintln(app.Out, string(plain))
 			return nil
 		},

@@ -518,6 +518,13 @@ const envFileHeader = `# Variables d'environnement de l'application %s, lues par
 // doit pas les rendre en clair.
 const EnvFileSecret = "app/envfile"
 
+// EnvFileTemplate est le modèle qu'ogs pose quand le fichier d'environnement
+// manque : un fichier qui lui est identique ne porte rien de l'exploitant, et ne
+// l'emporte jamais sur une copie scellée (D104).
+func EnvFileTemplate(id string) []byte {
+	return []byte(fmt.Sprintf(envFileHeader, id, id))
+}
+
 // CreateEnvFile crée le fichier d'environnement et son répertoire. Il ne remplace
 // jamais un fichier existant (O_EXCL) : un fichier apparu entre l'observation et
 // l'écriture est celui de l'exploitant, et il ne doit pas être vidé.
@@ -549,7 +556,7 @@ func (p *Provider) envFileStep(proj *model.Project, obs Observed) *engine.Step {
 		s := engine.NewStep(resource, engine.Create,
 			fmt.Sprintf("fichier d'environnement %s (vide, %04o root:root)", path, envFileMode))
 		s.Apply = func(context.Context) error {
-			return CreateEnvFile(path, []byte(fmt.Sprintf(envFileHeader, proj.ID(), proj.ID())))
+			return CreateEnvFile(path, EnvFileTemplate(proj.ID()))
 		}
 		s.Compensate = func(context.Context) error { return os.Remove(path) }
 		return s

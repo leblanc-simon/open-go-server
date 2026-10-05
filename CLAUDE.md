@@ -12,8 +12,8 @@ Les commits ne mentionnent jamais l'assistance d'un outil d'IA.
 
 ## La référence
 
-[`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md) fait autorité : 103 décisions d'architecture
-arbitrées (D1–D103, tableau §2), spécification par module, plan de tests, découpage en lots. **Consulter le
+[`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md) fait autorité : 104 décisions d'architecture
+arbitrées (D1–D104, tableau §2), spécification par module, plan de tests, découpage en lots. **Consulter le
 tableau des décisions avant de proposer une architecture** — la plupart des questions « pourquoi pas
 plutôt… ? » y sont déjà tranchées, avec leur raison. Toute décision nouvelle s'y ajoute.
 
@@ -893,6 +893,19 @@ Ils ont tous coûté un défaut réel ; les tests unitaires ne les voyaient pas.
   compteurs juste avant de la retirer sans condition ; seule une file classique est jugée par le broker
   lui-même. Et ce que l'application crée elle-même dans son vhost (Messenger, `auto_setup`) n'est jamais
   retiré : seul ce que la trace `amqp-declared/<vhost>` dit qu'ogs a déclaré l'est (D100).
+- **Une restauration qui ne rend pas tout n'est pas un succès** (D104) : une base non rechargée, un fichier
+  d'environnement non réécrit — un fichier déjà posé là, une autre clé maître — rendaient 0 ou un motif
+  vague, audit « ok ». Chaque manque est nommé avec son remède, code 6, audit « avertissement » ; le fichier
+  d'environnement non écrit reste scellé au keystore (`app/envfile`), et le modèle vide que l'apply pose
+  ensuite ne l'emporte jamais sur cette copie à la suppression suivante — archivé à sa place, il perdait
+  les secrets. Le remède d'une base est `ogs db restore --from-archive`, jamais `tar --zstd` : Debian
+  n'installe pas `zstd`. Toute ligne de commande affichée comme remède cite ses arguments
+  (`exec.ShellLine`) : un nom venu d'une archive se copie en root. Et une assertion d'audit cherche
+  `résultat=<valeur>` : la ligne n'a pas de tabulations, et un test qui y cherchait `\tok\t` ne pouvait
+  jamais échouer.
+- **Un rétablissement de liens en échec se remonte** (D104) : `removal.File` le jetait, et un vhost désactivé
+  restait hors ligne sous une erreur qui ne parlait que du retrait. L'erreur est marquée
+  `engine.ResidualError`, sans quoi `reportRollback` annonçait « revenu à son état initial » au-dessus.
 
 ## Codes de retour
 

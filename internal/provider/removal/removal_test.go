@@ -85,6 +85,9 @@ func TestLaCompensationRendLeFichierSonModeEtSesLiens(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.Links = func() []string { return []string{lien} }
+	// Les sauvegardes vivent hors du répertoire du fichier, comme sous
+	// /var/lib/ogs/backups.
+	f.Backups = filepath.Join(t.TempDir(), "backups")
 	avant, _ := os.ReadFile(path)
 	s, err := f.Step()
 	if err != nil {
@@ -147,5 +150,109 @@ func TestUnFichierIlisibleRendUneErreurDExamen(t *testing.T) {
 	var ie *InspectError
 	if !errors.As(err, &ie) || !errors.Is(err, os.ErrPermission) {
 		t.Errorf("erreur d'examen attendue : %v", err)
+	}
+}
+
+// sansDroits retire l'écriture de dir pour la durée du test. Root écrit
+// partout : le test ne prouverait rien.
+func sansDroits(t *testing.T, dir string) {
+	t.Helper()
+	if os.Geteuid() == 0 {
+		t.Skip("root ignore les droits du répertoire")
+	}
+	if err := os.Chmod(dir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
+}
+
+// Q-10 : un retrait en échec rétablit les liens qu'il a retirés ; l'échec de ce
+// rétablissement était jeté, et l'erreur rendue ne disait que la cause du
+// retrait — le vhost, désactivé, restait hors ligne sans un mot.
+func TestUnRetablissementDesLiensEnEchecEstRemonte(t *testing.T) {
+	f, path := fichier(t)
+	base := t.TempDir()
+	réel := filepath.Join(base, "réel")
+	if err := os.Mkdir(réel, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Le premier lien vit sous un répertoire que désigne le second : retiré en
+	// second, ce dernier emporte l'emplacement où le premier se rétablirait.
+	détour := filepath.Join(base, "actifs")
+	if err := os.Symlink(réel, détour); err != nil {
+		t.Fatal(err)
+	}
+	lien := filepath.Join(détour, "shopfr.conf")
+	if err := os.Symlink(path, lien); err != nil {
+		t.Fatal(err)
+	}
+	f.Links = func() []string { return []string{lien, détour} }
+	s, err := f.Step()
+	if err != nil || s == nil {
+		t.Fatalf("un retrait est attendu : %v", err)
+	}
+	// Le fichier ne peut pas partir : le retrait échoue après celui des liens.
+	sansDroits(t, filepath.Dir(path))
+	err = s.Apply(context.Background())
+	if err == nil {
+		t.Fatal("le retrait devait échouer")
+	}
+	if !errors.Is(err, os.ErrPermission) {
+		t.Errorf("l'erreur d'origine doit être conservée : %v", err)
+	}
+	// L'étape laisse un changement que rien ne défera : le compte rendu du
+	// rollback ne doit pas annoncer l'état initial.
+	if residual := (*engine.ResidualError)(nil); !errors.As(err, &residual) {
+		t.Errorf("l'erreur doit marquer le changement non défait : %T", err)
+	}
+	for _, motif := range []string{"liens non rétablis", "hors ligne", lien, "ln -s -- "} {
+		if !strings.Contains(err.Error(), motif) {
+			t.Errorf("DÉFAUT : l'erreur doit nommer %q :\n%v", motif, err)
+		}
+	}
+}
+
+// La compensation qui ne peut pas réécrire le fichier ne rétablit pas ses liens
+// — ils pointeraient dans le vide, ce que nginx tient pour fatal —, mais elle
+// doit dire que la ressource reste hors ligne, et garder le contenu de quoi la
+// rétablir.
+func TestUneCompensationEnEchecDitQueLaRessourceEstHorsLigne(t *testing.T) {
+	f, path := fichier(t)
+	actifs := t.TempDir()
+	lien := filepath.Join(actifs, "shopfr.conf")
+	if err := os.Symlink(path, lien); err != nil {
+		t.Fatal(err)
+	}
+	f.Links = func() []string { return []string{lien} }
+	// Les sauvegardes vivent hors du répertoire du fichier, comme sous
+	// /var/lib/ogs/backups.
+	f.Backups = filepath.Join(t.TempDir(), "backups")
+	avant, _ := os.ReadFile(path)
+	s, err := f.Step()
+	if err != nil || s == nil {
+		t.Fatalf("un retrait est attendu : %v", err)
+	}
+	if err := s.Apply(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	sansDroits(t, filepath.Dir(path))
+	err = s.Compensate(context.Background())
+	if err == nil {
+		t.Fatal("la compensation devait échouer")
+	}
+	for _, motif := range []string{"hors ligne", path, lien, f.Backups, "cp -- ", "ln -s -- "} {
+		if !strings.Contains(err.Error(), motif) {
+			t.Errorf("DÉFAUT : l'erreur doit nommer %q :\n%v", motif, err)
+		}
+	}
+	if _, lerr := os.Lstat(lien); !os.IsNotExist(lerr) {
+		t.Errorf("aucun lien ne doit être rétabli vers un fichier absent : %v", lerr)
+	}
+	copies, _ := filepath.Glob(filepath.Join(f.Backups, "shopfr.conf*"))
+	if len(copies) != 1 {
+		t.Fatalf("le contenu retiré doit être gardé dans %s : %v", f.Backups, copies)
+	}
+	if got, _ := os.ReadFile(copies[0]); string(got) != string(avant) {
+		t.Errorf("copie gardée : %q", got)
 	}
 }

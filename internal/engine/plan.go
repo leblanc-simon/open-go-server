@@ -171,6 +171,34 @@ func Partial(err error) error {
 	return &PartialError{Err: err}
 }
 
+// ResidualError marque l'échec d'une étape qui laisse derrière elle un
+// changement qu'elle n'a pas pu défaire — un vhost dont les liens d'activation
+// n'ont pas pu être rétablis. Le moteur ne compense jamais l'étape en échec :
+// sans cette marque, le compte rendu annoncerait un retour à l'état initial que
+// l'étape dément (D104).
+type ResidualError struct{ Err error }
+
+func (e *ResidualError) Error() string { return e.Err.Error() }
+func (e *ResidualError) Unwrap() error { return e.Err }
+
+// Residual enveloppe l'erreur d'une étape qui laisse un changement non défait.
+func Residual(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &ResidualError{Err: err}
+}
+
+// Residue rend l'étape en échec qui laisse un changement non défait, ou nil.
+func (r *Report) Residue() *StepOutcome {
+	for i := range r.Outcomes {
+		if residual := (*ResidualError)(nil); r.Outcomes[i].Err != nil && errors.As(r.Outcomes[i].Err, &residual) {
+			return &r.Outcomes[i]
+		}
+	}
+	return nil
+}
+
 // Execute applique le plan en saga : les étapes sont jouées dans l'ordre et,
 // si une étape critique échoue, les étapes déjà appliquées sont compensées en
 // ordre inverse. Une étape non critique en échec produit un avertissement et

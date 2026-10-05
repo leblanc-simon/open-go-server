@@ -1,9 +1,11 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"slices"
@@ -1714,6 +1716,12 @@ func (a *App) archiveProject(cmd *cobra.Command, provs *providers, p *model.Proj
 	// Les secrets restent chiffrés : l'archive n'est pas une porte de sortie.
 	if names, err := a.Store.SecretNames(p.ID()); err == nil {
 		for _, name := range names {
+			// Le fichier d'environnement qu'une restauration n'a pas pu rendre,
+			// resté scellé au keystore, est archivé plus bas avec le fichier en
+			// place (archiveEnvFile).
+			if name == appprov.EnvFileSecret {
+				continue
+			}
 			nonce, ciphertext, err := a.Store.GetSecret(p.ID(), name)
 			if err != nil {
 				continue
@@ -1728,22 +1736,8 @@ func (a *App) archiveProject(cmd *cobra.Command, provs *providers, p *model.Proj
 	if err := a.archiveCertificates(w, provs, p, scope.certs); err != nil {
 		return "", nil, wrap(CodeError, err)
 	}
-	// Le fichier d'environnement, scellé comme les secrets du keystore : il en
-	// porte, et le recopier en clair ferait de l'archive leur porte de sortie.
-	if data, err := os.ReadFile(a.Paths.EnvFile(p.ID())); err == nil {
-		if a.Keys == nil {
-			return "", nil, exitf(CodeError, "clé maître illisible : %s ne peut pas être "+
-				"archivé chiffré", a.Paths.EnvFile(p.ID()))
-		}
-		nonce, ciphertext, err := a.Keys.Seal(p.ID(), appprov.EnvFileSecret, data)
-		if err != nil {
-			return "", nil, wrap(CodeError, err)
-		}
-		if err := w.AddSecret(appprov.EnvFileSecret, nonce, ciphertext); err != nil {
-			return "", nil, wrap(CodeError, err)
-		}
-	} else if !os.IsNotExist(err) {
-		return "", nil, wrap(CodeError, err)
+	if err := a.archiveEnvFile(w, p); err != nil {
+		return "", nil, err
 	}
 	// L'arborescence complète, quand elle est au seul projet.
 	if err := interrupted(cmd.Context()); err != nil {
@@ -1775,6 +1769,64 @@ func (a *App) archiveProject(cmd *cobra.Command, provs *providers, p *model.Proj
 	a.printf("✓ archive créée : %s (%s de données, %d secret(s))\n",
 		path, humanBytes(manifest.Bytes), manifest.Secrets)
 	return path, removed, nil
+}
+
+// envFileKeptSecret porte dans l'archive la copie scellée du fichier
+// d'environnement qu'une restauration n'avait pas pu écrire, quand un fichier
+// écrit depuis l'emporte : elle est scellée sous le nom appprov.EnvFileSecret,
+// sa donnée associée, et retourne au keystore sous ce nom (D104).
+const envFileKeptSecret = "app/envfile.gardé"
+
+// archiveEnvFile scelle le fichier d'environnement dans l'archive : il porte des
+// secrets, et le recopier en clair ferait de l'archive leur porte de sortie.
+//
+// Une restauration qui n'a pas pu l'écrire en a laissé la copie scellée au
+// keystore, et l'apply qui la suivait a posé à sa place le modèle vide d'ogs.
+// Ce modèle ne l'emporte jamais sur la copie : archivé à sa place, il perdait
+// les secrets de l'application à la suppression suivante, sans un mot (D104).
+// Un fichier écrit depuis par l'exploitant l'emporte, et la copie, si elle en
+// diffère, voyage à côté.
+func (a *App) archiveEnvFile(w *archive.Writer, p *model.Project) error {
+	path := a.Paths.EnvFile(p.ID())
+	data, err := os.ReadFile(path)
+	present := err == nil
+	if err != nil && !os.IsNotExist(err) {
+		return wrap(CodeError, err)
+	}
+	var kept [2][]byte
+	if a.Store != nil {
+		if nonce, ciphertext, err := a.Store.GetSecret(p.ID(), appprov.EnvFileSecret); err == nil {
+			kept = [2][]byte{nonce, ciphertext}
+		}
+	}
+	if kept[1] != nil && (!present || bytes.Equal(data, appprov.EnvFileTemplate(p.ID()))) {
+		a.printf("✓ fichier d'environnement : la copie scellée qu'une restauration n'avait pas pu écrire est " +
+			"archivée, le modèle vide d'ogs écarté\n")
+		return wrap(CodeError, w.AddSecret(appprov.EnvFileSecret, kept[0], kept[1]))
+	}
+	if !present {
+		return nil
+	}
+	if a.Keys == nil {
+		return exitf(CodeError, "clé maître illisible : %s ne peut pas être archivé chiffré", path)
+	}
+	nonce, ciphertext, err := a.Keys.Seal(p.ID(), appprov.EnvFileSecret, data)
+	if err != nil {
+		return wrap(CodeError, err)
+	}
+	if err := w.AddSecret(appprov.EnvFileSecret, nonce, ciphertext); err != nil {
+		return wrap(CodeError, err)
+	}
+	if kept[1] != nil {
+		if plain, err := a.Keys.Open(p.ID(), appprov.EnvFileSecret, kept[0], kept[1]); err == nil &&
+			bytes.Equal(plain, data) {
+			return nil
+		}
+		a.printf("= fichier d'environnement : %s, écrit depuis la restauration, est archivé ; la copie scellée "+
+			"qui en diffère voyage à côté, et retournera au keystore\n", path)
+		return wrap(CodeError, w.AddSecret(envFileKeptSecret, kept[0], kept[1]))
+	}
+	return nil
 }
 
 func newRestoreCommand(app *App) *cobra.Command {
@@ -1863,15 +1915,29 @@ func newRestoreCommand(app *App) *cobra.Command {
 				app.printf("= %d preuve(s) de ressources que la déclaration ne nomme plus, non réinjectée(s) : "+
 					"la suppression les avait retirées (D100)\n", skipped)
 			}
-			app.restoreEnvFile(p, secrets)
-			app.restoreCertificates(p, secrets)
+			// Ce que la restauration n'a pas pu rendre, chacun avec son remède : le
+			// projet est en place, il lui manque une partie de ce que l'archive
+			// porte — succès partiel (code 6), jamais « ✓ restauré » ni un audit
+			// « ok » (Q-01).
+			var manques []restoreGap
+			if m := app.restoreEnvFile(p, path, secrets); m != nil {
+				manques = append(manques, *m)
+			}
+			manques = append(manques, app.restoreCertificates(p, path, secrets)...)
 			if len(secrets) > 0 {
 				app.printf("✓ %d secret(s) réinjecté(s)\n", len(secrets))
 				if app.Keys != nil {
 					for name, pair := range secrets {
+						if name == envFileKeptSecret {
+							// Scellée sous le nom du fichier d'environnement.
+							name = appprov.EnvFileSecret
+						}
 						if _, err := app.Keys.Open(p.ID(), name, pair[0], pair[1]); err != nil {
 							app.warnf("⚠ %s est illisible avec la clé maître actuelle : "+
 								"l'archive vient-elle d'un autre serveur ?\n", name)
+							manques = append(manques, restoreGap{
+								fmt.Sprintf("secrets illisibles avec la clé maître actuelle (%s le premier)", name),
+								"rétablir la clé maître d'origine dans " + app.Paths.MasterKey()})
 							break
 						}
 					}
@@ -1881,12 +1947,12 @@ func newRestoreCommand(app *App) *cobra.Command {
 			// Puis l'infrastructure, avant de remettre le contenu. Un succès partiel
 			// — une base indisponible, par exemple — ne doit pas empêcher la
 			// restauration des fichiers : le code est conservé et rendu à la fin.
-			partial := error(nil)
 			if err := app.applyProjects(cmd, []*model.Project{p}); err != nil {
 				if ExitCode(err) != CodePartial {
 					return err
 				}
-				partial = err
+				manques = append(manques, restoreGap{fmt.Sprintf("apply partiel (%v)", err),
+					"reprendre les étapes en échec : ogs apply " + p.ID()})
 			}
 			// L'arborescence vient après l'apply, et c'est voulu : le compte existe
 			// alors, et chaque entrée reçoit son propriétaire sur le descripteur de
@@ -1903,58 +1969,122 @@ func newRestoreCommand(app *App) *cobra.Command {
 			// root comme il l'était.
 			if err := app.restoreTree(path, p, archived, manifest); err != nil {
 				app.warnf("⚠ restauration de l'arborescence : %v\n", err)
-				if partial == nil {
-					partial = exitf(CodePartial, "l'arborescence n'a pas été entièrement restaurée")
-				}
+				manques = append(manques, restoreGap{
+					fmt.Sprintf("arborescence incomplète dans %s (%v)", p.Spec.Layout.Root, err),
+					fmt.Sprintf("l'archive %s en garde la copie, sous tree/", path)})
 			}
 			// Une base non rechargée est un succès partiel : le projet est en place,
 			// sa base vide (D92).
 			if withData {
-				ok, err := app.restoreDumps(cmd, path, p, manifest)
+				missing, err := app.restoreDumps(cmd, path, p, manifest)
 				if err != nil {
 					return err
 				}
-				if !ok && partial == nil {
-					partial = exitf(CodePartial, "une base au moins n'a pas été restaurée")
+				manques = append(manques, missing...)
+			}
+			if len(manques) > 0 {
+				// La sortie d'erreur porte chaque manque avec son remède ; le motif
+				// du code 6 et l'audit les nomment.
+				what := make([]string, len(manques))
+				app.warnf("\n⚠ %s restauré en partie :\n", p.ID())
+				for i, m := range manques {
+					what[i] = m.What
+					app.warnf("  - %s — %s\n", m.What, m.Remedy)
 				}
+				_ = app.Audit.Record(p.ID(), "project", "project.restore", "avertissement",
+					path+" : "+strings.Join(what, " ; "))
+				return exitf(CodePartial, "%s restauré en partie : %s (remèdes ci-dessus)", p.ID(),
+					strings.Join(what, " ; "))
 			}
 			_ = app.Audit.Record(p.ID(), "project", "project.restore", "ok", path)
-			if partial != nil {
-				app.warnf("\n⚠ %s restauré en partie\n", p.ID())
-			} else {
-				app.printf("\n✓ %s restauré\n", p.ID())
-			}
-			return partial
+			app.printf("\n✓ %s restauré\n", p.ID())
+			return nil
 		},
 	}
 	cmd.Flags().BoolVar(&withData, "with-data", true, "recharger les sauvegardes de bases")
 	return cmd
 }
 
-// restoreEnvFile réécrit le fichier d'environnement archivé. Il voyage parmi les
-// secrets, et n'a pas à rester dans le keystore une fois rendu à son fichier.
-func (a *App) restoreEnvFile(p *model.Project, secrets map[string][2][]byte) {
+// restoreEnvFile réécrit le fichier d'environnement archivé, et rend ce qui
+// manque s'il n'a pas pu l'être. Il voyage parmi les secrets, et n'a pas à
+// rester dans le keystore une fois rendu à son fichier ; non rendu, il y est
+// gardé, scellé tel que l'archive le porte : sans quoi il ne serait plus nulle
+// part hors de l'archive, qu'aucune commande ne relit en partie, et le remède
+// ne serait qu'une nouvelle suppression suivie d'une restauration.
+func (a *App) restoreEnvFile(p *model.Project, archivePath string, secrets map[string][2][]byte) *restoreGap {
 	pair, ok := secrets[appprov.EnvFileSecret]
 	if !ok {
-		return
+		a.keepEnvFileCopy(p, secrets)
+		return nil
 	}
 	path := a.Paths.EnvFile(p.ID())
+	// Le remède écrit le fichier en 0600 : une redirection sous l'umask de root
+	// le créerait lisible de tous.
+	show := "(umask 077 && " + exec.ShellLine("ogs", "secrets", "show", p.ID(), appprov.EnvFileSecret) +
+		" > " + exec.ShellLine(path) + ")"
+	keep := func(motif, remède string) *restoreGap {
+		a.warnf("⚠ %s : %s n'est pas restauré\n", motif, path)
+		err := errors.New("keystore indisponible")
+		if a.Store != nil {
+			err = a.Store.PutSecret(p.ID(), appprov.EnvFileSecret, pair[0], pair[1])
+		}
+		if err != nil {
+			a.warnf("⚠ %s : contenu non gardé au keystore (%v)\n", path, err)
+			return &restoreGap{fmt.Sprintf("fichier d'environnement %s non restauré (%s)", path, motif),
+				fmt.Sprintf("l'archive %s seule le garde, scellé", archivePath)}
+		}
+		if _, ok := secrets[envFileKeptSecret]; ok {
+			a.warnf("⚠ %s : la copie plus ancienne que l'archive portait aussi n'est pas gardée au keystore — "+
+				"l'archive %s la garde\n", path, archivePath)
+		}
+		return &restoreGap{fmt.Sprintf("fichier d'environnement %s non restauré (%s)", path, motif),
+			"son contenu reste scellé au keystore ; " + remède}
+	}
 	if a.Keys == nil {
-		a.warnf("⚠ clé maître illisible : %s n'est pas restauré\n", path)
-		return
+		return keep("clé maître illisible", fmt.Sprintf("rétablir la clé maître %s, puis %s",
+			a.Paths.MasterKey(), show))
 	}
 	data, err := a.Keys.Open(p.ID(), appprov.EnvFileSecret, pair[0], pair[1])
 	if err != nil {
-		a.warnf("⚠ %s illisible avec la clé maître actuelle : non restauré\n", path)
-		return
+		return keep("illisible avec la clé maître actuelle", fmt.Sprintf("rétablir la clé maître "+
+			"d'origine dans %s, puis %s", a.Paths.MasterKey(), show))
+	}
+	// Le modèle vide d'ogs ne porte rien de l'exploitant : la copie archivée le
+	// remplace (D104). Tout autre fichier en place est conservé.
+	if info, err := os.Lstat(path); err == nil && info.Mode().IsRegular() {
+		if cur, err := os.ReadFile(path); err == nil && bytes.Equal(cur, appprov.EnvFileTemplate(p.ID())) {
+			_ = os.Remove(path)
+		}
 	}
 	if err := appprov.CreateEnvFile(path, data); err != nil {
-		a.warnf("⚠ restauration de %s : %v\n", path, err)
-		return
+		return keep(err.Error(), fmt.Sprintf("le fichier en place est conservé ; le comparer au "+
+			"contenu archivé (%s), puis le remplacer s'il y a lieu : %s",
+			exec.ShellLine("ogs", "secrets", "show", p.ID(), appprov.EnvFileSecret), show))
 	}
 	_ = a.Store.DeleteSecret(p.ID(), appprov.EnvFileSecret)
 	a.printf("✓ fichier d'environnement restauré : %s\n", path)
+	a.keepEnvFileCopy(p, secrets)
+	return nil
 }
+
+// keepEnvFileCopy rend au keystore la copie scellée qu'une restauration
+// antérieure n'avait pas pu écrire, et qu'un fichier écrit depuis a supplantée
+// (archiveEnvFile) : rien de ce qu'elle porte n'est perdu.
+func (a *App) keepEnvFileCopy(p *model.Project, secrets map[string][2][]byte) {
+	pair, ok := secrets[envFileKeptSecret]
+	if !ok || a.Store == nil {
+		return
+	}
+	if err := a.Store.PutSecret(p.ID(), appprov.EnvFileSecret, pair[0], pair[1]); err != nil {
+		a.warnf("⚠ copie antérieure du fichier d'environnement non gardée au keystore : %v\n", err)
+		return
+	}
+	a.printf("= une copie antérieure du fichier d'environnement reste scellée au keystore : %s\n",
+		exec.ShellLine("ogs", "secrets", "show", p.ID(), appprov.EnvFileSecret))
+}
+
+// restoreGap est ce qu'une restauration n'a pas pu rendre, et le remède.
+type restoreGap struct{ What, Remedy string }
 
 // restoreTree remet l'arborescence archivée dans le home, chaque entrée au nom
 // que system.Provider.RestoredOwner lui donne — à l'utilisateur ce qui était à
@@ -1990,66 +2120,94 @@ func (a *App) restoreTree(path string, p *model.Project, archived []model.Dir, m
 	return err
 }
 
-// restoreDumps recharge les sauvegardes présentes dans l'archive, et rend faux
-// si l'une d'elles n'a pas pu l'être. Une interruption arrête tout et remonte en
-// code 9 : les bases suivantes ne sont pas rechargées.
-func (a *App) restoreDumps(cmd *cobra.Command, path string, p *model.Project, manifest archive.Manifest) (bool, error) {
-	provs, err := a.buildProviders()
-	if err != nil {
-		a.warnf("⚠ %v\n", err)
-		return false, nil
+// restoreDumps recharge les sauvegardes présentes dans l'archive, et rend, pour
+// chacune qui n'a pas pu l'être, ce qui manque et le remède. Une interruption
+// arrête tout et remonte en code 9 : les bases suivantes ne sont pas rechargées.
+func (a *App) restoreDumps(cmd *cobra.Command, path string, p *model.Project, manifest archive.Manifest) ([]restoreGap, error) {
+	var missing []restoreGap
+	// Chaque sauvegarde est d'abord rapportée à une base déclarée : le nom vient
+	// du manifeste, que rien n'a validé, et il ne compose de remède — une ligne
+	// que l'exploitant copiera en root — que s'il désigne une base de la
+	// déclaration. Le remède recharge la sauvegarde que l'archive garde, par ogs
+	// lui-même, sous le même confinement (D92) : ni tar ni zstd, que Debian
+	// n'installe pas.
+	type dump struct {
+		entry string
+		decl  *model.Database
 	}
-	defer provs.close()
-	dir, err := a.dumpWorkDir()
-	if err != nil {
-		a.warnf("⚠ %v\n", err)
-		return false, nil
-	}
-	ok := true
-	defer os.RemoveAll(dir)
+	var dumps []dump
 	for _, entry := range manifest.Entries {
 		if entry.Kind != "dump" {
-			continue
-		}
-		data, err := archive.ReadFile(path, entry.Name)
-		if err != nil {
-			a.warnf("⚠ %s : %v\n", entry.Name, err)
-			ok = false
-			continue
-		}
-		tmp := filepath.Join(dir, filepath.Base(entry.Name))
-		if err := os.WriteFile(tmp, data, 0o600); err != nil {
-			a.warnf("⚠ %s : %v\n", entry.Name, err)
-			ok = false
 			continue
 		}
 		name := strings.TrimSuffix(filepath.Base(entry.Name), ".sql")
 		var decl *model.Database
 		for i := range p.Spec.Databases {
-			if p.Spec.Databases[i].Name == name {
+			if p.Spec.Databases[i].Name == name && entry.Name == "dumps/"+name+".sql" {
 				decl = &p.Spec.Databases[i]
 			}
 		}
 		if decl == nil {
-			a.warnf("⚠ aucune base %s déclarée : sauvegarde ignorée\n", name)
-			_ = os.Remove(tmp)
-			ok = false
+			a.warnf("⚠ aucune base déclarée pour la sauvegarde %q : ignorée\n", entry.Name)
+			missing = append(missing, restoreGap{
+				fmt.Sprintf("sauvegarde %q ignorée : la déclaration ne nomme pas cette base", entry.Name),
+				"la déclarer, puis : " + exec.ShellLine("ogs", "db", "restore", p.ID(), name, "--from-archive", path)})
 			continue
 		}
-		if err := provs.DB.Restore(cmd.Context(), p, *decl, tmp); errors.Is(err, context.Canceled) ||
+		dumps = append(dumps, dump{entry.Name, decl})
+	}
+	manque := func(d dump, motif string) {
+		missing = append(missing, restoreGap{fmt.Sprintf("base %s non rechargée (%s)", d.decl.Name, motif),
+			"la recharger depuis l'archive : " + exec.ShellLine("ogs", "db", "restore", p.ID(), d.decl.Name,
+				"--from-archive", path)})
+	}
+	if len(dumps) == 0 {
+		return missing, nil
+	}
+	tous := func(motif string) []restoreGap {
+		for _, d := range dumps {
+			manque(d, motif)
+		}
+		return missing
+	}
+	provs, err := a.buildProviders()
+	if err != nil {
+		a.warnf("⚠ %v\n", err)
+		return tous(err.Error()), nil
+	}
+	defer provs.close()
+	dir, err := a.dumpWorkDir()
+	if err != nil {
+		a.warnf("⚠ %v\n", err)
+		return tous(err.Error()), nil
+	}
+	defer os.RemoveAll(dir)
+	for _, d := range dumps {
+		name := d.decl.Name
+		// En flux, sans passer en entier par la mémoire : une sauvegarde pèse ce
+		// que pèse la base.
+		tmp := filepath.Join(dir, name+".sql")
+		if err := copyEntryTo(tmp, func(w io.Writer) (int64, error) {
+			return archive.CopyFile(path, d.entry, w)
+		}); err != nil {
+			a.warnf("⚠ %s : %v\n", d.entry, err)
+			manque(d, err.Error())
+			continue
+		}
+		if err := provs.DB.Restore(cmd.Context(), p, *d.decl, tmp); errors.Is(err, context.Canceled) ||
 			errors.Is(err, context.DeadlineExceeded) {
 			_ = os.Remove(tmp)
-			return false, exitf(CodeCancelled, "restauration interrompue à la demande — la base %s n'est que "+
+			return missing, exitf(CodeCancelled, "restauration interrompue à la demande — la base %s n'est que "+
 				"partiellement chargée : %v", name, err)
 		} else if err != nil {
 			a.warnf("⚠ restauration de %s : %v\n", name, err)
-			ok = false
+			manque(d, err.Error())
 		} else {
 			a.printf("✓ base %s restaurée\n", name)
 		}
 		_ = os.Remove(tmp)
 	}
-	return ok, nil
+	return missing, nil
 }
 
 func newArchiveListCommand(app *App) *cobra.Command {

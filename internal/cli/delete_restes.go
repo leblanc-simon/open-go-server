@@ -141,8 +141,10 @@ func (a *App) removeCertificates(provs *providers, names []string, removed *[]st
 // l'apply : le vhost les présente d'emblée, et aucune émission n'est demandée
 // pour un certificat encore valable. Un certificat déjà présent — émis depuis —
 // n'est jamais remplacé.
-func (a *App) restoreCertificates(p *model.Project, secrets map[string][2][]byte) {
+func (a *App) restoreCertificates(p *model.Project, archivePath string, secrets map[string][2][]byte) []restoreGap {
+	var missing []restoreGap
 	files := map[string]map[string][]byte{}
+	unreadable := map[string]bool{}
 	for name, pair := range secrets {
 		rest, ok := strings.CutPrefix(name, certSecretPrefix)
 		if !ok {
@@ -158,17 +160,31 @@ func (a *App) restoreCertificates(p *model.Project, secrets map[string][2][]byte
 		}
 		if a.Keys == nil {
 			a.warnf("⚠ clé maître illisible : le certificat %s n'est pas restauré\n", cert)
-			return
+			return append(missing, restoreGap{"certificats non restaurés (clé maître illisible)",
+				fmt.Sprintf("l'apply en émet de nouveaux ; ceux de l'archive %s demandent la clé maître "+
+					"d'origine", archivePath)})
 		}
 		data, err := a.Keys.Open(p.ID(), name, pair[0], pair[1])
+		if err != nil && unreadable[cert] {
+			continue
+		}
 		if err != nil {
+			// Une fois par certificat, non par fichier : ses trois fichiers sont
+			// scellés sous la même clé.
+			unreadable[cert] = true
 			a.warnf("⚠ certificat %s illisible avec la clé maître actuelle : non restauré\n", cert)
+			missing = append(missing, restoreGap{
+				fmt.Sprintf("certificat %s non restauré (illisible avec la clé maître actuelle)", cert),
+				"l'apply en émet un nouveau, sinon : ogs cert renew " + p.ID()})
 			continue
 		}
 		if files[cert] == nil {
 			files[cert] = map[string][]byte{}
 		}
 		files[cert][file] = data
+	}
+	for cert := range unreadable {
+		delete(files, cert)
 	}
 	store := tlsprov.Store{Paths: a.Paths}
 	for cert, content := range files {
@@ -183,17 +199,20 @@ func (a *App) restoreCertificates(p *model.Project, secrets map[string][2][]byte
 		}
 		if err := store.Write(cert, m); err != nil {
 			a.warnf("⚠ restauration du certificat %s : %v\n", cert, err)
+			missing = append(missing, restoreGap{fmt.Sprintf("certificat %s non restauré (%v)", cert, err),
+				"l'apply en émet un nouveau, sinon : ogs cert renew " + p.ID()})
 			continue
 		}
 		a.printf("✓ certificat restauré : %s\n", cert)
 	}
+	return missing
 }
 
 // keystoreSecret dit si un secret de l'archive va au keystore à la
 // restauration : le fichier d'environnement et les certificats ont leur
 // emplacement propre.
 func keystoreSecret(name string) bool {
-	return name != appprov.EnvFileSecret && !strings.HasPrefix(name, certSecretPrefix)
+	return name != appprov.EnvFileSecret && name != envFileKeptSecret && !strings.HasPrefix(name, certSecretPrefix)
 }
 
 // restorableSecret dit si un secret de l'archive retourne au keystore du projet

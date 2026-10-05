@@ -219,3 +219,13 @@ func TestLAnnulationGardeLeCodeDeSortie(t *testing.T) {
 		t.Errorf("code de sortie %d, attendu %d", res.ExitCode, ee.ExitCode())
 	}
 }
+
+// ShellLine cite ce qui le demande, et seulement cela : un nom d'archive ou de
+// vhost fabriqué ne doit rien faire exécuter de plus à qui copie le remède.
+func TestShellLineCiteLesMetacaracteres(t *testing.T) {
+	got := ShellLine("ogs", "db", "restore", "shopfr", "x;rm -rf /", "/var/lib/ogs/a b.tar.zst", "l'x", "")
+	want := `ogs db restore shopfr 'x;rm -rf /' '/var/lib/ogs/a b.tar.zst' 'l'\''x' ''`
+	if got != want {
+		t.Errorf("ShellLine : %s, attendu %s", got, want)
+	}
+}
