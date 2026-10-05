@@ -263,3 +263,37 @@ func TestLaRestaurationDUneArchiveACLEstRefuseeAvantToutDepot(t *testing.T) {
 		t.Error("rien ne doit être déposé")
 	}
 }
+
+func TestLaRestaurationNommeLesTachesDuCompteQuElleNeReposePas(t *testing.T) {
+	// L'archive porte la crontab et les tâches at du compte (D107), que la
+	// restauration ne repose pas : un manque comme un autre, code 6, jamais
+	// « ✓ restauré » (D104).
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("site", "create", "shop.fr", "--kind", "static", "--tls=false", "--yes")
+	h.compteDuProjet(t, "www-data", func(r *exec.Recorder) {
+		r.Responses["crontab -l"] = exec.Result{Stdout: "*/5 * * * * /home/shop.fr/tache.sh\n"}
+		r.Responses["atq"] = exec.Result{Stdout: "7\tThu Oct  2 10:00:00 2026 a shopfr\n"}
+		r.Responses["at -c"] = exec.Result{Stdout: "#!/bin/sh\necho sept\n"}
+	})
+	h.mustRun("project", "delete", "shopfr", "--yes")
+	for _, f := range []string{"passwd", "group"} {
+		if err := os.WriteFile(h.path("etc", f), nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	path := h.seuleArchive(t)
+	out, code := h.run("project", "restore", path, "--yes")
+	if code != CodePartial {
+		t.Fatalf("code %d, %d attendu :\n%s", code, CodePartial, out)
+	}
+	for _, motif := range []string{"crontab personnelle de shopfr non reposée", "crontab -u shopfr <fichier>",
+		"tâches at 7 de shopfr non reposées"} {
+		if !strings.Contains(out, motif) {
+			t.Errorf("la sortie doit nommer %q :\n%s", motif, out)
+		}
+	}
+	if strings.Contains(out, "✓ shopfr restauré") {
+		t.Errorf("une restauration partielle ne s'annonce pas restaurée :\n%s", out)
+	}
+}

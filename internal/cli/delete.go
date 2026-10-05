@@ -2106,6 +2106,10 @@ func newRestoreCommand(app *App) *cobra.Command {
 				}
 				manques = append(manques, missing...)
 			}
+			// La crontab et les tâches at du compte ne sont pas reposées (D107) :
+			// l'archive les porte, la restauration ne les rend pas — un manque
+			// comme un autre (D104).
+			manques = append(manques, restoreUserJobs(path, p, manifest)...)
 			if len(manques) > 0 {
 				// La sortie d'erreur porte chaque manque avec son remède ; le motif
 				// du code 6 et l'audit les nomment.
@@ -2513,4 +2517,38 @@ func archiveUserJobs(w *archive.Writer, j system.UserJobs) error {
 		}
 	}
 	return nil
+}
+
+// restoreUserJobs nomme ce que l'archive porte sous user/ et que la
+// restauration ne repose pas (D107) : la crontab personnelle et les tâches at
+// du compte. Les reposer d'office rendrait au compte recréé des tâches que
+// personne n'a relues ; ne pas les nommer ferait annoncer « ✓ restauré » d'un
+// projet dont les tâches ne tournent plus (D104). Les noms viennent du
+// manifeste, que rien n'a validé : seul un numéro de tâche est repris.
+func restoreUserJobs(path string, p *model.Project, manifest archive.Manifest) []restoreGap {
+	var gaps []restoreGap
+	var ids []string
+	account := p.Spec.User.Name
+	for _, e := range manifest.Entries {
+		if e.Kind != "user" {
+			continue
+		}
+		if e.Name == "user/crontab" {
+			gaps = append(gaps, restoreGap{
+				fmt.Sprintf("crontab personnelle de %s non reposée", account),
+				fmt.Sprintf("l'archive %s en garde la copie, sous user/crontab ; la relire, puis : %s", path,
+					exec.ShellLine("crontab", "-u", account)+" <fichier>")})
+			continue
+		}
+		if id, ok := strings.CutPrefix(e.Name, "user/at/"); ok && id != "" &&
+			strings.Trim(id, "0123456789") == "" {
+			ids = append(ids, id)
+		}
+	}
+	if len(ids) > 0 {
+		gaps = append(gaps, restoreGap{
+			fmt.Sprintf("tâches at %s de %s non reposées", strings.Join(ids, ", "), account),
+			fmt.Sprintf("l'archive %s en garde les scripts, sous user/at/ ; les reprogrammer à la main", path)})
+	}
+	return gaps
 }
