@@ -150,7 +150,10 @@ projets visés : `apply blogfr` ou `plan -f` comparaient le projet à lui-même,
 voisin entraient sans un mot. Seuls y comptent les conflits qui touchent un projet visé
 (`validate.UniquenessFor`), et **tout chemin d'apply ou de déclaration** l'appelle — la TUI l'oubliait. Le nom
 d'un certificat est un nom de répertoire, unique dans le parc, et l'identifiant de chaque projet y est
-réservé : c'est celui de son certificat implicite. **Ce que `validate.Project` refuse arrête le parc entier**
+réservé : c'est celui de son certificat implicite. Une clé d'unicité se calcule sur **tout ce que le provider
+écrit ou sert**, jamais sur une partie de la déclaration (D106) : les domaines des vhosts déclarés comme
+ceux de `spec.domains`, le répertoire de surcharge (nom du vhost) comme le fichier, `mariadb` comme
+`mysql` — chacune de ces omissions laissait un projet prendre la ressource d'un voisin. **Ce que `validate.Project` refuse arrête le parc entier**
 — il suit chaque chargement, donc `cert renew --all`, `status` et le recalcul du parc à la suppression d'un
 voisin : une règle neuve qui rendrait invalide une déclaration jusque-là acceptée se porte au plan et à
 l'apply du projet visé (`checkFleetUniqueness`) et à `doctor`, jamais au chargement.

@@ -133,9 +133,17 @@ func (p *Provider) Observe(_ context.Context, proj *model.Project) (Observed, er
 		}
 		return obs, err
 	}
+	// Les domaines servis sont ceux de spec.domains et ceux des vhosts, que rien
+	// n'oblige à y figurer (R4-02, D106) ; les noms se comparent sans casse ni
+	// point final, comme le moteur les compare (canonicalName).
 	ownDomains := map[string]bool{}
 	for _, d := range proj.Spec.Domains {
-		ownDomains[d.Name] = true
+		ownDomains[canonicalName(d.Name)] = true
+	}
+	for _, vh := range p.vhosts(proj) {
+		for _, d := range vh.Domains {
+			ownDomains[canonicalName(d)] = true
+		}
 	}
 	for _, e := range entries {
 		if e.IsDir() {
@@ -161,7 +169,7 @@ func (p *Provider) Observe(_ context.Context, proj *model.Project) (Observed, er
 			continue
 		}
 		for _, name := range serverNames(string(data)) {
-			if ownDomains[name] {
+			if name = canonicalName(name); ownDomains[name] {
 				obs.Conflicts[name] = path
 			}
 		}
@@ -175,20 +183,34 @@ func (p *Provider) Observe(_ context.Context, proj *model.Project) (Observed, er
 func serverNames(content string) []string {
 	var out []string
 	for _, line := range strings.Split(content, "\n") {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "#") {
+		// Un commentaire peut suivre la directive (« server_name a.fr; # ancien
+		// b.fr ») : ce qui le suit n'est pas servi. Le « ; » clôt la directive
+		// nginx.
+		if i := strings.Index(line, "#"); i >= 0 {
+			line = line[:i]
+		}
+		if i := strings.Index(line, ";"); i >= 0 {
+			line = line[:i]
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
 			continue
 		}
-		lower := strings.ToLower(line)
-		switch {
-		case strings.HasPrefix(lower, "servername "), strings.HasPrefix(lower, "serveralias "):
-			out = append(out, strings.Fields(line)[1:]...)
-		case strings.HasPrefix(lower, "server_name "):
-			fields := strings.Fields(strings.TrimSuffix(line, ";"))
+		switch strings.ToLower(fields[0]) {
+		case "servername", "serveralias", "server_name":
 			out = append(out, fields[1:]...)
 		}
 	}
 	return out
+}
+
+// canonicalName ramène un nom servi à la forme que le moteur compare : sans
+// casse ni point final. Le préfixe « www. » est gardé, à la différence de la
+// clé d'unicité du parc (naming.NormalizeHost) : une configuration étrangère
+// qui sert www.shop.fr ne reçoit pas les requêtes de shop.fr, et la refuser
+// bloquerait un plan sans détournement.
+func canonicalName(name string) string {
+	return strings.TrimSuffix(strings.ToLower(strings.TrimSpace(name)), ".")
 }
 
 // vhosts renvoie les vhosts déclarés, ou ceux déduits du projet

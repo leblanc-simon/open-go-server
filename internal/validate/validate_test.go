@@ -853,3 +853,91 @@ func TestUnicitéDesNomsDeCertificat(t *testing.T) {
 		t.Fatalf("chacun son certificat : %v", err)
 	}
 }
+
+// Un vhost déclaré sert ses propres domaines, que spec.domains ne liste pas
+// forcément : la clé « domaine » ne lisait que ces derniers, et blogfr pouvait
+// servir shop.fr par spec.web.vhosts — le voisin détourné, puis refusé à son
+// propre apply sur le vhost de l'autre (R4-02).
+func TestUnicitéLitLesDomainesDesVhostsDéclarés(t *testing.T) {
+	shop := newProject(t, "shop.fr", naming.EnvProd, model.KindStatic)
+	blog := newProject(t, "blog.fr", naming.EnvProd, model.KindStatic)
+	blog.Spec.Web.VHosts = []model.VHost{
+		{Name: model.MainPoolName, Domains: []string{"blog.fr"}},
+		{Name: "promo", Domains: []string{"Shop.fr."}},
+	}
+	err := UniquenessFor([]*model.Project{shop, blog}, "preprod-pp.net", "blogfr")
+	if err == nil || !strings.Contains(err.Error(), `"shop.fr" est déjà utilisé par le projet "shopfr"`) {
+		t.Fatalf("le domaine d'un vhost déclaré doit entrer dans le contrôle : %v", err)
+	}
+	// Un même domaine dans spec.domains et dans un vhost du même projet n'est
+	// pas un conflit.
+	blog.Spec.Web.VHosts[1].Domains = []string{"www.blog.fr"}
+	if err := Uniqueness([]*model.Project{shop, blog}, "preprod-pp.net"); err != nil {
+		t.Errorf("un projet ne peut pas entrer en conflit avec lui-même : %v", err)
+	}
+}
+
+// Le répertoire de surcharge d'un vhost porte son nom, non celui de son
+// fichier : un vhost adopté « shopfr », écrit dans le fichier nginx « shopfr »
+// sans extension, et le projet shopfr, écrit dans shopfr.conf, n'ont aucun
+// fichier commun mais partagent /etc/nginx/projects/shopfr/ — les surcharges de
+// l'un s'appliquaient au site de l'autre (R3N-05).
+func TestUnicitéDétecteUnRépertoireDeSurchargePartagé(t *testing.T) {
+	adopté := newProject(t, "shop-fr.com", naming.EnvProd, model.KindStatic)
+	adopté.Metadata.Labels = map[string]string{"adopted": "true"}
+	adopté.Spec.Web.VHosts = []model.VHost{{Name: "shopfr", File: "shopfr", Domains: []string{"shop-fr.com"}}}
+	shop := newProject(t, "shop.fr", naming.EnvProd, model.KindStatic)
+	err := UniquenessFor([]*model.Project{adopté, shop}, "preprod-pp.net", "shopfr")
+	if err == nil || !strings.Contains(err.Error(), "répertoire de surcharge") ||
+		!strings.Contains(err.Error(), `"shopfrcom"`) || !strings.Contains(err.Error(), "spec.web.vhosts[].name") {
+		t.Fatalf("le répertoire de surcharge partagé doit être refusé : %v", err)
+	}
+	// Un fichier commun est déjà nommé comme tel : le répertoire, qui en découle,
+	// n'ajoute pas un second refus pour la même collision.
+	adopté.Spec.Web.VHosts[0].File = "shopfr.conf"
+	err = Uniqueness([]*model.Project{adopté, shop}, "preprod-pp.net")
+	if err == nil || !strings.Contains(err.Error(), "fichier de vhost") ||
+		strings.Contains(err.Error(), "répertoire de surcharge") {
+		t.Errorf("un fichier commun doit être nommé une seule fois, comme fichier : %v", err)
+	}
+}
+
+// MySQL et MariaDB sont un même serveur pour ogs : le provider les administre
+// par le même client et le même socket. Les clés « mysql:x » et « mariadb:x »
+// laissaient un projet déclarer la base et le compte d'un voisin (R1-23).
+func TestUnicitéConfondMySQLEtMariaDB(t *testing.T) {
+	shop := newProject(t, "shop.fr", naming.EnvProd, model.KindStatic)
+	shop.Spec.Databases = []model.Database{{Engine: "mysql", Name: "shopfr", User: "shopfr"}}
+	blog := newProject(t, "blog.fr", naming.EnvProd, model.KindStatic)
+	blog.Spec.Databases = []model.Database{{Engine: "mariadb", Name: "shopfr", User: "blogfr",
+		ExtraUsers: []model.DBUser{{User: "shopfr"}}}}
+	err := UniquenessFor([]*model.Project{shop, blog}, "preprod-pp.net", "blogfr")
+	if err == nil || !strings.Contains(err.Error(), "base de données") ||
+		!strings.Contains(err.Error(), "utilisateur de base") {
+		t.Fatalf("une base et un compte MariaDB homonymes d'un voisin MySQL doivent être refusés : %v", err)
+	}
+	// PostgreSQL reste un autre moteur.
+	blog.Spec.Databases = []model.Database{{Engine: "postgres", Name: "shopfr", User: "shopfr"}}
+	if err := Uniqueness([]*model.Project{shop, blog}, "preprod-pp.net"); err != nil {
+		t.Errorf("deux moteurs distincts doivent cohabiter : %v", err)
+	}
+}
+
+// Le refus d'un domaine nomme le nom déclaré quand sa forme canonique en
+// diffère : « www.shop.fr » refusé sous la seule clé « shop.fr » égarait.
+func TestUnicitéNommeLeDomaineDéclaré(t *testing.T) {
+	shop := newProject(t, "shop.fr", naming.EnvProd, model.KindStatic)
+	blog := newProject(t, "blog.fr", naming.EnvProd, model.KindStatic)
+	blog.Spec.Web.VHosts = []model.VHost{
+		{Name: model.MainPoolName, Domains: []string{"blog.fr"}},
+		{Name: "promo", Domains: []string{"WWW.Shop.fr"}},
+	}
+	err := Uniqueness([]*model.Project{shop, blog}, "preprod-pp.net")
+	if err == nil || !strings.Contains(err.Error(), `(demandé par "blogfr" pour "WWW.Shop.fr")`) {
+		t.Fatalf("le refus doit nommer le domaine déclaré : %v", err)
+	}
+	blog.Spec.Web.VHosts[1].Domains = []string{"shop.fr"}
+	if err := Uniqueness([]*model.Project{shop, blog}, "preprod-pp.net"); err == nil || strings.Contains(err.Error(), " pour ") {
+		t.Errorf("un nom déjà canonique n'est pas répété : %v", err)
+	}
+}

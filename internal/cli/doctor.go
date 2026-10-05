@@ -125,6 +125,31 @@ func certificateDeclarationChecks(projects []*model.Project, add func(name, stat
 	}
 }
 
+// fleetUniquenessChecks nomme les conflits d'unicité que porte déjà le parc
+// (D94, D106) : plan et apply les refusent au projet visé, en code 4, mais le
+// chargement les tolère — une déclaration écrite avant une règle neuve ne doit
+// pas arrêter le renouvellement des certificats de tout le parc. Sans doctor,
+// rien ne les dirait avant l'apply suivant.
+func fleetUniquenessChecks(projects []*model.Project, prepDomain string, add func(name, status, detail, fix string)) {
+	err := validate.Uniqueness(projects, prepDomain)
+	if err == nil {
+		add("unicité du parc", "ok", "aucun conflit entre projets", "")
+		return
+	}
+	for _, line := range strings.Split(err.Error(), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		fix := "corriger la déclaration de l'un des deux projets ; plan et apply de chacun le refusent"
+		if strings.HasPrefix(line, "répertoire de surcharge :") {
+			fix = "renommer le vhost de l'un des deux projets (spec.web.vhosts[].name) et déplacer ses " +
+				"surcharges sous le nouveau nom : l'ancien répertoire reste sinon orphelin, ses fichiers ignorés"
+		}
+		add("unicité du parc", "échec", line, fix)
+	}
+}
+
 // cronLegacyChecks nomme les tâches dont un nom nu n'est résolu dans le
 // répertoire de travail que par compatibilité (D101) : l'apply le dit aussi, par
 // une étape non critique, mais une tâche ne se relit pas à chaque apply.
@@ -653,6 +678,7 @@ func (a *App) runChecks(ctx context.Context) []check {
 	}
 	add("projets", "ok", fmt.Sprintf("%d déclaré(s)", len(projects)), "")
 	certificateDeclarationChecks(projects, add)
+	fleetUniquenessChecks(projects, a.Cfg.PrepDomain(), add)
 
 	// .htaccess sous Apache : ogs ne les active plus (AllowOverride None, D99) et
 	// porte lui-même les règles de base. Ce qu'un .htaccess ajoute est ignoré.

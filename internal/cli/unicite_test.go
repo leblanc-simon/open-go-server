@@ -363,3 +363,113 @@ func TestDoctorNommeLesCertificatsACorriger(t *testing.T) {
 		t.Errorf("doctor doit nommer le nom refusé et le doublon : %q", lignes)
 	}
 }
+
+// retoucher remplace une fois un fragment de la déclaration d'un projet, à la
+// main, comme le ferait un exploitant qui édite le YAML.
+func (h *harness) retoucher(t *testing.T, id, avant, apres string) {
+	t.Helper()
+	decl := filepath.Join("etc", "ogs", "projects", id+".yaml")
+	contenu := h.read(t, decl)
+	nouveau := strings.Replace(contenu, avant, apres, 1)
+	if nouveau == contenu {
+		t.Fatalf("%q absent de %s :\n%s", avant, decl, contenu)
+	}
+	if err := os.WriteFile(h.path(decl), []byte(nouveau), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Les trois clés du lot Y7 — moteur MySQL/MariaDB confondu, domaines des vhosts
+// déclarés, répertoire de surcharge — s'éprouvent au plan et à l'apply du projet
+// visé, jamais au chargement : une déclaration ancienne déjà en conflit laisse
+// status et le renouvellement du parc tourner, et doctor la nomme.
+func TestUnicitéY7AuPlanJamaisAuChargement(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("project", "create", "shop.fr", "--kind", "php-symfony", "--db", "mysql")
+	h.mustRun("project", "create", "blog.fr", "--kind", "php-symfony", "--db", "mariadb")
+	h.mustRun("project", "create", "news.fr", "--kind", "static")
+	h.mustRun("project", "create", "cc.fr", "--kind", "static")
+
+	// R1-23 : la base et le compte de shopfr, déclarés sous « mariadb ».
+	h.retoucher(t, "blogfr", "      name: blogfr\n      user: blogfr\n", "      name: shopfr\n      user: shopfr\n")
+	// R4-02 : un vhost déclaré qui sert le domaine d'un voisin.
+	h.retoucher(t, "newsfr", "spec:\n", "spec:\n  web:\n    vhosts:\n      - name: main\n        domains: [news.fr]\n"+
+		"      - name: promo\n        domains: [cc.fr]\n")
+
+	for _, cas := range []struct{ id, attendu string }{
+		{"blogfr", "base de données"},
+		{"newsfr", `"cc.fr" est déjà utilisé par le projet "ccfr"`},
+	} {
+		for _, args := range [][]string{{"plan", cas.id}, {"apply", cas.id, "--yes"}} {
+			out, code := h.run(args...)
+			if code != CodeConflict || !strings.Contains(out, cas.attendu) {
+				t.Errorf("« ogs %s » : code %d, attendu %d et %q :\n%s",
+					strings.Join(args, " "), code, CodeConflict, cas.attendu, out)
+			}
+		}
+	}
+	if _, err := os.Stat(h.path("etc", "apache2", "sites-available", "newsfr_promo.conf")); !os.IsNotExist(err) {
+		t.Errorf("le vhost qui détourne cc.fr a été écrit : %v", err)
+	}
+
+	// Le chargement n'en dit rien : le parc continue de tourner.
+	if out, code := h.run("status"); code == CodeValidation || code == CodeConflict {
+		t.Errorf("status : code %d, le chargement ne doit pas éprouver l'unicité :\n%s", code, out)
+	}
+	if out, code := h.run("cert", "renew", "--all", "--yes", "--quiet"); code == CodeValidation || code == CodeConflict || code == CodeError {
+		t.Errorf("cert renew --all : code %d\n%s", code, out)
+	}
+
+	app := h.ouvrirApp(t, false)
+	projects, err := app.loadProjects()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var lignes []string
+	fleetUniquenessChecks(projects, app.Cfg.PrepDomain(), func(_, status, detail, _ string) {
+		lignes = append(lignes, status+" "+detail)
+	})
+	joint := strings.Join(lignes, "\n")
+	for _, attendu := range []string{"mysql:shopfr", "cc.fr"} {
+		if !strings.Contains(joint, attendu) {
+			t.Errorf("doctor doit nommer le conflit %q :\n%s", attendu, joint)
+		}
+	}
+}
+
+// R3N-05 : le vhost adopté « shopfr » s'écrit dans le fichier nginx « shopfr »,
+// sans extension ; le projet shop.fr, d'identifiant shopfr, n'a aucun fichier en
+// commun avec lui mais aurait inclus ses surcharges, /etc/<moteur>/projects/shopfr/.
+func TestCreationRefuseLeRepertoireDeSurchargeDUnVhostAdopte(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("project", "create", "shop-fr.com", "--kind", "static")
+	h.retoucher(t, "shopfrcom", "  env: prod\n", "  env: prod\n  labels:\n    adopted: \"true\"\n")
+	h.retoucher(t, "shopfrcom", "spec:\n", "spec:\n  web:\n    vhosts:\n      - name: shopfr\n        file: shopfr\n"+
+		"        domains: [shop-fr.com]\n")
+
+	out, code := h.run("project", "create", "shop.fr", "--kind", "static")
+	if code != CodeConflict || !strings.Contains(out, "répertoire de surcharge") {
+		t.Fatalf("project create shop.fr : code %d, attendu %d (répertoire de surcharge) :\n%s", code, CodeConflict, out)
+	}
+	if _, err := os.Stat(h.path("etc", "ogs", "projects", "shopfr.yaml")); !os.IsNotExist(err) {
+		t.Errorf("la déclaration a été écrite malgré le conflit : %v", err)
+	}
+
+	// doctor dit quoi renommer, et que l'ancien répertoire resterait orphelin.
+	adopté, err := h.ouvrirApp(t, false).loadProject("shopfrcom")
+	if err != nil {
+		t.Fatal(err)
+	}
+	shop := model.New("shop.fr", "prod", model.KindStatic)
+	shop.Metadata.Name = "shopfr"
+	shop.Spec.Domains = []model.Domain{{Name: "shop.fr", Role: "primary"}}
+	var remèdes []string
+	fleetUniquenessChecks([]*model.Project{adopté, shop}, "preprod-pp.net", func(_, status, _, fix string) {
+		remèdes = append(remèdes, status+" "+fix)
+	})
+	if len(remèdes) != 1 || !strings.Contains(remèdes[0], "spec.web.vhosts[].name") || !strings.Contains(remèdes[0], "orphelin") {
+		t.Errorf("remède de doctor : %q", remèdes)
+	}
+}

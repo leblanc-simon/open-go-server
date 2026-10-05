@@ -468,9 +468,7 @@ var reservedDBAccounts = map[string][]string{
 // d'un projet ne connaît pas. La comparaison ignore la casse : « Root » est un
 // autre compte pour le moteur, mais il n'a sa place dans aucun projet.
 func ReservedDBAccount(engine, user string, extra ...string) string {
-	if engine == "mariadb" {
-		engine = "mysql"
-	}
+	engine = DBServer(engine)
 	name := strings.ToLower(user)
 	if engine == "postgres" && strings.HasPrefix(name, "pg_") {
 		// PostgreSQL réserve le préfixe à ses rôles prédéfinis : pg_monitor existe
@@ -909,28 +907,28 @@ func uniquenessConflicts(projects []*model.Project, prepDomain string) []conflic
 		{"utilisateur système", map[string]int{}, func(p *model.Project) []string {
 			return []string{p.Spec.User.Name}
 		}},
-		{"domaine", map[string]int{}, func(p *model.Project) []string {
-			out := make([]string, 0, len(p.Spec.Domains))
-			for _, d := range p.Spec.Domains {
-				if h, err := naming.NormalizeHost(d.Name); err == nil {
-					out = append(out, h)
-				}
-			}
-			return out
-		}},
+		// Les domaines servis sont ceux de spec.domains et ceux des vhosts
+		// déclarés, que rien n'oblige à y figurer : ne lire que les premiers
+		// laissait un projet servir le domaine d'un voisin par spec.web.vhosts
+		// (R4-02, D106).
+		{"domaine", map[string]int{}, servedDomains},
+		// MySQL et MariaDB sont un même serveur : le provider les administre par
+		// le même client et le même socket, comme ReservedDBAccount et les restes
+		// de la suppression (D106). Deux clés distinctes laissaient un projet
+		// déclarer sous « mariadb » la base et le compte d'un voisin « mysql ».
 		{"base de données", map[string]int{}, func(p *model.Project) []string {
 			out := make([]string, 0, len(p.Spec.Databases))
 			for _, db := range p.Spec.Databases {
-				out = append(out, db.Engine+":"+db.Name)
+				out = append(out, DBServer(db.Engine)+":"+db.Name)
 			}
 			return out
 		}},
 		{"utilisateur de base", map[string]int{}, func(p *model.Project) []string {
 			var out []string
 			for _, db := range p.Spec.Databases {
-				out = append(out, db.Engine+":"+db.User)
+				out = append(out, DBServer(db.Engine)+":"+db.User)
 				for _, u := range db.ExtraUsers {
-					out = append(out, db.Engine+":"+u.User)
+					out = append(out, DBServer(db.Engine)+":"+u.User)
 				}
 			}
 			return out
@@ -971,10 +969,19 @@ func uniquenessConflicts(projects []*model.Project, prepDomain string) []conflic
 					if owner == index {
 						continue
 					}
+					// Une clé canonique ne dit pas toujours le nom déclaré :
+					// « www.shop.fr » refusé sous la seule clé « shop.fr »
+					// égarait l'exploitant.
+					demande := ""
+					if k.label == "domaine" {
+						if r := declaredDomain(p, key); r != key {
+							demande = fmt.Sprintf(" pour %q", r)
+						}
+					}
 					errs = append(errs, conflict{Error{
 						Field: k.label,
-						Message: fmt.Sprintf("%q est déjà utilisé par le projet %q (demandé par %q)",
-							key, projects[owner].Metadata.Name, p.Metadata.Name),
+						Message: fmt.Sprintf("%q est déjà utilisé par le projet %q (demandé par %q%s)",
+							key, projects[owner].Metadata.Name, p.Metadata.Name, demande),
 					}, projects[owner].Metadata.Name, p.Metadata.Name})
 					continue
 				}
@@ -982,6 +989,7 @@ func uniquenessConflicts(projects []*model.Project, prepDomain string) []conflic
 			}
 		}
 	}
+	errs = append(errs, includeDirConflicts(projects)...)
 	// L'égalité des homes ne suffit pas : un home imbriqué dans celui d'un autre
 	// projet est effacé avec lui, et « ogs project delete » du premier emportait
 	// le second, toujours déclaré et servi. L'import en produit sans y penser : un
@@ -1046,6 +1054,94 @@ func vhostFiles(p *model.Project) []string {
 		out = append(out, p.VHostFile(vh))
 	}
 	return out
+}
+
+// servedDomains énumère, sous leur forme canonique, les domaines qu'un projet
+// sert : ceux de spec.domains et ceux de ses vhosts déclarés.
+func servedDomains(p *model.Project) []string {
+	var out []string
+	add := func(name string) {
+		if h, err := naming.NormalizeHost(name); err == nil {
+			out = append(out, h)
+		}
+	}
+	for _, d := range p.Spec.Domains {
+		add(d.Name)
+	}
+	for _, vh := range p.Spec.Web.VHosts {
+		for _, d := range vh.Domains {
+			add(d)
+		}
+	}
+	return out
+}
+
+// declaredDomain rend le premier nom déclaré par le projet dont la forme
+// canonique est key, ou key lui-même.
+func declaredDomain(p *model.Project, key string) string {
+	names := make([]string, 0, len(p.Spec.Domains))
+	for _, d := range p.Spec.Domains {
+		names = append(names, d.Name)
+	}
+	for _, vh := range p.Spec.Web.VHosts {
+		names = append(names, vh.Domains...)
+	}
+	for _, n := range names {
+		if h, err := naming.NormalizeHost(n); err == nil && h == key {
+			return n
+		}
+	}
+	return key
+}
+
+// DBServer ramène un moteur déclaré au serveur qu'il désigne : « mariadb » et
+// « mysql » sont le même, pour les comptes réservés comme pour l'unicité.
+func DBServer(engine string) string {
+	if engine == "mariadb" {
+		return "mysql"
+	}
+	return engine
+}
+
+// includeDirConflicts refuse deux vhosts de projets distincts qui partagent un
+// répertoire de surcharge (D63). Celui-ci porte le nom du vhost, non celui de
+// son fichier : un vhost adopté « shopfr » écrit dans le fichier nginx
+// « shopfr », sans extension, n'a aucun fichier commun avec le projet shopfr,
+// écrit dans shopfr.conf, mais les deux incluaient /etc/nginx/projects/shopfr/
+// — les surcharges de l'un, restrictions d'accès comprises, s'appliquaient au
+// site de l'autre (R3N-05, D106). Un fichier commun est déjà nommé par la clé
+// « fichier de vhost », dont le répertoire découle : il n'est pas signalé deux
+// fois.
+func includeDirConflicts(projects []*model.Project) []conflict {
+	type tenant struct {
+		index int
+		file  string
+	}
+	seen := map[string]tenant{}
+	var errs []conflict
+	for index, p := range projects {
+		for _, vh := range p.VHosts() {
+			name, file := p.VHostName(vh), p.VHostFile(vh)
+			owner, taken := seen[name]
+			if !taken {
+				seen[name] = tenant{index, file}
+				continue
+			}
+			if owner.index == index || owner.file == file {
+				continue
+			}
+			errs = append(errs, conflict{Error{
+				Field: "répertoire de surcharge",
+				Message: fmt.Sprintf("%q, répertoire de surcharge d'un vhost du projet %q, serait aussi celui "+
+					"d'un vhost du projet %q : les surcharges de l'un s'appliqueraient au site de l'autre — "+
+					"renommer le vhost de l'un des deux (spec.web.vhosts[].name ; le vhost principal d'un projet "+
+					"non adopté porte son identifiant, qui ne change qu'à la création, par --id) ; les fichiers "+
+					"posés sous l'ancien nom sont alors à déplacer, doctor signale le répertoire orphelin",
+					name, projects[owner.index].Metadata.Name, p.Metadata.Name),
+			}, projects[owner.index].Metadata.Name, p.Metadata.Name})
+		}
+	}
+	return errs
 }
 
 // validateVHosts contrôle les vhosts déclarés. Le nom réel d'un fichier

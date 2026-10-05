@@ -2674,3 +2674,69 @@ func TestComplementRejouéAprèsUnDaemonReloadEnÉchec(t *testing.T) {
 		t.Fatalf("le plan suivant doit rejouer le complément et le redémarrage : %d étape(s)", len(steps))
 	}
 }
+
+// Un vhost déclaré sert ses propres domaines, que spec.domains ne liste pas
+// forcément : la détection de conflit ne lisait que ces derniers, et le vhost
+// était écrit pour un nom qu'une configuration étrangère servait déjà, à la
+// casse près (R4-02).
+func TestObserveLitLesDomainesDesVhostsDeclares(t *testing.T) {
+	prov, _ := fixture(t, "nginx")
+	p := project(t, "shop.fr", model.KindSymfony, "6.4", "8.5")
+	p.Spec.Web.VHosts = []model.VHost{
+		{Name: model.MainPoolName, Domains: []string{"shop.fr"}},
+		{Name: "promo", Domains: []string{"promo.shop.fr"}},
+	}
+	foreign := filepath.Join(prov.Engine.AvailableDir(), "ancien-promo")
+	if err := os.WriteFile(foreign, []byte("server {\n  server_name Promo.Shop.fr;\n}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	obs, err := prov.Observe(context.Background(), p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if obs.Conflicts["promo.shop.fr"] != foreign {
+		t.Fatalf("le domaine du vhost déclaré doit être confronté aux configurations étrangères : %+v", obs.Conflicts)
+	}
+	if _, err := prov.Plan(context.Background(), p, obs); err == nil {
+		t.Error("un domaine déjà servi doit interrompre le plan")
+	}
+}
+
+// Ce qui suit un « # » ou le « ; » de la directive n'est pas servi : un
+// commentaire qui nomme shop.fr faisait conclure à un conflit. Un point final
+// déclaré ne masque pas le nom qu'un voisin sert.
+func TestObserveIgnoreLesCommentairesEtLePointFinal(t *testing.T) {
+	prov, _ := fixture(t, "nginx")
+	p := project(t, "shop.fr", model.KindSymfony, "6.4", "8.5")
+	commente := filepath.Join(prov.Engine.AvailableDir(), "legacy")
+	if err := os.WriteFile(commente, []byte("server {\n  server_name legacy.fr; # remplacé par Shop.fr\n}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	obs, err := prov.Observe(context.Background(), p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(obs.Conflicts) != 0 {
+		t.Errorf("un nom en commentaire n'est pas servi : %v", obs.Conflicts)
+	}
+
+	p.Spec.Web.VHosts = []model.VHost{{Name: model.MainPoolName, Domains: []string{"Promo.Shop.fr."}}}
+	etranger := filepath.Join(prov.Engine.AvailableDir(), "promo")
+	if err := os.WriteFile(etranger, []byte("server {\n  server_name promo.shop.fr;\n}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	obs, err = prov.Observe(context.Background(), p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if obs.Conflicts["promo.shop.fr"] != etranger {
+		t.Errorf("le point final déclaré ne doit pas masquer le conflit : %v", obs.Conflicts)
+	}
+}
+
+func TestServerNamesLitLesDirectivesSeules(t *testing.T) {
+	got := serverNames("  ServerName a.fr\n\tServerAlias b.fr c.fr\n# ServerName x.fr\nserver_name d.fr e.fr;  # f.fr\nserver_names_hash_bucket_size 64;\n")
+	if strings.Join(got, " ") != "a.fr b.fr c.fr d.fr e.fr" {
+		t.Errorf("noms servis : %q", got)
+	}
+}
