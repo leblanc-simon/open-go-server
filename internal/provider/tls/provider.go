@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -51,6 +52,85 @@ type Provider struct {
 	DNSSets   func() []DNSCredentials
 	dnsSets   []DNSCredentials
 	dnsLoaded bool
+	// ServedBy énumère les vhosts écrits qui désignent un répertoire de
+	// certificat (web.Provider.CertificateReferences). C'est ce que le serveur
+	// charge, non ce que déclarent les projets, qui décide si un certificat peut
+	// quitter le disque (D110) : un vhost resté en place après une déclaration
+	// retirée, un site hors d'ogs, un déroulage incomplet le désignent encore.
+	ServedBy func(dir string) []string
+}
+
+// servedBy rend les vhosts écrits qui désignent un certificat.
+func (p *Provider) servedBy(name string) []string {
+	if p.ServedBy == nil {
+		return nil
+	}
+	return p.ServedBy(p.Store.Dir(name))
+}
+
+// staging dit si les émissions doivent viser l'environnement de test de
+// l'autorité : acme.staging de config.yaml vaut pour l'apply et le
+// renouvellement comme pour « cert issue » (D110).
+func (p *Provider) staging() bool { return p.Cfg != nil && p.Cfg.ACME.Staging }
+
+// replacesStaging dit si un certificat présent, émis par l'environnement de test,
+// doit être remplacé : la demande vise la production, et l'autorité configurée
+// n'est pas elle-même celle de test — sans quoi chaque apply réémettrait un
+// certificat de test à la place d'un autre.
+func (p *Provider) replacesStaging(req Request, info Info) bool {
+	if !info.Staging || req.Staging || req.Challenge == ChallengeSelfSigned {
+		return false
+	}
+	return p.Cfg == nil || !SameDirectory(p.Cfg.ACME.Directory, DirectoryStaging)
+}
+
+// SameDirectory compare deux URL d'autorité ACME comme l'autorité les sert : le
+// schéma et l'hôte sans casse, le port par défaut omis, le chemin sans « / »
+// final. Une comparaison à la chaîne près faisait d'un « …/directory/ » une
+// autorité de production, et le certificat de test était réémis à chaque apply
+// et à chaque passage du timer, jusqu'au quota.
+func SameDirectory(a, b string) bool {
+	norm := func(raw string) string {
+		u, err := url.Parse(strings.TrimSpace(raw))
+		if err != nil || u.Host == "" {
+			return strings.TrimRight(strings.TrimSpace(raw), "/")
+		}
+		scheme, host := strings.ToLower(u.Scheme), strings.ToLower(u.Hostname())
+		if port := u.Port(); port != "" && !(scheme == "https" && port == "443") && !(scheme == "http" && port == "80") {
+			host += ":" + port
+		}
+		return scheme + "://" + host + strings.TrimRight(u.EscapedPath(), "/")
+	}
+	return a != "" && b != "" && norm(a) == norm(b)
+}
+
+// keepsProduction dit si le renouvellement d'un certificat de production en
+// place doit rester à l'autorité de production malgré acme.staging (D110) :
+// l'option, oubliée après un essai, ferait sinon remplacer par le timer chaque
+// certificat reconnu par un certificat qu'aucun navigateur n'accepte — HSTS
+// compris, le site devient injoignable. Seule une demande explicite (« staging »
+// déclaré, « cert issue --staging ») le remplace.
+func keepsProduction(req Request, info Info, present bool) bool {
+	return present && req.Staging && req.ConfigStaging && !info.Staging && !info.SelfSign &&
+		req.Challenge != ChallengeSelfSigned
+}
+
+// productionKept rend la demande ramenée à l'autorité de production.
+func productionKept(req Request) Request {
+	req.Staging, req.ConfigStaging = false, false
+	return req
+}
+
+// ProductionKeptError signale un renouvellement fait auprès de l'autorité de
+// production alors qu'acme.staging est actif (D110) : le certificat est
+// renouvelé, et l'exploitant doit l'apprendre — code 6.
+type ProductionKeptError struct{ Name string }
+
+func (e *ProductionKeptError) Error() string {
+	return fmt.Sprintf("certificat %s renouvelé auprès de l'autorité de production malgré acme.staging : "+
+		"un certificat reconnu n'est jamais remplacé par un certificat de test sans le demander "+
+		"(« ogs cert issue %s --staging ») — retirer acme.staging de config.yaml si l'essai est fini (D110)",
+		e.Name, e.Name)
 }
 
 // dnsCredentialSets rend les jeux d'identifiants DNS. Un fichier illisible est
@@ -129,7 +209,8 @@ func (p *Provider) Requests(proj *model.Project) ([]Request, error) {
 		}
 		req := Request{
 			Name: c.Name, Domains: c.Domains, Challenge: ch,
-			DNSProvider: c.DNSProvider, DNSCredentials: c.DNSCredentials, KeyType: c.KeyType, Staging: c.Staging,
+			DNSProvider: c.DNSProvider, DNSCredentials: c.DNSCredentials, KeyType: c.KeyType,
+			Staging: c.Staging || p.staging(), ConfigStaging: !c.Staging && p.staging(),
 		}
 		if req.Name == "" {
 			req.Name = proj.ID()
@@ -164,7 +245,7 @@ func (p *Provider) Requests(proj *model.Project) ([]Request, error) {
 		return nil, nil
 	}
 	req := Request{Name: proj.ID(), Domains: domains, Challenge: ChallengeHTTP01,
-		Essential: servedDomains(proj)}
+		Essential: servedDomains(proj), Staging: p.staging(), ConfigStaging: p.staging()}
 	p.chooseChallenge(&req, "")
 	if err := req.Validate(); err != nil {
 		return nil, err
@@ -215,6 +296,7 @@ func (p *Provider) SharedRequest(ref string) (Request, bool) {
 	req := Request{
 		Name: SharedPrefix + name, Domains: decl.Domains, Challenge: ch,
 		DNSProvider: decl.DNSProvider, DNSCredentials: decl.DNSCredentials, KeyType: decl.KeyType,
+		Staging: p.staging(), ConfigStaging: p.staging(),
 	}
 	p.chooseChallenge(&req, decl.Challenge)
 	return req, true
@@ -591,22 +673,9 @@ func CertifiedDomains(proj *model.Project) []string {
 
 // Plan calcule les étapes d'émission et de renouvellement.
 func (p *Provider) Plan(_ context.Context, proj *model.Project) ([]*engine.Step, error) {
-	reqs, err := p.Requests(proj)
+	reqs, err := p.planRequests(proj)
 	if err != nil {
 		return nil, err
-	}
-	if shared := p.SharedRef(proj); shared != "" {
-		if req, ok := p.SharedRequest(shared); ok {
-			reqs = append(reqs, req)
-		}
-	}
-	// Un certificat de portée serveur que désigne un vhost s'émet avec le projet
-	// qui le sert, comme le wildcard de la préproduction : sans quoi il attendait
-	// « cert issue », et le vhost restait en HTTP seul.
-	for _, req := range p.DesignatedShared(proj) {
-		if !slices.ContainsFunc(reqs, func(r Request) bool { return r.Name == req.Name }) {
-			reqs = append(reqs, req)
-		}
 	}
 	var steps []*engine.Step
 	for _, req := range reqs {
@@ -628,12 +697,170 @@ func (p *Provider) Plan(_ context.Context, proj *model.Project) ([]*engine.Step,
 	return steps, nil
 }
 
+// planRequests rend les demandes que le plan d'un projet examine : les siennes,
+// le partagé de sa préproduction, et ceux que désignent ses vhosts.
+func (p *Provider) planRequests(proj *model.Project) ([]Request, error) {
+	reqs, err := p.Requests(proj)
+	if err != nil {
+		return nil, err
+	}
+	if shared := p.SharedRef(proj); shared != "" {
+		if req, ok := p.SharedRequest(shared); ok {
+			reqs = append(reqs, req)
+		}
+	}
+	// Un certificat de portée serveur que désigne un vhost s'émet avec le projet
+	// qui le sert, comme le wildcard de la préproduction : sans quoi il attendait
+	// « cert issue », et le vhost restait en HTTP seul.
+	for _, req := range p.DesignatedShared(proj) {
+		if !slices.ContainsFunc(reqs, func(r Request) bool { return r.Name == req.Name }) {
+			reqs = append(reqs, req)
+		}
+	}
+	return reqs, nil
+}
+
+// PlanPairs rétablit, avant tout ce qui écrit la configuration du serveur web, les
+// paires clé/certificat dépareillées du projet (D110). Le moteur refuse une
+// paire dépareillée avec la configuration entière : nginx dès « nginx -t », donc
+// à l'écriture du premier vhost tant qu'un autre la désigne encore — le vhost de
+// redirection du même certificat, ou celui d'un projet voisin pour un partagé —,
+// Apache au rechargement seulement, dont il meurt, « apachectl -t » répondant
+// « Syntax OK ». L'étape d'émission, qui suit les vhosts pour que le challenge
+// HTTP-01 trouve le sien chargé, venait trop tard : l'apply échouait en code 1
+// sur le vhost, et seul « cert renew » réparait.
+//
+// Une écriture interrompue s'achève sans émission (Store.Repair) — étape
+// critique, le rendu des vhosts l'ayant tenue pour achevée (Store.Read). Une
+// paire qu'aucun fichier en attente n'achève est réémise ici, sans vidage des
+// rechargements — le serveur sert le challenge avec la configuration qu'il a
+// chargée, un rechargement échouerait ; l'étape est non critique, et son échec
+// dit ce qui suivra et le remède.
+func (p *Provider) PlanPairs(_ context.Context, proj *model.Project) ([]*engine.Step, error) {
+	reqs, err := p.planRequests(proj)
+	if err != nil {
+		return nil, err
+	}
+	var reload []string
+	if p.WebReload != "" {
+		reload = []string{p.WebReload}
+	}
+	var steps []*engine.Step
+	for _, req := range reqs {
+		info, present, paired, err := p.Store.ReadPair(req.Name)
+		if err != nil {
+			return nil, err
+		}
+		if !present || paired {
+			continue
+		}
+		resource := "tls/certificate/" + req.Name + "/paire"
+		if info.Repairable {
+			s := engine.NewStep(resource, engine.Update, fmt.Sprintf(
+				"certificat %s : écriture interrompue, clé et certificat dépareillés — achevée avant les vhosts, "+
+					"sans émission", req.Name))
+			s.Apply = func(ctx context.Context) error {
+				ok, err := p.Store.Repair(ctx, req.Name)
+				if err == nil && !ok {
+					err = fmt.Errorf("certificat %s : l'écriture interrompue n'a pas pu être achevée — %s",
+						req.Name, p.unpairedConsequence())
+				}
+				return err
+			}
+			s.Reload = reload
+			steps = append(steps, s)
+			continue
+		}
+		kept := keepsProduction(req, info, present)
+		if kept {
+			req = productionKept(req)
+		}
+		s := engine.NewStep(resource, engine.Update, fmt.Sprintf(
+			"certificat %s : clé et certificat dépareillés — réémis avant les vhosts%s", req.Name, keptNote(kept)))
+		s.Critical = false
+		s.Apply = func(ctx context.Context) error {
+			if ok, err := p.Store.Repair(ctx, req.Name); err != nil || ok {
+				return err
+			}
+			err := p.issueOrFallback(ctx, req, true)
+			if err != nil && !Written(err) {
+				return fmt.Errorf("%w — la paire reste dépareillée : %s ; remède : « ogs cert renew %s » une fois "+
+					"la cause levée, ou la clé d'origine remise en place", err, p.unpairedConsequence(), req.Name)
+			}
+			return stepError(withKept(err, kept, req.Name))
+		}
+		s.Reload = reload
+		steps = append(steps, s)
+	}
+	return steps, nil
+}
+
+// CheckPair vérifie la paire d'un répertoire de certificat que désigne un vhost
+// activé (web.Provider.CheckCertificates), avant tout rechargement, toute
+// validation et tout redémarrage du serveur web (D110). Avec repair, une
+// écriture interrompue est achevée : c'est ce qui couvre, hors de l'apply du
+// projet, une paire que Store.Read lit déjà comme achevée. Un répertoire hors du
+// magasin, ou sans certificat, ne relève pas de ce contrôle.
+func (p *Provider) CheckPair(ctx context.Context, dir string, repair bool) (name string, paired, repaired bool, err error) {
+	base := filepath.Base(filepath.Clean(dir))
+	name = base
+	if strings.HasPrefix(base, sharedDirPrefix) {
+		name = SharedPrefix + strings.TrimPrefix(base, sharedDirPrefix)
+	}
+	if filepath.Clean(p.Store.Dir(name)) != filepath.Clean(dir) {
+		return name, true, false, nil
+	}
+	info, present, ok, err := p.Store.ReadPair(name)
+	if err != nil || !present || ok {
+		return name, true, false, err
+	}
+	if !repair || !info.Repairable {
+		return name, false, false, nil
+	}
+	ok, err = p.Store.Repair(ctx, name)
+	return name, ok, ok, err
+}
+
+// unpairedConsequence dit ce que fait le moteur retenu d'une paire dépareillée
+// que des vhosts désignent encore.
+func (p *Provider) unpairedConsequence() string {
+	switch strings.TrimPrefix(p.WebReload, "web:") {
+	case "nginx":
+		return "nginx refuse toute configuration dont un vhost la désigne (« key values mismatch ») — " +
+			"l'écriture des vhosts échoue (code 1) tant qu'un autre vhost la désigne encore, et aucun " +
+			"rechargement ne passe"
+	case "apache":
+		return "Apache s'arrête au rechargement de toute configuration dont un vhost la désigne " +
+			"(AH02565), « apachectl -t » répondant « Syntax OK » — les vhosts du projet passent en HTTP seul, " +
+			"ceux d'un autre projet la désignent encore"
+	}
+	return "le serveur web refuse toute configuration dont un vhost la désigne"
+}
+
+// keptNote complète un résumé d'émission ramenée à l'autorité de production.
+func keptNote(kept bool) string {
+	if kept {
+		return " — autorité de production conservée malgré acme.staging"
+	}
+	return ""
+}
+
+// withKept signale, au terme d'un renouvellement réussi, que l'autorité de
+// production a été conservée malgré acme.staging : code 6, le rechargement
+// restant acquis.
+func withKept(err error, kept bool, name string) error {
+	if kept && err == nil {
+		return engine.Partial(&ProductionKeptError{Name: name})
+	}
+	return err
+}
+
 // certificateStep produit l'étape d'un certificat. Elle est toujours non
 // critique : un certificat qui échoue laisse le site en ligne en HTTP, avec un
 // avertissement et une commande de reprise (D16).
 func (p *Provider) certificateStep(req Request) (*engine.Step, error) {
 	resource := "tls/certificate/" + req.Name
-	info, present, err := p.Store.Read(req.Name)
+	info, present, paired, err := p.Store.ReadPair(req.Name)
 	if err != nil {
 		return nil, err
 	}
@@ -646,20 +873,69 @@ func (p *Provider) certificateStep(req Request) (*engine.Step, error) {
 	if p.WebReload != "" {
 		reload = []string{p.WebReload}
 	}
+	if present && !paired {
+		if pending, ok, err := p.Store.Pending(req.Name); err != nil {
+			return nil, err
+		} else if ok {
+			// PlanPairs l'achève avant les vhosts : le plan en juge achevée.
+			info, paired = pending, true
+		}
+	}
+	kept := keepsProduction(req, info, present)
+	if kept {
+		req = productionKept(req)
+	}
+	issue := func(urgent bool) func(context.Context) error {
+		return func(ctx context.Context) error {
+			return stepError(withKept(p.issueOrFallback(ctx, req, urgent), kept, req.Name))
+		}
+	}
 	switch {
+	case present && !paired:
+		// Une clé recopiée à la main : PlanPairs l'a réémise avant les vhosts. Si
+		// cette émission a échoué, une seconde tentative a lieu ici, les vhosts du
+		// projet écrits — en HTTP seul — et rechargés : sous Apache, un serveur
+		// arrêté par la paire a pu être relevé entre-temps.
+		s := engine.NewStep(resource, engine.Update, fmt.Sprintf(
+			"certificat %s : clé et certificat dépareillés — nouvelle tentative si la réémission d'avant les "+
+				"vhosts a échoué%s", req.Name, keptNote(kept)))
+		s.Critical = false
+		s.Apply = func(ctx context.Context) error {
+			if _, _, ok, err := p.Store.ReadPair(req.Name); err != nil || ok {
+				return err
+			}
+			if ok, err := p.Store.Repair(ctx, req.Name); err != nil || ok {
+				return err
+			}
+			return issue(true)(ctx)
+		}
+		s.FlushReloads = req.servesChallenge()
+		s.Reload = reload
+		return s, nil
+	case present && p.replacesStaging(req, info):
+		// acme.staging retiré : le certificat de test, qu'aucun navigateur ne
+		// reconnaît, est remplacé d'office. Il reste servi jusqu'à l'émission
+		// (D79) — un échec laisse le site tel qu'il était.
+		s := engine.NewStep(resource, engine.Update,
+			fmt.Sprintf("certificat %s émis par l'environnement de test de l'autorité (%s) : remplacé "+
+				"par un certificat reconnu, l'actuel restant servi jusqu'à l'émission", req.Name, info.Issuer))
+		s.Critical = false
+		s.Apply = issue(true)
+		s.FlushReloads = req.servesChallenge()
+		s.Reload = reload
+		return s, nil
 	case present && info.Covers(req.Domains) && !info.NeedsRenewal(now):
 		return engine.NewStep(resource, engine.NoOp,
 			fmt.Sprintf("certificat %s (expire dans %d jours)", req.Name, info.DaysLeft(now))), nil
 	case present && !info.Covers(req.Domains):
 		s := engine.NewStep(resource, engine.Update,
-			fmt.Sprintf("certificat %s : domaines à couvrir modifiés (%s)",
-				req.Name, strings.Join(req.Domains, ", ")))
+			fmt.Sprintf("certificat %s : domaines à couvrir modifiés (%s)%s",
+				req.Name, strings.Join(req.Domains, ", "), keptNote(kept)))
 		s.Critical = false
 		// Loin de l'échéance, le certificat en place reste servi : le repli n'a lieu
 		// que s'il couvre un nom de plus sans en retirer aucun. Près d'elle, il garde
 		// le site quoi qu'il en coûte aux autres noms.
-		urgent := info.NeedsRenewal(now)
-		s.Apply = func(ctx context.Context) error { return stepError(p.issueOrFallback(ctx, req, urgent)) }
+		s.Apply = issue(info.NeedsRenewal(now))
 		// Le vidage recharge un vhost qui garde son bloc 443 sur le certificat en
 		// place : il n'expose que les nouveaux noms au challenge du port 80.
 		s.FlushReloads = req.servesChallenge()
@@ -667,26 +943,48 @@ func (p *Provider) certificateStep(req Request) (*engine.Step, error) {
 		return s, nil
 	case present:
 		s := engine.NewStep(resource, engine.Update,
-			fmt.Sprintf("renouvellement du certificat %s (expire dans %d jours)",
-				req.Name, info.DaysLeft(now)))
+			fmt.Sprintf("renouvellement du certificat %s (expire dans %d jours)%s",
+				req.Name, info.DaysLeft(now), keptNote(kept)))
 		s.Critical = false
-		s.Apply = func(ctx context.Context) error { return stepError(p.issueOrFallback(ctx, req, true)) }
+		s.Apply = issue(true)
 		s.FlushReloads = req.servesChallenge()
 		s.Reload = reload
 		return s, nil
 	}
 	s := engine.NewStep(resource, engine.Create,
-		fmt.Sprintf("certificat %s pour %s (%s)", req.Name, strings.Join(req.Domains, ", "), req.Method()))
+		fmt.Sprintf("certificat %s pour %s (%s%s)", req.Name, strings.Join(req.Domains, ", "), req.Method(),
+			stagingNote(req)))
 	s.Critical = false
-	s.Apply = func(ctx context.Context) error { return stepError(p.issueOrFallback(ctx, req, true)) }
+	s.Apply = issue(true)
 	s.Reload = reload
 	// Le challenge HTTP-01 se fait servir par le vhost : il doit être chargé, non
 	// seulement écrit. Sans ce vidage, la première émission d'un site neuf échoue
 	// en 404, le serveur n'ayant pas encore relu sa configuration.
 	s.FlushReloads = req.servesChallenge()
-	// La compensation ne retire que ce que cette exécution a créé.
-	s.Compensate = func(context.Context) error { return p.Store.Remove(req.Name) }
+	// La compensation ne retire que ce que cette exécution a créé, et jamais un
+	// certificat qu'un vhost écrit désigne encore (D110) : la bascule TLS d'un
+	// déroulage incomplet — aboutie en partie, donc non compensée — laisserait
+	// sinon un bloc 443 sur un matériel absent, que le moteur refuse au
+	// rechargement suivant, le parc entier avec lui. Un certificat valide de
+	// trop ne coûte rien.
+	s.Compensate = func(context.Context) error {
+		if len(p.servedBy(req.Name)) > 0 {
+			return nil
+		}
+		return p.Store.Remove(req.Name)
+	}
 	return s, nil
+}
+
+// stagingNote complète un résumé d'émission vers l'environnement de test.
+func stagingNote(req Request) string {
+	switch {
+	case req.ConfigStaging:
+		return ", environnement de test (acme.staging)"
+	case req.Staging:
+		return ", environnement de test"
+	}
+	return ""
 }
 
 // stepError traduit l'issue d'une émission pour le moteur : un repli réussi est
@@ -943,7 +1241,7 @@ func (p *Provider) issue(ctx context.Context, req Request) error {
 		}
 		return err
 	}
-	if err := p.Store.Write(req.Name, material); err != nil {
+	if err := p.Store.WriteContext(ctx, req.Name, material); err != nil {
 		return err
 	}
 	if p.DB != nil {
@@ -982,7 +1280,7 @@ func (p *Provider) Renew(ctx context.Context, requests []Request, force bool) ([
 	var errs []error
 	now := p.now()
 	for _, req := range requests {
-		info, present, err := p.Store.Read(req.Name)
+		info, present, paired, err := p.Store.ReadPair(req.Name)
 		if err != nil {
 			errs = append(errs, err)
 			continue
@@ -993,13 +1291,43 @@ func (p *Provider) Renew(ctx context.Context, requests []Request, force bool) ([
 		if !present && !force {
 			continue
 		}
+		// Une paire dépareillée (D110) : l'écriture interrompue s'achève sans
+		// émission, puis le certificat achevé est jugé comme les autres — il peut
+		// être lui-même à échéance, ou ne plus couvrir la demande. À défaut, la
+		// paire est réémise comme à l'échéance.
+		repaired := false
+		if present && !paired {
+			ok, rerr := p.Store.Repair(ctx, req.Name)
+			if rerr != nil {
+				errs = append(errs, fmt.Errorf("%s : %w", req.Name, rerr))
+				continue
+			}
+			if ok {
+				repaired = true
+				if info, present, paired, err = p.Store.ReadPair(req.Name); err != nil {
+					errs = append(errs, err)
+					continue
+				}
+			}
+		}
 		// Un certificat qui ne couvre plus la demande est réémis comme s'il
 		// arrivait à échéance : c'est ce qui reprend seul une émission échouée à
 		// l'apply — un alias dont le DNS ne pointait pas encore ici —, le vhost
-		// servant déjà ce nom sur le certificat en place.
-		due := !present || info.NeedsRenewal(now)
+		// servant déjà ce nom sur le certificat en place. Un certificat de
+		// l'environnement de test l'est aussi, acme.staging retiré (D110).
+		due := !present || !paired || info.NeedsRenewal(now) || p.replacesStaging(req, info)
 		if present && !force && !due && info.Covers(req.Domains) {
+			if repaired {
+				// Le matériel a changé sur le disque : le serveur doit le relire.
+				done = append(done, req.Name)
+			}
 			continue
+		}
+		// Un certificat de production se renouvelle en production, acme.staging
+		// ou non (D110), et le renouvellement le dit.
+		kept := keepsProduction(req, info, present)
+		if kept {
+			req = productionKept(req)
 		}
 		err = p.issueOrFallback(ctx, req, due || force)
 		if Written(err) {
@@ -1010,6 +1338,9 @@ func (p *Provider) Renew(ctx context.Context, requests []Request, force bool) ([
 			continue
 		}
 		done = append(done, req.Name)
+		if kept {
+			errs = append(errs, &ProductionKeptError{Name: req.Name})
+		}
 	}
 	return done, errs
 }
@@ -1037,13 +1368,57 @@ func (p *Provider) Users(ref string, projects []*model.Project) []string {
 	return out
 }
 
+// CheckRef refuse une référence de certificat qui ne désigne pas un certificat
+// du magasin par son nom : un nom de projet (CheckProjectName), ou « @nom » pour
+// un partagé. « _shared-x » est le répertoire de « @x » — le désigner ainsi
+// échappait au contrôle des projets qui l'emploient —, et « . », « .. » ou un
+// « / » mèneraient hors du magasin, où la suppression est un RemoveAll.
+func CheckRef(ref string) error {
+	if IsShared(ref) {
+		if err := CheckProjectName(strings.TrimPrefix(ref, SharedPrefix)); err != nil {
+			return fmt.Errorf("référence de certificat partagé %q invalide", ref)
+		}
+		return nil
+	}
+	if strings.HasPrefix(ref, sharedDirPrefix) {
+		return fmt.Errorf("%q est le répertoire d'un certificat partagé : le désigner par « @%s »",
+			ref, strings.TrimPrefix(ref, sharedDirPrefix))
+	}
+	if ref == ".." {
+		return fmt.Errorf("nom de certificat %q invalide", ref)
+	}
+	return CheckProjectName(ref)
+}
+
+// DeleteRefusal dit pourquoi un certificat ne peut pas quitter le disque : une
+// déclaration l'emploie, ou un vhost écrit le désigne (D110). Les deux sont
+// nommés d'un coup : retirer l'un pour apprendre l'autre coûterait une coupure.
+func (p *Provider) DeleteRefusal(ref string, projects []*model.Project) error {
+	users := p.Users(ref, projects)
+	files := p.servedBy(ref)
+	var parts []string
+	if len(users) > 0 {
+		parts = append(parts, "employé par "+strings.Join(users, ", "))
+	}
+	if len(files) > 0 {
+		parts = append(parts, "désigné par les vhosts écrits "+strings.Join(files, ", "))
+	}
+	if len(parts) > 0 {
+		return fmt.Errorf("le certificat %s est %s : le retirer arrêterait le serveur web au "+
+			"rechargement suivant — retirer d'abord ces vhosts", ref, strings.Join(parts, " et "))
+	}
+	return nil
+}
+
 // Delete supprime un certificat, en refusant de casser les vhosts qui s'en servent.
 func (p *Provider) Delete(ref string, projects []*model.Project) error {
-	if users := p.Users(ref, projects); len(users) > 0 {
-		return fmt.Errorf("le certificat %s est référencé par %s : retirer d'abord ces vhosts",
-			ref, strings.Join(users, ", "))
+	if err := CheckRef(ref); err != nil {
+		return err
 	}
-	if _, ok, _ := p.Store.Read(ref); !ok {
+	if err := p.DeleteRefusal(ref, projects); err != nil {
+		return err
+	}
+	if _, present, _, _ := p.Store.ReadPair(ref); !present {
 		return fmt.Errorf("aucun certificat %s", ref)
 	}
 	return p.Store.Remove(ref)
@@ -1059,6 +1434,10 @@ func (p *Provider) Warnings() ([]string, error) {
 	now := p.now()
 	var out []string
 	for _, info := range list {
+		if info.Unpaired {
+			out = append(out, p.unpairedWarning(info))
+			continue
+		}
 		threshold := RenewBefore
 		if info.Shared {
 			threshold = SharedWarnBefore
@@ -1077,6 +1456,19 @@ func (p *Provider) Warnings() ([]string, error) {
 		}
 	}
 	return out, nil
+}
+
+// unpairedWarning nomme une paire dépareillée pour « doctor », « cert list » et
+// les alertes : ce que le moteur en fait, et le remède (D110).
+func (p *Provider) unpairedWarning(info Info) string {
+	if info.Repairable {
+		return fmt.Sprintf("certificat %s : écriture interrompue, clé et certificat dépareillés — %s ; "+
+			"« ogs apply » ou « ogs cert renew %s » l'achève sans émission",
+			info.Name, p.unpairedConsequence(), info.Name)
+	}
+	return fmt.Sprintf("certificat %s : clé et certificat dépareillés (clé recopiée à la main ?) — %s ; "+
+		"« ogs cert renew %s » le réémet, « ogs apply » aussi, avant d'écrire les vhosts",
+		info.Name, p.unpairedConsequence(), info.Name)
 }
 
 // RenewUnitPlan produit les étapes d'installation de l'unité et du timer de

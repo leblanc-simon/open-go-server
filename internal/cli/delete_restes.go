@@ -67,7 +67,8 @@ func (a *App) projectCertificates(provs *providers, p *model.Project) (remove []
 		// Le parc illisible ne dit pas qui d'autre se sert d'un certificat :
 		// rien ne part.
 		for name := range names {
-			if _, ok, _ := provs.TLS.Store.Read(name); ok {
+			// Une paire dépareillée est présente (D110) : elle est nommée aussi.
+			if _, ok, _, _ := provs.TLS.Store.ReadPair(name); ok {
 				kept = append(kept, keptCert{name, "parc illisible (" + err.Error() + ")"})
 			}
 		}

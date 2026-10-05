@@ -72,6 +72,11 @@ func newCertListCommand(app *App) *cobra.Command {
 					if c.SelfSign {
 						issuer = "auto-signé"
 					}
+					// Une paire dépareillée n'est servie par aucun vhost (D110) :
+					// l'avertissement qui suit la liste dit pourquoi et le remède.
+					if c.Unpaired {
+						issuer += " — CLÉ ET CERTIFICAT DÉPAREILLÉS"
+					}
 					fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%d\t%s\n",
 						c.Name, scope, strings.Join(c.Domains, " "),
 						c.NotAfter.Format("02/01/2006"), c.DaysLeft(now), issuer)
@@ -298,8 +303,17 @@ func newCertRenewCommand(app *App) *cobra.Command {
 				app.printf("✓ %s renouvelé\n", name)
 				_ = app.Audit.Record("", "tls/certificate/"+name, "cert.renew", "ok", "")
 			}
+			// Un certificat renouvelé en production malgré acme.staging (D110) est un
+			// avertissement, non un échec : il compte dans le code 6, sous son nom.
+			kept := 0
 			for _, e := range errs {
 				app.warnf("⚠ %v\n", e)
+				var pk *tlsprov.ProductionKeptError
+				if errors.As(e, &pk) {
+					kept++
+					_ = app.Audit.Record("", "tls/certificate/"+pk.Name, "cert.renew", "avertissement", e.Error())
+					continue
+				}
 				_ = app.Audit.Record("", "tls/certificate", "cert.renew", "échec", e.Error())
 			}
 			// Le hook est déclenché même en cas d'échec partiel : les certificats
@@ -327,7 +341,10 @@ func newCertRenewCommand(app *App) *cobra.Command {
 			if len(errs) > 0 {
 				// Code 6 : le timer systemd le tolère, un renouvellement en échec ne
 				// doit pas masquer ceux qui ont abouti.
-				return exitf(CodePartial, "%d renouvellement(s) en échec", len(errs))
+				if kept == len(errs) {
+					return exitf(CodePartial, "%d certificat(s) de production renouvelé(s) en production malgré acme.staging", kept)
+				}
+				return exitf(CodePartial, "%d renouvellement(s) en échec", len(errs)-kept)
 			}
 			if reloadErr != nil {
 				return exitf(CodePartial, "certificats renouvelés, mais le serveur web ne les a pas relus")
@@ -350,7 +367,10 @@ func newCertRevokeCommand(app *App) *cobra.Command {
 				return err
 			}
 			defer provs.close()
-			info, ok, err := provs.TLS.Store.Read(args[0])
+			// Une paire dépareillée se révoque comme une autre : la révocation porte
+			// sur le certificat en place, signée par le compte ACME, non par sa clé
+			// (D110). Elle est nommée, jamais dite absente.
+			info, ok, paired, err := provs.TLS.Store.ReadPair(args[0])
 			if err != nil {
 				return wrap(CodeError, err)
 			}
@@ -361,7 +381,12 @@ func newCertRevokeCommand(app *App) *cobra.Command {
 				return exitf(CodeUsage, "le certificat %s est auto-signé : il n'y a rien à révoquer "+
 					"(le supprimer avec « ogs cert delete »)", args[0])
 			}
-			if err := app.confirm(fmt.Sprintf("révoquer le certificat %s ?", args[0])); err != nil {
+			question := fmt.Sprintf("révoquer le certificat %s ?", args[0])
+			if !paired {
+				question = fmt.Sprintf("révoquer le certificat %s (%s, clé et certificat dépareillés : "+
+					"le certificat en place est révoqué) ?", args[0], strings.Join(info.Domains, ", "))
+			}
+			if err := app.confirm(question); err != nil {
 				return err
 			}
 			cert, err := os.ReadFile(provs.TLS.Store.Path(args[0], tlsprov.FileFullchain))
@@ -383,10 +408,19 @@ func newCertDeleteCommand(app *App) *cobra.Command {
 	return &cobra.Command{
 		Use:   "delete <id|@partagé>",
 		Short: "Supprimer un certificat du disque",
-		Long: "Refuse de supprimer un certificat encore référencé par un vhost : cela\n" +
-			"empêcherait le serveur web de démarrer.",
+		Long: "Refuse de supprimer un certificat qu'une déclaration emploie ou qu'un vhost\n" +
+			"écrit désigne encore — sites-available et sites-enabled du moteur, sites\n" +
+			"hors d'ogs compris : le serveur web refuserait sa configuration au\n" +
+			"rechargement suivant. Un certificat partagé se désigne par « @nom ». La\n" +
+			"suppression est demandée en confirmation (--yes pour s'en passer).",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			ref := args[0]
+			// Le nom devient un chemin que la suppression efface en entier : il est
+			// contrôlé avant toute lecture (D110).
+			if err := tlsprov.CheckRef(ref); err != nil {
+				return exitf(CodeUsage, "%s", err)
+			}
 			provs, err := app.certProviders()
 			if err != nil {
 				return err
@@ -396,11 +430,30 @@ func newCertDeleteCommand(app *App) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if err := provs.TLS.Delete(args[0], projects); err != nil {
+			info, present, paired, err := provs.TLS.Store.ReadPair(ref)
+			if err != nil {
+				return wrap(CodeError, err)
+			}
+			if !present {
+				return exitf(CodeUsage, "aucun certificat %q", ref)
+			}
+			if err := provs.TLS.DeleteRefusal(ref, projects); err != nil {
 				return exitf(CodeConflict, "%s", err)
 			}
-			_ = app.Audit.Record("", "tls/certificate/"+args[0], "cert.delete", "ok", "")
-			app.printf("✓ certificat %s supprimé\n", args[0])
+			question := fmt.Sprintf("supprimer le certificat %s (%s, expire le %s) ?", ref,
+				strings.Join(info.Domains, ", "), info.NotAfter.Format("02/01/2006"))
+			if !paired {
+				question = fmt.Sprintf("supprimer le certificat %s (%s, clé et certificat dépareillés) ?", ref,
+					strings.Join(info.Domains, ", "))
+			}
+			if err := app.confirm(question); err != nil {
+				return err
+			}
+			if err := provs.TLS.Store.Remove(ref); err != nil {
+				return wrap(CodeError, err)
+			}
+			_ = app.Audit.Record("", "tls/certificate/"+ref, "cert.delete", "ok", "")
+			app.printf("✓ certificat %s supprimé\n", ref)
 			return nil
 		},
 	}
@@ -614,6 +667,13 @@ func newCertDNSListCommand(app *App) *cobra.Command {
 // redirection, c'est elle qui est servie en HTTPS, non le site.
 func étatDuCertificat(provs *providers, p *model.Project, ref string) (état, problème string) {
 	info, ok, _ := provs.TLS.Store.Read(ref)
+	if !ok {
+		// Une paire dépareillée n'est servie par aucun vhost, mais elle n'est pas
+		// absente : la nommer dit le remède (D110).
+		if raw, present, _, _ := provs.TLS.Store.ReadPair(ref); present && raw.Unpaired {
+			return "dépareillé", "certificat " + ref + " : clé et certificat dépareillés — « ogs cert renew " + ref + " »"
+		}
+	}
 	switch {
 	case !ok:
 		return "absent", "certificat " + ref + " indisponible"

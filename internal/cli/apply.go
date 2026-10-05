@@ -192,6 +192,20 @@ func (a *App) buildPlan(ctx context.Context, provs *providers, p *model.Project)
 	}
 
 	if len(p.Spec.Domains) > 0 {
+		// Une paire clé/certificat dépareillée se rétablit avant tout ce qui écrit
+		// la configuration du serveur web (D110) : nginx refuse la configuration
+		// entière dès « nginx -t », donc l'écriture du premier vhost tant qu'un
+		// autre — la redirection du même certificat, un voisin pour un partagé —
+		// désigne encore la paire, et l'étape d'émission, qui suit les vhosts,
+		// n'était jamais atteinte.
+		pairSteps, err := provs.TLS.PlanPairs(ctx, p)
+		if err != nil {
+			return nil, wrap(CodeValidation, err)
+		}
+		for _, s := range pairSteps {
+			plan.Add(s)
+		}
+
 		// Le fragment de portée serveur précède les vhosts, et non le plan global
 		// qui s'exécute après les projets : un vhost de proxy emploie
 		// $connection_upgrade, que seule la « map » de ce fragment définit — sans

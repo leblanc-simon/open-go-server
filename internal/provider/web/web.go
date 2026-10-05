@@ -1,6 +1,7 @@
 package web
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -41,6 +42,11 @@ type Provider struct {
 	Certificate func(*model.Project, model.VHost) tlsprov.Coverage
 	// CertDir localise le matériel d'un certificat.
 	CertDir func(ref string) string
+	// CertificatePair vérifie la paire d'un répertoire de certificat que désigne
+	// un vhost activé, et l'achève avec repair si une écriture interrompue le
+	// permet (tls.Provider.CheckPair) : avant tout rechargement, toute
+	// validation, tout redémarrage (D110).
+	CertificatePair func(ctx context.Context, dir string, repair bool) (PairCheck, error)
 	// ProxyTarget résout la cible d'un vhost de proxy : socket ou adresse locale.
 	ProxyTarget func(*model.Project) (string, bool)
 	Now         func() time.Time
@@ -848,6 +854,12 @@ func (p *Provider) PlanTLS(_ context.Context, proj *model.Project) []*engine.Ste
 		s := engine.NewStep("web/vhost/"+name+"/tls", engine.Update, summary)
 		// Non critique : si l'émission a échoué, le site reste servi tel quel.
 		s.Critical = false
+		// Le fichier remplacé, relevé à l'application, pour la compensation.
+		var (
+			path        string
+			previous    []byte
+			hadPrevious bool
+		)
 		s.Apply = func(ctx context.Context) error {
 			// Le vhost est rendu d'après le matériel présent, et comparé au fichier
 			// en place, que l'émission ait abouti ou non : un repli a pu couvrir une
@@ -859,6 +871,7 @@ func (p *Provider) PlanTLS(_ context.Context, proj *model.Project) []*engine.Ste
 				return err
 			}
 			écrit := false
+			path, previous, hadPrevious = "", nil, false
 			switch bp.State {
 			case fs.StateCurrent:
 			case fs.StateHandEdited, fs.StateForeign:
@@ -867,10 +880,13 @@ func (p *Provider) PlanTLS(_ context.Context, proj *model.Project) []*engine.Ste
 				// bascule n'écrase pas.
 				return fmt.Errorf("%s modifié hors ogs pendant l'exécution : bascule abandonnée", bp.Path)
 			default:
+				if data, err := os.ReadFile(bp.Path); err == nil {
+					previous, hadPrevious = data, true
+				}
 				if err := p.writeVHost(ctx, bp); err != nil {
 					return err
 				}
-				écrit = true
+				écrit, path = true, bp.Path
 			}
 			cov := p.coverage(proj, vhCopy)
 			if cov.Pending != "" {
@@ -922,10 +938,72 @@ func (p *Provider) PlanTLS(_ context.Context, proj *model.Project) []*engine.Ste
 			}
 			return manque
 		}
+		// La compensation rend le vhost d'avant la bascule (D110). Sans elle, une
+		// étape critique en échec plus loin — ou une interruption — déroulait
+		// l'émission, qui retire le certificat neuf, et laissait le bloc 443 qui
+		// le désigne : le moteur refusait la configuration au rechargement
+		// suivant, et le parc tombait avec ce site. Une bascule aboutie en partie
+		// n'est pas compensée (engine.Partial) : c'est alors la compensation de
+		// l'émission qui garde le certificat qu'un vhost écrit désigne.
+		s.Compensate = func(context.Context) error {
+			switch {
+			case path == "":
+				return nil
+			case hadPrevious:
+				return fs.WriteAtomic(path, previous, 0o644, fs.KeepOwner)
+			}
+			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+				return err
+			}
+			return nil
+		}
 		s.Reload = []string{"web:" + p.Engine.Name()}
 		steps = append(steps, s)
 	}
 	return steps
+}
+
+// CertificateReferences énumère les vhosts écrits — sites-available et
+// sites-enabled du moteur — qui désignent le répertoire d'un certificat. C'est
+// ce que le serveur charge qui décide si un certificat peut quitter le disque
+// (D110), non ce que déclarent les projets : un vhost resté après une
+// déclaration retirée, celui d'un site hors d'ogs, une bascule qu'un déroulage
+// n'a pas défaite le désignent encore, et le moteur refuserait sa
+// configuration au rechargement suivant. Un fichier illisible ou démesuré est
+// tenu pour désignant : dans le doute, le certificat reste.
+func (p *Provider) CertificateReferences(dir string) []string {
+	needle := []byte(strings.TrimSuffix(dir, "/") + "/")
+	seen := map[string]bool{}
+	var out []string
+	for _, d := range []string{p.Engine.AvailableDir(), p.Engine.EnabledDir()} {
+		entries, err := os.ReadDir(d)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			path := filepath.Join(d, e.Name())
+			info, err := os.Stat(path)
+			if err != nil || !info.Mode().IsRegular() {
+				continue
+			}
+			if real, err := filepath.EvalSymlinks(path); err == nil {
+				if seen[real] {
+					continue
+				}
+				seen[real] = true
+			}
+			if info.Size() > 4<<20 {
+				out = append(out, path)
+				continue
+			}
+			data, err := os.ReadFile(path)
+			if err != nil || bytes.Contains(data, needle) {
+				out = append(out, path)
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // writeVHost écrit puis valide. La validation intervient avant l'activation :
@@ -942,7 +1020,7 @@ func (p *Provider) writeVHost(ctx context.Context, bp *VHostPlan) error {
 	if err := fs.WriteAtomic(bp.Path, bp.Content, 0o644, fs.KeepOwner); err != nil {
 		return err
 	}
-	if err := validate(ctx, p.Engine, p.Exec); err != nil {
+	if err := p.validateConfig(ctx); err != nil {
 		if hadPrevious == nil {
 			_ = fs.WriteAtomic(bp.Path, previous, 0o644, fs.KeepOwner)
 		} else {
@@ -966,7 +1044,7 @@ func (p *Provider) enable(ctx context.Context, bp *VHostPlan) error {
 	if err := os.Symlink(rel, bp.EnabledPath); err != nil && !os.IsExist(err) {
 		return err
 	}
-	if err := validate(ctx, p.Engine, p.Exec); err != nil {
+	if err := p.validateConfig(ctx); err != nil {
 		_ = os.Remove(bp.EnabledPath)
 		return err
 	}
@@ -1130,6 +1208,13 @@ func (p *Provider) PlanDropIn(ctx context.Context, projects []*model.Project) ([
 			if p.Exec.Simulated() {
 				return nil
 			}
+			// Un redémarrage charge toutes les clés : une paire dépareillée qu'un
+			// vhost désigne arrêterait le moteur (D110). Une écriture interrompue
+			// s'achève ; sinon le redémarrage est refusé, en le nommant.
+			if err := p.CheckCertificates(ctx, true); err != nil {
+				return fmt.Errorf("redémarrage refusé : %s continue de servir sa configuration précédente ; %w",
+					p.Engine.Unit(), err)
+			}
 			return p.restartUnit(ctx, verb)
 		}
 		steps = append(steps, r)
@@ -1215,7 +1300,7 @@ func (p *Provider) PlanSnippet() (*engine.Step, error) {
 		// sites, pas seulement celui qu'on installe. Et la revalidation porte sur
 		// la configuration entière : elle peut échouer pour une cause étrangère au
 		// fragment, d'où le retour au corps antérieur plutôt que la suppression.
-		if err := validate(ctx, p.Engine, p.Exec); err != nil {
+		if err := p.validateConfig(ctx); err != nil {
 			_ = restaurer()
 			return err
 		}
@@ -1247,7 +1332,15 @@ func (p *Provider) Reload(ctx context.Context) error {
 	if p.Exec.Simulated() {
 		return nil
 	}
-	if err := validate(ctx, p.Engine, p.Exec); err != nil {
+	// Une paire clé/certificat dépareillée qu'un vhost activé désigne : nginx
+	// refuse la configuration, le maître Apache meurt en la chargeant alors
+	// qu'« apachectl -t » ne voit rien (D110). Une écriture interrompue s'achève ;
+	// sinon le rechargement est refusé, en le nommant.
+	if err := p.CheckCertificates(ctx, true); err != nil {
+		return fmt.Errorf("rechargement refusé : %s continue de servir sa configuration précédente — "+
+			"les vhosts écrits par cette exécution ne sont pas encore servis ; %w", p.Engine.Unit(), err)
+	}
+	if err := p.validateConfig(ctx); err != nil {
 		return fmt.Errorf("%w\n  rechargement refusé : %s continue de servir sa configuration "+
 			"précédente", err, p.Engine.Unit())
 	}
@@ -1255,6 +1348,7 @@ func (p *Provider) Reload(ctx context.Context) error {
 		return fmt.Errorf("%w\n  rechargement refusé : %s continue de servir sa configuration "+
 			"précédente", err, p.Engine.Unit())
 	}
+	before := p.snapshot(ctx)
 	if _, err := p.Exec.Run(ctx, exec.Command{Name: "systemctl",
 		Args: []string{"reload", p.Engine.Unit()}}); err != nil {
 		return err
@@ -1267,17 +1361,27 @@ func (p *Provider) Reload(ctx context.Context) error {
 	// plutôt qu'à laisser un parc entier hors ligne jusqu'à ce que quelqu'un s'en
 	// aperçoive. Le fait est signalé dans tous les cas : un serveur qui meurt à
 	// chaque rechargement est un incident, même relevé aussitôt.
-	if p.unitActive(ctx) {
+	//
+	// La mort peut suivre le retour de la commande : « apachectl graceful » rend
+	// la main avant que le maître n'ait relu sa configuration. Le moteur est donc
+	// observé quelques instants (diedAfterReload), non relu une fois.
+	raison := p.diedAfterReload(ctx, before)
+	if raison == "" {
 		return nil
 	}
-	if err := p.restartUnit(ctx, "start"); err != nil {
-		return fmt.Errorf("le rechargement a arrêté %s, qui refuse de redémarrer : %w\n"+
-			"  les sites ne sont plus servis — voir « journalctl -u %s »",
-			p.Engine.Unit(), err, p.Engine.Unit())
+	if !p.unitActive(ctx) {
+		if err := p.restartUnit(ctx, "start"); err != nil || !p.unitActive(ctx) {
+			if err == nil {
+				err = errors.New("unité toujours inactive")
+			}
+			return fmt.Errorf("le rechargement a arrêté %s (%s), qui refuse de redémarrer : %w\n"+
+				"  les sites ne sont plus servis — voir « journalctl -u %s »",
+				p.Engine.Unit(), raison, err, p.Engine.Unit())
+		}
 	}
-	return fmt.Errorf("le rechargement a arrêté %s ; le service a été redémarré, "+
+	return fmt.Errorf("le rechargement a arrêté %s (%s) ; le service a été relevé, "+
 		"mais la cause reste à traiter (voir « journalctl -u %s »)",
-		p.Engine.Unit(), p.Engine.Unit())
+		p.Engine.Unit(), raison, p.Engine.Unit())
 }
 
 // restartUnit redémarre le moteur. Le compteur d'échecs est acquitté au préalable :

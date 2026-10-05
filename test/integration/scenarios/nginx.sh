@@ -640,6 +640,139 @@ fi
 echo "un rechargement suffit, comme sur Apache"
 
 echo
+echo "--- paire clé/certificat dépareillée sur un projet à redirection (D110) ---"
+# Deux vhosts sur le même certificat : le site et sa redirection. Une autre clé
+# remplace privkey.pem. L'étape web réécrivait le premier vhost en HTTP seul,
+# « nginx -t » lisait le second, qui désignait toujours la paire — « key values
+# mismatch », étape critique, saga déroulée, code 1 —, et la réparation, placée
+# après le web, n'était jamais atteinte. Elle précède désormais les vhosts.
+ogs site create shop.test --kind static --redirect www.shop.test --self-signed --yes -q >/dev/null 2>&1
+echo "boutique" > /home/shop.test/www/index.html
+chown shoptest:shoptest /home/shop.test/www/index.html
+gpasswd -a www-data shoptest >/dev/null
+systemctl reload nginx
+sleep 1
+paire=/var/lib/ogs/acme/certificates/shoptest
+openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$paire/privkey.pem" 2>/dev/null
+if nginx -t >/dev/null 2>&1; then
+    echo "ÉCHEC : le témoin manque — nginx doit refuser une paire dépareillée"
+    exit 1
+fi
+echo "témoin : nginx -t refuse la paire dépareillée"
+plan=$(ogs plan shoptest 2>&1)
+echo "$plan" | grep -E "dépareill|vhost nginx" | head -4
+ligne_paire=$(echo "$plan" | grep -n "réémis avant les vhosts" | head -1 | cut -d: -f1)
+ligne_vhost=$(echo "$plan" | grep -n "vhost nginx" | head -1 | cut -d: -f1)
+if [ -z "$ligne_paire" ] || { [ -n "$ligne_vhost" ] && [ "$ligne_paire" -gt "$ligne_vhost" ]; }; then
+    echo "ÉCHEC : la réémission de la paire doit précéder les vhosts"
+    echo "$plan"
+    exit 1
+fi
+ogs doctor 2>&1 | grep -E "dépareill" | head -2
+sortie=$(ogs apply shoptest --yes 2>&1)
+code=$?
+echo "$sortie" | grep -E "dépareill|✗|⚠" | head -4
+echo "apply : code $code"
+if [ "$code" != 0 ] && [ "$code" != 6 ]; then
+    echo "ÉCHEC : l'apply doit rétablir la paire au lieu d'échouer sur le vhost"
+    echo "$sortie" | tail -15
+    exit 1
+fi
+if ! nginx -t >/dev/null 2>&1; then
+    echo "ÉCHEC : configuration refusée après l'apply"
+    nginx -t 2>&1 | tail -3
+    exit 1
+fi
+reponse=$(curl -sk --resolve shop.test:443:127.0.0.1 https://shop.test/index.html)
+redir=$(curl -sk -o /dev/null -w '%{http_code}' --resolve www.shop.test:443:127.0.0.1 https://www.shop.test/)
+echo "shop.test en HTTPS : $reponse ; redirection en HTTPS : $redir"
+if [ "$reponse" != "boutique" ] || [ "$redir" != "301" ]; then
+    echo "ÉCHEC : le site et sa redirection doivent être servis en HTTPS sur la paire rétablie"
+    exit 1
+fi
+
+echo "--- écriture interrompue : achevée avant les vhosts, sans les réécrire ---"
+# Ce que laisse un kill -9 entre deux renommages : la clé neuve en place, la
+# chaîne neuve en attente. Elle s'achève sans émission, et les vhosts, lus
+# comme servis par la paire achevée, ne passent pas en HTTP seul.
+tmp=$(mktemp -d)
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 90 \
+    -subj /CN=shop.test -addext "subjectAltName=DNS:shop.test,DNS:www.shop.test" \
+    -keyout "$tmp/k" -out "$tmp/c" 2>/dev/null
+cp "$tmp/k" "$paire/privkey.pem"
+cp "$tmp/c" "$paire/fullchain.pem.ogs-new"
+rm -rf "$tmp"
+avant=$(md5sum /etc/nginx/sites-available/shoptest.conf | cut -d' ' -f1)
+sortie=$(ogs apply shoptest --yes 2>&1)
+code=$?
+echo "$sortie" | grep -E "interrompue|✗" | head -2
+echo "apply : code $code"
+apres=$(md5sum /etc/nginx/sites-available/shoptest.conf | cut -d' ' -f1)
+if [ "$code" != 0 ] || [ "$avant" != "$apres" ] || [ -e "$paire/fullchain.pem.ogs-new" ] || ! nginx -t >/dev/null 2>&1; then
+    echo "ÉCHEC : l'écriture interrompue doit s'achever sans réécrire le vhost (code $code)"
+    echo "$sortie" | tail -10
+    exit 1
+fi
+echo "écriture achevée, vhost inchangé, configuration valide"
+ogs project delete shoptest --yes >/dev/null 2>&1
+
+echo
+echo "--- paire dépareillée laissée en place, apply d'un projet sans rapport (D110, B2) ---"
+# Une clé recopiée à la main sur shop.test, puis la création d'un autre site. Le
+# rechargement de fin d'apply chargeait la paire : sous Apache, « apachectl -t »
+# répondait « Syntax OK » et le maître mourait après le retour de graceful —
+# tous les sites tombaient, code 0, rien de signalé. Le rechargement est refusé,
+# nommé, et le serveur continue de servir sa configuration précédente.
+ogs site create shop.test --kind static --redirect www.shop.test --self-signed --yes -q >/dev/null 2>&1
+echo "boutique" > /home/shop.test/www/index.html
+chown shoptest:shoptest /home/shop.test/www/index.html
+gpasswd -a www-data shoptest >/dev/null
+systemctl reload nginx
+sleep 1
+paire=/var/lib/ogs/acme/certificates/shoptest
+openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$paire/privkey.pem" 2>/dev/null
+echo "(nginx -t refuse déjà la paire : éprouvé plus haut)"
+sortie=$(ogs site create neuf.test --kind static --self-signed --yes 2>&1)
+code=$?
+echo "$sortie" | grep -E "dépareill|refusé|✗" | head -3
+echo "site create neuf.test : code $code"
+sleep 3
+if ! pgrep -x nginx >/dev/null; then
+    echo "ÉCHEC : le serveur web est mort après l'apply d'un projet sans rapport"
+    exit 1
+fi
+if ! [ "$code" = 1 ] || [ "$code" = 6 ] || ! echo "$sortie" | grep -q "ogs cert renew shoptest"; then
+    echo "ÉCHEC : attendu code 1 (le vhost neuf ne peut être validé) ou 6, le certificat dépareillé nommé avec son remède"
+    echo "$sortie" | tail -12
+    exit 1
+fi
+reponse=$(curl -sk --resolve shop.test:443:127.0.0.1 https://shop.test/index.html)
+echo "serveur vivant ; shop.test toujours servi : $reponse"
+if [ "$reponse" != "boutique" ]; then
+    echo "ÉCHEC : les sites doivent rester servis sur la configuration précédente"
+    exit 1
+fi
+ogs doctor 2>&1 | grep -E "certificats des vhosts" | head -1
+sortie=$(ogs cert renew shoptest 2>&1)
+code=$?
+echo "$sortie" | tail -2
+sleep 3
+if [ "$code" != 0 ] || ! pgrep -x nginx >/dev/null; then
+    echo "ÉCHEC : « cert renew » doit réémettre la paire et recharger le serveur (code $code)"
+    exit 1
+fi
+ogs apply neuftest --yes >/dev/null 2>&1
+sleep 2
+reponse=$(curl -sk --resolve shop.test:443:127.0.0.1 https://shop.test/index.html)
+if [ "$reponse" != "boutique" ] || ! pgrep -x nginx >/dev/null; then
+    echo "ÉCHEC : après « cert renew », le site doit être servi sur la paire rétablie"
+    exit 1
+fi
+echo "paire réémise par « cert renew », serveur rechargé et vivant"
+ogs project delete neuftest --yes >/dev/null 2>&1
+ogs project delete shoptest --yes >/dev/null 2>&1
+
+echo
 echo "--- suppression : le vhost part et la configuration reste valide ---"
 ogs project delete phptest --yes >/dev/null 2>&1
 if ls /etc/nginx/sites-enabled/ | grep -q phptest; then

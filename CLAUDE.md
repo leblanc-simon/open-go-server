@@ -12,8 +12,8 @@ Les commits ne mentionnent jamais l'assistance d'un outil d'IA.
 
 ## La référence
 
-[`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md) fait autorité : 109 décisions d'architecture
-arbitrées (D1–D109, tableau §2), spécification par module, plan de tests, découpage en lots. **Consulter le
+[`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md) fait autorité : 110 décisions d'architecture
+arbitrées (D1–D110, tableau §2), spécification par module, plan de tests, découpage en lots. **Consulter le
 tableau des décisions avant de proposer une architecture** — la plupart des questions « pourquoi pas
 plutôt… ? » y sont déjà tranchées, avec leur raison. Toute décision nouvelle s'y ajoute.
 
@@ -111,9 +111,11 @@ les précédentes en ordre inverse, une étape non critique produit un avertisse
 
 `plan`, `diff` et `apply` partagent le même calcul : `apply.go:buildPlan` assemble les providers dans un
 ordre qui est une décision, non un détail — système → bases → AMQP → applicatif (runtime, lien, unité) →
-PHP → cron → unités et démarrage des instances → attente de disponibilité → web → TLS → bascule TLS du
-vhost → sudoers. Les services démarrent **avant** le serveur web : un vhost de proxy branché sur une
-application qui n'a pas encore démarré exposerait une 502. `buildGlobalPlan` porte ce qui vaut pour tout le
+PHP → cron → unités et démarrage des instances → attente de disponibilité → paires TLS dépareillées →
+web → TLS → bascule TLS du vhost → sudoers. Les services démarrent **avant** le serveur web : un vhost de
+proxy branché sur une application qui n'a pas encore démarré exposerait une 502. Une paire clé/certificat
+dépareillée se rétablit **avant** tout ce qui écrit la configuration du serveur web (D110) : nginx refuse la
+configuration entière dès `nginx -t` tant qu'un vhost la désigne encore. `buildGlobalPlan` porte ce qui vaut pour tout le
 parc (logrotate, tmpfiles, unités de renouvellement, vhost de statut, supervision).
 
 **Le plan global lit le parc entier lui-même, jamais la liste des projets visés.** Chacun de ses fichiers
@@ -447,8 +449,8 @@ Ils ont tous coûté un défaut réel ; les tests unitaires ne les voyaient pas.
   fichier référencé a pu disparaître entre les deux —, et le constat `is-active` après.
 - Aucune vérification en amont d'un rechargement ne couvre tout : `ProtectHome` dans une unité fait voir
   `/home` en lecture seule **au seul service**, là où ogs écrit sans peine. D'où le constat en aval —
-  `web.Provider.Reload` vérifie `is-active` après le rechargement, relève le serveur s'il est mort et le
-  signale même alors.
+  `web.Provider.Reload` observe le moteur quelques instants après le rechargement (une mort peut suivre
+  le retour de la commande), relève le serveur s'il est mort et le signale même alors.
 - **L'unité du serveur web est durcie par la distribution** : Ubuntu livre `apache2.service` avec
   `ProtectHome=read-only`, qui montre `/home` en lecture seule **au seul service** — `mount` affiche `rw`,
   root écrit sans peine, et le maître meurt en ouvrant le journal d'un vhost. D'où le complément d'unité
@@ -457,6 +459,13 @@ Ils ont tous coûté un défaut réel ; les tests unitaires ne les voyaient pas.
   faisant échouer le service en 226/NAMESPACE.
 - Avant toute relance du moteur, **acquitter le compteur d'échecs** (`systemctl reset-failed`) : passé
   `StartLimitBurst`, systemd refuse de démarrer et le serveur reste mort alors que la cause est levée.
+- **`apachectl -t` ne charge aucune clé TLS, et `graceful` rend la main avant la mort du maître** (D110) :
+  une clé recopiée sur un site, puis l'apply d'un projet sans rapport — « Syntax OK », « ↻ rechargement »,
+  code 0, et le maître mourait en chargeant la paire (AH02565), tous les sites en 000 ; `is-active` relu
+  aussitôt le voyait vivant. Avant tout rechargement, toute validation et tout redémarrage,
+  `web.Provider.CheckCertificates` relit les paires que désignent les vhosts activés — achève une écriture
+  interrompue, refuse sinon le rechargement en nommant le certificat (code 6) —, et `Reload` observe le
+  moteur 2 s (`MainPID`, `NRestarts`, `is-active`) avant de le croire vivant.
 - **`apachectl -t` répond « Syntax OK » sans ouvrir un seul journal**, alors que le maître les ouvre tous au
   (re)démarrage et s'arrête sur le premier qui résiste (`AH00019: Unable to open logs, exiting`). Un `/home`
   remonté en lecture seule après une erreur disque a ainsi tué un serveur entier, configuration valide à
@@ -775,6 +784,23 @@ Ils ont tous coûté un défaut réel ; les tests unitaires ne les voyaient pas.
   fichier en place. Un certificat réémis n'est présenté qu'après rechargement : l'étape d'émission porte
   l'intention (`tls.Provider.WebReload`), et `cert renew` recharge dès qu'un certificat a changé, même si un
   autre a échoué.
+- **Un certificat ne quitte le disque que si aucun vhost écrit ne le désigne** (D110) : la compensation
+  d'une émission retirait le certificat neuf pendant que la bascule TLS, sans compensation, laissait le bloc
+  443 qui le désigne — le moteur refusait la configuration au rechargement suivant, le parc avec ce site. La
+  bascule rend le fichier d'avant, et `cert delete` comme la compensation lisent les vhosts écrits
+  (`web.Provider.CertificateReferences`), jamais les seules déclarations. Clé et certificat s'écrivent sous
+  le verrou du répertoire (`flock`), noms d'attente puis renommages, et toute lecture vérifie qu'ils
+  s'appareillent : `Store.Read` tient une paire dépareillée pour absente — le moteur la refuserait avec
+  toute sa configuration —, `ReadPair` la dit dépareillée au plan. `cert renew` ne prend pas le verrou
+  global : deux émissions concurrentes entrelaçaient leurs fichiers en quelques tours. **La paire se
+  rétablit avant les vhosts** (`tls.Provider.PlanPairs`) : placée à l'étape d'émission, après le web, la
+  réparation n'était jamais atteinte — l'étape web réécrivait le premier vhost en HTTP seul, `nginx -t`
+  lisait le second, la redirection du même certificat, qui désignait toujours la paire, et la saga
+  déroulait l'apply en code 1. **`apachectl -t` ne voit pas une paire dépareillée** (« Syntax OK ») : le
+  maître meurt au rechargement (AH02565) ; une règle sur la paire se juge donc sous les deux moteurs. Une
+  écriture interrompue que les fichiers en attente achèvent se lit comme achevée, et `acme.staging` ne
+  remplace jamais un certificat de production au renouvellement : le timer le faisait, sans annonce, HSTS
+  compris.
 - **Une commande ACME échoue tout entière sur un seul nom refusé** (D80) : une redirection, couverte par le
   certificat du projet, dont le DNS pointe ailleurs empêchait sinon le renouvellement du site. L'émission se
   replie par paliers ; le repli sur les seuls noms déjà couverts laissait un alias ajouté à jamais sans

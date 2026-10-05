@@ -652,6 +652,16 @@ func (a *App) runChecks(ctx context.Context) []check {
 		} else {
 			add("journaux des vhosts", "ok", "les journaux des vhosts gérés sont inscriptibles", "")
 		}
+		// Paires clé/certificat que désignent les vhosts activés (D110) : nginx
+		// refuse toute sa configuration, Apache meurt au rechargement suivant —
+		// « apachectl -t » n'en dit rien. Doctor n'écrit rien : une écriture
+		// interrompue est nommée comme les autres, l'apply ou « cert renew »
+		// l'achève.
+		if err := provs.Web.CheckCertificates(context.Background(), false); err != nil {
+			add("certificats des vhosts", "échec",
+				"un rechargement de "+provs.Engine.Unit()+" serait refusé : "+err.Error(),
+				"ogs cert renew <nom> (ou remettre la clé d'origine en place)")
+		}
 		// Surcharges de vhost (D63) : un fichier lu en root par le maître, un
 		// fichier déposé hors de tout contexte donc jamais chargé, un répertoire
 		// qu'aucun vhost ne référence plus. Rien de tout cela ne se voit dans une

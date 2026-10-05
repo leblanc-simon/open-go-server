@@ -152,7 +152,7 @@ func (p *Provider) PlanStatus(ctx context.Context, projects []*model.Project,
 			}
 			// Même précaution que pour un vhost de projet : une configuration
 			// invalide écrite ici arrête tout le serveur au rechargement suivant.
-			if err := validate(ctx, p.Engine, p.Exec); err != nil {
+			if err := p.validateConfig(ctx); err != nil {
 				if hadPrevious {
 					_ = fs.WriteAtomic(filePath, previous, 0o644, fs.KeepOwner)
 				} else {

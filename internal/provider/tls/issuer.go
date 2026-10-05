@@ -52,7 +52,12 @@ type Request struct {
 	AutoDNS bool
 	KeyType string
 	Staging bool
-	Email   string
+	// ConfigStaging signale un Staging qui ne vient que d'acme.staging de
+	// config.yaml, ni de la déclaration ni de « --staging » : il vaut pour une
+	// émission neuve, jamais pour le renouvellement d'un certificat de production
+	// en place (D110).
+	ConfigStaging bool
+	Email         string
 	// Essential porte les noms dont l'émission ne doit dépendre d'aucun autre :
 	// ceux du vhost principal. Quand la demande complète échoue, l'émission se
 	// replie par paliers qui écartent d'abord les redirections, puis les noms que

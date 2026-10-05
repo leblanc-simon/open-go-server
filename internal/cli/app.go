@@ -419,6 +419,23 @@ func (a *App) buildProviders() (*providers, error) {
 	// Sans déclaration lisible, les adresses de confiance sont inconnues : les
 	// prisons gardent celles qu'elles ignorent déjà (D109).
 	trusted, trustedErr := fw.IgnoreIP()
+	webProv := &web.Provider{
+		Paths: a.Paths, Exec: a.Exec, Templates: tmpl, Engine: eng, PHP: php,
+		Certificate: certs.VHostCoverage,
+		CertDir:     certStore.Dir,
+		ProxyTarget: appProv.ProxyTarget,
+		Force:       a.Force,
+		LogsRoot:    a.logsRoot(),
+	}
+	// Un certificat ne quitte le disque — suppression, compensation d'une
+	// émission — que si aucun vhost écrit ne le désigne (D110).
+	certs.ServedBy = webProv.CertificateReferences
+	// Avant tout rechargement, toute validation et tout redémarrage du serveur
+	// web, les paires que désignent les vhosts activés sont vérifiées (D110).
+	webProv.CertificatePair = func(ctx context.Context, dir string, repair bool) (web.PairCheck, error) {
+		name, paired, repaired, err := certs.CheckPair(ctx, dir, repair)
+		return web.PairCheck{Name: name, Paired: paired, Repaired: repaired}, err
+	}
 	return &providers{
 		System: sys,
 		TLS:    certs,
@@ -427,19 +444,12 @@ func (a *App) buildProviders() (*providers, error) {
 		App:    appProv,
 		Cron: &cron.Provider{Paths: a.Paths, Templates: tmpl, Force: a.Force, Simulated: a.Exec.Simulated(),
 			Owner: func(proj *model.Project) (int, int, error) { return sys.ResolveOwner(proj, "") }},
-		Unit:    &unit.Provider{Paths: a.Paths, Exec: a.Exec, Templates: tmpl, Force: a.Force},
-		Sudoers: &sudoers.Provider{Paths: a.Paths, Exec: a.Exec, Force: a.Force},
-		Runtime: &runtime.Provider{Paths: a.Paths},
-		Hooks:   a.hookRunner(),
-		PHP:     php,
-		Web: &web.Provider{
-			Paths: a.Paths, Exec: a.Exec, Templates: tmpl, Engine: eng, PHP: php,
-			Certificate: certs.VHostCoverage,
-			CertDir:     certStore.Dir,
-			ProxyTarget: appProv.ProxyTarget,
-			Force:       a.Force,
-			LogsRoot:    a.logsRoot(),
-		},
+		Unit:      &unit.Provider{Paths: a.Paths, Exec: a.Exec, Templates: tmpl, Force: a.Force},
+		Sudoers:   &sudoers.Provider{Paths: a.Paths, Exec: a.Exec, Force: a.Force},
+		Runtime:   &runtime.Provider{Paths: a.Paths},
+		Hooks:     a.hookRunner(),
+		PHP:       php,
+		Web:       webProv,
 		Logrotate: &logrotate.Provider{Paths: a.Paths, Templates: tmpl, Config: a.Cfg, Force: a.Force},
 		Monitoring: &monitoring.Provider{
 			Paths: a.Paths, Cfg: a.Cfg, Exec: a.Exec, Templates: tmpl,

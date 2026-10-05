@@ -935,6 +935,66 @@ if [ "$code" != "200" ]; then
 fi
 
 echo
+echo "--- paire dépareillée laissée en place, apply d'un projet sans rapport (D110, B2) ---"
+# Une clé recopiée à la main sur shop.test, puis la création d'un autre site. Le
+# rechargement de fin d'apply chargeait la paire : sous Apache, « apachectl -t »
+# répondait « Syntax OK » et le maître mourait après le retour de graceful —
+# tous les sites tombaient, code 0, rien de signalé. Le rechargement est refusé,
+# nommé, et le serveur continue de servir sa configuration précédente.
+ogs site create shop.test --kind static --redirect www.shop.test --self-signed --yes -q >/dev/null 2>&1
+echo "boutique" > /home/shop.test/www/index.html
+chown shoptest:shoptest /home/shop.test/www/index.html
+gpasswd -a www-data shoptest >/dev/null
+apache2ctl graceful
+sleep 2
+paire=/var/lib/ogs/acme/certificates/shoptest
+openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$paire/privkey.pem" 2>/dev/null
+if ! apache2ctl -t >/dev/null 2>&1; then
+    echo "ÉCHEC : le témoin manque — apachectl -t ne charge aucune clé et doit répondre Syntax OK"
+    exit 1
+fi
+echo "témoin : apachectl -t répond Syntax OK sur la paire dépareillée"
+sortie=$(ogs site create neuf.test --kind static --self-signed --yes 2>&1)
+code=$?
+echo "$sortie" | grep -E "dépareill|refusé|✗" | head -3
+echo "site create neuf.test : code $code"
+sleep 3
+if ! pgrep -x apache2 >/dev/null; then
+    echo "ÉCHEC : le serveur web est mort après l'apply d'un projet sans rapport"
+    exit 1
+fi
+if ! [ "$code" = 6 ] || ! echo "$sortie" | grep -q "ogs cert renew shoptest"; then
+    echo "ÉCHEC : attendu code 6, le certificat dépareillé nommé avec son remède"
+    echo "$sortie" | tail -12
+    exit 1
+fi
+reponse=$(curl -sk --resolve shop.test:443:127.0.0.1 https://shop.test/index.html)
+echo "serveur vivant ; shop.test toujours servi : $reponse"
+if [ "$reponse" != "boutique" ]; then
+    echo "ÉCHEC : les sites doivent rester servis sur la configuration précédente"
+    exit 1
+fi
+ogs doctor 2>&1 | grep -E "certificats des vhosts" | head -1
+sortie=$(ogs cert renew shoptest 2>&1)
+code=$?
+echo "$sortie" | tail -2
+sleep 3
+if [ "$code" != 0 ] || ! pgrep -x apache2 >/dev/null; then
+    echo "ÉCHEC : « cert renew » doit réémettre la paire et recharger le serveur (code $code)"
+    exit 1
+fi
+ogs apply neuftest --yes >/dev/null 2>&1
+sleep 2
+reponse=$(curl -sk --resolve shop.test:443:127.0.0.1 https://shop.test/index.html)
+if [ "$reponse" != "boutique" ] || ! pgrep -x apache2 >/dev/null; then
+    echo "ÉCHEC : après « cert renew », le site doit être servi sur la paire rétablie"
+    exit 1
+fi
+echo "paire réémise par « cert renew », serveur rechargé et vivant"
+ogs project delete neuftest --yes >/dev/null 2>&1
+ogs project delete shoptest --yes >/dev/null 2>&1
+
+echo
 echo "--- la suppression du projet laisse ce qu'ogs n'a pas écrit ---"
 ogs apply phptest --yes >/dev/null 2>&1
 echo 'Header always set X-Ogs-Garde oui' > "$surcharges/vhost/10-garde.conf"
