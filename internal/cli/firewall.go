@@ -60,13 +60,24 @@ func newFirewallCommand(app *App) *cobra.Command {
 // l'échec du mode réel devant deux moteurs sans web.engine.
 var firewallWebEngine = (*App).webEngine
 
+// firewallAdmin rend la session d'administration ; nil : celle que le provider
+// cherche lui-même, aucune en mode préfixé. Les tests y posent une session pour
+// éprouver les gardes, que le mode préfixé ne voit jamais autrement.
+var firewallAdmin func() (firewall.Session, bool)
+
 // firewall construit le provider pour les commandes du pare-feu. Le moteur web
 // n'est cherché que pour le profil « web » : son absence ne doit pas empêcher
 // de lire l'état d'ufw. Un moteur introuvable n'est pas pour autant l'absence
 // de serveur web : deux moteurs sans web.engine, c'est un serveur web qu'on ne
 // sait pas nommer, et le profil web reste disponible — le tenir pour absent
 // retirait l'accès public de tous les sites au premier bannissement.
-func (a *App) firewall() (*firewall.Provider, error) {
+func (a *App) firewall() (*firewall.Provider, error) { return a.firewallFor(nil) }
+
+// firewallFor construit le provider sur une déclaration donnée, ou sur ufw.yaml
+// si cfg est nil. Une déclaration donnée remplace le fichier, valide ou non :
+// « ban » et « unban » calculent le plan du document qu'ils s'apprêtent à
+// écrire, et « init » en compose un neuf.
+func (a *App) firewallFor(cfg *config.UFW) (*firewall.Provider, error) {
 	unit, undecided := "", false
 	if eng, err := firewallWebEngine(a); err == nil {
 		unit = eng.Unit()
@@ -78,6 +89,10 @@ func (a *App) firewall() (*firewall.Provider, error) {
 		return nil, err
 	}
 	fw.WebUndecided = undecided
+	fw.Admin = firewallAdmin
+	if cfg != nil {
+		fw.Cfg, fw.LoadErr = cfg, nil
+	}
 	if fw.LoadErr != nil {
 		return nil, wrap(CodeValidation, fw.LoadErr)
 	}
@@ -95,9 +110,9 @@ func webServerInstalled(prefix string) bool {
 	return false
 }
 
-// managedFirewall exige ufw.yaml.
-func (a *App) managedFirewall() (*firewall.Provider, error) {
-	fw, err := a.firewall()
+// managedFirewall exige ufw.yaml, ou la déclaration donnée.
+func (a *App) managedFirewall(cfg *config.UFW) (*firewall.Provider, error) {
+	fw, err := a.firewallFor(cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -148,12 +163,7 @@ func newFirewallInitCommand(app *App) *cobra.Command {
 
 // firewallProviderWith construit un provider sur une déclaration donnée.
 func (a *App) firewallProviderWith(cfg *config.UFW) (*firewall.Provider, error) {
-	fw, err := a.firewall()
-	if err != nil {
-		return nil, err
-	}
-	fw.Cfg = cfg
-	return fw, nil
+	return a.firewallFor(cfg)
 }
 
 // starterUFW compose un ufw.yaml de départ.
@@ -257,10 +267,22 @@ func newFirewallStatusCommand(app *App) *cobra.Command {
 			}
 			lignes = append(lignes, ligne{"règles", fmt.Sprintf("%d d'ogs, %d de l'administrateur", managed, foreign), ""})
 			switch {
+			case obs.DisabledWhilePending():
+				lignes = append(lignes, ligne{"confirmation", "rien à confirmer — ufw a été désactivé dans le délai",
+					"ogs firewall apply"})
+			case obs.RollbackPending && obs.BootGuard:
+				lignes = append(lignes, ligne{"confirmation", "en attente — un redémarrage d'ici là laisse ufw inactif",
+					"ogs firewall confirm"})
 			case obs.RollbackPending:
 				lignes = append(lignes, ligne{"confirmation", "en attente", "ogs firewall confirm"})
+			case obs.RollbackLost() && obs.BootGuard:
+				lignes = append(lignes, ligne{"confirmation", "jamais confirmée, retour automatique perdu — le " +
+					"prochain démarrage laissera ufw inactif", "ogs firewall confirm"})
 			case obs.RollbackLost():
-				lignes = append(lignes, ligne{"confirmation", "jamais confirmée, retour automatique perdu",
+				lignes = append(lignes, ligne{"confirmation", "jamais confirmée, retour automatique perdu, sans filet",
+					"ogs firewall confirm"})
+			case obs.BootGuard && !obs.Unconfirmed:
+				lignes = append(lignes, ligne{"confirmation", "complément d'unité resté sans témoin, sans effet",
 					"ogs firewall confirm"})
 			case obs.RolledBack():
 				lignes = append(lignes, ligne{"confirmation", "défaite par le retour automatique", "ogs firewall apply"})
@@ -398,7 +420,7 @@ func newFirewallSourcesCommand(app *App) *cobra.Command {
 		Use:   "sources",
 		Short: "Lister les sources nommées : à qui appartiennent les adresses",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			fw, err := app.managedFirewall()
+			fw, err := app.managedFirewall(nil)
 			if err != nil {
 				return err
 			}
@@ -430,7 +452,7 @@ func newFirewallWhoisCommand(app *App) *cobra.Command {
 		Short: "Dire à qui appartient une adresse et ce que le pare-feu lui permet",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			fw, err := app.managedFirewall()
+			fw, err := app.managedFirewall(nil)
 			if err != nil {
 				return err
 			}
@@ -490,11 +512,18 @@ func newFirewallWhoisCommand(app *App) *cobra.Command {
 // lève les gardes contre la coupure : c'est la seule voie qui le fasse, le
 // --force des fichiers retouchés n'en ayant pas le pouvoir.
 func (a *App) firewallPlan(cmd *cobra.Command, allowLockout bool) (*engine.Plan, *firewall.Provider, error) {
+	return a.firewallPlanFor(cmd, allowLockout, nil)
+}
+
+// firewallPlanFor calcule le plan d'une déclaration donnée, ou d'ufw.yaml si cfg
+// est nil : les gardes s'y prononcent avant que rien ne soit écrit.
+func (a *App) firewallPlanFor(cmd *cobra.Command, allowLockout bool, cfg *config.UFW) (*engine.Plan,
+	*firewall.Provider, error) {
 	projects, err := a.loadProjects()
 	if err != nil {
 		return nil, nil, err
 	}
-	fw, err := a.managedFirewall()
+	fw, err := a.managedFirewall(cfg)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -587,7 +616,21 @@ func (a *App) applyFirewall(cmd *cobra.Command, allowLockout bool) error {
 	if err != nil {
 		return err
 	}
+	return a.executeFirewall(cmd, plan, fw, nil)
+}
+
+// executeFirewall exécute un plan du pare-feu déjà calculé, donc déjà gardé.
+// commit, s'il est donné, s'exécute une fois la confirmation obtenue et avant
+// la première étape : c'est là que « ban » et « unban » écrivent ufw.yaml, pour
+// qu'un refus ou une confirmation déclinée le laissent intact.
+func (a *App) executeFirewall(cmd *cobra.Command, plan *engine.Plan, fw *firewall.Provider, commit func() error) error {
+	if commit == nil {
+		commit = func() error { return nil }
+	}
 	if plan.Empty() {
+		if err := commit(); err != nil {
+			return err
+		}
 		a.printf("= pare-feu : aucun changement\n")
 		return nil
 	}
@@ -597,6 +640,9 @@ func (a *App) applyFirewall(cmd *cobra.Command, allowLockout bool) error {
 		return nil
 	}
 	if err := a.confirm(fmt.Sprintf("appliquer %d changement(s) au pare-feu ?", len(plan.Mutating()))); err != nil {
+		return err
+	}
+	if err := commit(); err != nil {
 		return err
 	}
 	report, err := engine.Execute(cmd.Context(), plan, engine.Options{
@@ -630,13 +676,14 @@ func newFirewallConfirmCommand(app *App) *cobra.Command {
 		Long: "À lancer depuis une NOUVELLE session SSH : c'est elle qui prouve que le pare-feu\n" +
 			"laisse passer l'administration. Une session ouverte avant l'activation survit à\n" +
 			"des règles qui refuseraient la suivante.\n\n" +
-			"Un redémarrage dans le délai efface le retour automatique, et ufw repart actif :\n" +
-			"l'activation reste alors à confirmer, ce que « status » et « doctor » signalent.",
+			"Un redémarrage de la machine dans le délai vaut retour : ufw repart inactif, et\n" +
+			"« ogs firewall apply » le réactive, à confirmer de nouveau. Relancer l'unité ufw ne\n" +
+			"défait rien. ufw inactif, il n'y a rien à confirmer : la commande le dit, code 6.",
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			// La confirmation ne lit pas ufw.yaml : un fichier retouché, voire cassé,
 			// depuis l'activation ne doit pas empêcher de garder un pare-feu qui
 			// fonctionne — faute de quoi il retomberait de lui-même.
-			fw := &firewall.Provider{Paths: app.Paths, Exec: app.Exec}
+			fw := &firewall.Provider{Paths: app.Paths, Exec: app.Exec, Force: app.Force}
 			obs, err := fw.Observe(cmd.Context())
 			if err != nil {
 				return wrap(CodeError, err)
@@ -660,6 +707,11 @@ func newFirewallConfirmCommand(app *App) *cobra.Command {
 						app.printf("aucune activation en attente de confirmation : ufw est inactif, comme " +
 							"ufw.yaml le demande (active: false)\n")
 						return nil
+					case obs.DisabledWhilePending():
+						app.warnf("⚠ ufw est inactif alors que son activation attendait encore sa confirmation : " +
+							"il a été désactivé dans le délai — rien n'est confirmé ; « ogs firewall apply » le " +
+							"réactive, à confirmer depuis une nouvelle session\n")
+						return exitf(CodePartial, "ufw est inactif : rien à confirmer")
 					case obs.RolledBack():
 						app.warnf("⚠ ufw est inactif : le retour automatique a défait l'activation, faute de " +
 							"confirmation dans le délai — « ogs firewall apply » la refait, à confirmer depuis une " +
@@ -678,7 +730,12 @@ func newFirewallConfirmCommand(app *App) *cobra.Command {
 			if app.Audit != nil {
 				_ = app.Audit.Record("", "firewall/state", "firewall.confirm", "ok", "")
 			}
-			if obs.RollbackLost() {
+			switch {
+			case obs.RollbackLost() && obs.BootGuard:
+				app.printf("✓ activation d'ufw confirmée — son minuteur avait déjà disparu ; le complément qui " +
+					"l'aurait laissé inactif au prochain démarrage est retiré\n")
+				return nil
+			case obs.RollbackLost():
 				app.printf("✓ activation d'ufw confirmée — son retour automatique avait déjà disparu (un " +
 					"redémarrage l'efface) : ufw tenait sans filet\n")
 				return nil
@@ -693,6 +750,11 @@ func newFirewallConfirmCommand(app *App) *cobra.Command {
 // — il reste la source de vérité (D1) — puis appliquent le pare-feu, sauf
 // --no-apply. L'écriture passe par l'arbre du document : les commentaires de
 // l'exploitant, qui disent souvent pourquoi une adresse est là, survivent.
+//
+// Le plan du document modifié se calcule et se garde **avant** l'écriture
+// (D109) : un bannissement que les gardes contre la coupure refusent — ou que
+// l'exploitant décline à la confirmation — laisse ufw.yaml intact. Écrit
+// d'abord, il restait dans le fichier, et le prochain apply le retrouvait.
 func newFirewallBanCommand(app *App, ban bool) *cobra.Command {
 	var (
 		comment      string
@@ -732,28 +794,46 @@ func newFirewallBanCommand(app *App, ban bool) *cobra.Command {
 			}
 			defer lock.Release()
 
-			changed, err := editBanList(path, entry, ban)
+			edit, err := editBanList(path, entry, ban)
 			if err != nil {
 				return err
 			}
-			if !changed {
-				if ban {
-					app.printf("= %s est déjà bannie\n", entry.Label())
-				} else {
-					app.printf("= %s n'est pas bannie dans %s\n", entry.Label(), path)
+			commit := func() error {
+				if edit.changed {
+					if err := edit.write(path); err != nil {
+						return err
+					}
 				}
-			} else if ban {
-				app.printf("✓ %s ajoutée aux bannissements de %s\n", entry.Label(), path)
-			} else {
-				app.printf("✓ %s retirée des bannissements de %s\n", entry.Label(), path)
-			}
-			if noApply {
+				switch {
+				case !edit.changed && ban:
+					app.printf("= %s est déjà bannie\n", entry.Label())
+				case !edit.changed:
+					app.printf("= %s n'est pas bannie dans %s\n", entry.Label(), path)
+				case ban:
+					app.printf("✓ %s ajoutée aux bannissements de %s\n", entry.Label(), path)
+				default:
+					app.printf("✓ %s retirée des bannissements de %s\n", entry.Label(), path)
+				}
 				return nil
 			}
-			if err := app.openStore(); err != nil {
-				return err
+			if noApply && !edit.changed {
+				return commit()
 			}
-			return app.applyFirewall(cmd, allowLockout)
+			if !noApply {
+				if err := app.openStore(); err != nil {
+					return err
+				}
+			}
+			// Le plan du document à écrire : les gardes s'y prononcent, sous
+			// --no-apply aussi — le prochain apply le retrouverait refusé.
+			plan, fw, err := app.firewallPlanFor(cmd, allowLockout, edit.cfg)
+			if err != nil {
+				return app.banRefusal(cmd, err, edit, allowLockout, noApply, commit)
+			}
+			if noApply {
+				return commit()
+			}
+			return app.executeFirewall(cmd, plan, fw, commit)
 		},
 	}
 	if ban {
@@ -764,24 +844,90 @@ func newFirewallBanCommand(app *App, ban bool) *cobra.Command {
 	return cmd
 }
 
-// editBanList ajoute ou retire une entrée de la liste « ban » d'ufw.yaml. Le
-// document modifié est validé avant d'être écrit : une adresse bannie qui en
+// banRefusal décide d'un plan refusé pour « ban » et « unban ». Seuls les refus
+// des gardes contre la coupure (D86), et les problèmes que le document modifié
+// fait naître — ceux de la règle bannie —, empêchent d'écrire ufw.yaml. Un
+// problème qu'ufw.yaml porte déjà n'y est pour rien : un profil ftp à plage
+// passive inconnue faisait refuser, sous --no-apply, un bannissement que main
+// écrivait (D109). Le document est alors écrit, le problème dit : sous
+// --no-apply, code 6 ; sinon, le pare-feu ne s'appliquant pas tel quel, code 3.
+// Sous --no-apply, un refus des gardes que le plan du fichier en place portait
+// déjà vaut de même : rien n'est appliqué, et main écrivait. Hors --no-apply,
+// tout refus des gardes arrête l'écriture, et un refus neuf toujours.
+func (a *App) banRefusal(cmd *cobra.Command, err error, edit banEdit, allowLockout, noApply bool,
+	commit func() error) error {
+	var ve *firewall.ValidationError
+	if !edit.changed || !errors.As(err, &ve) || (len(ve.Lockout) > 0 && !noApply) {
+		return err
+	}
+	var base *firewall.ValidationError
+	if _, _, baseErr := a.firewallPlanFor(cmd, allowLockout, nil); !errors.As(baseErr, &base) {
+		return err
+	}
+	known := map[string]bool{}
+	for _, p := range base.Problems {
+		known[p] = true
+	}
+	for _, p := range ve.Problems {
+		if !known[p] {
+			return err
+		}
+	}
+	if err := commit(); err != nil {
+		return err
+	}
+	path := a.Paths.UFWConfig()
+	a.warnf("⚠ %s porte déjà des problèmes sans rapport avec ce bannissement — le pare-feu ne s'applique pas "+
+		"tel quel :\n  %s\n", path, strings.Join(ve.Problems, "\n  "))
+	if len(ve.Lockout) > 0 {
+		a.warnf("  les refus des gardes contre la coupure s'y trouvaient déjà : « ogs firewall apply " +
+			"--allow-lockout » passe outre, à bon escient\n")
+	}
+	if noApply {
+		return exitf(CodePartial, "%s écrit ; le pare-feu reste à corriger avant « ogs firewall apply »", path)
+	}
+	return exitf(CodeValidation, "%s écrit, pare-feu non appliqué : corriger les problèmes ci-dessus, puis "+
+		"« ogs firewall apply »", path)
+}
+
+// banEdit est la liste « ban » modifiée, pas encore écrite.
+type banEdit struct {
+	changed bool
+	// out est le document réécrit, cfg sa lecture validée ; nil sans changement.
+	out []byte
+	cfg *config.UFW
+}
+
+// write écrit le document, au mode du fichier en place.
+func (e banEdit) write(path string) error {
+	mode := os.FileMode(0o600)
+	if info, err := os.Stat(path); err == nil {
+		mode = info.Mode().Perm()
+	}
+	if err := fs.WriteAtomic(path, e.out, mode, fs.KeepOwner); err != nil {
+		return wrap(CodeError, err)
+	}
+	return nil
+}
+
+// editBanList ajoute ou retire une entrée de la liste « ban » d'ufw.yaml, sans
+// rien écrire. Le document modifié est validé : une adresse bannie qui en
 // recouvre une autorisée est refusée ici, non découverte à l'apply.
-func editBanList(path string, entry config.UFWEntry, add bool) (bool, error) {
+func editBanList(path string, entry config.UFWEntry, add bool) (banEdit, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return false, wrap(CodeError, err)
+		return banEdit{}, wrap(CodeError, err)
 	}
 	file, err := parser.ParseBytes(data, parser.ParseComments)
 	if err != nil {
-		return false, exitf(CodeValidation, "%s : %v", path, err)
+		return banEdit{}, exitf(CodeValidation, "%s : %v", path, err)
 	}
 	if len(file.Docs) == 0 || file.Docs[0].Body == nil {
-		return false, exitf(CodeValidation, "%s est vide", path)
+		return banEdit{}, exitf(CodeValidation, "%s est vide", path)
 	}
 	root, ok := file.Docs[0].Body.(*ast.MappingNode)
 	if !ok {
-		return false, exitf(CodeValidation, "%s : un document de clés est attendu", path)
+		return banEdit{}, exitf(CodeValidation, "%s : un document de clés est attendu", path)
 	}
 	var seq *ast.SequenceNode
 	var holder *ast.MappingValueNode
@@ -814,13 +960,13 @@ func editBanList(path string, entry config.UFWEntry, add bool) (bool, error) {
 		if seq != nil {
 			for _, n := range seq.Values {
 				if same(n) {
-					return false, nil
+					return banEdit{}, nil
 				}
 			}
 		}
 		node, err := yaml.ValueToNode(entry.YAMLValue())
 		if err != nil {
-			return false, wrap(CodeError, err)
+			return banEdit{}, wrap(CodeError, err)
 		}
 		switch {
 		case seq != nil && !seq.IsFlowStyle:
@@ -840,7 +986,7 @@ func editBanList(path string, entry config.UFWEntry, add bool) (bool, error) {
 			values = append(values, entry.YAMLValue())
 			fresh, err := yaml.ValueToNode(map[string]any{"ban": values})
 			if err != nil {
-				return false, wrap(CodeError, err)
+				return banEdit{}, wrap(CodeError, err)
 			}
 			newMV := fresh.(*ast.MappingNode).Values[0]
 			if holder != nil {
@@ -869,7 +1015,7 @@ func editBanList(path string, entry config.UFWEntry, add bool) (bool, error) {
 		}
 	}
 	if !changed {
-		return false, nil
+		return banEdit{}, nil
 	}
 
 	out := []byte(file.String())
@@ -878,17 +1024,10 @@ func editBanList(path string, entry config.UFWEntry, add bool) (bool, error) {
 	}
 	tmp := &config.UFW{}
 	if err := yaml.UnmarshalWithOptions(out, tmp, yaml.Strict()); err != nil {
-		return false, exitf(CodeError, "réécriture de %s illisible : %v", path, err)
+		return banEdit{}, exitf(CodeError, "réécriture de %s illisible : %v", path, err)
 	}
 	if err := tmp.Validate(); err != nil {
-		return false, exitf(CodeValidation, "%s refusé :\n%v", path, err)
+		return banEdit{}, exitf(CodeValidation, "%s refusé :\n%v", path, err)
 	}
-	mode := os.FileMode(0o600)
-	if info, err := os.Stat(path); err == nil {
-		mode = info.Mode().Perm()
-	}
-	if err := fs.WriteAtomic(path, out, mode, fs.KeepOwner); err != nil {
-		return false, wrap(CodeError, err)
-	}
-	return true, nil
+	return banEdit{changed: true, out: out, cfg: tmp}, nil
 }

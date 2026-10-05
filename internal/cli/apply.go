@@ -485,9 +485,16 @@ func (a *App) firewallSteps(ctx context.Context, fw *firewall.Provider, projects
 		case !errors.As(err, &ve):
 			return nil, planErr(err)
 		case strict:
-			return nil, exitf(CodeValidation, "%v", err)
+			return nil, wrap(CodeValidation, err)
 		}
-		return []*engine.Step{firewall.RefusedStep(err)}, nil
+		refused := firewall.RefusedStep(err)
+		// Les prisons gardent alors les adresses de confiance de leur fichier
+		// (D109) : le plan le dit, car le pas de fail2ban, inchangé, n'y figure pas.
+		if _, terr := fw.IgnoreIP(); terr != nil {
+			refused.Summary += " — les prisons fail2ban gardent leurs adresses de confiance : une adresse " +
+				"retirée d'ufw.yaml y reste de confiance tant qu'il ne se relit pas"
+		}
+		return []*engine.Step{refused}, nil
 	}
 	return steps, nil
 }

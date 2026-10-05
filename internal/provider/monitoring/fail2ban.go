@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 
 	"leblanc.io/open-go-server/internal/engine"
 	"leblanc.io/open-go-server/internal/fs"
@@ -50,6 +51,9 @@ type Fail2banData struct {
 	MaxRetry int
 	IgnoreIP []string
 	Jails    []Jail
+	// TrustedNote dit, quand ufw.yaml ne se lit pas (KeepTrusted), d'où viennent
+	// les adresses de confiance : le plan l'affiche.
+	TrustedNote string
 }
 
 // Défauts des prisons générées.
@@ -72,11 +76,26 @@ const (
 // /home/*/logs, et le filtrage des fichiers absents.
 func (p *Provider) BuildFail2ban(projects []*model.Project) Fail2banData {
 	mon := p.Cfg.Monitoring
+	trusted := p.TrustedIP
+	var note string
+	if p.KeepTrusted {
+		path := p.Paths.Fail2banJailFile()
+		kept, err := PreviousIgnoreIP(path)
+		switch {
+		case err != nil:
+			note = fmt.Sprintf("ufw.yaml ne se lisant pas, aucune adresse de confiance n'est reprise : %v", err)
+		case len(kept) > 0:
+			trusted = kept
+			note = "ufw.yaml ne se lisant pas, les adresses de confiance sont reprises du fichier en place — une " +
+				"adresse retirée d'ufw.yaml y reste de confiance tant qu'il ne se relit pas"
+		}
+	}
 	data := Fail2banData{
-		BanTime:  firstNonEmpty(mon.Fail2ban.BanTime, defaultBanTime),
-		FindTime: firstNonEmpty(mon.Fail2ban.FindTime, defaultFindTime),
-		MaxRetry: mon.Fail2ban.MaxRetry,
-		IgnoreIP: withLoopback(append(append([]string{}, mon.Fail2ban.IgnoreIP...), p.TrustedIP...)),
+		BanTime:     firstNonEmpty(mon.Fail2ban.BanTime, defaultBanTime),
+		FindTime:    firstNonEmpty(mon.Fail2ban.FindTime, defaultFindTime),
+		MaxRetry:    mon.Fail2ban.MaxRetry,
+		IgnoreIP:    withLoopback(append(append([]string{}, mon.Fail2ban.IgnoreIP...), trusted...)),
+		TrustedNote: note,
 	}
 	if data.MaxRetry == 0 {
 		data.MaxRetry = defaultMaxRetry
@@ -166,6 +185,56 @@ func (p *Provider) BuildFail2ban(projects []*model.Project) Fail2banData {
 	return data
 }
 
+// PreviousIgnoreIP relit les adresses de l'« ignoreip » des prisons d'ogs dans
+// le fichier en place. Quand ufw.yaml ne se lit pas, les adresses de confiance
+// sont inconnues : les retirer rendrait bannissable l'adresse d'où l'on
+// administre, alors que le plan laisse ufw en l'état (R2-15, D109). Elles sont
+// donc reprises telles quelles — celles de monitoring.fail2ban.ignoreIP
+// comprises, qu'on ne sait pas en distinguer — jusqu'à ce qu'ufw.yaml se lise de
+// nouveau.
+//
+// Seul un fichier conforme à son en-tête est relu : retouché à la main, ou non
+// écrit par ogs, il porterait des adresses que personne n'a déclarées de
+// confiance, et l'erreur le dit. Un fichier absent n'en porte aucune.
+func PreviousIgnoreIP(path string) ([]string, error) {
+	state, err := fs.InspectRemoval(path, "")
+	if err != nil {
+		return nil, err
+	}
+	switch state {
+	case fs.StateAbsent:
+		return nil, nil
+	case fs.StateCurrent:
+	default:
+		return nil, fmt.Errorf("%s est %s", path, state)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	seen := map[string]bool{}
+	ours := false
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
+			ours = strings.HasPrefix(strings.TrimSpace(line[1:len(line)-1]), "ogs-")
+			continue
+		}
+		key, value, ok := strings.Cut(line, "=")
+		if !ours || !ok || strings.TrimSpace(key) != "ignoreip" {
+			continue
+		}
+		for _, a := range strings.Fields(value) {
+			if !seen[a] {
+				seen[a] = true
+				out = append(out, a)
+			}
+		}
+	}
+	return out, nil
+}
+
 // existing ne retient que les journaux réellement présents. En mode simulé, tout
 // est retenu : le mode d'essai doit rendre un fichier complet, et rien n'y est
 // jamais donné à lire à fail2ban.
@@ -196,6 +265,9 @@ func (p *Provider) planFail2ban(projects []*model.Project) (*engine.Step, error)
 	}
 	content := fs.Render(p.header("monitoring/fail2ban", "fail2ban/ogs.conf", len(projects)), body, "#")
 	summary := fmt.Sprintf("prisons fail2ban (%d prison(s), %d projet(s))", len(data.Jails), len(projects))
+	if data.TrustedNote != "" {
+		summary += " — " + data.TrustedNote
+	}
 	// 0644 : le fichier ne porte aucun secret, et fail2ban le lit en root. Le
 	// rendre illisible n'apporterait rien qu'« ogs harden » ne fasse déjà sur le
 	// répertoire.

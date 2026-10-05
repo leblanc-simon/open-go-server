@@ -859,6 +859,14 @@ func (p Paths) UFWUser6Rules() string   { return p.join(ufwDir, "user6.rules") }
 func (p Paths) UFWConf() string         { return p.join(ufwDir, "ufw.conf") }
 func (p Paths) UFWDefaults() string     { return p.join(ufwDefaults) }
 
+// UFWBootMark est la marque posée sous /run à l'armement du retour automatique
+// d'ufw, et par le complément d'unité au premier démarrage d'ufw qui suit celui
+// de la machine (D109). /run est vidé à chaque démarrage : la marque absente,
+// c'est la machine qui vient de démarrer, et non l'unité qu'on relance. Elle vit
+// à la racine de /run, et non sous /run/ogs, que systemd-tmpfiles crée trop tard
+// pour ufw.service. Seul root écrit dans /run.
+func (p Paths) UFWBootMark() string { return p.join("/run", "ogs-ufw-armed") }
+
 // Rooted place sous le préfixe un chemin système que Paths ne nomme pas : les
 // fichiers de configuration des services dont le pare-feu lit les ports.
 func (p Paths) Rooted(path string) string { return p.join(path) }

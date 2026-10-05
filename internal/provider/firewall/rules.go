@@ -94,18 +94,26 @@ func (r Rule) Describe() string {
 // addArgs rend les arguments d'ufw qui posent la règle. Un refus nouveau est
 // placé en tête : ufw retient la première règle qui correspond, et un refus
 // posé après une autorisation plus large ne servirait jamais.
-func (r Rule) addArgs(prepend bool) []string {
+func (r Rule) addArgs(prepend bool) []string { return r.addArgsIn(prepend, 0) }
+
+// addArgsIn pose la règle dans une seule famille (4 ou 6), ou dans les deux
+// (0). Une règle « any » s'écrit dans les deux d'une commande ; restreinte, elle
+// désigne l'adresse « toute » de sa famille — 0.0.0.0/0 ou ::/0 —, que ufw range
+// sous le même tuple que la moitié correspondante d'une règle « any ». C'est ce
+// qui permet de poser, de corriger ou de retirer la moitié d'ogs sans toucher à
+// celle de l'administrateur (R2-16, D109).
+func (r Rule) addArgsIn(prepend bool, family int) []string {
 	var args []string
 	switch {
 	case r.App != "":
-		args = []string{r.Action, "from", r.From, "to", "any", "app", r.App}
+		args = []string{r.Action, "from", r.fromIn(family), "to", "any", "app", r.App}
 	case r.Direction == "in":
-		args = []string{r.Action, "from", r.From}
+		args = []string{r.Action, "from", r.fromIn(family)}
 		if prepend {
 			args = append([]string{"prepend"}, args...)
 		}
 	default:
-		args = []string{r.Action, "out", r.portSpec()}
+		args = append([]string{r.Action}, r.outSpec(family)...)
 	}
 	if r.Comment != "" {
 		args = append(args, "comment", r.Comment)
@@ -115,15 +123,48 @@ func (r Rule) addArgs(prepend bool) []string {
 
 // deleteArgs rend les arguments qui la retirent. Le commentaire n'y figure
 // pas : ufw retire une règle commentée sur sa seule définition.
-func (r Rule) deleteArgs() []string {
+func (r Rule) deleteArgs() []string { return r.deleteArgsIn(0) }
+
+// deleteArgsIn retire la règle d'une seule famille, ou des deux (0).
+func (r Rule) deleteArgsIn(family int) []string {
 	switch {
 	case r.App != "":
-		return []string{"delete", r.Action, "from", r.From, "to", "any", "app", r.App}
+		return []string{"delete", r.Action, "from", r.fromIn(family), "to", "any", "app", r.App}
 	case r.Direction == "in":
-		return []string{"delete", r.Action, "from", r.From}
+		return []string{"delete", r.Action, "from", r.fromIn(family)}
 	default:
-		return []string{"delete", r.Action, "out", r.portSpec()}
+		return append([]string{"delete", r.Action}, r.outSpec(family)...)
 	}
+}
+
+// anyIn rend l'adresse « toute » d'une famille.
+func anyIn(family int) string {
+	if family == 6 {
+		return "::/0"
+	}
+	return "0.0.0.0/0"
+}
+
+// fromIn rend l'origine de la règle, restreinte à une famille si elle vaut
+// « any ».
+func (r Rule) fromIn(family int) string {
+	if family == 0 || r.From != config.UFWAny {
+		return r.From
+	}
+	return anyIn(family)
+}
+
+// outSpec rend la cible d'une sortie : la forme courte (« out 53/udp ») pour
+// les deux familles, la forme étendue, destination comprise, pour une seule.
+func (r Rule) outSpec(family int) []string {
+	if family == 0 {
+		return []string{"out", r.portSpec()}
+	}
+	spec := []string{"out", "to", anyIn(family), "port", r.Port}
+	if r.Proto != "" && r.Proto != "any" {
+		spec = append(spec, "proto", r.Proto)
+	}
+	return spec
 }
 
 func (r Rule) portSpec() string {

@@ -391,10 +391,13 @@ avant l'activation survit à des règles qui refuseraient la suivante. Sans conf
 lui-même, et le prochain `apply` le réactivera, de nouveau à confirmer ; un `confirm` tardif le dit — ufw
 inactif — et rend le code 6.
 
-**Un redémarrage dans le délai emporte le retour automatique** : son minuteur vit sous `/run`, et ufw repart
-actif, sans filet. L'activation laisse donc un témoin, `/var/lib/ogs/ufw-unconfirmed`, que
-`ogs firewall status` et `ogs doctor` signalent tant qu'aucun `confirm` ne l'a retiré. Le témoin rend l'état visible, il
-ne réarme rien : confirmer depuis une nouvelle session reste la seule preuve.
+**Un redémarrage de la machine dans le délai vaut retour** : le minuteur vit sous `/run` et ne survit pas,
+mais l'activation laisse un témoin, `/var/lib/ogs/ufw-unconfirmed`, et un complément d'unité,
+`/etc/systemd/system/ufw.service.d/ogs-rollback.conf` : au démarrage de la machine, tant que le témoin
+existe, ufw reste inactif, et son journal (`journalctl -u ufw`) dit pourquoi. Relancer l'unité
+(`systemctl restart ufw`) ne désactive rien. `ogs firewall status` et `ogs doctor` le signalent tant
+qu'aucun `confirm` ne les a retirés ; `ogs firewall apply` réactive, à confirmer de nouveau. Un ufw
+désactivé dans le délai n'a rien à confirmer : `confirm` le dit et rend le code 6.
 
 ### Les gardes contre la coupure
 
@@ -432,10 +435,14 @@ sudo ogs firewall ban 192.0.2.66 --comment "scan du 12/09"
 sudo ogs firewall unban 192.0.2.66
 ```
 
-`ban` et `unban` écrivent `ufw.yaml` sans en perdre les commentaires, puis appliquent. Les adresses de
-confiance sont aussi ajoutées à l'`ignoreip` des prisons fail2ban d'ogs, au prochain `ogs apply`. Sous
-`--dry-run`, ils refusent l'option (code 2) plutôt que de réécrire `ufw.yaml`. Un bannissement que la garde
-refuse reste en revanche écrit dans `ufw.yaml`, où le prochain apply le retrouve : le retirer à la main.
+`ban` et `unban` calculent d'abord le plan du document modifié : un bannissement que la garde refuse, ou
+une confirmation déclinée, laissent `ufw.yaml` intact. Un problème que `ufw.yaml` portait déjà, sans
+rapport avec le bannissement, ne l'empêche pas d'être écrit : il est signalé, et le pare-feu reste à
+corriger (code 6 sous `--no-apply`, 3 sinon) ; sous `--no-apply`, de même d'un refus de garde déjà
+présent — un refus que le bannissement fait naître n'écrit jamais rien. Sinon ils l'écrivent sans en perdre les
+commentaires, puis appliquent. Les adresses de confiance sont aussi ajoutées à l'`ignoreip` des prisons
+fail2ban d'ogs, au prochain `ogs apply` ; un `ufw.yaml` illisible ne les en retire pas. Sous `--dry-run`,
+ils refusent l'option (code 2) plutôt que de réécrire `ufw.yaml`.
 
 ### Trois pièges
 

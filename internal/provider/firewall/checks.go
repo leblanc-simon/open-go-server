@@ -41,19 +41,41 @@ func (p *Provider) Checks(obs Observed, listeners []string) []Finding {
 		add("pare-feu", "ok", "ufw inactif, comme ufw.yaml le demande", "")
 	}
 	switch {
-	case obs.RollbackPending:
+	case obs.DisabledWhilePending():
 		add("pare-feu : confirmation", "avertissement",
-			"l'activation d'ufw n'a pas été confirmée : il se désactivera de lui-même au terme du délai",
-			"ogs firewall confirm")
+			"ufw est inactif alors que son activation attend encore sa confirmation : il a été désactivé dans "+
+				"le délai, et il n'y a rien à confirmer",
+			"ogs firewall apply, puis ogs firewall confirm depuis une nouvelle session SSH")
+	case obs.RollbackPending:
+		detail := "l'activation d'ufw n'a pas été confirmée : il se désactivera de lui-même au terme du délai"
+		if obs.BootGuard {
+			detail += ", ou au prochain démarrage s'il survient avant"
+		}
+		add("pare-feu : confirmation", "avertissement", detail, "ogs firewall confirm")
+	case obs.RollbackLost() && obs.BootGuard:
+		add("pare-feu : confirmation", "avertissement",
+			"l'activation d'ufw n'a jamais été confirmée, et son retour automatique a disparu : ufw reste actif "+
+				"jusqu'au prochain démarrage, qui le laissera inactif ("+p.BootGuardPath()+")",
+			"ogs firewall confirm, depuis une nouvelle session SSH")
 	case obs.RollbackLost():
 		add("pare-feu : confirmation", "avertissement",
 			"l'activation d'ufw n'a jamais été confirmée, et son retour automatique a disparu — un redémarrage "+
 				"dans le délai l'efface : ufw reste actif, sans filet",
 			"ogs firewall confirm, depuis une nouvelle session SSH")
+	case obs.BootGuard && !obs.Unconfirmed:
+		add("pare-feu : confirmation", "avertissement",
+			p.BootGuardPath()+" est resté sans témoin d'activation : sans effet, il n'a plus d'objet",
+			"ogs firewall confirm le retire")
 	case obs.RolledBack() && cfg.IsActive():
 		add("pare-feu : confirmation", "avertissement",
 			"le retour automatique a désactivé ufw, faute de confirmation dans le délai",
 			"ogs firewall apply, puis ogs firewall confirm depuis une nouvelle session SSH")
+	}
+	if obs.BootGuardForeign && obs.Unconfirmed {
+		add("pare-feu : confirmation", "avertissement",
+			p.BootGuardPath()+" n'a pas été écrit par ogs : il occupe le nom du complément d'unité, qu'ogs n'a "+
+				"pas pu poser — un redémarrage dans le délai ne défera pas l'activation",
+			"examiner ce fichier, le retirer, puis ogs firewall apply")
 	}
 	if unit, ok := p.unitExists("docker"); ok {
 		add("pare-feu : docker", "avertissement", unit+" est installé : Docker publie les ports de ses "+

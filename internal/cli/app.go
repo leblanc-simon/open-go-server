@@ -416,6 +416,9 @@ func (a *App) buildProviders() (*providers, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Sans déclaration lisible, les adresses de confiance sont inconnues : les
+	// prisons gardent celles qu'elles ignorent déjà (D109).
+	trusted, trustedErr := fw.IgnoreIP()
 	return &providers{
 		System: sys,
 		TLS:    certs,
@@ -443,8 +446,9 @@ func (a *App) buildProviders() (*providers, error) {
 			Store: a.Store, Keys: a.Keys,
 			DB: dbProv, AMQP: amqpProv, PHP: php,
 			WebEngine: eng.Name(), WebUnit: eng.Unit(),
-			TrustedIP: fw.IgnoreIP(),
-			Force:     a.Force,
+			TrustedIP:   trusted,
+			KeepTrusted: trustedErr != nil,
+			Force:       a.Force,
 		},
 		Mail: &mail.Provider{
 			Paths: a.Paths, Cfg: a.Cfg, Exec: a.Exec,

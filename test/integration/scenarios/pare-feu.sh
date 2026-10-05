@@ -25,7 +25,17 @@
 #     fût-ce par une seule interface ;
 #   — sshd déplacé : le plan qui suit son nouveau port passe, le port d'une
 #     session où sshd n'écoute plus ne comptant pas ;
-#   — deux moteurs sans web.engine : bannir ne retire pas l'accès au web.
+#   — deux moteurs sans web.engine : bannir ne retire pas l'accès au web ;
+#   — une règle de l'administrateur tenue dans une seule famille ne reçoit pas la
+#     marque d'ogs, qui pose la sienne dans l'autre famille seulement (D109) ;
+#   — un bannissement refusé par la garde n'est pas écrit dans ufw.yaml (D109) ;
+#   — relancer l'unité ufw dans le délai ne désactive rien ; désactivé dans le
+#     délai, confirm dit qu'il n'y a rien à confirmer, code 6 (D109) ;
+#   — un vrai redémarrage dans le délai vaut retour : le complément d'unité posé
+#     avec le témoin laisse ufw inactif au démarrage ; confirmé, ufw repart
+#     actif, et un complément resté sans témoin ne désactive rien (D109). Le
+#     scénario rend alors 100, et run.sh relance le conteneur avant la phase
+#     suivante.
 set -uo pipefail
 . /scenarios/lib.sh
 
@@ -43,6 +53,63 @@ doit_bloquer() { ! ouvert "$1" "$2" || echec "$1 → $2 : connexion ouverte, att
 
 # changements rend le nombre de changements du plan du pare-feu.
 changements() { ogs firewall plan 2>/dev/null | sed -n 's/^\([0-9]*\) changement(s).*/\1/p'; }
+
+temoin=/var/lib/ogs/ufw-unconfirmed
+complement=/etc/systemd/system/ufw.service.d/ogs-rollback.conf
+
+# --- Phase 2 : redémarré dans le délai d'une activation non confirmée --------
+redemarre_dans_le_delai() {
+    echo "=== scénario : pare-feu ufw, redémarré dans le délai ==="
+    systemctl is-failed --quiet ufw && { systemctl status ufw --no-pager; echec "ufw.service ne doit pas échouer"; }
+    ufw status | grep -q "Status: inactive" || { ufw status; echec "redémarré dans le délai, ufw doit être resté inactif"; }
+    iptables -S ufw-user-input 2>/dev/null | grep -q 10.200.0.2 && echec "aucune règle d'ufw ne doit être chargée"
+    journalctl -b -u ufw --no-pager | grep -q "jamais confirmée" ||
+        { journalctl -b -u ufw --no-pager; echec "le journal d'ufw doit dire pourquoi il reste inactif"; }
+    [ -f "$temoin" ] || echec "le témoin survit au redémarrage"
+    systemctl is-active --quiet ogs-ufw-rollback.timer && echec "le minuteur ne survit pas au redémarrage"
+    ogs firewall status | grep -q "défaite par le retour automatique" || { ogs firewall status; echec "status : retour joué"; }
+    sortie=$(ogs firewall confirm 2>&1)
+    code=$?
+    [ "$code" = 6 ] || { echo "$sortie"; echec "confirm après le redémarrage doit rendre 6, obtenu $code"; }
+    echo "$sortie" | grep -q "le retour automatique a défait" || { echo "$sortie"; echec "confirm : retour joué"; }
+
+    [ -e /run/ogs-ufw-armed ] || echec "le complément pose la marque de /run après avoir joué"
+
+    # Réactivée puis confirmée : plus rien ne la défera.
+    ogs firewall apply --yes >/tmp/apply.log 2>&1 || { cat /tmp/apply.log; echec "firewall apply (après redémarrage)"; }
+    ufw status | grep -q "Status: active" || echec "ufw doit être actif"
+    # Relancer l'unité après le démarrage ne désactive rien : le complément ne
+    # joue qu'au premier démarrage d'ufw qui suit celui de la machine.
+    systemctl restart ufw || echec "systemctl restart ufw (après redémarrage)"
+    ufw status | grep -q "Status: active" || { ufw status; echec "relancé après le démarrage, ufw doit rester actif"; }
+    ogs firewall confirm | grep -q "confirmée" || echec "confirm"
+    [ -e "$temoin" ] && echec "confirm doit retirer le témoin"
+    [ -e "$complement" ] && echec "confirm doit retirer le complément d'unité"
+    systemctl cat ufw 2>/dev/null | grep -q ogs-rollback && echec "systemd ne doit plus lire le complément"
+
+    # Un complément resté sans témoin — confirm interrompu entre les deux
+    # retraits — ne doit rien désactiver : il le prouve au prochain démarrage.
+    cp /root/ogs-rollback.conf.copie "$complement"
+    systemctl daemon-reload
+    docteur | grep -q "resté sans témoin" || { docteur | grep pare-feu; echec "doctor : complément sans témoin"; }
+    exit 100
+}
+
+# --- Phase 3 : redémarré après confirmation ----------------------------------
+redemarre_apres_confirmation() {
+    echo "=== scénario : pare-feu ufw, redémarré après confirmation ==="
+    ufw status | grep -q "Status: active" || { ufw status; echec "confirmé, ufw doit repartir actif"; }
+    iptables -S ufw-user-input | grep -q 10.200.0.2 || { iptables -S ufw-user-input; echec "les règles doivent être chargées"; }
+    ogs firewall confirm >/dev/null || echec "confirm (complément sans témoin)"
+    [ -e "$complement" ] && echec "confirm doit retirer un complément resté sans témoin"
+    echo "✓ scénario pare-feu réussi"
+    exit 0
+}
+
+case "${1:-1}" in
+2) redemarre_dans_le_delai ;;
+3) redemarre_apres_confirmation ;;
+esac
 
 echo "=== scénario : pare-feu ufw ==="
 
@@ -189,8 +256,11 @@ ufw status | grep -q "Status: active" || echec "confirmé, ufw doit rester actif
 ufw --force disable >/dev/null
 ogs firewall apply --yes >/dev/null || echec "firewall apply (troisième activation)"
 [ -f /var/lib/ogs/ufw-unconfirmed ] || echec "l'activation doit poser son témoin"
+[ -f "$complement" ] || echec "l'activation doit poser le complément d'unité d'ufw"
+systemctl cat ufw | grep -q "ogs-rollback.conf" || { systemctl cat ufw; echec "systemd doit lire le complément"; }
+ogs firewall status | grep -q "un redémarrage d'ici là" || { ogs firewall status; echec "status : complément"; }
 systemctl stop ogs-ufw-rollback.timer
-ufw status | grep -q "Status: active" || echec "ufw doit rester actif, sans filet"
+ufw status | grep -q "Status: active" || echec "ufw doit rester actif jusqu'au prochain démarrage"
 ogs firewall status | grep -q "retour automatique perdu" || { ogs firewall status; echec "status : retour perdu"; }
 docteur | grep -q "retour automatique a disparu" || echec "doctor doit signaler le retour perdu"
 ogs firewall confirm | grep -q "avait déjà disparu" || echec "confirm doit confirmer l'activation au retour perdu"
@@ -369,4 +439,88 @@ sed -i 's/^rollbackAfter: 30s/active: false\nrollbackAfter: 30s/' /etc/ogs/ufw.y
 ogs firewall apply --yes >/dev/null || echec "firewall apply (désactivation)"
 ufw status | grep -q "Status: inactive" || echec "active: false doit désactiver ufw"
 
-echo "✓ scénario pare-feu réussi"
+# --- Famille par famille ---------------------------------------------------
+# L'administrateur ouvre le web en IPv4 seulement ; ufw.yaml le veut ouvert à
+# tous. La commande commune donnait à sa règle la marque d'ogs.
+sed -i '/^active: false$/d' /etc/ogs/ufw.yaml
+ogs firewall apply --yes >/dev/null || echec "firewall apply (réactivation)"
+ogs firewall confirm >/dev/null || echec "confirm (réactivation)"
+ufw delete allow from any to any app ogs-web >/dev/null || echec "montage : retrait de l'accès au web"
+ufw allow from 0.0.0.0/0 to any app ogs-web comment 'web, à moi' >/dev/null
+ogs firewall apply --yes >/tmp/apply.log 2>&1 || { cat /tmp/apply.log; echec "firewall apply (famille)"; }
+ufw status | grep "ogs-web" | grep -v "(v6)" | grep -q "web, à moi" ||
+    { ufw status; echec "la règle IPv4 de l'administrateur doit garder son commentaire"; }
+ufw status | grep "ogs-web (v6)" | grep -q "ogs: accès public à web" ||
+    { ufw status; echec "la moitié IPv6 doit être posée par ogs"; }
+[ "$(changements)" = 0 ] || { ogs firewall plan; echec "plan non vide, familles partagées"; }
+# ufw.yaml ne demande plus le web : seule la moitié d'ogs part.
+cp /etc/ogs/ufw.yaml /tmp/ufw.yaml.famille
+python3 - <<'PY'
+import re
+p = "/etc/ogs/ufw.yaml"
+s = open(p).read()
+s = re.sub(r"^  web:\n    allow: \[any\]\n", "", s, flags=re.M)
+open(p, "w").write(s)
+PY
+ogs firewall apply --yes >/tmp/apply.log 2>&1 || { cat /tmp/apply.log; echec "firewall apply (web retiré)"; }
+ufw status | grep -q "web, à moi" || { ufw status; echec "la règle de l'administrateur doit survivre au retrait"; }
+ufw status | grep "ogs-web (v6)" | grep -q "ogs:" && { ufw status; echec "la moitié d'ogs doit être retirée"; }
+ufw delete allow from 0.0.0.0/0 to any app ogs-web >/dev/null
+cp /tmp/ufw.yaml.famille /etc/ogs/ufw.yaml
+ogs firewall apply --yes >/dev/null || echec "firewall apply (web rétabli)"
+[ "$(changements)" = 0 ] || { ogs firewall plan; echec "plan non vide, web rétabli"; }
+
+# --- Bannissement refusé : ufw.yaml intact ----------------------------------
+# La session vient de 10.202.0.5 : bannir son réseau la couperait. Refusé, le
+# bannissement ne doit pas rester dans ufw.yaml, où le prochain apply le
+# retrouverait.
+cp /etc/ogs/ufw.yaml /tmp/ufw.yaml.ban
+sortie=$(SSH_CONNECTION="10.202.0.5 50000 10.200.0.1 22" ogs firewall ban 10.202.0.0/24 --yes 2>&1)
+code=$?
+[ "$code" = 3 ] || { echo "$sortie"; echec "bannir la session doit être refusé (code 3), obtenu $code"; }
+echo "$sortie" | grep -q "bannirait" || { echo "$sortie"; echec "c'est la garde qui doit refuser"; }
+cmp -s /etc/ogs/ufw.yaml /tmp/ufw.yaml.ban || { diff /tmp/ufw.yaml.ban /etc/ogs/ufw.yaml; echec "un bannissement refusé ne doit pas être écrit"; }
+
+# --- Redémarrage dans le délai : un vrai ------------------------------------
+# Les phases suivantes passent par un redémarrage du conteneur : /run repart
+# vide, l'unité transitoire du retour avec lui. Le délai est long, pour que
+# seul le complément d'unité puisse laisser ufw inactif au démarrage.
+systemctl enable ufw >/dev/null 2>&1
+systemctl is-enabled --quiet ufw || echec "montage : ufw.service doit démarrer avec la machine"
+sed -i 's/^rollbackAfter: 30s/rollbackAfter: 10m/' /etc/ogs/ufw.yaml
+ufw --force disable >/dev/null
+ogs firewall apply --yes >/tmp/apply.log 2>&1 || { cat /tmp/apply.log; echec "firewall apply (avant redémarrage)"; }
+[ -f "$temoin" ] && [ -f "$complement" ] || echec "l'activation doit poser témoin et complément"
+docteur | grep -q "prochain démarrage" || { docteur | grep pare-feu; echec "doctor : un redémarrage d'ici là"; }
+iptables -S ufw-user-input | grep -q 10.200.0.2 || echec "montage : règles chargées avant le redémarrage"
+[ -e /run/ogs-ufw-armed ] || echec "l'armement doit poser la marque de /run"
+
+# Relancer l'unité dans le délai n'est pas redémarrer la machine : ExecStartPre
+# tourne à chaque démarrage de l'unité, et la v1 du complément désactivait ufw
+# — que status disait encore « en attente » et que confirm déclarait confirmé,
+# code 0, ufw inactif (D109).
+systemctl restart ufw || echec "systemctl restart ufw (dans le délai)"
+systemctl is-failed --quiet ufw && echec "ufw.service ne doit pas échouer à la relance"
+grep -q '^ENABLED=yes' /etc/ufw/ufw.conf || { cat /etc/ufw/ufw.conf; echec "relancé dans le délai, ufw.conf doit garder ENABLED=yes"; }
+ufw status | grep -q "Status: active" || { ufw status; echec "relancé dans le délai, ufw doit rester actif"; }
+iptables -S ufw-user-input | grep -q 10.200.0.2 || echec "relancé dans le délai, les règles doivent être rechargées"
+ogs firewall status | grep -q "un redémarrage d'ici là" || { ogs firewall status; echec "status : toujours en attente"; }
+
+# Désactivé dans le délai, il n'y a rien à confirmer : confirm le dit, code 6,
+# et status aussi.
+ufw --force disable >/dev/null
+ogs firewall status | grep -q "désactivé dans le délai" || { ogs firewall status; echec "status : désactivé dans le délai"; }
+sortie=$(ogs firewall confirm 2>&1)
+code=$?
+[ "$code" = 6 ] || { echo "$sortie"; echec "confirm, ufw inactif dans le délai : code 6 attendu, obtenu $code"; }
+echo "$sortie" | grep -q "rien n'est confirmé" || { echo "$sortie"; echec "confirm doit dire que rien n'est confirmé"; }
+[ -f "$temoin" ] || echec "confirm sans effet : le témoin reste"
+docteur | grep -q "désactivé dans le délai" || { docteur | grep pare-feu; echec "doctor : désactivé dans le délai"; }
+ogs firewall apply --yes >/tmp/apply.log 2>&1 || { cat /tmp/apply.log; echec "firewall apply (réarmement)"; }
+ufw status | grep -q "Status: active" || echec "ufw doit être réactivé"
+[ -f "$temoin" ] && [ -f "$complement" ] && [ -e /run/ogs-ufw-armed ] || echec "le réarmement pose témoin, complément et marque"
+
+cp "$complement" /root/ogs-rollback.conf.copie
+sync
+echo "redémarrage dans le délai…"
+exit 100

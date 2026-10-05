@@ -119,6 +119,13 @@ type Observed struct {
 	// Unconfirmed dit qu'une activation n'a jamais été confirmée : le témoin posé
 	// à l'armement du retour automatique est toujours là.
 	Unconfirmed bool
+	// BootGuard dit que le complément d'unité d'ufw qu'ogs pose avec le témoin
+	// est en place : tant que le témoin existe, ufw ne s'active pas au premier
+	// démarrage qui suit celui de la machine.
+	BootGuard bool
+	// BootGuardForeign dit qu'un fichier qu'ogs n'a pas écrit occupe le nom du
+	// complément : ogs ne le touche pas, et rien ne dit ce qu'il fait.
+	BootGuardForeign bool
 	// PreviousProfiles porte les ports du fichier de profils actuel.
 	PreviousProfiles map[string]string
 }
@@ -132,11 +139,152 @@ func (o Observed) RollbackLost() bool { return o.Unconfirmed && o.Enabled && !o.
 // retour automatique a joué.
 func (o Observed) RolledBack() bool { return o.Unconfirmed && !o.Enabled && !o.RollbackPending }
 
+// DisabledWhilePending dit qu'ufw est inactif alors que son retour automatique
+// attend encore : quelqu'un l'a désactivé dans le délai. Il n'y a rien à
+// confirmer — confirmer annoncerait un pare-feu qui ne filtre rien.
+func (o Observed) DisabledWhilePending() bool { return o.RollbackPending && !o.Enabled }
+
 // unconfirmedMark est le témoin d'une activation que personne n'a confirmée. Il
 // vit sous /var/lib/ogs, là où l'unité transitoire du retour vit sous /run : un
 // redémarrage dans le délai efface celle-ci, ufw repart actif sans filet, et
 // sans le témoin ni confirm, ni status, ni doctor n'en disaient rien.
 func (p *Provider) unconfirmedMark() string { return filepath.Join(p.Paths.Lib(), "ufw-unconfirmed") }
+
+// BootGuardPath est le complément d'unité qui accompagne le témoin (D109).
+func (p *Provider) BootGuardPath() string {
+	return filepath.Join(p.Paths.SystemdDir(), "ufw.service.d", "ogs-rollback.conf")
+}
+
+// bootGuardResource marque le complément dans son en-tête.
+const bootGuardResource = "firewall/rollback"
+
+// bootGuardContent compose le complément d'unité d'ufw. L'unité transitoire du
+// retour vit sous /run : un redémarrage dans le délai l'efface, et ufw repartait
+// actif, sans filet (R2-13). Le complément fait jouer le retour au démarrage de
+// la machine : si le témoin existe et que la marque de /run (UFWBootMark) a
+// disparu, ExecStartPre range ENABLED=no dans ufw.conf avant qu'ufw-init ne le
+// lise, et ufw-init laisse alors le pare-feu éteint.
+//
+// Quatre choix, chacun pour la sûreté :
+//   - la marque de /run, posée à l'armement : ExecStartPre tourne à chaque
+//     démarrage de l'unité, et non au seul démarrage de la machine. Sans elle,
+//     un « systemctl restart ufw » dans le délai désactivait ufw, que status
+//     disait encore « en attente » et que confirm déclarait confirmé, ufw
+//     inactif. /run étant vidé au démarrage, la marque absente désigne la
+//     machine qui démarre ; le complément la pose ensuite, si bien qu'un ufw
+//     réactivé à la main n'est pas désactivé de nouveau à la relance suivante ;
+//   - ENABLED=no plutôt qu'une condition sur l'unité : une unité sautée laisse
+//     ENABLED=yes, et « ufw status » dirait actif un pare-feu qui ne filtre
+//     rien ; désactivé, l'état est celui d'un retour joué, que status, doctor et
+//     confirm savent dire ;
+//   - le témoin éprouvé au démarrage même : un complément resté sans témoin —
+//     confirm interrompu entre les deux retraits — ne désactive rien ;
+//   - le préfixe « - » : un échec de la commande ne fait pas échouer ufw.service,
+//     qui chargerait sinon un pare-feu sans règles. « sed --follow-symlinks »
+//     écrit dans la cible d'un ufw.conf lié, au lieu de remplacer le lien par un
+//     fichier ordinaire.
+func (p *Provider) bootGuardContent() []byte {
+	script := fmt.Sprintf(`if [ -e "%s" ] && [ ! -e "%s" ]; then `+
+		`sed --follow-symlinks -i "s/^ENABLED=.*/ENABLED=no/" "%s" && `+
+		`echo "ogs : activation d’ufw jamais confirmée, ufw laissé inactif au démarrage — `+
+		`ogs firewall apply, puis ogs firewall confirm" >&2; : > "%s"; fi`,
+		p.unconfirmedMark(), p.Paths.UFWBootMark(), p.Paths.UFWConf(), p.Paths.UFWBootMark())
+	body := "# Posé avec le témoin " + p.unconfirmedMark() + " à la première activation d'ufw,\n" +
+		"# retiré avec lui par « ogs firewall confirm » (D109). Tant que le témoin existe,\n" +
+		"# ufw ne s'active pas au premier démarrage qui suit celui de la machine : un\n" +
+		"# redémarrage dans le délai vaut retour. Relancer l'unité ne désactive rien.\n" +
+		"[Service]\n" +
+		"ExecStartPre=-/bin/sh -c '" + script + "'\n"
+	return fs.Render(fs.Header{Project: "parc", Resource: bootGuardResource, Generated: p.now()}, []byte(body), "#")
+}
+
+// bootGuardState juge le fichier du complément, sous les cinq états : il est à
+// ogs si son en-tête porte la ressource du complément.
+func (p *Provider) bootGuardState() (fs.State, error) {
+	path := p.BootGuardPath()
+	state, err := fs.InspectRemoval(path, "parc")
+	if err != nil || state == fs.StateAbsent || state == fs.StateForeign {
+		return state, err
+	}
+	if _, res, err := fs.ManagedResource(path); err != nil {
+		return state, err
+	} else if res != bootGuardResource {
+		return fs.StateForeign, nil
+	}
+	return state, nil
+}
+
+// bootGuardRefusal nomme un complément qu'ogs ne touche pas.
+func (p *Provider) bootGuardRefusal(state fs.State) error {
+	if state == fs.StateHandEdited {
+		return fmt.Errorf("%s a été modifié à la main : laissé en place (--force le remplace, l'original "+
+			"sauvegardé dans %s)", p.BootGuardPath(), p.Paths.BackupsDir())
+	}
+	return fmt.Errorf("%s n'a pas été écrit par ogs : laissé en place", p.BootGuardPath())
+}
+
+// writeBootGuard pose le complément, puis fait relire les unités. Un fichier de
+// ce nom qu'ogs n'a pas écrit, ou qu'on a retouché sans --force, reste en place :
+// l'activation se fait, avec son minuteur, et l'erreur rendue (refused) le dit —
+// un redémarrage dans le délai ne la défera pas.
+func (p *Provider) writeBootGuard(ctx context.Context) (refused, err error) {
+	path := p.BootGuardPath()
+	state, err := p.bootGuardState()
+	if err != nil {
+		return nil, err
+	}
+	switch state {
+	case fs.StateForeign:
+		return p.bootGuardRefusal(state), nil
+	case fs.StateHandEdited:
+		if !p.Force {
+			return p.bootGuardRefusal(state), nil
+		}
+		if _, err := fs.BackupTo(path, p.Paths.BackupsDir(), p.now()); err != nil && !os.IsNotExist(err) {
+			return nil, fmt.Errorf("sauvegarde de %s : %w", path, err)
+		}
+	}
+	if err := fs.EnsureDir(filepath.Dir(path), 0o755, fs.KeepOwner); err != nil {
+		return nil, err
+	}
+	if err := fs.WriteAtomic(path, p.bootGuardContent(), 0o644, fs.KeepOwner); err != nil {
+		return nil, err
+	}
+	_, err = p.Exec.Run(ctx, exec.Command{Name: "systemctl", Args: []string{"daemon-reload"}})
+	return nil, err
+}
+
+// removeBootGuard retire le complément, s'il est d'ogs et intact — retouché, sous
+// --force seulement, sauvegardé : un fichier de ce nom qu'ogs n'a pas écrit
+// reste en place, et l'erreur le dit.
+func (p *Provider) removeBootGuard(ctx context.Context) error {
+	path := p.BootGuardPath()
+	state, err := p.bootGuardState()
+	if err != nil {
+		return err
+	}
+	switch state {
+	case fs.StateAbsent:
+		return nil
+	case fs.StateForeign:
+		return p.bootGuardRefusal(state)
+	case fs.StateHandEdited:
+		if !p.Force {
+			return p.bootGuardRefusal(state)
+		}
+		if _, err := fs.BackupTo(path, p.Paths.BackupsDir(), p.now()); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("sauvegarde de %s : %w", path, err)
+		}
+	}
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if p.Exec == nil {
+		return nil
+	}
+	_, err = p.Exec.Run(ctx, exec.Command{Name: "systemctl", Args: []string{"daemon-reload"}})
+	return err
+}
 
 // Observe relit l'état d'ufw dans ses fichiers : ceux-là mêmes que la commande
 // ufw écrit, et qu'elle relit à chaque démarrage.
@@ -176,6 +324,12 @@ func (p *Provider) Observe(ctx context.Context) (Observed, error) {
 	if _, err := os.Lstat(p.unconfirmedMark()); err == nil {
 		obs.Unconfirmed = true
 	}
+	switch state, _ := p.bootGuardState(); state {
+	case fs.StateCurrent, fs.StateHandEdited:
+		obs.BootGuard = true
+	case fs.StateForeign:
+		obs.BootGuardForeign = true
+	}
 	return obs, nil
 }
 
@@ -194,7 +348,13 @@ func policyName(v string) string {
 
 // ValidationError rassemble ce qui interdit d'appliquer la déclaration : elle
 // se traduit par le code 3, et rien n'est tenté.
-type ValidationError struct{ Problems []string }
+type ValidationError struct {
+	Problems []string
+	// Lockout porte, parmi Problems, les refus des gardes contre la coupure
+	// (D86) : « ban » et « unban » n'écrivent rien sur eux, et ne font que
+	// signaler les autres quand le bannissement n'y est pour rien (D109).
+	Lockout []string
+}
 
 func (e *ValidationError) Error() string {
 	return "pare-feu :\n  " + strings.Join(e.Problems, "\n  ")
@@ -273,14 +433,18 @@ func (p *Provider) Plan(ctx context.Context, projects []*model.Project, obs Obse
 
 	// Règles relues, regroupées par clé : une règle « any » existe dans les deux
 	// familles, et une seule commande la pose ou la retire.
+	// Une clé est sans objet dès qu'ogs en tient une famille, quelle que soit
+	// celle relue la première : l'autre peut être à l'administrateur.
 	byKey := map[string][]ObservedRule{}
+	staleSeen := map[string]bool{}
 	var staleKeys []string
 	for _, o := range obs.Rules {
 		if !o.Recognized {
 			continue
 		}
 		k := o.Key()
-		if len(byKey[k]) == 0 && o.Managed && !desiredKeys[k] {
+		if o.Managed && !desiredKeys[k] && !staleSeen[k] {
+			staleSeen[k] = true
 			staleKeys = append(staleKeys, k)
 		}
 		byKey[k] = append(byKey[k], o)
@@ -307,7 +471,7 @@ func (p *Provider) Plan(ctx context.Context, projects []*model.Project, obs Obse
 			r := rules[0].Rule
 			vanishing := r.App != "" && !profileNames[r.App]
 			if vanishing == first {
-				steps = append(steps, p.deleteStep(r, st, obs.PreviousProfiles[r.App], vanishing))
+				steps = append(steps, p.deleteStep(r, ownFamilies(rules), st, obs.PreviousProfiles[r.App], vanishing))
 			}
 		}
 	}
@@ -456,18 +620,25 @@ func (p *Provider) commandStep(resource string, action engine.Action, summary st
 
 // ruleStep pose une règle voulue, ou en corrige le commentaire, ou replace un
 // refus en tête.
+//
+// Une règle « any » existe dans les deux familles, et une seule commande la pose
+// dans les deux. Quand l'administrateur en tient une famille, la commande
+// commune lui donnerait la marque d'ogs — ufw remplace le commentaire en place —
+// et ogs la retirerait le jour où ufw.yaml cesserait de la demander : chaque
+// commande vise alors la seule famille qui l'appelle (R2-16, D109).
 func (p *Provider) ruleStep(r Rule, observed []ObservedRule, obs Observed, st *run) *engine.Step {
 	families := r.Families(obs.IPv6)
 	present := map[int]ObservedRule{}
 	for _, o := range observed {
 		present[o.Family] = o
 	}
-	missing, commentDiffers, misplaced := false, false, false
+	var missing, renamed, misplaced []int
+	foreign := false
 	var oldComment string
 	for _, f := range families {
 		o, ok := present[f]
 		if !ok {
-			missing = true
+			missing = append(missing, f)
 			continue
 		}
 		// Une règle de l'administrateur de même définition satisfait la
@@ -475,72 +646,115 @@ func (p *Provider) ruleStep(r Rule, observed []ObservedRule, obs Observed, st *r
 		// remplace le commentaire en place — ferait qu'ogs la retire le jour où
 		// ufw.yaml cesse de la demander.
 		if !o.Managed {
+			foreign = true
 			continue
 		}
 		if o.Comment != r.Comment {
-			commentDiffers = true
+			renamed = append(renamed, f)
 			oldComment = o.Comment
 		}
 		if r.Kind == KindBan && precededByAccess(obs.Rules, o) {
-			misplaced = true
+			misplaced = append(misplaced, f)
 		}
+	}
+	// scope rend les familles visées par une commande : toutes d'un coup (0)
+	// tant qu'aucune n'est à l'administrateur, une à une sinon.
+	scope := func(fams []int) []int {
+		if !foreign {
+			return []int{0}
+		}
+		return fams
 	}
 	resource := "firewall/rule/" + r.Key()
 	label := r.Kind + " « " + r.Describe() + " »"
-	switch {
-	case misplaced:
-		s := engine.NewStep(resource, engine.Update, "pare-feu : "+label+" replacé en tête des règles")
-		s.Critical = false
-		s.Diff = func() (string, error) {
-			return commandLine(r.deleteArgs()) + "\n" + commandLine(r.addArgs(true)), nil
-		}
-		s.Apply = func(ctx context.Context) error {
-			if err := p.ufw(ctx, r.deleteArgs()...); err != nil {
-				st.failed = append(st.failed, r.Describe())
-				return err
-			}
-			if err := p.ufw(ctx, r.addArgs(true)...); err != nil {
-				st.failed = append(st.failed, r.Describe())
-				return err
-			}
-			return nil
-		}
-		return s
-	case missing:
-		s := engine.NewStep(resource, engine.Create, "pare-feu : "+label)
-		s.Critical = false
-		args := r.addArgs(r.Kind == KindBan)
-		s.Diff = func() (string, error) { return commandLine(args), nil }
-		s.Apply = func(ctx context.Context) error {
+	runAll := func(ctx context.Context, cmds [][]string) error {
+		for _, args := range cmds {
 			if err := p.ufw(ctx, args...); err != nil {
 				st.failed = append(st.failed, r.Describe())
 				return err
 			}
-			return nil
 		}
-		// Seule une règle entièrement nouvelle se retire : celle qui existait dans
-		// une famille appartenait déjà au pare-feu avant cette exécution.
-		if len(present) == 0 {
-			s.Compensate = func(ctx context.Context) error { return p.ufw(ctx, r.deleteArgs()...) }
+		return nil
+	}
+	switch {
+	case len(misplaced) > 0:
+		var cmds [][]string
+		for _, f := range scope(misplaced) {
+			cmds = append(cmds, r.deleteArgsIn(f), r.addArgsIn(true, f))
+		}
+		s := engine.NewStep(resource, engine.Update, "pare-feu : "+label+" replacé en tête des règles")
+		s.Critical = false
+		s.Diff = func() (string, error) { return commandLines(cmds), nil }
+		s.Apply = func(ctx context.Context) error { return runAll(ctx, cmds) }
+		return s
+	case len(missing) > 0:
+		var cmds, undo [][]string
+		for _, f := range scope(missing) {
+			cmds = append(cmds, r.addArgsIn(r.Kind == KindBan, f))
+			undo = append(undo, r.deleteArgsIn(f))
+		}
+		s := engine.NewStep(resource, engine.Create, "pare-feu : "+label)
+		s.Critical = false
+		s.Diff = func() (string, error) { return commandLines(cmds), nil }
+		s.Apply = func(ctx context.Context) error { return runAll(ctx, cmds) }
+		// Seul ce que l'étape a posé se retire : une famille qu'ogs tenait déjà
+		// appartenait au pare-feu avant cette exécution, et celle de
+		// l'administrateur n'est jamais touchée.
+		if len(present) == 0 || foreign {
+			s.Compensate = func(ctx context.Context) error {
+				for _, args := range undo {
+					if err := p.ufw(ctx, args...); err != nil {
+						return err
+					}
+				}
+				return nil
+			}
 		}
 		return s
-	case commentDiffers:
+	case len(renamed) > 0:
 		// ufw remplace en place le commentaire d'une règle identique : la
 		// commande d'ajout, sans « prepend » — qui, elle, ignore une règle
 		// existante —, suffit.
-		s := engine.NewStep(resource, engine.Update, "pare-feu : commentaire de "+label)
-		s.Critical = false
-		args := r.addArgs(false)
-		s.Diff = func() (string, error) {
-			return fmt.Sprintf("commentaire : %q → %q\n%s", oldComment, r.Comment, commandLine(args)), nil
-		}
-		s.Apply = func(ctx context.Context) error { return p.ufw(ctx, args...) }
 		prev := r
 		prev.Comment = oldComment
-		s.Compensate = func(ctx context.Context) error { return p.ufw(ctx, prev.addArgs(false)...) }
+		var cmds, undo [][]string
+		for _, f := range scope(renamed) {
+			cmds = append(cmds, r.addArgsIn(false, f))
+			undo = append(undo, prev.addArgsIn(false, f))
+		}
+		s := engine.NewStep(resource, engine.Update, "pare-feu : commentaire de "+label)
+		s.Critical = false
+		s.Diff = func() (string, error) {
+			return fmt.Sprintf("commentaire : %q → %q\n%s", oldComment, r.Comment, commandLines(cmds)), nil
+		}
+		s.Apply = func(ctx context.Context) error {
+			for _, args := range cmds {
+				if err := p.ufw(ctx, args...); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+		s.Compensate = func(ctx context.Context) error {
+			for _, args := range undo {
+				if err := p.ufw(ctx, args...); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
 		return s
 	}
 	return nil
+}
+
+// commandLines rend une suite de commandes ufw, une par ligne.
+func commandLines(cmds [][]string) string {
+	lines := make([]string, 0, len(cmds))
+	for _, args := range cmds {
+		lines = append(lines, commandLine(args))
+	}
+	return strings.Join(lines, "\n")
 }
 
 // precededByAccess dit si une règle autre qu'un refus précède ce refus dans sa
@@ -557,10 +771,30 @@ func precededByAccess(all []ObservedRule, ban ObservedRule) bool {
 	return false
 }
 
-// deleteStep retire une règle d'ogs qui n'est plus voulue. Le retrait se garde
-// comme un durcissement : il retire un accès. Celui d'une règle dont le profil
-// disparaît (vanishing) garde le profil défini s'il échoue.
-func (p *Provider) deleteStep(r Rule, st *run, ports string, vanishing bool) *engine.Step {
+// ownFamilies rend les familles où une règle relue est à ogs : toutes (0) si
+// aucune n'est à l'administrateur, les siennes une à une sinon — le retrait
+// commun emporterait la moitié de l'administrateur (R2-16, D109).
+func ownFamilies(rules []ObservedRule) []int {
+	var own []int
+	foreign := false
+	for _, o := range rules {
+		if o.Managed {
+			own = append(own, o.Family)
+		} else {
+			foreign = true
+		}
+	}
+	if !foreign {
+		return []int{0}
+	}
+	return own
+}
+
+// deleteStep retire une règle d'ogs qui n'est plus voulue, dans les familles
+// données (0 : les deux d'une commande). Le retrait se garde comme un
+// durcissement : il retire un accès. Celui d'une règle dont le profil disparaît
+// (vanishing) garde le profil défini s'il échoue.
+func (p *Provider) deleteStep(r Rule, families []int, st *run, ports string, vanishing bool) *engine.Step {
 	summary := "pare-feu : retrait de " + r.Kind + " « " + r.Describe() + " »"
 	if r.Kind == "" {
 		summary = "pare-feu : retrait de « " + r.Describe() + " »"
@@ -568,13 +802,21 @@ func (p *Provider) deleteStep(r Rule, st *run, ports string, vanishing bool) *en
 			summary = "pare-feu : retrait de « " + r.App + " depuis " + r.From + " »"
 		}
 	}
+	var cmds, undo [][]string
+	for _, f := range families {
+		cmds = append(cmds, r.deleteArgsIn(f))
+		undo = append(undo, r.addArgsIn(r.Action == "deny" && r.Direction == "in", f))
+	}
 	s := engine.NewStep("firewall/rule/"+r.Key(), engine.Delete, summary)
 	s.Critical = false
-	s.Diff = func() (string, error) { return commandLine(r.deleteArgs()), nil }
+	s.Diff = func() (string, error) { return commandLines(cmds), nil }
 	s.Apply = func(ctx context.Context) error {
 		err := st.guard("le retrait de « " + r.Describe() + " »")
-		if err == nil {
-			err = p.ufw(ctx, r.deleteArgs()...)
+		for _, args := range cmds {
+			if err != nil {
+				break
+			}
+			err = p.ufw(ctx, args...)
 		}
 		if err != nil && vanishing && ports != "" {
 			if st.keep == nil {
@@ -585,7 +827,12 @@ func (p *Provider) deleteStep(r Rule, st *run, ports string, vanishing bool) *en
 		return err
 	}
 	s.Compensate = func(ctx context.Context) error {
-		return p.ufw(ctx, r.addArgs(r.Action == "deny" && r.Direction == "in")...)
+		for _, args := range undo {
+			if err := p.ufw(ctx, args...); err != nil {
+				return err
+			}
+		}
+		return nil
 	}
 	return s
 }
@@ -605,8 +852,9 @@ func (p *Provider) stateStep(obs Observed, st *run) *engine.Step {
 		s.Diff = func() (string, error) {
 			d := "ufw --force enable"
 			if delay > 0 {
-				d = fmt.Sprintf("systemd-run --unit=%s --on-active=%ds ufw --force disable\n", RollbackUnit,
-					int(delay.Seconds())) + d
+				d = fmt.Sprintf("témoin %s et complément %s (ufw inactif au démarrage tant qu'il n'est pas "+
+					"confirmé)\nsystemd-run --unit=%s --on-active=%ds ufw --force disable\n",
+					p.unconfirmedMark(), p.BootGuardPath(), RollbackUnit, int(delay.Seconds())) + d
 			}
 			return d, nil
 		}
@@ -614,8 +862,16 @@ func (p *Provider) stateStep(obs Observed, st *run) *engine.Step {
 			if err := st.guard("l'activation d'ufw"); err != nil {
 				return err
 			}
+			if delay == 0 {
+				// Sans retour voulu, le témoin et le complément d'une activation
+				// antérieure jamais confirmée désactiveraient au prochain démarrage
+				// le pare-feu qu'on active ici sans filet, délibérément.
+				p.disarm(ctx)
+			}
+			var refused error
 			if delay > 0 {
-				if err := p.armRollback(ctx, delay); err != nil {
+				var err error
+				if refused, err = p.armRollback(ctx, delay); err != nil {
 					return fmt.Errorf("activation refusée : le retour automatique n'a pas pu être programmé (%w) — "+
 						"« rollbackAfter: 0 » dans ufw.yaml active sans ce filet", err)
 				}
@@ -626,6 +882,12 @@ func (p *Provider) stateStep(obs Observed, st *run) *engine.Step {
 			}
 			if delay > 0 {
 				p.Armed = delay
+			}
+			if refused != nil {
+				// L'activation a eu lieu, minuteur compris : seul manque le retour
+				// au démarrage. Un aboutissement partiel, code 6, jamais compensé.
+				return engine.Partial(fmt.Errorf("ufw activé, retour automatique programmé, mais le complément "+
+					"d'unité n'est pas posé — %w : un redémarrage dans le délai ne défera pas l'activation", refused))
 			}
 			return nil
 		}
@@ -657,20 +919,38 @@ func (p *Provider) stateStep(obs Observed, st *run) *engine.Step {
 // armRollback programme la désactivation d'ufw. C'est systemd qui la porte, non
 // ogs : si la session qui active le pare-feu est celle qu'il coupe, plus rien
 // de ce qu'elle a lancé ne tourne pour réparer.
-func (p *Provider) armRollback(ctx context.Context, delay time.Duration) error {
+func (p *Provider) armRollback(ctx context.Context, delay time.Duration) (refused, err error) {
 	if p.simulated() {
-		return nil
+		return nil, nil
 	}
 	p.disarm(ctx)
-	// Le témoin d'abord : un retour programmé sans lui se perdrait en silence au
+	// La marque de /run d'abord : elle dit au complément que la machine n'a pas
+	// redémarré depuis l'armement, et qu'une relance d'ufw dans le délai ne doit
+	// rien désactiver. Seul root écrit dans /run.
+	mark := p.Paths.UFWBootMark()
+	if err := os.MkdirAll(filepath.Dir(mark), 0o755); err != nil {
+		return nil, fmt.Errorf("marque de démarrage : %w", err)
+	}
+	if err := fs.WriteAtomic(mark, []byte("armé\n"), 0o600, fs.KeepOwner); err != nil {
+		return nil, fmt.Errorf("marque de démarrage : %w", err)
+	}
+	// Le témoin ensuite : un retour programmé sans lui se perdrait en silence au
 	// premier redémarrage.
 	now := p.now()
 	note := fmt.Sprintf("# Activation d'ufw du %s, jamais confirmée : retour automatique prévu le %s.\n"+
 		"# « ogs firewall confirm » retire ce fichier.\n", now.Format(time.RFC3339), now.Add(delay).Format(time.RFC3339))
 	if err := fs.WriteAtomic(p.unconfirmedMark(), []byte(note), 0o600, fs.KeepOwner); err != nil {
-		return fmt.Errorf("témoin de l'activation : %w", err)
+		return nil, fmt.Errorf("témoin de l'activation : %w", err)
 	}
-	_, err := p.Exec.Run(ctx, exec.Command{Name: "systemd-run", Args: []string{
+	// Le complément ensuite : c'est lui qui fait jouer le retour à un
+	// redémarrage dans le délai, que l'unité transitoire ne passe pas.
+	refused, err = p.writeBootGuard(ctx)
+	if err != nil {
+		_ = os.Remove(p.unconfirmedMark())
+		_ = p.removeBootGuard(ctx)
+		return nil, fmt.Errorf("complément d'unité d'ufw %s : %w", p.BootGuardPath(), err)
+	}
+	_, err = p.Exec.Run(ctx, exec.Command{Name: "systemd-run", Args: []string{
 		"--unit=" + RollbackUnit,
 		"--description=ogs : désactivation d'ufw faute de confirmation",
 		fmt.Sprintf("--on-active=%ds", int(delay.Seconds())),
@@ -679,13 +959,17 @@ func (p *Provider) armRollback(ctx context.Context, delay time.Duration) error {
 	}})
 	if err != nil {
 		_ = os.Remove(p.unconfirmedMark())
+		if refused == nil {
+			_ = p.removeBootGuard(ctx)
+		}
+		return nil, err
 	}
-	return err
+	return refused, nil
 }
 
-// disarm annule un retour automatique en attente et retire son témoin, et
-// oublie un précédent échec : une unité transitoire en échec empêcherait d'en
-// recréer une du même nom.
+// disarm annule un retour automatique en attente, retire son témoin et son
+// complément d'unité, et oublie un précédent échec : une unité transitoire en
+// échec empêcherait d'en recréer une du même nom.
 func (p *Provider) disarm(ctx context.Context) {
 	if p.simulated() {
 		return
@@ -694,6 +978,7 @@ func (p *Provider) disarm(ctx context.Context) {
 	_, _ = p.Exec.Run(ctx, exec.Command{Name: "systemctl", Args: []string{"reset-failed",
 		RollbackUnit + ".timer", RollbackUnit + ".service"}})
 	_ = os.Remove(p.unconfirmedMark())
+	_ = p.removeBootGuard(ctx)
 }
 
 // Confirm annule le retour automatique d'une activation et retire son témoin.
@@ -702,18 +987,40 @@ func (p *Provider) disarm(ctx context.Context) {
 // nouvelle session d'où l'on confirme prouve l'accès dans les deux cas. Un
 // retour qui a joué laisse le témoin : il n'y a rien à confirmer, et status et
 // doctor disent pourquoi ufw est inactif.
+//
+// Le témoin part avant le complément d'unité : sans lui, le complément ne
+// désactive plus rien, et un retrait interrompu entre les deux laisse un
+// pare-feu confirmé qui redémarre actif. Un complément resté seul est retiré à
+// la confirmation suivante. Un fichier de ce nom qu'ogs n'a pas écrit n'est pas
+// le sien : il reste, et n'empêche pas la confirmation.
+//
+// ufw inactif alors que le retour attend encore (DisabledWhilePending), il n'y a
+// rien à confirmer : la confirmation déclarait confirmé un pare-feu qui ne
+// filtre rien. Le minuteur reste armé — il ne fera que désactiver un ufw
+// inactif —, le témoin aussi, et « ogs firewall apply » réactive.
 func (p *Provider) Confirm(ctx context.Context, obs Observed) (bool, error) {
 	switch {
+	case obs.DisabledWhilePending():
+		return false, nil
 	case obs.RollbackPending:
 		if _, err := p.Exec.Run(ctx, exec.Command{Name: "systemctl",
 			Args: []string{"stop", RollbackUnit + ".timer"}}); err != nil {
 			return true, err
 		}
 	case !obs.RollbackLost():
+		if obs.BootGuard && !obs.Unconfirmed {
+			return false, p.removeBootGuard(ctx)
+		}
 		return false, nil
 	}
 	if err := os.Remove(p.unconfirmedMark()); err != nil && !os.IsNotExist(err) {
 		return true, fmt.Errorf("témoin de l'activation : %w", err)
+	}
+	if !obs.BootGuard {
+		return true, nil
+	}
+	if err := p.removeBootGuard(ctx); err != nil {
+		return true, fmt.Errorf("complément d'unité d'ufw (sans effet, le témoin étant retiré) : %w", err)
 	}
 	return true, nil
 }
@@ -963,6 +1270,59 @@ func (p *Provider) validate(ctx context.Context, projects []*model.Project, prof
 		return false
 	}
 
+	// wantedIn est wanted, sans session, restreint à une famille.
+	wantedIn := func(ports []string, family int) bool {
+		for _, r := range desired {
+			if r.Direction != "in" || r.Action != "allow" || r.App == "" || !overlaps(byUFW[r.App].Ports, ports) {
+				continue
+			}
+			for _, f := range r.Families(obs.IPv6) {
+				if f == family {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	// closedFamilies dit, sans session, si ces ports restent ouverts du dehors
+	// une fois le plan appliqué, et dans quelle famille ils cesseraient de
+	// l'être. Le jugement se fait famille par famille, là où les ports sont
+	// ouverts avant le plan : une règle de l'administrateur tenue en IPv4 seule ne
+	// garde pas l'accès IPv6 que le plan retire — retirer la moitié d'ogs d'une
+	// règle « any » dont l'administrateur tient l'autre (R2-16) fermait ainsi
+	// ssh en IPv6 sans que la garde le voie (D109). Fermés partout avant le plan,
+	// il suffit qu'une famille s'ouvre.
+	closedFamilies := func(ports []string) (bool, []int) {
+		var before []int
+		for _, f := range []int{4, 6} {
+			if keptRuleIn(obs.Rules, byUFW, ports, Session{}, true, f, true) {
+				before = append(before, f)
+			}
+		}
+		if len(before) == 0 {
+			return !wanted(ports, netip.Addr{}) && !keptOpens(obs.Rules, byUFW, ports, Session{}), nil
+		}
+		var closed []int
+		for _, f := range before {
+			if !wantedIn(ports, f) && !keptRuleIn(obs.Rules, byUFW, ports, Session{}, true, f, false) {
+				closed = append(closed, f)
+			}
+		}
+		return len(closed) > 0, closed
+	}
+	// inFamilies complète un refus des familles qu'il ferme.
+	inFamilies := func(closed []int) string {
+		if len(closed) == 0 || len(closed) == 2 {
+			return ""
+		}
+		other := 4
+		if closed[0] == 4 {
+			other = 6
+		}
+		return fmt.Sprintf(" — en IPv%d : seule une règle IPv%d le laisserait ouvert, et chaque famille a ses "+
+			"propres règles", closed[0], other)
+	}
+
 	// Un port où sshd écoute, que plus rien n'ouvre une fois le plan appliqué,
 	// est l'accès que la politique par défaut coupe. La garde vaut quelle que
 	// soit la disponibilité du profil : un profil ssh écarté, ou qu'aucune unité
@@ -970,16 +1330,21 @@ func (p *Provider) validate(ctx context.Context, projects []*model.Project, prof
 	// déclaré — et sans session SSH à protéger, rien d'autre ne le voyait.
 	if filtering && tightening {
 		for _, port := range sshdPorts() {
-			if (ssh.Available && opens(ssh.Ports, port)) || wanted(tcpSpecs(port), netip.Addr{}) ||
-				keptOpens(obs.Rules, byUFW, tcpSpecs(port), Session{}) {
+			if ssh.Available && opens(ssh.Ports, port) {
+				continue
+			}
+			shut, closed := closedFamilies(tcpSpecs(port))
+			if !shut {
 				continue
 			}
 			if ssh.Available {
 				lockout = append(lockout, fmt.Sprintf("sshd écoute sur le port %s, que le profil ssh n'ouvre pas "+
-					"(%s), ni aucune autre règle — le déclarer dans profiles.ssh.ports", port, ssh.PortsSpec()))
+					"(%s), ni aucune autre règle%s — le déclarer dans profiles.ssh.ports", port, ssh.PortsSpec(),
+					inFamilies(closed)))
 			} else {
 				lockout = append(lockout, fmt.Sprintf("sshd écoute sur le port %s, que plus rien n'ouvrirait : le "+
-					"profil ssh n'est pas disponible (%s), et aucune autre règle n'ouvre ce port", port, ssh.Reason))
+					"profil ssh n'est pas disponible (%s), et aucune autre règle n'ouvre ce port%s", port, ssh.Reason,
+					inFamilies(closed)))
 			}
 		}
 	}
@@ -993,10 +1358,10 @@ func (p *Provider) validate(ctx context.Context, projects []*model.Project, prof
 			if len(target) == 0 {
 				target = ssh.Ports
 			}
-			if !wanted(target, netip.Addr{}) && !keptOpens(obs.Rules, byUFW, target, Session{}) {
+			if shut, closed := closedFamilies(target); shut {
 				lockout = append(lockout, "ssh : aucune source autorisée alors que la politique entrante est "+
-					cfg.IncomingPolicy()+" — plus personne ne se connecterait ; ajouter une adresse de confiance "+
-					"(trusted) ou profiles.ssh.allow")
+					cfg.IncomingPolicy()+" — plus personne ne se connecterait"+inFamilies(closed)+" ; ajouter une "+
+					"adresse de confiance (trusted) ou profiles.ssh.allow")
 			}
 		}
 		// La garde porte sur ce que le plan laisse ouvert, non sur la seule
@@ -1060,13 +1425,15 @@ func (p *Provider) validate(ctx context.Context, projects []*model.Project, prof
 		}
 	}
 
+	var guarded []string
 	if !p.AllowLockout {
 		for _, l := range lockout {
-			problems = append(problems, l+" (« ogs firewall apply --allow-lockout » passe outre)")
+			guarded = append(guarded, l+" (« ogs firewall apply --allow-lockout » passe outre)")
 		}
+		problems = append(problems, guarded...)
 	}
 	if len(problems) > 0 {
-		return &ValidationError{Problems: problems}
+		return &ValidationError{Problems: problems, Lockout: guarded}
 	}
 	return nil
 }
@@ -1157,9 +1524,20 @@ func viaInterface(rules []ObservedRule, profiles map[string]Profile, ports []str
 // d'origine n'admet pas un client ordinaire. Sans session, ce qui ne sert que
 // la boucle locale, qu'ufw laisse passer de toute façon, n'ouvre rien du dehors.
 func keptRule(rules []ObservedRule, profiles map[string]Profile, ports []string, s Session, anyInterface bool) bool {
+	return keptRuleIn(rules, profiles, ports, s, anyInterface, 0, false)
+}
+
+// keptRuleIn porte keptRule, restreint à une famille (4 ou 6 ; 0 : les deux).
+// withManaged y compte aussi les règles d'ogs reconnues : c'est alors ce qui est
+// ouvert avant le plan, non ce qu'il laisse en place.
+func keptRuleIn(rules []ObservedRule, profiles map[string]Profile, ports []string, s Session, anyInterface bool,
+	family int, withManaged bool) bool {
 	for _, o := range rules {
 		// Une règle d'ogs reconnue est voulue — comptée comme telle —, ou retirée.
-		if o.Managed && o.Recognized {
+		if o.Managed && o.Recognized && !withManaged {
+			continue
+		}
+		if family != 0 && o.Family != family {
 			continue
 		}
 		f := o.fields
@@ -1477,17 +1855,23 @@ func parentPID(pid int) (int, bool) {
 }
 
 // IgnoreIP rend les adresses de confiance, pour les prisons de fail2ban : une
-// adresse qui a accès à tout ne doit pas être bannie par une autre voie.
-func (p *Provider) IgnoreIP() []string {
+// adresse qui a accès à tout ne doit pas être bannie par une autre voie. Une
+// déclaration qui ne se lit pas, ou une entrée qui ne se résout pas, est une
+// erreur, jamais une liste vide : vide, elle retirait l'adresse d'administration
+// de l'« ignoreip » (R2-15, D109) — l'appelant garde alors celles en place.
+func (p *Provider) IgnoreIP() ([]string, error) {
+	if p.LoadErr != nil {
+		return nil, p.LoadErr
+	}
 	if p.Cfg == nil {
-		return nil
+		return nil, nil
 	}
 	cfg := p.cfg()
 	var out []string
 	for _, e := range cfg.Trusted {
 		addrs, err := cfg.Resolve(e)
 		if err != nil {
-			continue
+			return nil, fmt.Errorf("adresse de confiance %s : %w", e.Label(), err)
 		}
 		for _, a := range addrs {
 			if !a.Any {
@@ -1495,7 +1879,7 @@ func (p *Provider) IgnoreIP() []string {
 			}
 		}
 	}
-	return out
+	return out, nil
 }
 
 // Desired rend les règles voulues, pour l'affichage.

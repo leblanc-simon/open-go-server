@@ -63,6 +63,11 @@ type Provider struct {
 	// profils ne doit pas être bannie par une autre voie — c'est d'ordinaire
 	// celle d'où l'on administre, et quelques mots de passe mal tapés suffiraient.
 	TrustedIP []string
+	// KeepTrusted dit que les adresses de confiance ne se lisent pas — ufw.yaml
+	// présent mais invalide : celles de l'« ignoreip » du fichier de prisons en
+	// place sont gardées (D109). Recalculer sans elles rendait bannissable
+	// l'adresse d'administration, alors que le pare-feu, lui, restait en l'état.
+	KeepTrusted bool
 
 	// Force autorise l'écrasement d'un fichier modifié à la main (§6.4). Sans
 	// elle, l'apply refuse — les deux fichiers de supervision sont recalculés en

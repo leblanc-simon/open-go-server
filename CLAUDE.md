@@ -300,8 +300,13 @@ tout profil qui ouvre les ports visés, et les règles de l'administrateur qu'il
 (`keptOpens`). Elles ne se lèvent que par **`--allow-lockout`**, propre aux commandes `ogs firewall`
 (`plan`, `apply`, `ban`, `unban`) : le `--force` des fichiers retouchés ne les lève jamais, le plan global
 jamais non plus — porté jusqu'à lui, il retirait la dernière règle ssh dans un `ogs apply <id> --force` sans
-rapport. La première activation pose en outre un témoin, `/var/lib/ogs/ufw-unconfirmed`, que `confirm`
-retire et que `status`, `confirm` et `doctor` lisent.
+rapport. La première activation pose en outre un témoin, `/var/lib/ogs/ufw-unconfirmed`, et un complément
+d'unité, `ufw.service.d/ogs-rollback.conf`, qui laisse ufw inactif au **premier démarrage d'ufw après celui
+de la machine** tant que le témoin existe (D109) — jamais à une relance de l'unité ; `confirm` retire l'un
+puis l'autre, et `status`, `confirm` et `doctor` les lisent. `ban` et `unban` calculent et gardent le plan
+**avant** d'écrire `ufw.yaml` — seuls les gardes et les problèmes qu'ils font naître les arrêtent —, et un
+`ufw.yaml` illisible garde l'`ignoreip` des prisons en place (`IgnoreIP` rend une erreur, jamais une liste
+vide).
 
 ### Surfaces particulières
 
@@ -794,8 +799,22 @@ Ils ont tous coûté un défaut réel ; les tests unitaires ne les voyaient pas.
   HTTP-01 comprise. Le mode préfixé, qui se rabat sur Apache, ne produit jamais cet échec : le test passe
   par `firewallWebEngine`.
 - **L'unité transitoire du retour automatique d'ufw vit sous `/run`** : un redémarrage dans le délai
-  l'efface, et ufw repart actif sans filet. Le témoin `/var/lib/ogs/ufw-unconfirmed` est ce qui le fait
-  savoir à `confirm`, `status` et `doctor` ; il ne réarme rien (§20 du cahier).
+  l'efface, et ufw repartait actif sans filet. Le complément `ufw.service.d/ogs-rollback.conf` (D109) range
+  `ENABLED=no` avant qu'ufw-init ne lise `ufw.conf`, **si le témoin existe** — une unité sautée par une
+  condition laisserait `ENABLED=yes`, et `ufw status` dirait actif un pare-feu qui ne filtre rien. Mais
+  **`ExecStartPre` tourne à chaque démarrage de l'unité**, pas au seul démarrage de la machine : la v1 du
+  complément faisait d'un `systemctl restart ufw` dans le délai un retour, que `status` disait encore « en
+  attente » et que `confirm` déclarait confirmé, code 0, ufw inactif. D'où la marque `/run/ogs-ufw-armed`,
+  posée à l'armement et par le complément après avoir joué — `/run` vidé, c'est la machine qui démarre —, à
+  la racine de `/run` : `/run/ogs` naît de `systemd-tmpfiles`, après `ufw.service`. Le scénario `pare-feu`
+  éprouve la relance et un vrai redémarrage du conteneur : un scénario qui rend 100 demande à `run.sh` de le
+  relancer (`/run` repart vide) et reprend à la phase suivante.
+- **Une règle « any » d'ufw tient deux familles, et une seule commande les pose ou les retire** : quand
+  l'administrateur en tient une, la commande commune marquait sa moitié — ufw remplace le commentaire en
+  place — ou l'emportait au retrait. Chaque commande vise alors sa famille (`from ::/0`, `out to 0.0.0.0/0
+  port …`), que ufw range sous le même tuple que la moitié d'une règle « any » (D109). Les gardes sans
+  session jugent de même chaque famille : une règle ssh de l'administrateur en IPv4 seule comptait comme
+  ouverture pour tous, et le retrait de la moitié IPv6 d'ogs fermait ssh en IPv6 sans refus.
 - **Le serveur web suit les liens du docroot sous une identité membre de tous les groupes** (D25, D87) : un
   lien posé dans un docroot lui faisait servir publiquement les fichiers d'un voisin, que le pool du projet
   ne pouvait même pas lire. Apache `SymLinksIfOwnerMatch` et nginx `disable_symlinks if_not_owner`,

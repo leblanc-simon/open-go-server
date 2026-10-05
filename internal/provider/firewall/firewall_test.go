@@ -498,8 +498,14 @@ func TestSortiesSousPolitiqueFermee(t *testing.T) {
 
 func TestIgnoreIPReprendLaConfiance(t *testing.T) {
 	b := nouveauBanc(t, declarationType, "ssh")
-	if got := b.prov.IgnoreIP(); len(got) != 1 || got[0] != "203.0.113.10" {
-		t.Errorf("adresses de confiance pour fail2ban : %v", got)
+	if got, err := b.prov.IgnoreIP(); err != nil || len(got) != 1 || got[0] != "203.0.113.10" {
+		t.Errorf("adresses de confiance pour fail2ban : %v %v", got, err)
+	}
+	// Une déclaration qui ne se lit pas ne rend pas une liste vide : l'appelant
+	// garderait sinon l'ignoreip sans l'adresse d'administration (D109).
+	b.prov.Cfg, b.prov.LoadErr = nil, errors.New("ufw.yaml invalide")
+	if got, err := b.prov.IgnoreIP(); err == nil {
+		t.Errorf("ufw.yaml invalide : une erreur est attendue, obtenu %v", got)
 	}
 }
 

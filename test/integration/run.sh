@@ -58,16 +58,38 @@ systemd | runtimes | runtimes-compiles | harden | suppression | web-durci | dkim
         -v "$PWD/test/integration/scenarios:/scenarios:ro" \
         -v "$PWD/test/integration/dist:/depot:ro" \
         --entrypoint /sbin/init ogs-integration >/dev/null
-    for _ in $(seq 1 30); do
-        etat=$(docker exec "$nom" systemctl is-system-running 2>/dev/null || true)
-        case "$etat" in running | degraded) break ;; esac
-        sleep 1
-    done
-    echo "systemd : ${etat:-indéterminé}"
+    attendre_systemd() {
+        for _ in $(seq 1 30); do
+            etat=$(docker exec "$nom" systemctl is-system-running 2>/dev/null || true)
+            case "$etat" in running | degraded) break ;; esac
+            sleep 1
+        done
+        echo "systemd : ${etat:-indéterminé}"
+    }
+    attendre_systemd
     echo "exécution du scénario « $scenario »…"
     echo
-    docker exec "$nom" "/scenarios/$scenario.sh"
-    exit $?
+    # Un scénario qui rend 100 demande un redémarrage : le conteneur est relancé
+    # — /run, tmpfs, repart vide, comme au démarrage d'une machine, et le reste du
+    # système de fichiers survit —, puis le scénario reprend à la phase suivante.
+    # « -t 2 » coupe court à l'arrêt : une coupure plutôt qu'un arrêt propre.
+    phase=1
+    while :; do
+        code=0
+        docker exec "$nom" "/scenarios/$scenario.sh" "$phase" || code=$?
+        [ "$code" = 100 ] || exit "$code"
+        phase=$((phase + 1))
+        # Une borne : un scénario qui rendrait 100 à chaque phase relancerait le
+        # conteneur sans fin.
+        if [ "$phase" -gt 5 ]; then
+            echo "✗ « $scenario » demande un redémarrage au-delà de la phase 5 : arrêt" >&2
+            exit 1
+        fi
+        echo
+        echo "redémarrage du conteneur (phase $phase)…"
+        docker restart -t 2 "$nom" >/dev/null
+        attendre_systemd
+    done
     ;;
 esac
 
