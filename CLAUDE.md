@@ -12,8 +12,8 @@ Les commits ne mentionnent jamais l'assistance d'un outil d'IA.
 
 ## La référence
 
-[`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md) fait autorité : 110 décisions d'architecture
-arbitrées (D1–D110, tableau §2), spécification par module, plan de tests, découpage en lots. **Consulter le
+[`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md) fait autorité : 111 décisions d'architecture
+arbitrées (D1–D111, tableau §2), spécification par module, plan de tests, découpage en lots. **Consulter le
 tableau des décisions avant de proposer une architecture** — la plupart des questions « pourquoi pas
 plutôt… ? » y sont déjà tranchées, avec leur raison. Toute décision nouvelle s'y ajoute.
 
@@ -718,7 +718,14 @@ Ils ont tous coûté un défaut réel ; les tests unitaires ne les voyaient pas.
   compris —, et qu'aucune suppression ne retire.
 - MySQL : le nom de base après `ON` est un motif où `_` est un joker, donc échappé — **et déséchappé à la
   relecture**, sans quoi toute base contenant un souligné reste éternellement « en écart ». Le nom
-  d'utilisateur, lui, est un littéral.
+  d'utilisateur, lui, est un littéral. **Un motif à joker se relit à part** (D111) : le `GRANT` non échappé
+  `` `shop_fr` `` — de l'administrateur d'un serveur repris, ou d'une ancienne version — et le
+  `` `shop\_fr` `` d'ogs tombaient sous la même clé, le dernier relu l'emportant — le plan révoquait à chaque
+  apply le `GRANT` échappé, jamais le joker. Le joker part après le `GRANT` échappé, sauf s'il couvre une
+  autre base existante, dont il porte l'accès (`doctor` le nomme) ; compte de supervision compris. Il
+  se retire **par les privilèges relus**, `GRANT OPTION` compris quand `IS_GRANTABLE` le dit
+  (`SCHEMA_PRIVILEGES` ne le liste jamais : la ligne survivait, relue « USAGE »), jamais `ALL` : MariaDB refuse à root `REVOKE ALL PRIVILEGES`
+  sur `performance_schema` (ERROR 1044), et la ligne restait, code 6 à chaque apply.
 - **Root ne se connecte qu'au socket du vrai moteur** (D92). `/tmp` figurait parmi les emplacements
   cherchés : tout compte local y pose `mysql.sock` ou `.s.PGSQL.5432`, et le jour où le moteur est arrêté,
   root s'y connectait — mots de passe du parc en clair dans les `CREATE USER`, contenu des bases d'un clone.
@@ -745,7 +752,16 @@ Ils ont tous coûté un défaut réel ; les tests unitaires ne les voyaient pas.
   premier projet invalide, et une déclaration ancienne bloquerait tout le parc.
 - PostgreSQL : l'authentification `peer` exige un rôle au nom de l'utilisateur système (`root`), et
   `CONNECT` doit être révoqué à `PUBLIC` — il est accordé par défaut sur toute base nouvelle. Créer depuis
-  `template0`, jamais `template1`.
+  `template0`, jamais `template1`. **La révocation se juge sur l'ACL relue** (`datacl`, nulle = ouverte à
+  `PUBLIC`) et **ne vaut que pour une base créée par ogs** (D111) : juger sur la seule propriété laissait un
+  `GRANT CONNECT … TO PUBLIC` invisible, et l'exiger d'une base adoptée — dont l'import déclare le rôle
+  d'après le nom, pas d'après le propriétaire — faisait repasser l'étape à chaque apply, schéma `public`
+  donné au rôle déclaré et autres rôles coupés. Une base adoptée ouverte est signalée (plan, `doctor`).
+- **Un mot de passe n'est scellé que posé** (D91, D111) : le compte existant d'un projet adopté sans
+  secret ne reçoit ni mot de passe ni `CREATE USER` — `IF NOT EXISTS` ne posait pas celui qu'ogs tirait et
+  publiait. Recréé (restauration après `delete --force`), il est **toujours** annoncé en code 6 : avec un mot de
+  passe neuf, ou avec le secret scellé — qu'un apply antérieur à D111 a pu sceller sans le poser, et que
+  l'archive réinjecte.
 - **Deux comptes MySQL du même nom sous deux hôtes sont deux comptes**, et MySQL retient pour chaque
   connexion celui dont l'hôte est le plus précis. Un `'x'@'localhost'` créé à côté de `'x'@'%'` fait refuser
   le mot de passe de l'application, par le socket comme par 127.0.0.1 : l'adoption coupait l'hôte et

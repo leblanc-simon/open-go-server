@@ -418,5 +418,96 @@ fi
 echo "'vitrinefr'@'%' est reconnu sous son hôte réel, et son mot de passe fonctionne toujours"
 
 echo
+echo "--- un GRANT à joker est remplacé par le GRANT échappé (R1-47, D111) ---"
+# Le GRANT d'un serveur repris est souvent écrit sans échappement : « vitrine_fr »,
+# où le souligné est un joker. Relu sous le même nom que le GRANT échappé d'ogs, il
+# l'écrasait ou le masquait, et n'était jamais retiré.
+mariadb -e "CREATE DATABASE vitrine_fr; GRANT ALL PRIVILEGES ON vitrine_fr.* TO 'vitrinefr'@'%';
+            CREATE TABLE vitrine_fr.pages (id INT); INSERT INTO vitrine_fr.pages VALUES (1)"
+sed -i "/- engine: mysql/,/user:/ s/name: vitrinefr$/name: vitrine_fr/" /etc/ogs/projects/vitrinefr.yaml
+grep -q "name: vitrine_fr" /etc/ogs/projects/vitrinefr.yaml || { echo "ÉCHEC : déclaration non modifiée"; exit 1; }
+ogs plan vitrinefr 2>&1 | grep -i "joker" | head -2
+ogs apply vitrinefr --yes >/tmp/vitrine.log 2>&1
+grants=$(mariadb -N -e "SHOW GRANTS FOR 'vitrinefr'@'%'")
+echo "$grants" | grep -i vitrine | sed 's/^/  /'
+if echo "$grants" | grep -q '`vitrine_fr`'; then
+    echo "ÉCHEC : le GRANT à joker n'a pas été retiré"
+    tail -5 /tmp/vitrine.log
+    exit 1
+fi
+# mariadb -N échappe la contre-oblique de sa sortie : une ou deux selon le client.
+if ! echo "$grants" | grep -Eq '`vitrine\\+_fr`'; then
+    echo "ÉCHEC : le GRANT échappé n'a pas été posé"
+    exit 1
+fi
+if ! mariadb -h 127.0.0.1 -u vitrinefr -pancien vitrine_fr -e 'SELECT * FROM pages' >/dev/null 2>&1; then
+    echo "ÉCHEC : l'application a perdu l'accès à sa base"
+    exit 1
+fi
+ecart=$(ogs diff vitrinefr 2>&1)
+if echo "$ecart" | grep -qi "base mysql vitrine_fr"; then
+    echo "ÉCHEC : la base reste en écart après le retrait du joker"
+    ogs diff vitrinefr 2>&1 | tail -4
+    exit 1
+fi
+# R2-21 : l'étape a tourné sur un compte adopté dont ogs ne tient pas le mot de
+# passe — elle n'en scelle aucun, puisqu'elle n'en pose aucun.
+if ogs secrets list vitrinefr 2>/dev/null | grep -q "mysql/vitrinefr"; then
+    echo "ÉCHEC : un mot de passe jamais posé a été scellé pour le compte adopté"
+    exit 1
+fi
+echo "joker retiré, GRANT échappé en place, l'ancien mot de passe sert toujours, rien de scellé"
+
+echo
+echo "--- un joker posé WITH GRANT OPTION part entier (D111) ---"
+# SCHEMA_PRIVILEGES ne liste jamais GRANT OPTION, seulement IS_GRANTABLE : le
+# REVOKE des seuls privilèges relus laissait la ligne, relue « USAGE », et le plan
+# repassait sans fin.
+mariadb -e "GRANT SELECT ON vitrine_fr.* TO 'vitrinefr'@'%' WITH GRANT OPTION"
+mariadb -N -e "SHOW GRANTS FOR 'vitrinefr'@'%'" | grep -q '`vitrine_fr`' || { echo "ÉCHEC : joker non posé"; exit 1; }
+ogs apply vitrinefr --yes >/tmp/vitrine.log 2>&1
+code=$?
+if [ "$code" != 0 ]; then
+    echo "ÉCHEC : apply en code $code, 0 attendu"
+    tail -6 /tmp/vitrine.log
+    exit 1
+fi
+if mariadb -N -e "SHOW GRANTS FOR 'vitrinefr'@'%'" | grep -q '`vitrine_fr`'; then
+    echo "ÉCHEC : la ligne à joker WITH GRANT OPTION est restée"
+    mariadb -N -e "SHOW GRANTS FOR 'vitrinefr'@'%'"
+    exit 1
+fi
+ecart=$(ogs diff vitrinefr 2>&1)
+if [ $? != 0 ]; then
+    echo "ÉCHEC : le plan suivant n'est pas conforme"
+    echo "$ecart" | tail -4
+    exit 1
+fi
+echo "joker WITH GRANT OPTION retiré, plan suivant conforme"
+
+echo
+echo "--- restauration d'un projet adopté : compte recréé, mot de passe neuf annoncé (R1-60, D111) ---"
+ogs project delete vitrinefr --force --yes >/tmp/vitrine.log 2>&1 || { tail -5 /tmp/vitrine.log; echo "ÉCHEC : suppression"; exit 1; }
+if mariadb -N -e "SELECT user FROM mysql.user WHERE user='vitrinefr'" | grep -q vitrinefr; then
+    echo "ÉCHEC : le compte adopté devait partir sous --force"
+    exit 1
+fi
+archive=$(ls -t /var/lib/ogs/archives/vitrinefr-*.tar.zst | head -1)
+ogs project restore "$archive" --yes >/tmp/vitrine.log 2>&1
+code=$?
+if [ "$code" != 6 ] || ! grep -q "ogs secrets show vitrinefr mysql/vitrinefr" /tmp/vitrine.log; then
+    echo "ÉCHEC : le mot de passe neuf doit être annoncé (code $code, 6 attendu)"
+    tail -8 /tmp/vitrine.log | sed 's/^/  /'
+    exit 1
+fi
+neuf=$(ogs secrets show vitrinefr mysql/vitrinefr | tail -1)
+if [ "$(mariadb -h 127.0.0.1 -u vitrinefr -p"$neuf" vitrine_fr -N -e 'SELECT COUNT(*) FROM pages' 2>/dev/null)" != 1 ]; then
+    echo "ÉCHEC : le mot de passe scellé n'est pas celui du compte recréé, ou la base n'est pas restaurée"
+    exit 1
+fi
+grep "secrets show" /tmp/vitrine.log | head -1 | sed 's/^/  /'
+echo "compte recréé, mot de passe neuf scellé, posé et annoncé ; la base est restaurée"
+
+echo
 echo "RÉSULTAT : le provider MySQL fonctionne sur un vrai serveur — privilèges"
 echo "           bornés, motif échappé, rotation effective, suppression complète."

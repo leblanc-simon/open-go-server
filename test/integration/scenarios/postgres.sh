@@ -112,6 +112,89 @@ fi
 echo "le propriétaire garde son accès"
 
 echo
+echo "--- CONNECT rendu à PUBLIC sur une base d'ogs : annoncé, puis révoqué (R1-45, D111) ---"
+# Le jugement ne lisait que la propriété de la base : un GRANT posé après coup
+# restait invisible, et tout rôle du cluster pouvait de nouveau s'y connecter.
+pg "GRANT CONNECT ON DATABASE autrefr TO PUBLIC" >/dev/null
+sortie=$(ogs diff autrefr 2>&1)
+code=$?
+echo "$sortie" | grep -i connect | head -2
+if [ "$code" != 6 ] || ! echo "$sortie" | grep -q "CONNECT rendu à PUBLIC"; then
+    echo "ÉCHEC : la dérive de CONNECT doit apparaître au diff (code $code)"
+    echo "$sortie" | tail -4
+    exit 1
+fi
+ogs apply autrefr --yes >/dev/null 2>&1
+if PGPASSWORD="$nouveau_ou_initial" psql -h 127.0.0.1 -U shopfr -d autrefr -c "SELECT 1" >/dev/null 2>&1; then
+    echo "ÉCHEC : après l'apply, le rôle shopfr se connecte encore à la base autrefr"
+    exit 1
+fi
+if ! PGPASSWORD="$voisin" psql -h 127.0.0.1 -U autrefr -d autrefr -c "SELECT 1" >/dev/null 2>&1; then
+    echo "ÉCHEC : la révocation a fermé la base à son propriétaire"
+    exit 1
+fi
+if ! ogs diff autrefr >/dev/null 2>&1; then
+    echo "ÉCHEC : la base refermée reste en écart"
+    ogs diff autrefr 2>&1 | tail -3
+    exit 1
+fi
+echo "CONNECT rendu à PUBLIC est annoncé au diff, révoqué par l'apply, puis conforme"
+
+echo
+echo "--- une base adoptée n'est jamais refermée, et n'est pas en écart (R1-46, D111) ---"
+# Un serveur repris : la base appartient à un autre rôle que celui que l'import
+# déclare d'après son nom, et PUBLIC s'y connecte. L'apply révoquait CONNECT,
+# donnait le schéma public au rôle déclaré, et recommençait à chaque passage.
+pg "CREATE ROLE vitrine_proprio" >/dev/null
+pg "CREATE ROLE vitrinefr LOGIN PASSWORD 'ancien'" >/dev/null
+pg "CREATE DATABASE vitrinefr OWNER vitrine_proprio" >/dev/null
+ogs site create vitrine.fr --kind static --db postgres --tls=false --yes >/tmp/vitrine.log 2>&1
+if ! grep -q "sans qu'ogs l'ait créé" /tmp/vitrine.log; then
+    echo "ÉCHEC : la base préexistante d'un projet non adopté n'est pas refusée"
+    tail -5 /tmp/vitrine.log
+    exit 1
+fi
+sed -i 's/^metadata:$/metadata:\n  labels:\n    adopted: "true"/' /etc/ogs/projects/vitrinefr.yaml
+ogs apply vitrinefr --yes >/tmp/vitrine.log 2>&1
+if [ "$(pg "SELECT has_database_privilege('public', 'vitrinefr', 'CONNECT')")" != t ]; then
+    echo "ÉCHEC : CONNECT a été révoqué à PUBLIC sur une base adoptée"
+    exit 1
+fi
+if [ "$(pg "SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname='vitrinefr'")" != vitrine_proprio ]; then
+    echo "ÉCHEC : la propriété de la base adoptée a changé"
+    exit 1
+fi
+schema=$(su - postgres -c "psql -tAc \"SELECT nspowner::regrole FROM pg_namespace WHERE nspname='public'\" vitrinefr")
+if [ "$schema" = vitrinefr ]; then
+    echo "ÉCHEC : le schéma public de la base adoptée a été donné au rôle déclaré"
+    exit 1
+fi
+ecart=$(ogs diff vitrinefr 2>&1)
+if echo "$ecart" | grep -qi "base postgres vitrinefr"; then
+    echo "ÉCHEC : la base adoptée repasse en écart"
+    ogs diff vitrinefr 2>&1 | tail -3
+    exit 1
+fi
+if ogs secrets list vitrinefr 2>/dev/null | grep -q "postgres/vitrinefr"; then
+    echo "ÉCHEC : un mot de passe jamais posé a été scellé pour le rôle adopté (R2-21)"
+    exit 1
+fi
+# doctor rend un code non nul sur ses avertissements : sa sortie est lue à part,
+# pipefail ferait sinon échouer le grep qui réussit.
+diagnostic=$(ogs doctor 2>&1)
+if ! echo "$diagnostic" | grep -q "base adoptée vitrinefr.*CONNECT"; then
+    echo "ÉCHEC : doctor doit signaler la base adoptée ouverte à PUBLIC"
+    echo "$diagnostic" | grep -i "postgres" | head -5
+    exit 1
+fi
+echo "$diagnostic" | grep "base adoptée vitrinefr" | head -1 | sed 's/  */ /g' | cut -c1-160
+ogs project delete vitrinefr --yes >/dev/null 2>&1
+pg "DROP DATABASE vitrinefr" >/dev/null
+pg "DROP ROLE vitrinefr" >/dev/null
+pg "DROP ROLE vitrine_proprio" >/dev/null
+echo "base adoptée laissée ouverte à PUBLIC et à son propriétaire, sans écart, signalée par doctor"
+
+echo
 echo "--- compte additionnel en lecture seule ---"
 ogs db user add shopfr lecture --privileges readonly >/dev/null
 ogs apply shopfr --yes 2>&1 | grep -Ei "lecture" | head -3

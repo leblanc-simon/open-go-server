@@ -111,6 +111,32 @@ func (c *pgClient) Grants(ctx context.Context, role, _ string) (map[string]strin
 	return out, rows.Err()
 }
 
+// databaseAccess est la relecture de l'ACL d'une base PostgreSQL (D111).
+type databaseAccess interface {
+	// DatabaseAccess rend le propriétaire de la base, si PUBLIC peut s'y
+	// connecter, et si le rôle role le peut — par PUBLIC, par la propriété ou par
+	// un GRANT ; faux pour un rôle absent. Une base absente rend sql.ErrNoRows.
+	DatabaseAccess(ctx context.Context, database, role string) (owner string, publicConnect, roleConnect bool, err error)
+}
+
+// DatabaseAccess relit le propriétaire d'une base et le droit CONNECT de PUBLIC
+// et du rôle donné. Une ACL nulle est celle par défaut, qui accorde CONNECT et
+// TEMPORARY à PUBLIC : c'est l'état de toute base qu'aucun GRANT ni REVOKE n'a
+// touchée.
+func (c *pgClient) DatabaseAccess(ctx context.Context, database, role string) (string, bool, bool, error) {
+	var (
+		owner        string
+		public, mine bool
+	)
+	err := c.db.QueryRowContext(ctx, `SELECT pg_get_userbyid(d.datdba),
+		d.datacl IS NULL OR EXISTS (SELECT 1 FROM aclexplode(d.datacl) a
+			WHERE a.grantee = 0 AND a.privilege_type = 'CONNECT'),
+		COALESCE((SELECT has_database_privilege(r.oid, d.oid, 'CONNECT') FROM pg_roles r
+			WHERE r.rolname = $2), false)
+		FROM pg_database d WHERE d.datname = $1`, database, role).Scan(&owner, &public, &mine)
+	return owner, public, mine, err
+}
+
 // Extensions liste les extensions installées dans une base.
 func (c *pgClient) Extensions(ctx context.Context, database string) (map[string]bool, error) {
 	conn, err := sql.Open("pgx", c.dsn(database))

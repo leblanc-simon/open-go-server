@@ -2,6 +2,8 @@ package cli
 
 import (
 	"fmt"
+	"os"
+	"strings"
 	"text/tabwriter"
 
 	"github.com/spf13/cobra"
@@ -101,6 +103,7 @@ func newSecretsShowCommand(app *App) *cobra.Command {
 				return wrap(CodeError, err)
 			}
 			fmt.Fprintln(app.Out, string(plain))
+			app.warnAdoptedPassword(args[0], scope, name)
 			return nil
 		},
 	}
@@ -145,4 +148,33 @@ func newSecretsEnvCommand(app *App) *cobra.Command {
 			return nil
 		},
 	}
+}
+
+// warnAdoptedPassword avertit, sur la sortie d'erreur, que le mot de passe d'un
+// compte SGBD d'un projet adopté n'est pas forcément celui que le compte porte :
+// un apply antérieur à D111 en scellait un sans le poser (R2-21). Seule la
+// rotation en donne la certitude.
+func (a *App) warnAdoptedPassword(arg, scope, name string) {
+	if scope == monitoring.SecretScope {
+		return
+	}
+	engine, user, ok := strings.Cut(name, "/")
+	if !ok || (engine != "mysql" && engine != "mariadb" && engine != "postgres") {
+		return
+	}
+	p, err := a.loadProject(arg)
+	if err != nil || p.Metadata.Labels["adopted"] != "true" {
+		return
+	}
+	// Sur la sortie d'erreur, jamais par warnf, qui écrit sur la sortie standard en
+	// table : celle-ci ne porte que la valeur, qu'un script capture.
+	if a.Quiet {
+		return
+	}
+	w := a.Err
+	if w == nil {
+		w = os.Stderr
+	}
+	fmt.Fprintf(w, "⚠ %s est adopté : ce mot de passe a pu être scellé par un apply antérieur à D111 sans être "+
+		"posé sur le compte — il n'est sûr qu'après « ogs db user rotate %s %s »\n", p.ID(), p.ID(), user)
 }

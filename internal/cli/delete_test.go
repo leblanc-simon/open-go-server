@@ -1255,7 +1255,9 @@ func (m *mysqlFactice) appliquer(q string) {
 			m.comptes = append(m.comptes, u+"@"+h)
 		}
 	case strings.HasPrefix(q, "GRANT ") && strings.Contains(q, ".* TO "):
-		base := strings.ReplaceAll(motifMySQL(q, " ON ", '`'), `\_`, "_")
+		// Le motif est gardé tel qu'il est écrit, échappement compris, comme
+		// mysql.db le stocke : le désechapper en ferait un joker à la relecture.
+		base := motifMySQL(q, " ON ", '`')
 		compte := "'" + motifMySQL(q, " TO ", '\'') + "'@'" + motifMySQL(q[strings.Index(q, " TO "):], "@", '\'') + "'"
 		if m.privilèges[compte] == nil {
 			m.privilèges[compte] = map[string]string{}
@@ -1309,7 +1311,7 @@ func (m *mysqlFactice) exécuter(c net.Conn, p []byte) {
 		}
 		sort.Strings(bases)
 		for _, base := range bases {
-			lignes = append(lignes, []string{base, privs[base]})
+			lignes = append(lignes, []string{base, privs[base], "NO"})
 		}
 	}
 	m.mu.Unlock()
@@ -1317,7 +1319,7 @@ func (m *mysqlFactice) exécuter(c net.Conn, p []byte) {
 	envoyer := func(p []byte) { paquetMySQL(c, seq, p); seq++ }
 	colonnes := 1
 	if strings.Contains(q, "SCHEMA_PRIVILEGES") {
-		colonnes = 2
+		colonnes = 3
 	}
 	envoyer([]byte{byte(colonnes)})
 	for i := 0; i < colonnes; i++ {

@@ -518,8 +518,11 @@ func TestPlanNeMasquePasUnCompteSousUnAutreHote(t *testing.T) {
 	if steps, err = prov.Plan(context.Background(), proj, obs); err != nil {
 		t.Fatal(err)
 	}
-	if len(steps) != 1 || steps[0].Action != engine.Create || !steps[0].Critical {
-		t.Errorf("une création critique attendue : %+v", steps)
+	// Le projet est adopté : la création s'accompagne de l'annonce du mot de
+	// passe neuf (D111).
+	if len(steps) != 2 || steps[0].Action != engine.Create || !steps[0].Critical ||
+		!strings.HasSuffix(steps[1].Resource, "/mot-de-passe") || steps[1].Critical {
+		t.Errorf("une création critique attendue, puis son annonce : %+v", steps)
 	}
 }
 
@@ -527,7 +530,7 @@ func TestStatementsForMySQLDeclaration(t *testing.T) {
 	prov, proj := fixture(t)
 	decl := DefaultDatabase(proj, "mysql")
 	decl.ExtraUsers = []model.DBUser{{User: "shopfr_ro", Privileges: "readonly"}}
-	stmts, err := prov.statements(decl, DBState{}, PrivAll, "localhost", "secret")
+	stmts, err := prov.statements(decl, DBState{}, PrivAll, "localhost", func(string, bool) string { return "secret" })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -551,7 +554,7 @@ func TestStatementsForPostgresDeclaration(t *testing.T) {
 	prov, proj := fixture(t)
 	decl := RoleDatabase(proj, "postgres", "analytics")
 	decl.Extensions = []string{"pg_trgm"}
-	stmts, err := prov.statements(decl, DBState{}, PrivAll, "", "secret")
+	stmts, err := prov.statements(decl, DBState{}, PrivAll, "", func(string, bool) string { return "secret" })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -798,6 +801,11 @@ func TestPlanRefuseUneBaseOuUnCompteQuOgsNAPasCrees(t *testing.T) {
 		}
 		if steps, err = prov.Plan(context.Background(), proj, obs); err != nil {
 			t.Fatal(err)
+		}
+		// Un compte à créer s'accompagne de l'annonce de son mot de passe neuf
+		// (D111), qui n'est pas un refus.
+		if n := len(steps); n > 1 && strings.HasSuffix(steps[n-1].Resource, "/mot-de-passe") {
+			steps = steps[:n-1]
 		}
 		if len(steps) != 1 || (steps[0].Action != engine.NoOp && !steps[0].Critical) {
 			t.Errorf("%s : un projet adopté ne doit pas être refusé : %+v", c.nom, steps)

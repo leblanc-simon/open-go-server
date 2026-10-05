@@ -416,7 +416,9 @@ func TestLePrivilegeHeriteEstRevoqueAuMotifLitteral(t *testing.T) {
 	// le GRANT non échappé a déjà tourné, la ligne joker de mysql.db survit à tous
 	// les apply — GRANT est additif, seul un REVOKE la retire. Il vise le motif
 	// **littéral**, celui qui a été stocké ; l'échapper ne désignerait rien.
-	stmt, err := MonitoringMySQLLegacyRevoke("telegraf", "localhost")
+	// Les privilèges relus, jamais ALL : MariaDB refuse à root « REVOKE ALL
+	// PRIVILEGES ON `performance_schema`.* » (ERROR 1044), et la ligne restait.
+	stmt, err := RevokeMySQLJoker("performance_schema", "SELECT", "telegraf", "localhost")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -434,8 +436,28 @@ func TestLePrivilegeHeriteEstRevoqueAuMotifLitteral(t *testing.T) {
 	if !strings.Contains(strings.Join(stmts, "\n"), "GRANT SELECT ON `performance\\_schema`.*") {
 		t.Errorf("le GRANT doit rester échappé :\n%s", strings.Join(stmts, "\n"))
 	}
-	if _, err := MonitoringMySQLLegacyRevoke("tele'graf", "localhost"); err == nil {
+	if _, err := RevokeMySQLJoker("performance_schema", "SELECT", "tele'graf", "localhost"); err == nil {
 		t.Error("un nom d'utilisateur hors liste blanche doit être refusé")
+	}
+	if _, err := RevokeMySQLJoker("perf`ormance", "SELECT", "telegraf", "localhost"); err == nil {
+		t.Error("un motif hors liste blanche doit être refusé")
+	}
+	if _, err := RevokeMySQLJoker("performance_schema", "SELECT; DROP", "telegraf", "localhost"); err == nil {
+		t.Error("un privilège hors liste blanche doit être refusé")
+	}
+	if _, err := RevokeMySQLJoker("performance_schema", "", "telegraf", "localhost"); err == nil {
+		t.Error("une ligne sans privilège relu ne se révoque pas")
+	}
+	if _, err := RevokeMySQLJoker("performance_schema", "USAGE", "telegraf", "localhost"); err == nil {
+		t.Error("« REVOKE USAGE » ne retire rien : il ne doit pas être produit")
+	}
+	if stmt, err := RevokeMySQLJoker("performance_schema", "SELECT,GRANT OPTION", "telegraf", "localhost"); err != nil ||
+		stmt != "REVOKE SELECT, GRANT OPTION ON `performance_schema`.* FROM 'telegraf'@'localhost'" {
+		t.Errorf("GRANT OPTION doit partir avec la ligne : %q (%v)", stmt, err)
+	}
+	stmt, err = RevokeMySQLJoker("shop_fr", "ALTER ROUTINE,SELECT,SHOW VIEW", "shop", "%")
+	if err != nil || stmt != "REVOKE ALTER ROUTINE, SELECT, SHOW VIEW ON `shop_fr`.* FROM 'shop'@'%'" {
+		t.Errorf("requête = %q (%v)", stmt, err)
 	}
 }
 

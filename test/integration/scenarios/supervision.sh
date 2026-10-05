@@ -100,6 +100,25 @@ fi
 echo "  il lit l'état du serveur, pas les données des projets"
 
 echo
+echo "--- la ligne à joker d'une ancienne version est retirée (D111) ---"
+# Les versions qui n'échappaient pas le souligné posaient un motif : le compte
+# lisait aussi une base « performanceXschema ». Relue à part, la ligne part après
+# le GRANT échappé — par les privilèges relus : MariaDB refuse à root
+# « REVOKE ALL PRIVILEGES ON `performance_schema`.* » (ERROR 1044).
+mariadb -e "GRANT SELECT ON performance_schema.* TO 'telegraf'@'localhost'"
+mariadb -N -e "SHOW GRANTS FOR 'telegraf'@'localhost'" | grep -q '`performance_schema`' \
+    || echec "la ligne à joker n'a pas été posée, rien n'est éprouvé"
+ogs apply shopfr --yes >/tmp/joker.log 2>&1
+code=$?
+[ "$code" -eq 0 ] || { tail -8 /tmp/joker.log; echec "apply : code $code, 0 attendu"; }
+droits=$(mariadb -N -e "SHOW GRANTS FOR 'telegraf'@'localhost'")
+echo "$droits" | grep -q '`performance_schema`' && { echo "$droits"; echec "la ligne à joker est restée"; }
+echo "$droits" | grep -Eq '`performance\\+_schema`' || { echo "$droits"; echec "le GRANT échappé a disparu"; }
+plan=$(ogs plan shopfr 2>&1)
+echo "$plan" | grep -q "compte de supervision MySQL" && { echo "$plan"; echec "le plan suivant n'est pas conforme"; }
+echo "  ligne à joker retirée, GRANT échappé en place, plan suivant conforme"
+
+echo
 echo "--- le rôle PostgreSQL s'authentifie-t-il sans mot de passe ? ---"
 su -s /bin/sh postgres -c "psql -tAc \"SELECT rolname FROM pg_roles WHERE rolname='telegraf'\"" | grep -q telegraf \
     || echec "le rôle de supervision n'a pas été créé"

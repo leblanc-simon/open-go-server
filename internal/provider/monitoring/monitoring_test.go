@@ -1011,3 +1011,52 @@ func TestUnSocketMySQLRefuseNEstPasUneAbsence(t *testing.T) {
 		t.Errorf("moteur absent : aucune étape attendue, obtenu %v", step)
 	}
 }
+
+// fakeMySQLJoker rend, pour le compte de supervision, des privilèges complets
+// et la ligne à joker d'une ancienne version.
+type fakeMySQLJoker struct{ fakeMySQL }
+
+func (m *fakeMySQLJoker) Grants(context.Context, string, string) (map[string]string, error) {
+	return map[string]string{
+		db.GlobalGrantKey:                      "PROCESS,REPLICATION CLIENT",
+		"performance_schema":                   "SELECT",
+		db.JokerGrantKey("performance_schema"): "SELECT",
+	}, nil
+}
+
+func TestLaLigneAJokerDuCompteDeSupervisionEstRetiree(t *testing.T) {
+	// La ligne à joker d'une ancienne version — `performance_schema`, qui couvre
+	// « performanceXschema » — se relisait sous la même clé que le GRANT échappé :
+	// le compte était jugé conforme et la ligne ne partait jamais. Relue à part
+	// (D111), elle est retirée après le GRANT échappé.
+	p, paths := fixture(t)
+	socket := filepath.Join(paths.Prefix(), "run", "mysqld", "mysqld.sock")
+	if err := os.MkdirAll(filepath.Dir(socket), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(socket, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	account := p.Cfg.Monitoring.TelegrafAccount()
+	moteur := &fakeMySQLJoker{fakeMySQL{users: map[string]bool{account + "@localhost": true}}}
+	p.DB = &db.Provider{}
+	previous := engineClient
+	engineClient = func(*db.Provider, string, string) (db.Client, error) { return moteur, nil }
+	t.Cleanup(func() { engineClient = previous })
+	if err := p.sealSecret("mysql/"+account, "scelle"); err != nil {
+		t.Fatal(err)
+	}
+
+	step, _ := p.planMySQLAccount(context.Background())
+	if step == nil || step.Action == engine.NoOp {
+		t.Fatalf("la ligne à joker doit faire repasser le compte : %+v", step)
+	}
+	if err := step.Apply(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	revoke := "REVOKE SELECT ON `performance_schema`.* FROM '" + account + "'@'localhost'"
+	n := len(moteur.execs)
+	if n == 0 || moteur.execs[n-1] != revoke {
+		t.Errorf("le joker doit partir en dernier, après le GRANT échappé : %v", moteur.execs)
+	}
+}

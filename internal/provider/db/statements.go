@@ -297,6 +297,46 @@ func RevokeMySQL(database, user, host string) (string, error) {
 		quoteMySQLIdent(naming.EscapeMySQLPattern(database)), quoteLiteral(user), quoteLiteral(host)), nil
 }
 
+// reMySQLPattern borne un motif de privilège relu sur le serveur avant de le
+// reporter dans une requête : la liste blanche des noms, plus ses jokers et leur
+// échappement.
+var reMySQLPattern = regexp.MustCompile(`^[a-zA-Z0-9_%\\]+$`)
+
+// reMySQLPrivilege borne un privilège relu avant de le reporter dans un REVOKE.
+var reMySQLPrivilege = regexp.MustCompile(`^[A-Z]+( [A-Z]+)*$`)
+
+// RevokeMySQLJoker retire le GRANT d'un motif à joker tel qu'il est stocké —
+// « shop_fr », écrit sans échappement, par l'administrateur ou une ancienne version (D111). Le motif
+// est reporté tel quel : c'est la ligne de mysql.db qu'il désigne.
+//
+// Il révoque les privilèges relus sur la ligne, jamais ALL : root n'a pas tous
+// les privilèges sur toute base — sur performance_schema, MariaDB refuse
+// « REVOKE ALL PRIVILEGES » à root (ERROR 1044), et la ligne restait.
+func RevokeMySQLJoker(pattern, privileges, user, host string) (string, error) {
+	if !reMySQLPattern.MatchString(pattern) {
+		return "", fmt.Errorf("motif de privilège %q invalide", pattern)
+	}
+	// GRANT OPTION figure parmi les privilèges relus quand la ligne est
+	// « IS_GRANTABLE » : sans lui, la ligne survivait au REVOKE.
+	privs := revocable(privileges)
+	for _, p := range privs {
+		if !reMySQLPrivilege.MatchString(p) {
+			return "", fmt.Errorf("privilège %q invalide", p)
+		}
+	}
+	if len(privs) == 0 {
+		return "", fmt.Errorf("aucun privilège relu sur le motif %q", pattern)
+	}
+	if err := checkIdentifier("nom d'utilisateur", user); err != nil {
+		return "", err
+	}
+	if host == "" {
+		host = "localhost"
+	}
+	return fmt.Sprintf("REVOKE %s ON %s.* FROM %s@%s",
+		strings.Join(privs, ", "), quoteMySQLIdent(pattern), quoteLiteral(user), quoteLiteral(host)), nil
+}
+
 // SetMySQLPassword produit la requête de rotation de mot de passe.
 func SetMySQLPassword(user, host, password, plugin string) (string, error) {
 	if err := checkIdentifier("nom d'utilisateur", user); err != nil {
@@ -354,6 +394,12 @@ type PostgresSpec struct {
 	Collate    string
 	Extensions []string
 	Privileges Privilege
+	// Adopted dit que la base existait avant ogs et qu'il la reprend d'un projet
+	// adopté (D111) : ni CONNECT ni le schéma public n'y sont touchés — les
+	// refermer coupait tout autre rôle qui s'y connectait, et donnait le schéma à
+	// un rôle déclaré d'après le nom, qui n'en est pas toujours le propriétaire.
+	// Le rôle déclaré reçoit seulement CONNECT, ce qui n'ôte rien à personne.
+	Adopted bool
 }
 
 func (s *PostgresSpec) normalize() error {
@@ -433,13 +479,20 @@ func CreatePostgres(spec PostgresSpec, roleExists, dbExists bool) (PostgresState
 	// nouvelle : sans cette révocation, le rôle de n'importe quel projet peut se
 	// connecter à la base d'un autre — y occuper une connexion, et lire du
 	// catalogue ce que les privilèges ne filtrent pas. Les deux requêtes sont
-	// idempotentes, donc rejouées à chaque apply : une base créée avant cette
-	// correction se trouve durcie au passage.
+	// idempotentes ; l'observation relit l'ACL de la base, et un CONNECT rendu à
+	// PUBLIC fait repasser l'étape (D111) — une base créée avant D45 se trouve
+	// durcie au premier apply. Jamais une base adoptée : elle est signalée.
+	if !spec.Adopted || !dbExists {
+		out.Cluster = append(out.Cluster,
+			fmt.Sprintf("REVOKE CONNECT ON DATABASE %s FROM PUBLIC", quotePGIdent(spec.Database)))
+	}
 	out.Cluster = append(out.Cluster,
-		fmt.Sprintf("REVOKE CONNECT ON DATABASE %s FROM PUBLIC", quotePGIdent(spec.Database)),
 		fmt.Sprintf("GRANT CONNECT ON DATABASE %s TO %s",
 			quotePGIdent(spec.Database), quotePGIdent(spec.Role)),
 	)
+	if spec.Adopted && dbExists {
+		return out, appendExtensions(&out, spec.Extensions)
+	}
 
 	// Durcissement du schéma public : depuis PostgreSQL 15, il n'est plus
 	// inscriptible par PUBLIC, mais on l'applique explicitement pour homogénéiser
@@ -449,16 +502,21 @@ func CreatePostgres(spec PostgresSpec, roleExists, dbExists bool) (PostgresState
 		fmt.Sprintf("GRANT ALL ON SCHEMA public TO %s", quotePGIdent(spec.Role)),
 		fmt.Sprintf("ALTER SCHEMA public OWNER TO %s", quotePGIdent(spec.Role)),
 	)
-	exts := append([]string(nil), spec.Extensions...)
+	return out, appendExtensions(&out, spec.Extensions)
+}
+
+// appendExtensions ajoute la création des extensions déclarées.
+func appendExtensions(out *PostgresStatements, extensions []string) error {
+	exts := append([]string(nil), extensions...)
 	sort.Strings(exts)
 	for _, ext := range exts {
 		if !regexp.MustCompile(`^[a-zA-Z0-9_-]+$`).MatchString(ext) {
-			return out, fmt.Errorf("nom d'extension %q invalide", ext)
+			return fmt.Errorf("nom d'extension %q invalide", ext)
 		}
 		out.InDatabase = append(out.InDatabase,
 			fmt.Sprintf("CREATE EXTENSION IF NOT EXISTS %s", quotePGIdent(ext)))
 	}
-	return out, nil
+	return nil
 }
 
 // PostgresExtraUser produit les requêtes d'un compte additionnel sur une base
@@ -581,31 +639,6 @@ func MonitoringMySQL(user, host, password string) ([]string, error) {
 // MonitoringMySQLSchema est la seule base que le compte de supervision peut lire :
 // c'est de là que viennent presque toutes les métriques du moteur.
 const MonitoringMySQLSchema = "performance_schema"
-
-// MonitoringMySQLLegacyRevoke retire le privilège hérité du compte de
-// supervision. Les versions posant « GRANT SELECT ON `performance_schema`.* »
-// sans échappement accordaient un **motif**, où le souligné est un joker : le
-// compte lit aussi une base nommée « performanceXschema », qu'un projet adopté
-// peut porter — l'inverse de ce que promet D67. GRANT étant additif, la ligne de
-// mysql.db survit à tous les apply suivants : seul un REVOKE la retire, et il
-// vise le motif **littéral**, tel qu'il a été stocké.
-//
-// Elle ne figure pas dans MonitoringMySQL, dont chaque requête doit réussir :
-// celle-ci rend ER_NONEXISTING_GRANT partout où la ligne n'existe pas, c'est-à-dire
-// sur toute installation postérieure à l'échappement. Son échec est le cas
-// nominal, et l'appelant doit le traiter comme tel — la ligne héritée ne peut pas
-// être cherchée d'abord, la relecture des privilèges ramenant les deux motifs
-// sous la même clé (voir mysqlClient.Grants).
-func MonitoringMySQLLegacyRevoke(user, host string) (string, error) {
-	if err := checkIdentifier("utilisateur de supervision", user); err != nil {
-		return "", err
-	}
-	if host == "" {
-		host = "localhost"
-	}
-	return fmt.Sprintf("REVOKE SELECT ON %s.* FROM %s@%s",
-		quoteMySQLIdent(MonitoringMySQLSchema), quoteLiteral(user), quoteLiteral(host)), nil
-}
 
 // MonitoringMySQLGrants énumère les privilèges **globaux** attendus du compte de
 // supervision, chaque entrée donnant les orthographes acceptées.

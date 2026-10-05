@@ -185,6 +185,38 @@ type DBState struct {
 	// pgOwner est, sous PostgreSQL, le compte à ogs qui possède la base quand ce
 	// n'est pas le compte déclaré : la propriété lui est reprise.
 	pgOwner string
+	// Owner et PublicConnect sont, sous PostgreSQL, le propriétaire relu de la
+	// base et le droit CONNECT de PUBLIC, lu dans son ACL (D111). Une relecture
+	// en échec les laisse vides : elle ne fonde aucune correction.
+	Owner         string
+	PublicConnect bool
+	// RoleConnect dit que le rôle déclaré peut se connecter à la base ;
+	// accessRead, que l'ACL a pu être relue.
+	RoleConnect bool
+	accessRead  bool
+	// Jokers associe à un compte MySQL le motif à joker qui désigne la base —
+	// « shop_fr », GRANT écrit sans échappement — et qu'aucune autre
+	// base existante ne partage : il est retiré, le GRANT échappé posé avant lui.
+	// JokersKept nomme ceux qui couvrent aussi d'autres bases, dont ils portent
+	// l'accès : ils restent, hors du jugement de la base (D111).
+	Jokers     map[string]string
+	JokerPrivs map[string]string
+	JokersKept map[string][]string
+}
+
+// CreatedByOGS dit si ogs a créé la base, ou la crée : celle de tout projet non
+// adopté — une base qu'ogs n'a pas créée y est refusée (D91) —, et celle qui
+// n'existe pas encore. La base existante d'un projet adopté était là avant lui :
+// CONNECT et le schéma public n'y sont pas touchés (D111).
+func (s DBState) CreatedByOGS() bool { return !s.Adopted || !s.DBExists }
+
+// needsPassword dit si un compte appelle un mot de passe : absent, ogs le crée et
+// le scelle ; présent, ogs ne le connaît que s'il le tient. Le compte existant
+// d'un projet adopté sans secret n'en reçoit aucun (D78) : en tirer un pour
+// « CREATE USER IF NOT EXISTS », qui ne le pose pas, scellait un mot de passe
+// que le moteur ignore (R2-21).
+func (p *Provider) needsPassword(project, engine, user string, exists bool) bool {
+	return !exists || p.sealed(project, engine, user)
 }
 
 // account nomme un compte comme le moteur le désigne.
@@ -215,6 +247,7 @@ func (p *Provider) Observe(ctx context.Context, proj *model.Project) (Observed, 
 			Extensions: map[string]bool{}, ExtraUsers: map[string]bool{},
 			ExtraGrants: map[string]string{}, OtherHosts: map[string][]string{},
 			ExtraOwned: map[string]bool{}, Adopted: proj.Metadata.Labels["adopted"] == "true",
+			Jokers: map[string]string{}, JokerPrivs: map[string]string{}, JokersKept: map[string][]string{},
 			projectID: proj.ID()}
 		state.UserOwned = p.sealed(proj.ID(), decl.Engine, decl.User)
 		state.Moved = map[string][]string{}
@@ -307,6 +340,7 @@ func (p *Provider) Observe(ctx context.Context, proj *model.Project) (Observed, 
 				// conforme un compte dont on n'a rien pu relire.
 				if grants, err := client.Grants(ctx, u.User, host); err == nil {
 					state.ExtraGrants[u.User] = grants[decl.Name]
+					state.observeJoker(u.User, grants, databases)
 				}
 			}
 		}
@@ -314,6 +348,19 @@ func (p *Provider) Observe(ctx context.Context, proj *model.Project) (Observed, 
 		if state.UserExists {
 			if grants, err := client.Grants(ctx, decl.User, host); err == nil {
 				state.Grants = grants
+				if decl.Engine != "postgres" {
+					state.observeJoker(decl.User, grants, databases)
+				}
+			}
+		}
+		// L'ACL de la base : CONNECT rendu à PUBLIC sur une base d'ogs est une
+		// dérive à corriger, sur une base adoptée un constat (D111).
+		if state.DBExists && decl.Engine == "postgres" {
+			if acl, ok := client.(databaseAccess); ok {
+				if owner, public, mine, err := acl.DatabaseAccess(ctx, decl.Name, decl.User); err == nil {
+					state.Owner, state.PublicConnect, state.RoleConnect = owner, public, mine
+					state.accessRead = true
+				}
 			}
 		}
 		if state.DBExists && decl.Engine == "postgres" && len(decl.Extensions) > 0 {
@@ -412,7 +459,19 @@ func (p *Provider) Plan(ctx context.Context, proj *model.Project, obs Observed) 
 		}
 		observedGrants := state.Grants[decl.Name]
 		hasGrant := grantsConform(decl.Engine, observedGrants, priv)
-		conforming := state.DBExists && state.UserExists && hasGrant &&
+		// Une base adoptée n'appartient pas toujours au rôle que l'import a
+		// déclaré d'après son nom (R1-46) : exiger la propriété faisait repasser
+		// l'étape à chaque apply, sans jamais la rendre. Seule une base qu'un ancien
+		// compte d'ogs possède lui est reprise (pgOwnership).
+		// Le rôle déclaré doit pouvoir s'y connecter : sans quoi l'étape lui
+		// accorde CONNECT, ce qui n'ôte rien à personne.
+		if decl.Engine == "postgres" && !state.CreatedByOGS() && state.pgOwner == "" {
+			hasGrant = !state.accessRead || state.RoleConnect
+		}
+		// CONNECT rendu à PUBLIC sur une base d'ogs : une correction annoncée,
+		// jamais un refus (R1-45).
+		reopened := decl.Engine == "postgres" && state.CreatedByOGS() && state.PublicConnect
+		conforming := state.DBExists && state.UserExists && hasGrant && !reopened && len(state.Jokers) == 0 &&
 			extensionsSatisfied(decl, state) && extraUsersSatisfied(decl, state)
 
 		// Ce qu'une déclaration changée laisse derrière elle (D100) : l'ancien
@@ -450,7 +509,7 @@ func (p *Provider) Plan(ctx context.Context, proj *model.Project, obs Observed) 
 			continue
 		}
 		summary := fmt.Sprintf("base %s %s (utilisateur %s, privilèges %s)",
-			decl.Engine, decl.Name, decl.User, priv)
+			decl.Engine, decl.Name, decl.User, priv) + stateNotes(state, reopened)
 		s := engine.NewStep(resource, action, summary)
 		declCopy, stateCopy := decl, state
 		s.Diff = func() (string, error) { return p.describe(declCopy, stateCopy, priv, host) }
@@ -527,6 +586,9 @@ func (p *Provider) Plan(ctx context.Context, proj *model.Project, obs Observed) 
 			return nil
 		}
 		steps = append(steps, s)
+		if notice := p.recreatedNotice(resource, proj, decl, state, &sealedHere); notice != nil {
+			steps = append(steps, notice)
+		}
 		steps = append(steps, follow...)
 	}
 	// Les comptes qu'aucune déclaration ne nomme plus viennent en dernier : un
@@ -614,6 +676,20 @@ func grantsConform(engine, observed string, priv Privilege) bool {
 	return MySQLGrantsSatisfied(observed, priv)
 }
 
+// observeJoker relève le motif à joker qui désigne la base parmi les privilèges
+// d'un compte MySQL (D111).
+func (s *DBState) observeJoker(user string, grants map[string]string, databases map[string]bool) {
+	pattern, others := mysqlJoker(grants, s.Declaration.Name, databases)
+	switch {
+	case pattern == "":
+	case len(others) > 0:
+		s.JokersKept[user] = others
+	default:
+		s.Jokers[user] = pattern
+		s.JokerPrivs[user] = grants[jokerKey(pattern)]
+	}
+}
+
 // otherHosts énumère les hôtes sous lesquels le compte MySQL user existe, hors
 // l'hôte déclaré. Les comptes sont relevés sous la forme « user@host » ; un hôte
 // ne contient jamais « @ », d'où la coupure au dernier.
@@ -689,7 +765,12 @@ func extraUsersSatisfied(decl model.Database, state DBState) bool {
 // describe rend le détail des requêtes qui seront exécutées, pour que le plan
 // soit vérifiable avant application.
 func (p *Provider) describe(decl model.Database, state DBState, priv Privilege, host string) (string, error) {
-	stmts, err := p.statements(decl, state, priv, host, "«mot de passe généré»")
+	stmts, err := p.statements(decl, state, priv, host, func(user string, exists bool) string {
+		if !p.needsPassword(state.projectID, decl.Engine, user, exists) {
+			return ""
+		}
+		return "«mot de passe généré»"
+	})
 	if err != nil {
 		return "", err
 	}
@@ -697,16 +778,18 @@ func (p *Provider) describe(decl model.Database, state DBState, priv Privilege, 
 }
 
 // statements produit la liste des requêtes à exécuter pour une déclaration.
-func (p *Provider) statements(decl model.Database, state DBState, priv Privilege, host, password string) ([]string, error) {
+// password rend le mot de passe d'un compte, vide s'il n'en appelle aucun.
+func (p *Provider) statements(decl model.Database, state DBState, priv Privilege, host string,
+	password func(user string, exists bool) string) ([]string, error) {
 	switch decl.Engine {
 	case "mysql", "mariadb":
 		spec := MySQLSpec{
 			Database: decl.Name, Charset: decl.Charset, Collation: decl.Collation,
-			User: decl.User, Host: host, Password: password, Privileges: priv,
+			User: decl.User, Host: host, Password: password(decl.User, state.UserExists), Privileges: priv,
 			AuthPlugin: decl.AuthPlugin,
 			Revoke:     MySQLGrantsOverflow(state.Grants[decl.Name], priv),
 		}
-		stmts, err := CreateMySQL(spec)
+		stmts, err := createMySQL(spec)
 		if err != nil {
 			return nil, err
 		}
@@ -716,9 +799,9 @@ func (p *Provider) statements(decl model.Database, state DBState, priv Privilege
 			if err != nil {
 				return nil, err
 			}
-			extra, err := CreateMySQL(MySQLSpec{
+			extra, err := createMySQL(MySQLSpec{
 				Database: decl.Name, Charset: decl.Charset, Collation: decl.Collation,
-				User: u.User, Host: host, Password: password, Privileges: extraPriv,
+				User: u.User, Host: host, Password: password(u.User, state.ExtraUsers[u.User]), Privileges: extraPriv,
 				Revoke: MySQLGrantsOverflow(state.ExtraGrants[u.User], extraPriv),
 			})
 			if err != nil {
@@ -727,11 +810,15 @@ func (p *Provider) statements(decl model.Database, state DBState, priv Privilege
 			out = append(out, extra.User...)
 			out = append(out, extra.Grants...)
 		}
-		return out, nil
+		jokers, err := jokerRevokes(decl, state, host)
+		if err != nil {
+			return nil, err
+		}
+		return append(out, jokers...), nil
 	case "postgres":
 		stmts, err := CreatePostgres(PostgresSpec{
-			Database: decl.Name, Role: decl.User, Password: password,
-			Extensions: decl.Extensions, Privileges: priv,
+			Database: decl.Name, Role: decl.User, Password: password(decl.User, state.UserExists),
+			Extensions: decl.Extensions, Privileges: priv, Adopted: !state.CreatedByOGS(),
 		}, state.UserExists, state.DBExists)
 		if err != nil {
 			return nil, err
@@ -751,14 +838,19 @@ func (p *Provider) apply(ctx context.Context, proj *model.Project, decl model.Da
 	if err != nil {
 		return err
 	}
-	password := func(user string) (string, error) {
+	// Un mot de passe n'est tiré et scellé que pour être posé : sur un compte à
+	// créer, ou relu quand ogs le tient déjà (D91, R2-21).
+	password := func(user string, exists bool) (string, error) {
+		if !p.needsPassword(proj.ID(), decl.Engine, user, exists) {
+			return "", nil
+		}
 		pw, created, err := p.obtainPassword(proj.ID(), decl.Engine, user)
 		if err == nil && created && onSeal != nil {
 			onSeal(user)
 		}
 		return pw, err
 	}
-	mainPassword, err := password(decl.User)
+	mainPassword, err := password(decl.User, state.UserExists)
 	if err != nil {
 		return err
 	}
@@ -771,7 +863,7 @@ func (p *Provider) apply(ctx context.Context, proj *model.Project, decl model.Da
 			AuthPlugin: decl.AuthPlugin,
 			Revoke:     MySQLGrantsOverflow(state.Grants[decl.Name], priv),
 		}
-		stmts, err := CreateMySQL(spec)
+		stmts, err := createMySQL(spec)
 		if err != nil {
 			return err
 		}
@@ -785,11 +877,11 @@ func (p *Provider) apply(ctx context.Context, proj *model.Project, decl model.Da
 			if err != nil {
 				return err
 			}
-			extraPassword, err := password(u.User)
+			extraPassword, err := password(u.User, state.ExtraUsers[u.User])
 			if err != nil {
 				return err
 			}
-			extra, err := CreateMySQL(MySQLSpec{
+			extra, err := createMySQL(MySQLSpec{
 				Database: decl.Name, User: u.User, Host: host,
 				Password: extraPassword, Privileges: extraPriv,
 				Revoke: MySQLGrantsOverflow(state.ExtraGrants[u.User], extraPriv),
@@ -803,10 +895,21 @@ func (p *Provider) apply(ctx context.Context, proj *model.Project, decl model.Da
 				}
 			}
 		}
+		// Le joker en dernier : le GRANT échappé est en place, l'application ne
+		// perd aucun droit dans l'intervalle.
+		jokers, err := jokerRevokes(decl, state, host)
+		if err != nil {
+			return err
+		}
+		for _, stmt := range jokers {
+			if err := client.Exec(ctx, stmt); err != nil {
+				return err
+			}
+		}
 	case "postgres":
 		stmts, err := CreatePostgres(PostgresSpec{
 			Database: decl.Name, Role: decl.User, Password: mainPassword,
-			Extensions: decl.Extensions, Privileges: priv,
+			Extensions: decl.Extensions, Privileges: priv, Adopted: !state.CreatedByOGS(),
 		}, state.UserExists, state.DBExists)
 		if err != nil {
 			return err
@@ -832,7 +935,7 @@ func (p *Provider) apply(ctx context.Context, proj *model.Project, decl model.Da
 			if err != nil {
 				return err
 			}
-			extraPassword, err := password(u.User)
+			extraPassword, err := password(u.User, false)
 			if err != nil {
 				return err
 			}

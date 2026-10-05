@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 
 	"leblanc.io/open-go-server/internal/naming"
@@ -66,7 +67,8 @@ func (c *mysqlClient) Users(ctx context.Context) (map[string]bool, error) {
 func (c *mysqlClient) Grants(ctx context.Context, user, host string) (map[string]string, error) {
 	grantee := fmt.Sprintf("'%s'@'%s'", user, host)
 	rows, err := c.db.QueryContext(ctx,
-		`SELECT TABLE_SCHEMA, GROUP_CONCAT(DISTINCT PRIVILEGE_TYPE ORDER BY PRIVILEGE_TYPE)
+		`SELECT TABLE_SCHEMA, GROUP_CONCAT(DISTINCT PRIVILEGE_TYPE ORDER BY PRIVILEGE_TYPE),
+		        MAX(IS_GRANTABLE)
 		 FROM information_schema.SCHEMA_PRIVILEGES
 		 WHERE GRANTEE = ? GROUP BY TABLE_SCHEMA`, grantee)
 	if err != nil {
@@ -75,12 +77,29 @@ func (c *mysqlClient) Grants(ctx context.Context, user, host string) (map[string
 	defer rows.Close()
 	out := map[string]string{}
 	for rows.Next() {
-		var schema, privs string
-		if err := rows.Scan(&schema, &privs); err != nil {
+		var (
+			schema, privs string
+			grantable     sql.NullString
+		)
+		if err := rows.Scan(&schema, &privs, &grantable); err != nil {
 			return nil, err
 		}
 		// Le motif est rendu tel qu'il est stocké, échappement compris : il faut le
-		// ramener au nom réel pour pouvoir le comparer à l'état désiré.
+		// ramener au nom réel pour pouvoir le comparer à l'état désiré. Un motif
+		// à joker — le GRANT « shop_fr », écrit sans échappement — est
+		// rangé à part (D111) : sous le nom réel, il écrasait ou masquait le GRANT
+		// échappé d'ogs, selon l'ordre de relecture, et n'était jamais retiré.
+		// GRANT OPTION n'est jamais un PRIVILEGE_TYPE de SCHEMA_PRIVILEGES — il
+		// n'y paraît que par IS_GRANTABLE : un joker posé WITH GRANT OPTION que
+		// l'on ne révoquerait que par ses privilèges relus garderait sa ligne
+		// (Grant_priv), relue ensuite « USAGE », et le plan repasserait sans fin.
+		if IsMySQLJoker(schema) {
+			if grantable.String == "YES" {
+				privs += ",GRANT OPTION"
+			}
+			out[jokerKey(schema)] = privs
+			continue
+		}
 		out[naming.UnescapeMySQLPattern(schema)] = privs
 	}
 	if err := rows.Err(); err != nil {
@@ -103,4 +122,121 @@ func (c *mysqlClient) Grants(ctx context.Context, user, host string) (map[string
 // Extensions n'a pas d'équivalent MySQL.
 func (c *mysqlClient) Extensions(context.Context, string) (map[string]bool, error) {
 	return map[string]bool{}, nil
+}
+
+// jokerPrefix préfixe, dans le relevé de Grants, la clé d'un motif à joker : un
+// nom de base ne contient jamais d'octet nul.
+const jokerPrefix = "\x00joker:"
+
+func jokerKey(pattern string) string { return jokerPrefix + pattern }
+
+// JokerGrantKey est la clé sous laquelle Grants range le motif à joker pattern.
+func JokerGrantKey(pattern string) string { return jokerKey(pattern) }
+
+// MySQLJokerPattern rend le motif à joker, relevé par Grants, qui désigne la
+// base database — vide s'il n'y en a pas —, qu'il en couvre d'autres ou non, et
+// les privilèges que porte sa ligne.
+func MySQLJokerPattern(grants map[string]string, database string) (pattern, privileges string) {
+	pattern, _ = mysqlJoker(grants, database, nil)
+	return pattern, grants[jokerKey(pattern)]
+}
+
+// IsMySQLJoker dit si un motif de privilège MySQL contient un joker non
+// échappé — « _ » ou « % » —, c'est-à-dire s'il désigne potentiellement
+// plusieurs bases.
+func IsMySQLJoker(pattern string) bool {
+	for i := 0; i < len(pattern); i++ {
+		switch pattern[i] {
+		case '\\':
+			i++
+		case '_', '%':
+			return true
+		}
+	}
+	return false
+}
+
+// matchMySQLPattern dit si une base répond à un motif de privilège MySQL : « _ »
+// vaut un caractère, « % » une suite quelconque, « \x » le caractère x.
+func matchMySQLPattern(pattern, name string) bool {
+	p, n := []rune(pattern), []rune(name)
+	var match func(i, j int) bool
+	match = func(i, j int) bool {
+		for i < len(p) {
+			switch p[i] {
+			case '%':
+				for k := j; k <= len(n); k++ {
+					if match(i+1, k) {
+						return true
+					}
+				}
+				return false
+			case '_':
+				if j >= len(n) {
+					return false
+				}
+			case '\\':
+				if i+1 < len(p) {
+					i++
+				}
+				if j >= len(n) || n[j] != p[i] {
+					return false
+				}
+			default:
+				if j >= len(n) || n[j] != p[i] {
+					return false
+				}
+			}
+			i++
+			j++
+		}
+		return j == len(n)
+	}
+	return match(0, 0)
+}
+
+// grantDatabase rend le nom de base qu'une clé du relevé de Grants désigne : le
+// nom réel, ou celui qu'un motif à joker désigne une fois ses échappements
+// retirés.
+func grantDatabase(key string) (name string, joker bool) {
+	if pattern, ok := strings.CutPrefix(key, jokerPrefix); ok {
+		return naming.UnescapeMySQLPattern(pattern), true
+	}
+	return key, false
+}
+
+// mysqlJoker cherche, parmi les privilèges relevés d'un compte, le motif à joker
+// qui désigne la base database — un GRANT écrit sans échappement. Il
+// rend ce motif, et les autres bases existantes qu'il couvre : tant qu'il en
+// couvre une, il en porte l'accès, et le retirer couperait l'application.
+func mysqlJoker(grants map[string]string, database string, databases map[string]bool) (pattern string, others []string) {
+	for key, privs := range grants {
+		raw, ok := strings.CutPrefix(key, jokerPrefix)
+		if !ok || naming.UnescapeMySQLPattern(raw) != database || len(revocable(privs)) == 0 {
+			continue
+		}
+		pattern = raw
+		for name := range databases {
+			if name != database && matchMySQLPattern(raw, name) {
+				others = append(others, name)
+			}
+		}
+	}
+	sort.Strings(others)
+	return pattern, others
+}
+
+// revocable rend les privilèges d'une ligne relue qu'un REVOKE peut retirer :
+// USAGE n'est pas un privilège — c'est l'absence de privilège —, et
+// « REVOKE USAGE » ne retire rien. Une ligne qui ne porte rien d'autre n'est
+// pas un joker à révoquer : elle ferait repasser le plan sans fin.
+func revocable(privileges string) []string {
+	var out []string
+	for _, p := range strings.Split(privileges, ",") {
+		p = strings.ToUpper(strings.TrimSpace(p))
+		if p != "" && p != "USAGE" {
+			out = append(out, p)
+		}
+	}
+	return out
 }

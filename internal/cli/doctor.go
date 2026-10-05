@@ -150,6 +150,40 @@ func fleetUniquenessChecks(projects []*model.Project, prepDomain string, add fun
 	}
 }
 
+// databaseChecks rapporte ce que le plan des bases ne montre pas (D111) : une
+// base PostgreSQL ouverte à PUBLIC — celle d'un projet adopté, qu'ogs laisse en
+// l'état et dont le plan ne dit rien tant qu'il n'y a rien à faire ; celle
+// d'ogs, que l'apply referme —, un joker MySQL gardé parce qu'il couvre une
+// autre base, et une base illisible, sans quoi doctor se tairait sur elle.
+func databaseChecks(ctx context.Context, provs *providers, projects []*model.Project,
+	add func(name, status, detail, fix string)) {
+	for _, p := range projects {
+		for _, n := range provs.DB.Notices(ctx, p) {
+			switch n.Kind {
+			case db.NoticeUnavailable:
+				add("bases", "avertissement", fmt.Sprintf("projet %s : base %s %s illisible — %v",
+					p.ID(), n.Engine, n.Database, n.Err), "")
+			case db.NoticeJokerKept:
+				add("bases", "avertissement", fmt.Sprintf("projet %s : %s garde un GRANT à joker sur %s, qui couvre "+
+					"aussi %s ; ogs ne le retire pas, il porte l'accès à ces bases (D111)", p.ID(), n.Account,
+					n.Database, strings.Join(n.Covers, ", ")),
+					"accorder ces bases nommément, puis retirer le joker à la main")
+			case db.NoticePublicConnect:
+				if n.Adopted {
+					add("bases", "avertissement", fmt.Sprintf("projet %s : la base adoptée %s (propriétaire %s) "+
+						"accorde CONNECT à PUBLIC — tout rôle du cluster peut s'y connecter et lire son catalogue ; "+
+						"ogs ne referme pas une base qu'il n'a pas créée (D111)", p.ID(), n.Database, n.Owner),
+						fmt.Sprintf("s'assurer qu'aucun autre rôle n'en dépend, puis « REVOKE CONNECT ON DATABASE %s "+
+							"FROM PUBLIC » et « GRANT CONNECT » à chaque rôle qui l'emploie", n.Database))
+					continue
+				}
+				add("bases", "avertissement", fmt.Sprintf("projet %s : la base %s accorde de nouveau CONNECT "+
+					"à PUBLIC (D45)", p.ID(), n.Database), "ogs apply "+p.ID())
+			}
+		}
+	}
+}
+
 // cronLegacyChecks nomme les tâches dont un nom nu n'est résolu dans le
 // répertoire de travail que par compatibilité (D101) : l'apply le dit aussi, par
 // une étape non critique, mais une tâche ne se relit pas à chaque apply.
@@ -711,6 +745,9 @@ func (a *App) runChecks(ctx context.Context) []check {
 			}
 		}
 		cronLegacyChecks(provs, projects, add)
+		if a.Prefix == "" && !a.Exec.Simulated() {
+			databaseChecks(ctx, provs, projects, add)
+		}
 		provs.close()
 	}
 	// « ogs my » s'exécute dans l'environnement que sudo reconstruit : env_reset

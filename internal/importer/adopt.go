@@ -101,10 +101,21 @@ func Adopt(c Candidate, homeRoot, prepDomain string, opts ...model.NormalizeOpti
 				decl.Host = host
 			}
 			p.Spec.Databases = append(p.Spec.Databases, decl)
+			// Rien n'est scellé (D78) : ogs ne scelle qu'un mot de passe qu'il a
+			// posé. Un compte recréé — une restauration après « project delete
+			// --force » — reçoit un mot de passe neuf, annoncé en code 6 (D111).
 			notes = append(notes, fmt.Sprintf(
 				"le mot de passe de %s est inconnu d'ogs : il n'est ni deviné ni réinitialisé. "+
-					"Employer « ogs db user rotate %s %s » pour en reprendre la main",
+					"Employer « ogs db user rotate %s %s » pour en reprendre la main ; sans quoi un compte "+
+					"recréé par ogs — à la restauration d'une archive, par exemple — reçoit un mot de passe neuf, "+
+					"à reporter dans la configuration de l'application",
 				compte, p.ID(), decl.User))
+			if engine == "postgres" {
+				notes = append(notes, fmt.Sprintf(
+					"base postgres %s : ogs n'y révoque pas CONNECT à PUBLIC ni ne touche à son schéma public, "+
+						"qu'il n'a pas créés (D111) ; « ogs doctor » signale une base adoptée ouverte à tous les rôles "+
+						"du cluster", r.Name))
+			}
 		case KindCertificate:
 			if r.Attr("source") == "certbot" {
 				notes = append(notes, fmt.Sprintf(

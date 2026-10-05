@@ -174,13 +174,24 @@ func (p *Provider) planMySQLAccount(ctx context.Context) (*engine.Step, *MySQLAc
 		return foreignAccountStep(resource, "MySQL", account+"@localhost"), nil
 	}
 	conforming := users[account+"@localhost"] && sealed
-	if conforming {
+	// Les versions qui posaient « GRANT SELECT ON `performance_schema`.* » sans
+	// échappement accordaient un motif, où le souligné est un joker : le compte
+	// lisait aussi une base nommée « performanceXschema », qu'un projet adopté
+	// peut porter — l'inverse de ce que promet D67. GRANT étant additif, la ligne
+	// survit à tous les apply : elle est relue à part (D111) et retirée, après le
+	// GRANT échappé, sur tout compte existant qui la porte.
+	var joker, jokerPrivs string
+	if users[account+"@localhost"] {
 		// Le mot de passe scellé et celui du moteur ne se comparent pas : MySQL ne
 		// rend que l'empreinte. Les privilèges, eux, se vérifient — et c'est ce qui
 		// dérive en pratique, un moteur mis à jour perdant parfois ses GRANT. Un
 		// échec de lecture est une raison de repasser, pas de se déclarer conforme.
 		grants, err := client.Grants(ctx, account, "localhost")
-		conforming = err == nil && mysqlGrantsConform(grants)
+		conforming = conforming && err == nil && mysqlGrantsConform(grants)
+		if err == nil {
+			joker, jokerPrivs = db.MySQLJokerPattern(grants, db.MonitoringMySQLSchema)
+		}
+		conforming = conforming && joker == ""
 	}
 	if conforming {
 		return engine.NewStep(resource, engine.NoOp,
@@ -191,11 +202,11 @@ func (p *Provider) planMySQLAccount(ctx context.Context) (*engine.Step, *MySQLAc
 	if !users[account+"@localhost"] {
 		action = engine.Create
 	}
-	// Sur un compte préexistant, le privilège hérité au motif joker est retiré
-	// avant tout : un compte neuf n'a rien à révoquer, et la requête échouerait.
+	// Le joker relevé part après le GRANT échappé : le compte ne perd pas son
+	// accès à performance_schema dans l'intervalle.
 	var legacy string
-	if action == engine.Update {
-		if stmt, err := db.MonitoringMySQLLegacyRevoke(account, "localhost"); err == nil {
+	if joker != "" {
+		if stmt, err := db.RevokeMySQLJoker(joker, jokerPrivs, account, "localhost"); err == nil {
 			legacy = stmt
 		}
 	}
@@ -210,7 +221,7 @@ func (p *Provider) planMySQLAccount(ctx context.Context) (*engine.Step, *MySQLAc
 			return "", err
 		}
 		if legacy != "" {
-			stmts = append([]string{legacy}, stmts...)
+			stmts = append(stmts, legacy)
 		}
 		return strings.Join(stmts, ";\n") + ";", nil
 	}
@@ -230,17 +241,12 @@ func (p *Provider) planMySQLAccount(ctx context.Context) (*engine.Step, *MySQLAc
 				return err
 			}
 		}
-		if legacy != "" {
-			// L'échec de cette seule requête est le cas nominal : MySQL rend
-			// ER_NONEXISTING_GRANT dès qu'aucune ligne ne porte le motif littéral,
-			// ce qui est vrai de tout compte créé depuis l'échappement. On ne peut
-			// pas la chercher d'abord — la relecture ramène le motif joker et le
-			// motif échappé sous la même clé.
-			_ = client.Exec(ctx, legacy)
-		}
 		stmts, err := db.MonitoringMySQL(account, "localhost", password)
 		if err != nil {
 			return err
+		}
+		if legacy != "" {
+			stmts = append(stmts, legacy)
 		}
 		for _, stmt := range stmts {
 			if err := client.Exec(ctx, stmt); err != nil {

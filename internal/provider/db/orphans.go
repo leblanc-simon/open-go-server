@@ -399,8 +399,12 @@ func (p *Provider) observeOrphan(ctx context.Context, proj *model.Project, engin
 			o.Unavailable = err
 			return o
 		}
-		for db, privs := range grants {
-			if db == GlobalGrantKey || privs == "" || !databases[db] {
+		for key, privs := range grants {
+			// Un motif à joker vaut pour la base qu'il désigne (D111) : il en
+			// porte l'accès comme le GRANT échappé.
+			db, _ := grantDatabase(key)
+			if key == GlobalGrantKey || privs == "" || !databases[db] ||
+				slices.Contains(o.Keeps, db) || slices.Contains(o.Waits, db) {
 				continue
 			}
 			if !declaredDBs[db] {
