@@ -261,7 +261,12 @@ code sous l'identité du projet**, le protocole FastCGI n'ayant aucune authentif
 (`spec.mail.dkim`), la **scelle** dans le keystore — état compris, pour qu'archive et restauration la
 reprennent entière — et l'écrit pour OpenDKIM ; le plan global écrit la `KeyTable` et la `SigningTable`
 (`refile:`, d'où `*@domaine`) depuis le parc entier. Le keystore fait foi : un fichier disparu est
-**réécrit**, jamais régénéré, une clé neuve exigeant de republier chez le client. ogs ne touche ni au MTA,
+**réécrit**, jamais régénéré, une clé neuve exigeant de republier chez le client ; à l'inverse, un fichier en
+place que le keystore ne connaît plus (`state.db` perdue) est **rescellé tel quel**, au seul régime d'ogs
+(D108). Un fichier de clé ne part que si les tables en place ne la désignent plus **et** qu'OpenDKIM les a
+relues (`releasable`) : `FlushReloads` vide la file, il ne dit pas que le rechargement a réussi. Les deux tables
+s'écrivent ensemble ou pas du tout : une SigningTable retouchée refusée pendant que la KeyTable était réécrite
+désignait un nom absent de celle-ci, et le courrier restait en file. ogs ne touche ni au MTA,
 ni à `opendkim.conf`, ni au DNS ; la rotation (`rotate` puis `activate`) ne bascule qu'une fois
 l'enregistrement publié, vérifié par le résolveur.
 

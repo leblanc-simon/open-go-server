@@ -275,12 +275,12 @@ func validateMail(p *model.Project, add func(string, string, ...any)) {
 	// unique dans le parc, les domaines l'étant déjà.
 	own := map[string]bool{}
 	for _, d := range p.Spec.Domains {
-		own[strings.ToLower(strings.TrimSuffix(d.Name, "."))] = true
+		own[model.MailDomain(d.Name)] = true
 	}
 	seen := map[string]bool{}
 	for i, d := range dkim.Domains {
 		f := fmt.Sprintf("spec.mail.dkim.domains[%d]", i)
-		name := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(d), "."))
+		name := model.MailDomain(d)
 		if _, err := naming.NormalizeHost(name); err != nil || strings.HasPrefix(name, "*") {
 			add(f, "nom de domaine attendu, obtenu %q", d)
 			continue

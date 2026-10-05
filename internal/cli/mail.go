@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -42,18 +43,25 @@ func newDKIMEnableCommand(app *App) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "enable <id>",
 		Short: "Demander la signature DKIM du courrier d'un projet",
-		Long: "Sans --domain, les domaines primaires du projet sont signés. La clé est créée par\n" +
-			"« ogs apply », qui signe aussitôt : une signature invérifiable ne vaut pas moins\n" +
-			"qu'une absence de signature. Refusé en préproduction.",
+		Long: "Sans --domain, les domaines primaires du projet sont signés. --domain ajoute un\n" +
+			"domaine à ceux déjà signés, sans en retirer aucun. La clé est créée par « ogs apply »,\n" +
+			"qui signe aussitôt : une signature invérifiable ne vaut pas moins qu'une absence de\n" +
+			"signature. Refusé en préproduction.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			p, err := app.loadProject(args[0])
 			if err != nil {
 				return err
 			}
-			p.Spec.Mail = &model.Mail{DKIM: &model.DKIM{Enabled: true, Domains: domains}}
+			before := p.DKIMDomains()
+			p.Spec.Mail = &model.Mail{DKIM: &model.DKIM{Enabled: true, Domains: enabledDomains(p, domains)}}
 			if err := app.prepare(p); err != nil {
 				return err
+			}
+			if lost := missingFrom(before, p.DKIMDomains()); len(lost) > 0 {
+				// Ne devrait pas arriver : l'union ne retire rien. Mais un domaine qui
+				// cesse d'être signé ne doit jamais l'être sans un mot.
+				app.warnf("⚠ ne seraient plus signés : %s\n", strings.Join(lost, ", "))
 			}
 			if app.DryRun {
 				app.printf("--dry-run : la signature DKIM serait demandée pour %s\n",
@@ -102,6 +110,41 @@ func newDKIMDisableCommand(app *App) *cobra.Command {
 			return nil
 		},
 	}
+}
+
+// enabledDomains rend la liste à déclarer pour « mail dkim enable » (D108).
+// Elle remplaçait la liste en place : un domaine déjà signé cessait de l'être sans
+// que rien ne le dise. Les domaines demandés s'ajoutent donc à ceux déjà signés —
+// défaut compris, alors matérialisé — et, sans --domain, une signature déjà
+// demandée reste ce qu'elle est. Non demandée, sans --domain, c'est le défaut :
+// les domaines primaires, non matérialisés.
+func enabledDomains(p *model.Project, requested []string) []string {
+	current := p.DKIMDomains()
+	if len(requested) == 0 {
+		if len(current) == 0 {
+			return nil
+		}
+		return p.Spec.Mail.DKIM.Domains
+	}
+	out := append([]string(nil), current...)
+	for _, d := range requested {
+		name := model.MailDomain(d)
+		if !slices.Contains(out, name) {
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
+// missingFrom rend les éléments de before absents de after.
+func missingFrom(before, after []string) []string {
+	var out []string
+	for _, d := range before {
+		if !slices.Contains(after, d) {
+			out = append(out, d)
+		}
+	}
+	return out
 }
 
 // dkimKeyView est la vue machine d'une clé : jamais sa partie privée.
@@ -269,7 +312,29 @@ func newDKIMActivateCommand(app *App) *cobra.Command {
 			pending, err := provs.Mail.Pending(p, domain)
 			if err != nil {
 				if errors.Is(err, mail.ErrNothingPending) {
-					return exitf(CodeConflict, "%v", err)
+					// Une bascule scellée dont le recalcul des tables a échoué se
+					// rejoue : sans quoi rien ne permettait d'en faire la seconde
+					// moitié, la clé n'étant plus « préparée » (D108).
+					obs, obsErr := provs.Mail.Observe(cmd.Context())
+					if obsErr != nil {
+						return wrap(CodeError, obsErr)
+					}
+					late, lateErr := provs.Mail.Undesignated(p, domain, obs)
+					if lateErr != nil || len(late) == 0 {
+						return exitf(CodeConflict, "%v", err)
+					}
+					names := make([]string, 0, len(late))
+					for _, k := range late {
+						names = append(names, k.Name())
+					}
+					app.printf("= bascule déjà scellée (%s), que les tables ne désignent pas encore : "+
+						"recalcul des tables\n", strings.Join(names, ", "))
+					lock, err := app.lock()
+					if err != nil {
+						return err
+					}
+					defer lock.Release()
+					return app.refreshDKIMTables(cmd.Context(), provs, p)
 				}
 				return exitf(CodeValidation, "%v", err)
 			}
@@ -295,10 +360,8 @@ func newDKIMActivateCommand(app *App) *cobra.Command {
 				[]*engine.Step{provs.Mail.Activate(p, pending)}, false); err != nil {
 				return err
 			}
-			// Les tables sont de portée parc : recalculées en entier, jamais depuis le
-			// seul projet basculé.
-			if err := app.refreshGlobal(cmd.Context(), provs); err != nil {
-				return wrap(CodeError, err)
+			if err := app.refreshDKIMTables(cmd.Context(), provs, p); err != nil {
+				return err
 			}
 			app.printf("✓ signature basculée ; la clé remplacée est conservée %s, "+
 				"son enregistrement est à retirer ensuite\n", humanDuration(app.Cfg.Mail.DKIMRetention()))
@@ -307,6 +370,54 @@ func newDKIMActivateCommand(app *App) *cobra.Command {
 	}
 	cmd.Flags().StringVar(&domain, "domain", "", "ne basculer que la clé de ce domaine")
 	return cmd
+}
+
+// refreshDKIMTables recalcule le plan global après une bascule : les tables sont
+// de portée parc, recalculées en entier, jamais depuis le seul projet basculé.
+//
+// La bascule est déjà scellée quand il s'exécute. Un échec — plan impossible,
+// table refusée, rechargement en échec — ne rendait rien de plus qu'un
+// avertissement, en code 0, et « activate » relancé répondait qu'aucune clé
+// n'était préparée (D108) : l'échec le dit désormais, avec la commande qui rejoue.
+func (a *App) refreshDKIMTables(ctx context.Context, provs *providers, p *model.Project) error {
+	replay := fmt.Sprintf("la bascule est scellée, mais les tables d'OpenDKIM désignent encore l'ancienne "+
+		"clé — relancer « ogs mail dkim activate %s » une fois la cause levée", p.ID())
+	plan, err := a.buildGlobalPlan(ctx, provs, nil)
+	if err != nil {
+		return exitf(ExitCode(err), "%v : %s", err, replay)
+	}
+	report, err := engine.Execute(ctx, plan, engine.Options{
+		OnStep: func(s *engine.Step, stepErr error) {
+			if stepErr == nil {
+				a.printf("  ✓ %s\n", s.Summary)
+			}
+		},
+		OnWarning: func(s *engine.Step, stepErr error) {
+			a.warnf("  ⚠ %s : %v\n", s.Summary, stepErr)
+		},
+		Audit: func(s *engine.Step, outcome, detail string) {
+			_ = a.Audit.Record("", s.Resource, "mail."+s.Action.String(), outcome, detail)
+		},
+		Reload:          a.reloadFunc(provs),
+		OnReloadWarning: a.reloadWarning,
+	})
+	if err != nil {
+		if report != nil {
+			a.reportRollback(report)
+		}
+		return exitf(CodeError, "%v : %s", err, replay)
+	}
+	obs, err := provs.Mail.Observe(ctx)
+	if err != nil {
+		return wrap(CodeError, err)
+	}
+	if late, err := provs.Mail.Undesignated(p, "", obs); err == nil && len(late) > 0 {
+		return exitf(CodePartial, "%s", replay)
+	}
+	if len(report.Warnings) > 0 {
+		return exitf(CodePartial, "terminé avec %d avertissement(s)", len(report.Warnings))
+	}
+	return nil
 }
 
 // humanDuration rend une durée en jours quand elle en compte un nombre entier :

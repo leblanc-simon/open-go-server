@@ -292,6 +292,23 @@ func tables(t *testing.T, f *fixture, projects ...*model.Project) (string, strin
 	return string(kt), string(st)
 }
 
+// deletions rend les retraits de clés du plan global : expirations et domaines
+// qui ne sont plus signés (D108).
+func deletions(t *testing.T, f *fixture, projects ...*model.Project) []*engine.Step {
+	t.Helper()
+	steps, err := f.p.PlanTables(projects, f.observe(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []*engine.Step
+	for _, s := range steps {
+		if s.Action == engine.Delete && strings.HasPrefix(s.Resource, "mail/dkim/") {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
 func TestLesTablesPortentToutLeParc(t *testing.T) {
 	f := newFixture(t)
 	shop := project(t, "shop.fr", &model.DKIM{Enabled: true})
@@ -520,11 +537,16 @@ func TestUneCleRemplaceeDisparaitApresLaRetention(t *testing.T) {
 	old := f.paths.OpenDKIMKeyFile(p.ID(), "shop.fr", "ogs202609")
 
 	f.now = f.now.Add(6 * 24 * time.Hour)
-	if len(mutating(f.plan(t, p))) != 0 {
+	if len(deletions(t, f, p)) != 0 {
 		t.Fatal("avant la fin de la rétention, la clé remplacée reste en place")
 	}
 	f.now = f.now.Add(2 * 24 * time.Hour)
-	steps = mutating(f.plan(t, p))
+	// L'expiration se fait au plan global, après les tables (D108), jamais au
+	// plan du projet.
+	if len(mutating(f.plan(t, p))) != 0 {
+		t.Fatal("le plan du projet ne retire aucune clé")
+	}
+	steps = deletions(t, f, p)
 	if len(steps) != 1 || steps[0].Action != engine.Delete ||
 		!strings.Contains(steps[0].Summary, "ogs202609._domainkey.shop.fr") {
 		t.Fatalf("retrait nommant l'enregistrement à retirer attendu, obtenu %v", steps)
@@ -616,23 +638,23 @@ func TestUneCleRetoucheeNEstRetireeQueSousForce(t *testing.T) {
 		path := f.paths.OpenDKIMKeyFile(p.ID(), "shop.fr", "ogs202609")
 		retoucher(t, path)
 		p.Spec.Mail = nil
-		retrait := func() *engine.Step {
+		retrait := func() []*engine.Step {
 			steps, err := f.p.PlanTables([]*model.Project{p}, f.observe(t))
 			if err != nil {
 				t.Fatal(err)
 			}
-			steps = mutating(steps)
-			return steps[len(steps)-1]
+			return mutating(steps)
 		}
-		verifier(t, f, retrait(), path)
+		steps := retrait()
+		verifier(t, f, steps[len(steps)-1], path)
 		f.p.Force = true
-		s := retrait()
-		if !strings.Contains(s.Summary, "retrait forcé") {
+		steps = retrait()
+		if s := steps[len(steps)-1]; !strings.Contains(s.Summary, "retrait forcé") {
 			t.Fatalf("le plan doit annoncer le retrait forcé : %s", s.Summary)
 		}
-		if err := s.Apply(context.Background()); err != nil {
-			t.Fatal(err)
-		}
+		// Les tables d'abord : le fichier ne part qu'une fois qu'elles ne le
+		// désignent plus (D108).
+		run(t, steps)
 		sauvegarde(t, f, path)
 	})
 
@@ -653,10 +675,8 @@ func TestUneCleRetoucheeNEstRetireeQueSousForce(t *testing.T) {
 		retoucher(t, path)
 		f.now = f.now.Add(8 * 24 * time.Hour)
 		expiration := func() *engine.Step {
-			for _, s := range mutating(f.plan(t, p)) {
-				if s.Action == engine.Delete {
-					return s
-				}
+			if d := deletions(t, f, p); len(d) > 0 {
+				return d[0]
 			}
 			t.Fatal("expiration attendue")
 			return nil
@@ -695,10 +715,8 @@ func TestLExpirationRelitLaCleAvantDeLaRetirer(t *testing.T) {
 	}
 	f.now = f.now.Add(8 * 24 * time.Hour)
 	var expiration *engine.Step
-	for _, s := range mutating(f.plan(t, p)) {
-		if s.Action == engine.Delete {
-			expiration = s
-		}
+	for _, s := range deletions(t, f, p) {
+		expiration = s
 	}
 	if expiration == nil || strings.Contains(expiration.Summary, "hors ogs") {
 		t.Fatalf("une expiration ordinaire est attendue : %+v", expiration)
@@ -722,10 +740,10 @@ func TestLExpirationRelitLaCleAvantDeLaRetirer(t *testing.T) {
 
 func TestLeSelecteurSuivantDuMemeMoisRecoitUneLettre(t *testing.T) {
 	now := time.Date(2026, 9, 4, 0, 0, 0, 0, time.UTC)
-	if s := nextSelector("ogs", now, nil); s != "ogs202609" {
+	if s := nextSelector("ogs", now, nil, nil); s != "ogs202609" {
 		t.Errorf("ogs202609 attendu, obtenu %s", s)
 	}
-	if s := nextSelector("ogs", now, []Key{{Selector: "ogs202609"}, {Selector: "ogs202609b"}}); s != "ogs202609c" {
+	if s := nextSelector("ogs", now, []Key{{Selector: "ogs202609"}, {Selector: "ogs202609b"}}, nil); s != "ogs202609c" {
 		t.Errorf("ogs202609c attendu, obtenu %s", s)
 	}
 }

@@ -37,6 +37,16 @@ func (p *Provider) Checks(ctx context.Context, projects []*model.Project, obs Ob
 		wanted += len(proj.DKIMDomains())
 	}
 	if !obs.Present {
+		// Signature désactivée alors qu'opendkim.conf désigne les tables d'ogs :
+		// elles sont tenues vides, OpenDKIM ne démarrerait plus sans elles (D108).
+		// Rien n'est signé, et rien d'autre ne le dirait.
+		if p.ConfDesignatesTables() {
+			add("tables d'OpenDKIM", statusWarning,
+				p.Paths.OpenDKIMConf()+" désigne encore les tables d'ogs, que la signature désactivée "+
+					"(mail.dkim.enabled: false) laisse vides : OpenDKIM ne signe rien",
+				"retirer KeyTable et SigningTable de "+p.Paths.OpenDKIMConf()+
+					" puis « systemctl restart opendkim » — ou réactiver mail.dkim.enabled")
+		}
 		if wanted > 0 {
 			add("signature DKIM", statusWarning,
 				fmt.Sprintf("%d domaine(s) demandent la signature, mais OpenDKIM est absent", wanted),
@@ -77,7 +87,7 @@ func (p *Provider) Checks(ctx context.Context, projects []*model.Project, obs Ob
 				missing = append(missing, d)
 				continue
 			}
-			path := p.Paths.OpenDKIMKeyFile(proj.ID(), d, active.Selector)
+			path := p.Paths.OpenDKIMKeyFile(proj.ID(), active.Domain, active.Selector)
 			info, err := os.Stat(path)
 			switch {
 			case err != nil:
@@ -198,6 +208,25 @@ func orNone(s string) string {
 		return "(absente)"
 	}
 	return s
+}
+
+// ConfDesignatesTables dit si opendkim.conf désigne l'une des tables d'ogs. Les
+// retirer alors empêcherait OpenDKIM de démarrer (D108).
+func (p *Provider) ConfDesignatesTables() bool {
+	data, err := os.ReadFile(p.Paths.OpenDKIMConf())
+	if err != nil {
+		return false
+	}
+	strip := func(v string) string {
+		for _, prefix := range []string{"refile:", "file:"} {
+			if rest, ok := strings.CutPrefix(v, prefix); ok {
+				return rest
+			}
+		}
+		return v
+	}
+	return strip(confValue(data, "KeyTable")) == p.Paths.OpenDKIMKeyTable() ||
+		strip(confValue(data, "SigningTable")) == p.Paths.OpenDKIMSigningTable()
 }
 
 // ForeignTables dit si opendkim.conf désigne des tables qui ne sont pas celles

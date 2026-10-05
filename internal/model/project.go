@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"path"
 	"path/filepath"
+	"strings"
 
 	"leblanc.io/open-go-server/internal/naming"
 )
@@ -359,20 +360,44 @@ type DKIM struct {
 // appliqué ; nil si le projet ne demande pas de signature. Le défaut n'est pas
 // matérialisé dans le fichier : un domaine primaire ajouté plus tard doit être
 // signé sans qu'il faille y penser.
+//
+// Les domaines sont rendus canonisés (MailDomain), doublons écartés (D108) : la
+// validation compare des formes normalisées, et ogs employait la chaîne brute —
+// « Shop.FR. » nommait un répertoire de clés et des lignes de table que
+// l'enregistrement publié ne reconnaissait pas. Canoniser à la lecture, jamais
+// refuser au chargement : la forme brute a été acceptée jusque-là.
 func (p *Project) DKIMDomains() []string {
 	if p.Spec.Mail == nil || p.Spec.Mail.DKIM == nil || !p.Spec.Mail.DKIM.Enabled {
 		return nil
 	}
+	var raw []string
 	if len(p.Spec.Mail.DKIM.Domains) > 0 {
-		return append([]string(nil), p.Spec.Mail.DKIM.Domains...)
-	}
-	var out []string
-	for _, d := range p.Spec.Domains {
-		if d.Role == "" || d.Role == "primary" {
-			out = append(out, d.Name)
+		raw = p.Spec.Mail.DKIM.Domains
+	} else {
+		for _, d := range p.Spec.Domains {
+			if d.Role == "" || d.Role == "primary" {
+				raw = append(raw, d.Name)
+			}
 		}
 	}
+	var out []string
+	seen := map[string]bool{}
+	for _, d := range raw {
+		name := MailDomain(d)
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		out = append(out, name)
+	}
 	return out
+}
+
+// MailDomain canonise un domaine d'envoi : sans blancs autour, en minuscules,
+// sans point final. C'est la forme sous laquelle ogs nomme les clés, les lignes
+// des tables et l'enregistrement à publier.
+func MailDomain(d string) string {
+	return strings.ToLower(strings.TrimSuffix(strings.TrimSpace(d), "."))
 }
 
 // New construit un projet neuf à partir d'un host et d'un environnement.

@@ -48,6 +48,13 @@ type Provider struct {
 	LookupTXT func(ctx context.Context, name string) ([]string, error)
 	// Generate engendre une clé privée en PEM ; nil, GenerateKey.
 	Generate func(bits int) (string, error)
+
+	// written compte les tables écrites par ce processus, et loadedAt vaut
+	// written au dernier rechargement réussi d'OpenDKIM (reloaded) : un fichier
+	// de clé ne part qu'une fois les tables qui la désignaient relues (D108).
+	written  int
+	loadedAt int
+	reloaded bool
 }
 
 // Name identifie le provider.
@@ -97,13 +104,14 @@ func (p *Provider) Observe(context.Context) (Observed, error) {
 		info, err := os.Stat(p.Paths.OpenDKIMConf())
 		obs.Present = err == nil && info.Mode().IsRegular()
 	}
-	if obs.Present {
-		if u, err := user.Lookup(p.Cfg.Mail.DKIMUser()); err == nil {
-			uid, err1 := strconv.Atoi(u.Uid)
-			gid, err2 := strconv.Atoi(u.Gid)
-			if err1 == nil && err2 == nil {
-				obs.UID, obs.GID, obs.OwnerOK = uid, gid, true
-			}
+	// Le compte est cherché même quand ogs ne gère pas les clés : les tables
+	// qu'opendkim.conf désigne encore, signature désactivée, sont tenues vides
+	// (PlanTables, D108), et écrites pour root, OpenDKIM ne les lirait plus.
+	if u, err := user.Lookup(p.Cfg.Mail.DKIMUser()); err == nil {
+		uid, err1 := strconv.Atoi(u.Uid)
+		gid, err2 := strconv.Atoi(u.Gid)
+		if err1 == nil && err2 == nil {
+			obs.UID, obs.GID, obs.OwnerOK = uid, gid, true
 		}
 	}
 	return obs, nil
@@ -128,18 +136,24 @@ func (p *Provider) dirOwner(obs Observed) fs.Owner {
 }
 
 // Plan calcule les étapes d'un projet : créer la clé d'un domaine qui n'en a
-// pas, réécrire un fichier disparu depuis le keystore, retirer une clé remplacée
-// dont la rétention a expiré.
+// pas — ou reprendre celle qui est en place —, réécrire un fichier disparu
+// depuis le keystore.
 //
 // Toutes les étapes sont **non critiques** : une clé qui n'est pas posée ne doit
-// pas défaire un site par ailleurs fonctionnel.
+// pas défaire un site par ailleurs fonctionnel. Pour la même raison, des clés
+// illisibles — keystore indisponible, clé maître régénérée — ne font pas échouer
+// le plan : une étape en échec nomme la cause (D108).
+//
+// L'expiration d'une clé remplacée n'est pas ici : elle se fait au plan global,
+// après les tables, et seulement quand elles ne la désignent plus (D108).
 func (p *Provider) Plan(_ context.Context, proj *model.Project, obs Observed) ([]*engine.Step, error) {
 	if !obs.Present {
 		return nil, nil
 	}
 	keys, err := p.loadKeys(proj.ID())
 	if err != nil {
-		return nil, err
+		return []*engine.Step{p.unreadableStep("mail/dkim/"+proj.ID(), proj.ID(),
+			"aucune clé n'est posée ni réécrite", err)}, nil
 	}
 	domains := proj.DKIMDomains()
 	if len(domains) > 0 && !obs.OwnerOK && !p.simulated() {
@@ -161,16 +175,15 @@ func (p *Provider) Plan(_ context.Context, proj *model.Project, obs Observed) ([
 		_, hasActive := find(existing, StateActive)
 		_, hasPending := find(existing, StatePending)
 		if !hasActive && !hasPending {
-			selector := nextSelector(p.Cfg.Mail.DKIMSelectorPrefix(), p.now(), existing)
-			steps = append(steps, p.createStep(proj.ID(), domain, selector, StateActive, obs))
+			s, err := p.adoptOrCreateStep(proj.ID(), domain, existing, obs)
+			if err != nil {
+				return nil, err
+			}
+			steps = append(steps, s)
 		}
 		for _, k := range existing {
 			if k.State == StateRetired && p.expired(k) {
-				s, err := p.expireStep(proj.ID(), k)
-				if err != nil {
-					return nil, err
-				}
-				steps = append(steps, s)
+				// Le plan global la retire, après les tables (D108).
 				continue
 			}
 			s, err := p.keyFileStep(proj.ID(), k, obs)
@@ -396,9 +409,12 @@ func (p *Provider) expireStep(projectID string, k Key) (*engine.Step, error) {
 	}
 	s := engine.NewStep(resource, engine.Delete, summary)
 	s.Critical = false
+	// Comme le retrait d'un domaine qui n'est plus signé : après le rechargement
+	// des tables, et seulement si elles ne désignent plus la clé (D108).
+	s.FlushReloads = true
 	var previous []byte
 	var saved *sealed
-	s.Apply = func(context.Context) error {
+	s.Apply = func(ctx context.Context) error {
 		// L'état est relu, comme pour tout retrait (removal.File) : une clé intacte
 		// au plan, remplacée avant la confirmation, partirait sans copie.
 		state, err := keyFileState(path, k)
@@ -406,6 +422,9 @@ func (p *Provider) expireStep(projectID string, k Key) (*engine.Step, error) {
 			return err
 		}
 		if err := refus(state); err != nil {
+			return err
+		}
+		if err := p.releasable(ctx, k, path); err != nil {
 			return err
 		}
 		if saved, err = p.snapshot(projectID, k); err != nil {
@@ -445,10 +464,13 @@ func (p *Provider) expireStep(projectID string, k Key) (*engine.Step, error) {
 // L'étape vide les rechargements en attente avant de s'exécuter : les tables
 // qui désignaient la clé ont été réécrites juste avant, mais OpenDKIM garde en
 // mémoire celles qu'il a chargées, et retirer le fichier d'abord lui ferait
-// retenir le courrier du domaine jusqu'au rechargement.
+// retenir le courrier du domaine jusqu'au rechargement. Et elle ne s'exécute
+// que si ces tables ne la désignent plus et qu'OpenDKIM les a relues
+// (releasable, D108) : vider la file ne dit pas que le rechargement a réussi, ni
+// qu'une table retouchée a bien été réécrite.
 func (p *Provider) removeFileStep(projectID string, k Key) (*engine.Step, error) {
 	path := p.Paths.OpenDKIMKeyFile(projectID, k.Domain, k.Selector)
-	return removal.File{
+	s, err := removal.File{
 		Resource: "mail/dkim/" + k.Domain + "/" + k.Selector,
 		Summary: fmt.Sprintf("clé DKIM de %s (sélecteur %s) — domaine qui n'est plus signé, clé conservée "+
 			"dans le keystore", k.Domain, k.Selector),
@@ -460,6 +482,18 @@ func (p *Provider) removeFileStep(projectID string, k Key) (*engine.Step, error)
 		FlushReloads: true,
 		NonCritical:  true,
 	}.Step()
+	if err != nil || s == nil || !s.FlushReloads {
+		// Un refus ne retire rien : il n'a rien à attendre.
+		return s, err
+	}
+	remove := s.Apply
+	s.Apply = func(ctx context.Context) error {
+		if err := p.releasable(ctx, k, path); err != nil {
+			return err
+		}
+		return remove(ctx)
+	}
+	return s, nil
 }
 
 // keyFileState juge le fichier d'une clé contre la clé scellée, qui fait foi :
@@ -528,8 +562,47 @@ func (p *Provider) ProjectKeys(proj *model.Project) ([]Key, error) { return p.lo
 
 // RemoveProject retire les fichiers de clés d'un projet supprimé. Les clés
 // restent scellées, et partent dans l'archive avec les autres secrets du projet.
+//
+// Comme tout retrait de clé (D108), il n'a lieu que si les tables en place ne
+// désignent plus aucune d'elles et qu'OpenDKIM les a relues : la suppression
+// recalcule les tables juste avant, mais un recalcul en échec n'y est qu'un
+// avertissement, et retirer alors les fichiers ferait garder en file tout le
+// courrier des domaines du projet.
 func (p *Provider) RemoveProject(id string) error {
 	dir := filepath.Join(p.Paths.OpenDKIMKeysDir(), id)
+	domains, err := os.ReadDir(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	for _, d := range domains {
+		if !d.IsDir() {
+			continue
+		}
+		for sel := range p.selectorsOnDisk(id, d.Name()) {
+			k := Key{Domain: d.Name(), Selector: sel}
+			path := p.Paths.OpenDKIMKeyFile(id, d.Name(), sel)
+			where, err := p.designatedBy(k, path)
+			if err != nil {
+				return fmt.Errorf("%s reste en place : tables illisibles (%v)", dir, err)
+			}
+			if where != "" {
+				return fmt.Errorf("%s désigne encore la clé %s : les clés de %s restent en place (%s) — "+
+					"OpenDKIM garderait en file le courrier de %s ; relancer « ogs apply » une fois la "+
+					"table recalculée, puis retirer le répertoire", where, k.Name(), id, dir, d.Name())
+			}
+		}
+	}
+	if !p.reloaded || p.loadedAt != p.written {
+		// La suppression a franchi son point de non-retour : le rechargement se
+		// fait jusqu'au bout, interruption comprise.
+		if err := p.Reload(context.Background()); err != nil {
+			return fmt.Errorf("les clés de %s restent en place (%s) : OpenDKIM n'a pas relu les tables (%v)",
+				id, dir, err)
+		}
+	}
 	if err := os.RemoveAll(dir); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
@@ -553,7 +626,7 @@ func selectDomains(proj *model.Project, only string) ([]string, error) {
 		return domains, nil
 	}
 	for _, d := range domains {
-		if strings.EqualFold(d, only) {
+		if d == model.MailDomain(only) {
 			return []string{d}, nil
 		}
 	}
@@ -587,7 +660,8 @@ func (p *Provider) Rotate(ctx context.Context, proj *model.Project, only string,
 		if _, ok := find(grouped[d], StateActive); !ok {
 			return nil, fmt.Errorf("%s n'a pas encore de clé active : « ogs apply %s » la crée", d, proj.ID())
 		}
-		selector := nextSelector(p.Cfg.Mail.DKIMSelectorPrefix(), p.now(), grouped[d])
+		selector := nextSelector(p.Cfg.Mail.DKIMSelectorPrefix(), p.now(), grouped[d],
+			p.selectorsOnDisk(proj.ID(), d))
 		steps = append(steps, p.createStep(proj.ID(), d, selector, StatePending, obs))
 	}
 	return steps, nil

@@ -13,7 +13,10 @@
 #     en file, ce que « doctor » dit et que l'apply répare ;
 #   — la rotation ne bascule qu'une fois l'enregistrement publié ;
 #   — les tables portent tout le parc, et un rechargement sur une configuration
-#     invalide n'arrête pas le démon.
+#     invalide n'arrête pas le démon ;
+#   — une clé en place que le keystore a perdue est rescellée, une clé maître
+#     illisible ne fait ni échouer l'apply ni vider les tables, et la signature
+#     désactivée vide les tables qu'opendkim.conf désigne (D108).
 set -uo pipefail
 . /scenarios/lib.sh
 
@@ -186,6 +189,39 @@ ogs apply shopfr --yes 2>&1 | grep -i "réécrite" | head -1
     echec "la clé réécrite diffère : une clé neuve exigerait de republier chez le client"
 
 echo
+echo "--- clés scellées perdues : la clé en place est rescellée, jamais régénérée (D108) ---"
+# Perte ou recréation de state.db : le fichier en place est la clé que le DNS
+# publie. La régénérer — même sélecteur, même mois — l'écrasait sans copie.
+empreinte=$(sha256sum "$cle" | cut -d' ' -f1)
+python3 - <<'PY' || echec "base d'état inaccessible"
+import sqlite3
+db = sqlite3.connect("/var/lib/ogs/state.db")
+n = db.execute("DELETE FROM secrets WHERE name LIKE 'dkim/%'").rowcount
+db.commit()
+print("  %d clé(s) retirée(s) du keystore" % n)
+PY
+ogs apply shopfr --yes >/tmp/apply.log 2>&1
+grep -i "reprise du fichier en place" /tmp/apply.log | head -1
+grep -qi "reprise du fichier en place" /tmp/apply.log || { cat /tmp/apply.log; echec "la clé en place n'est pas reprise"; }
+[ "$(sha256sum "$cle" | cut -d' ' -f1)" = "$empreinte" ] || echec "la clé publiée a été réécrite"
+grep -q "^\*@shop.fr $selecteur._domainkey.shop.fr" /etc/opendkim/ogs/SigningTable ||
+    echec "la SigningTable ne désigne plus la clé publiée"
+[ "$(envoyer contact@shop.fr apres-perte)" = signé ] || echec "courrier non signé après la reprise"
+verifier shopfr "$selecteur"
+
+echo
+echo "--- clé maître illisible : l'apply n'échoue pas, et les tables restent (D108) ---"
+mv /etc/ogs/master.key /etc/ogs/master.key.essai
+ogs apply shopfr --yes >/tmp/apply.log 2>&1
+code=$?
+mv /etc/ogs/master.key.essai /etc/ogs/master.key
+[ "$code" = 6 ] || { cat /tmp/apply.log; echec "keystore indisponible : code 6 attendu, obtenu $code"; }
+grep -i "illisibles" /tmp/apply.log | head -1
+grep -q "^\*@shop.fr $selecteur._domainkey.shop.fr" /etc/opendkim/ogs/SigningTable ||
+    echec "un keystore indisponible a vidé les tables"
+[ -f "$cle" ] || echec "un keystore indisponible a retiré la clé"
+
+echo
 echo "--- rotation : rien ne bascule avant la publication ---"
 ogs mail dkim rotate shopfr 2>&1 | grep -i "préparée" | head -1
 nouveau=$(ogs --output json mail dkim show shopfr | python3 -c \
@@ -264,6 +300,28 @@ grep -q "configuration d'OpenDKIM refusée" /tmp/apply.log || { cat /tmp/apply.l
 echo "  rechargement refusé, démon toujours actif"
 cp /tmp/opendkim.conf.bon /etc/opendkim.conf
 systemctl restart opendkim
+
+echo
+echo "--- signature désactivée par la machine : tables vidées, jamais retirées (D108) ---"
+# opendkim.conf désigne les tables d'ogs : retirées, OpenDKIM ne redémarrerait
+# plus ; vides, elles ne désignent aucune clé et ne retiennent aucun courrier.
+cp /etc/ogs/config.yaml /tmp/config.yaml.bon
+sed -i 's/^  dkim: {}$/  dkim: {enabled: false}/' /etc/ogs/config.yaml
+grep -q "enabled: false" /etc/ogs/config.yaml || echec "mail.dkim.enabled non posé dans config.yaml"
+ogs apply blogfr --yes >/tmp/apply.log 2>&1
+for table in KeyTable SigningTable; do
+    [ -f /etc/opendkim/ogs/$table ] || { cat /tmp/apply.log; echec "$table retirée alors qu'opendkim.conf la désigne"; }
+    grep -q "_domainkey" /etc/opendkim/ogs/$table && echec "$table non vidée"
+done
+systemctl restart opendkim || echec "OpenDKIM ne redémarre plus, signature désactivée"
+[ "$(envoyer contact@blog.fr desactive)" = "non signé" ] || echec "courrier retenu ou signé, signature désactivée"
+docteur | grep -i "tables d'OpenDKIM" | grep -q "désigne encore" ||
+    echec "doctor ne dit pas qu'opendkim.conf désigne encore les tables vidées"
+cp /tmp/config.yaml.bon /etc/ogs/config.yaml
+ogs apply blogfr --yes >/dev/null 2>&1
+grep -q "^\*@blog.fr " /etc/opendkim/ogs/SigningTable || echec "la signature réactivée ne reprend pas blog.fr"
+[ "$(envoyer contact@blog.fr reactive)" = signé ] || echec "le courrier de blog.fr n'est plus signé"
+echo "  tables vidées puis rétablies, OpenDKIM toujours démarrable"
 
 echo
 echo "--- la préproduction ne signe pas au nom de la production ---"

@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"leblanc.io/open-go-server/internal/model"
 	"leblanc.io/open-go-server/internal/store"
 )
 
@@ -44,7 +45,9 @@ type Key struct {
 }
 
 // Name est le nom DNS de l'enregistrement de la clé.
-func (k Key) Name() string { return k.Selector + "._domainkey." + k.Domain }
+// Le domaine y est canonisé : une clé scellée sous « Shop.fr », forme acceptée
+// avant D108, garde son fichier mais se publie et se désigne sous « shop.fr ».
+func (k Key) Name() string { return k.Selector + "._domainkey." + model.MailDomain(k.Domain) }
 
 // secretPrefix nomme les secrets DKIM d'un projet. Le domaine précède le
 // sélecteur : c'est l'ordre dans lequel on les cherche.
@@ -206,11 +209,14 @@ func (p *Provider) restore(projectID string, k Key, s *sealed) error {
 	return p.Store.PutSecret(projectID, name, s.nonce, s.ciphertext)
 }
 
-// byDomain regroupe des clés par domaine.
+// byDomain regroupe des clés par domaine canonisé (D108). Une clé garde le
+// domaine sous lequel elle a été scellée, qui nomme son fichier : la regrouper
+// sous sa forme brute la ferait ignorer, et engendrer une clé neuve — à publier.
 func byDomain(keys []Key) map[string][]Key {
 	out := map[string][]Key{}
 	for _, k := range keys {
-		out[k.Domain] = append(out[k.Domain], k)
+		d := model.MailDomain(k.Domain)
+		out[d] = append(out[d], k)
 	}
 	return out
 }
@@ -228,8 +234,13 @@ func find(keys []Key, state string) (Key, bool) {
 // nextSelector choisit le sélecteur d'une nouvelle clé : le préfixe, l'année et
 // le mois. Une seconde clé dans le même mois reçoit une lettre — un sélecteur
 // déjà employé désignerait deux clés différentes pour le même enregistrement.
-func nextSelector(prefix string, now time.Time, existing []Key) string {
+// Les fichiers en place que le keystore ne connaît pas comptent aussi (onDisk,
+// D108) : la clé neuve les écraserait sans copie.
+func nextSelector(prefix string, now time.Time, existing []Key, onDisk map[string]bool) string {
 	taken := map[string]bool{}
+	for s := range onDisk {
+		taken[s] = true
+	}
 	for _, k := range existing {
 		taken[k.Selector] = true
 	}
