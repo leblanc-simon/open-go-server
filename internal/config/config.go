@@ -793,6 +793,10 @@ func (p Paths) RobotsNoindexFile() string { return p.join(libDir, "robots-noinde
 func (p Paths) ArchivesDir() string       { return p.join(libDir, "archives") }
 func (p Paths) DumpsDir() string          { return p.join(libDir, "dumps") }
 
+// RestoresDir tient le témoin de chaque restauration inachevée, que
+// « project restore --resume » reprend (D113).
+func (p Paths) RestoresDir() string { return p.join(libDir, "restores") }
+
 // BackupsDir recueille la copie de tout fichier écrasé par « --force ». Aucune
 // sauvegarde ne reste à côté de son original : les répertoires de configuration
 // sont lus en entier, et par deux sortes de lecteurs. Leur démon d'abord —

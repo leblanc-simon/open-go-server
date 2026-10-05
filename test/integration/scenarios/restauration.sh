@@ -12,8 +12,11 @@
 #     fichier du système posé dans le home ;
 #   — l'aller-retour ordinaire rétablit les liens gérés, et l'apply suivant est vide ;
 #   — l'ancien ~/logs d'un projet d'avant D71, répertoire root, revient à root, et
-#     l'apply suivant le migre : rendu à l'utilisateur, la migration le refusait à
-#     chaque apply comme un répertoire substitué.
+#     l'apply final de la restauration le migre (D113) : rendu à l'utilisateur, la
+#     migration le refusait à chaque apply comme un répertoire substitué ;
+#   — les services ne démarrent qu'après le contenu (D113) : une application dont
+#     le script manque au home échoue, et restait « failed » après l'extraction ;
+#   — une restauration interrompue se reprend par --resume (D113).
 set -uo pipefail
 . /scenarios/lib.sh
 
@@ -71,10 +74,13 @@ code=$?
 [ "$code" -eq 0 ] || { echo "$sortie" | tail -8; echec "suppression : code $code"; }
 archive=$(archive_de shopfr)
 [ -n "$archive" ] || echec "aucune archive"
+# L'apply final de la restauration (D113) traite ce que l'archive a rendu selon
+# ses règles : les fichiers de l'utilisateur à la place des liens en font un
+# succès partiel.
 sortie=$(ogs project restore "$archive" --yes 2>&1)
 code=$?
 echo "$sortie" | tail -4
-[ "$code" -eq 0 ] || echec "restauration : code $code"
+[ "$code" -eq 6 ] || echec "restauration : code $code, attendu 6 (fichiers de l'utilisateur à la place des liens)"
 
 [ "$(sha256sum /opt/default_authorized_keys)" = "$trousseau" ] || echec "le trousseau commun a été réécrit"
 [ "$(sha256sum "/usr/bin/php$version")" = "$interpreteur" ] || echec "l'interpréteur du système a été réécrit"
@@ -172,19 +178,68 @@ code=$?
 [ "$code" -eq 0 ] || [ "$code" -eq 6 ] || echec "suppression du projet ancien : code $code"
 archive=$(archive_de vieuxfr)
 [ -n "$archive" ] || echec "aucune archive du projet ancien"
-ogs project restore "$archive" --yes >/dev/null 2>&1 || echec "restauration du projet ancien"
-[ -d /home/vieux.fr/logs ] && [ ! -L /home/vieux.fr/logs ] || echec "l'ancien ~/logs doit revenir en répertoire"
-[ "$(stat -c '%U:%G %a' /home/vieux.fr/logs)" = "root:vieuxfr 710" ] ||
-    echec "l'ancien ~/logs doit revenir à root : $(stat -c '%U:%G %a' /home/vieux.fr/logs)"
-[ "$(proprio /home/vieux.fr/logs/apache-access.log)" = root:vieuxfr ] || echec "ses journaux doivent revenir à root"
-grep -qs "accès ancien" $vieux/apache-access.log && echec "l'extraction a écrit sous logs.root à travers le lien"
-sortie=$(ogs apply vieuxfr --yes 2>&1)
+# L'apply final de la restauration le migre : la migration n'admet qu'un ancien
+# ~/logs à root (trustedLegacyEntries), donc sa réussite dit que l'extraction
+# l'a rendu à root.
+sortie=$(ogs project restore "$archive" --yes 2>&1)
 code=$?
-[ "$code" -eq 0 ] || { echo "$sortie" | grep -i "journaux\|substitué" | head -3; echec "apply de migration : code $code"; }
+[ "$code" -eq 0 ] || { echo "$sortie" | grep -i "journaux\|substitué" | head -3; echec "restauration du projet ancien : code $code"; }
 [ "$(readlink /home/vieux.fr/logs)" = "$vieux" ] || echec "l'ancien répertoire n'a pas laissé place au lien"
 grep -q "accès ancien" $vieux/apache-access.log || echec "le journal courant n'a pas été repris"
 grep -q "accès roté" $vieux/apache-access.log.1 || echec "le journal roté n'a pas été repris sous son nom"
-echo "  rendu à root, puis migré par l'apply suivant : journaux sous $vieux, lien posé"
+ogs apply vieuxfr --yes >/dev/null 2>&1 || echec "l'apply suivant la restauration doit rendre 0"
+echo "  rendu à root, migré par l'apply final de la restauration : journaux sous $vieux, lien posé"
+
+echo
+echo "--- les services démarrent après le contenu (D113) ---"
+ogs site create svc.fr --kind php-plain --php "$version" --tls=false --yes >/dev/null 2>&1 || echec "création de svc.fr"
+su -s /bin/bash svcfr -c 'printf "#!/bin/sh\nexec sleep 3600\n" >~/www/veille.sh && chmod 700 ~/www/veille.sh' ||
+    echec "dépôt du worker"
+ogs service add svcfr veille --template worker --command /home/svc.fr/www/veille.sh --instances 1 >/dev/null ||
+    echec "déclaration du service"
+ogs apply svcfr --yes >/dev/null 2>&1 || echec "apply de svc.fr"
+[ "$(systemctl is-active ogs-svcfr-veille@1.service)" = active ] || echec "le worker doit tourner avant la suppression"
+# Contournement de R1-16 (lot Y13, à retirer à son intégration) : la cible du projet n'est jamais
+# démarrée (les instances le sont une à une), et la suppression, qui arrête la
+# cible, laisse tourner les instances liées par PartOf — userdel échoue alors.
+systemctl stop ogs-svcfr-veille@1.service
+sortie=$(ogs project delete svcfr --no-dump --yes 2>&1) || { echo "$sortie" | grep -E "⚠|✗"; echec "suppression de svc.fr"; }
+systemctl reset-failed 'ogs-svcfr-*' >/dev/null 2>&1
+archive=$(archive_de svcfr)
+[ -n "$archive" ] || echec "aucune archive de svc.fr"
+sortie=$(ogs project restore "$archive" --yes 2>&1)
+code=$?
+[ "$code" -eq 0 ] || { echo "$sortie" | tail -6; echec "restauration de svc.fr : code $code"; }
+etat=$(systemctl is-active ogs-svcfr-veille@1.service)
+[ "$etat" = active ] || echec "le worker doit tourner après la restauration : $etat"
+# Démarré avant l'extraction, il échouait sur un script absent (203/EXEC) et
+# systemd le relançait : le compteur le dit.
+relances=$(systemctl show -p NRestarts --value ogs-svcfr-veille@1.service)
+[ "$relances" = 0 ] || echec "le worker a démarré avant son script : $relances relance(s)"
+echo "  worker démarré une fois, après le contenu"
+
+echo
+echo "--- une restauration interrompue se reprend (D113) ---"
+systemctl stop ogs-svcfr-veille@1.service
+sortie=$(ogs project delete svcfr --no-dump --yes 2>&1) || { echo "$sortie" | grep -E "⚠|✗"; echec "seconde suppression de svc.fr"; }
+archive=$(archive_de svcfr)
+pool=/etc/php/$version/fpm/pool.d/svcfr.conf
+printf '; pool posé hors ogs\n' >"$pool"
+sortie=$(ogs project restore "$archive" --yes 2>&1)
+code=$?
+[ "$code" -ne 0 ] && [ "$code" -ne 6 ] || echec "l'apply devait échouer sur le pool étranger (code $code)"
+echo "$sortie" | grep -q -- "--resume" || { echo "$sortie" | tail -4; echec "l'échec doit nommer la reprise"; }
+[ -e /var/lib/ogs/restores/svcfr.json ] || echec "le témoin de la restauration inachevée doit rester"
+ogs project restore "$archive" --yes >/dev/null 2>&1
+[ $? -eq 4 ] || echec "une relance sans --resume doit être refusée en conflit"
+rm "$pool"
+sortie=$(ogs project restore --resume "$archive" --yes 2>&1)
+code=$?
+[ "$code" -eq 0 ] || { echo "$sortie" | tail -6; echec "reprise : code $code"; }
+[ -e /var/lib/ogs/restores/svcfr.json ] && echec "le témoin doit partir avec la restauration achevée"
+[ "$(systemctl is-active ogs-svcfr-veille@1.service)" = active ] || echec "le worker doit tourner après la reprise"
+ogs diff svcfr >/dev/null 2>&1 || echec "aucun écart ne doit subsister après la reprise"
+echo "  échec nommé, reprise par --resume, témoin retiré, worker actif"
 
 echo
 echo "=== scénario restauration : succès ==="

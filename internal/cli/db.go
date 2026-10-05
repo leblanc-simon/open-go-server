@@ -202,17 +202,18 @@ func newDBRemoveCommand(app *App) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			// Un nom que portent deux bases, sur deux moteurs, se précise par
+			// « <moteur>:<nom> » : le nom seul les retirait toutes deux (D113).
+			target, err := findDatabase(p, args[1])
+			if err != nil {
+				return err
+			}
 			kept := make([]model.Database, 0, len(p.Spec.Databases))
-			found := false
 			for _, d := range p.Spec.Databases {
-				if d.Name == args[1] {
-					found = true
+				if d.Engine == target.Engine && d.Name == target.Name {
 					continue
 				}
 				kept = append(kept, d)
-			}
-			if !found {
-				return exitf(CodeUsage, "aucune base %q déclarée dans %s", args[1], p.ID())
 			}
 			p.Spec.Databases = kept
 			if err := spec.Save(app.Paths.ProjectFile(p.ID()), p); err != nil {
@@ -249,8 +250,10 @@ func newDBDumpCommand(app *App) *cobra.Command {
 				if err := os.MkdirAll(dir, 0o700); err != nil {
 					return wrap(CodeError, err)
 				}
+				// Le moteur n'y figure que pour distinguer deux bases homonymes
+				// (D113) : « postgres:shopfr » y devient « postgres-shopfr ».
 				output = filepath.Join(dir, fmt.Sprintf("%s-%s-%s.sql",
-					p.ID(), decl.Name, nowFunc().UTC().Format("20060102-150405")))
+					p.ID(), strings.ReplaceAll(dbArg(p, decl), ":", "-"), nowFunc().UTC().Format("20060102-150405")))
 			}
 			if err := app.openStore(); err != nil {
 				return err
@@ -305,15 +308,16 @@ func newDBRestoreCommand(app *App) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			entry := ""
 			if fromArchive != "" {
-				if err := checkArchivedDump(f, fromArchive, p.ID(), decl.Name); err != nil {
+				if entry, err = checkArchivedDump(f, fromArchive, p, decl); err != nil {
 					return err
 				}
 			} else {
 				f.Close()
 			}
 			if err := app.confirm(fmt.Sprintf(
-				"restaurer %s dans la base %s (le contenu actuel peut être écrasé) ?", source, decl.Name)); err != nil {
+				"restaurer %s dans la base %s (le contenu actuel peut être écrasé) ?", source, dbLabel(decl))); err != nil {
 				return err
 			}
 			if err := app.openStore(); err != nil {
@@ -333,11 +337,11 @@ func newDBRestoreCommand(app *App) *cobra.Command {
 					return wrap(CodeError, err)
 				}
 				defer os.RemoveAll(dir)
-				path = filepath.Join(dir, decl.Name+".sql")
+				path = filepath.Join(dir, decl.Engine+"-"+decl.Name+".sql")
 				// Recopiée en flux, par le descripteur ouvert avant la confirmation :
 				// une sauvegarde pèse ce que pèse la base — une archive fabriquée,
 				// ce qu'elle veut —, et n'a pas à passer en entier par la mémoire.
-				if err := copyArchivedDump(f, decl.Name, path); err != nil {
+				if err := copyArchivedDump(f, entry, path); err != nil {
 					return wrap(CodeError, fmt.Errorf("%s : %w", fromArchive, err))
 				}
 			}
@@ -347,7 +351,7 @@ func newDBRestoreCommand(app *App) *cobra.Command {
 				}
 				return wrap(CodeError, err)
 			}
-			app.printf("✓ base %s restaurée depuis %s\n", decl.Name, source)
+			app.printf("✓ base %s restaurée depuis %s\n", dbLabel(decl), source)
 			return nil
 		},
 	}
@@ -360,40 +364,50 @@ func newDBRestoreCommand(app *App) *cobra.Command {
 // projet avant la confirmation : elle doit être celle de ce projet, d'un format
 // que cet ogs relit, et porter la sauvegarde de cette base, fichier ordinaire.
 // Le remède d'une restauration partielle (D104) la désigne : il ne demande ainsi
-// ni tar ni zstd, que Debian n'installe pas.
-func checkArchivedDump(f *os.File, path, id, base string) error {
+// ni tar ni zstd, que Debian n'installe pas. Il rend le nom de l'entrée : celle
+// que le moteur de la base nomme, ou celle, sans moteur, d'une archive antérieure
+// à D113 qui ne peut désigner qu'elle (archivedDump).
+func checkArchivedDump(f *os.File, path string, p *model.Project, decl model.Database) (string, error) {
 	data, err := archive.ReadEntry(f, archive.ManifestName)
 	if err != nil {
-		return exitf(CodeUsage, "%s : %v", path, err)
+		return "", exitf(CodeUsage, "%s : %v", path, err)
 	}
 	var manifest archive.Manifest
 	if err := json.Unmarshal(data, &manifest); err != nil {
-		return exitf(CodeUsage, "%s : manifeste illisible : %v", path, err)
+		return "", exitf(CodeUsage, "%s : manifeste illisible : %v", path, err)
 	}
-	if manifest.Project != id {
-		return exitf(CodeUsage, "%s est l'archive du projet %s, non de %s", path, manifest.Project, id)
+	if manifest.Project != p.ID() {
+		return "", exitf(CodeUsage, "%s est l'archive du projet %s, non de %s", path, manifest.Project, p.ID())
 	}
 	if manifest.Version > archive.Version {
-		return exitf(CodeUsage, "%s : archive au format %d, cet ogs ne relit que le format %d",
+		return "", exitf(CodeUsage, "%s : archive au format %d, cet ogs ne relit que le format %d",
 			path, manifest.Version, archive.Version)
 	}
+	entry, err := archivedDump(manifest, p, decl)
+	var ambiguous *ambiguousDumpError
+	if errors.As(err, &ambiguous) {
+		return "", exitf(CodeUsage, "%s : %v — %s", path, err, ambiguous.remedy(p.ID()))
+	}
+	if err != nil {
+		return "", exitf(CodeUsage, "%s : %v", path, err)
+	}
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		return wrap(CodeError, err)
+		return "", wrap(CodeError, err)
 	}
-	if err := archive.FindEntry(f, "dumps/"+base+".sql"); err != nil {
-		return exitf(CodeUsage, "%s : aucune sauvegarde de la base %s (%v)", path, base, err)
+	if err := archive.FindEntry(f, entry); err != nil {
+		return "", exitf(CodeUsage, "%s : aucune sauvegarde de la base %s (%v)", path, dbLabel(decl), err)
 	}
-	return nil
+	return entry, nil
 }
 
-// copyArchivedDump recopie en flux la sauvegarde de la base vers dest, créé en
+// copyArchivedDump recopie en flux une sauvegarde de l'archive vers dest, créé en
 // 0600 sans jamais remplacer un fichier.
-func copyArchivedDump(f *os.File, base, dest string) error {
+func copyArchivedDump(f *os.File, entry, dest string) error {
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
 		return err
 	}
 	return copyEntryTo(dest, func(w io.Writer) (int64, error) {
-		return archive.CopyEntry(f, "dumps/"+base+".sql", w)
+		return archive.CopyEntry(f, entry, w)
 	})
 }
 
@@ -537,17 +551,12 @@ func pickDatabase(p *model.Project, args []string) (model.Database, error) {
 		if len(p.Spec.Databases) > 1 {
 			names := make([]string, 0, len(p.Spec.Databases))
 			for _, d := range p.Spec.Databases {
-				names = append(names, d.Name)
+				names = append(names, dbArg(p, d))
 			}
 			return model.Database{}, exitf(CodeUsage,
 				"plusieurs bases déclarées, préciser laquelle : %s", strings.Join(names, ", "))
 		}
 		return p.Spec.Databases[0], nil
 	}
-	for _, d := range p.Spec.Databases {
-		if d.Name == args[1] {
-			return d, nil
-		}
-	}
-	return model.Database{}, exitf(CodeUsage, "aucune base %q déclarée dans %s", args[1], p.ID())
+	return findDatabase(p, args[1])
 }

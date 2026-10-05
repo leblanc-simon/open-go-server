@@ -24,6 +24,7 @@ import (
 	"leblanc.io/open-go-server/internal/fs"
 	"leblanc.io/open-go-server/internal/hook"
 	"leblanc.io/open-go-server/internal/model"
+	"leblanc.io/open-go-server/internal/naming"
 	appprov "leblanc.io/open-go-server/internal/provider/app"
 	"leblanc.io/open-go-server/internal/provider/cron"
 	"leblanc.io/open-go-server/internal/provider/php"
@@ -433,6 +434,9 @@ func newDeleteCommand(app *App) *cobra.Command {
 					warn("état : %v", err)
 				}
 			}
+			// Une restauration inachevée à laquelle on renonce : son témoin ne doit
+			// pas faire reprendre, plus tard, un projet recréé sous ce nom (D113).
+			app.clearRestoreState(p.ID())
 
 			// 7. Les fichiers de portée parc énumèrent les projets, et celui-ci n'en
 			// fait plus partie. Le recalcul n'est pas cosmétique : une prison fail2ban
@@ -1808,7 +1812,7 @@ func (a *App) archiveProject(cmd *cobra.Command, provs *providers, p *model.Proj
 		}
 		defer os.RemoveAll(dir)
 		for _, decl := range scope.dumps {
-			tmp := filepath.Join(dir, decl.Name+".sql")
+			tmp := filepath.Join(dir, decl.Engine+"-"+decl.Name+".sql")
 			if _, err := provs.DB.Dump(cmd.Context(), p, decl, tmp); err != nil {
 				if scope.strict {
 					return "", nil, exitf(CodeError, "sauvegarde de %s impossible : %v — sans elle, la "+
@@ -1818,12 +1822,12 @@ func (a *App) archiveProject(cmd *cobra.Command, provs *providers, p *model.Proj
 					"et « ogs project restore » ne les rendra pas", decl.Name, err)
 				continue
 			}
-			if err := w.AddFile("dump", "dumps/"+decl.Name+".sql", tmp); err != nil {
+			if err := w.AddFile("dump", dumpEntry(decl), tmp); err != nil {
 				_ = os.Remove(tmp)
 				return "", nil, wrap(CodeError, err)
 			}
 			_ = os.Remove(tmp)
-			a.printf("✓ sauvegarde de %s incluse\n", decl.Name)
+			a.printf("✓ sauvegarde de %s incluse\n", dbLabel(decl))
 		}
 	}
 	// Les secrets restent chiffrés : l'archive n'est pas une porte de sortie.
@@ -1948,15 +1952,18 @@ func (a *App) archiveEnvFile(w *archive.Writer, p *model.Project) error {
 }
 
 func newRestoreCommand(app *App) *cobra.Command {
-	var withData bool
+	var withData, resume bool
 	cmd := &cobra.Command{
 		Use:   "restore <archive>",
 		Short: "Restaurer un projet depuis une archive",
 		Long: "Recrée le projet depuis sa déclaration archivée, réinjecte les secrets scellés,\n" +
-			"restaure l'arborescence puis, si demandé, recharge les sauvegardes de bases.\n" +
-			"La clé maître doit être la même : sans elle, les secrets sont illisibles.",
+			"restaure l'arborescence puis, si demandé, recharge les sauvegardes de bases ; ses\n" +
+			"services, son attente de disponibilité et ses tâches planifiées ne démarrent qu'ensuite.\n" +
+			"La clé maître doit être la même : sans elle, les secrets sont illisibles.\n" +
+			"Une restauration interrompue — apply en échec, interruption — se reprend par\n" +
+			"--resume, sur la même archive, ou s'abandonne par « ogs project delete ».",
 		Args: cobra.ExactArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
+		RunE: func(cmd *cobra.Command, args []string) (err error) {
 			path := args[0]
 			manifest, err := archive.ReadManifest(path)
 			if err != nil {
@@ -1967,15 +1974,62 @@ func newRestoreCommand(app *App) *cobra.Command {
 			app.printf("  %d entrée(s), %s de données, %d secret(s)\n",
 				len(manifest.Entries), humanBytes(manifest.Bytes), manifest.Secrets)
 
-			target := app.Paths.ProjectFile(manifest.Project)
-			if _, err := os.Stat(target); err == nil {
-				return exitf(CodeConflict, "le projet %s existe déjà : le supprimer d'abord", manifest.Project)
+			// L'identifiant vient du manifeste, que rien n'a validé : il compose le
+			// chemin de la déclaration et celui du témoin.
+			id := manifest.Project
+			if err := naming.ValidateIdentifier(id); err != nil {
+				return exitf(CodeUsage, "%s : projet %q du manifeste refusé : %v", path, id, err)
 			}
-			if err := app.confirm(fmt.Sprintf("restaurer %s ?", manifest.Project)); err != nil {
+			target := app.Paths.ProjectFile(id)
+			state, err := app.readRestoreState(id)
+			if err != nil {
+				return wrap(CodeError, err)
+			}
+			_, statErr := os.Stat(target)
+			exists := statErr == nil
+			resumeLine := exec.ShellLine("ogs", "project", "restore", "--resume", path)
+			switch {
+			case resume && !exists:
+				return exitf(CodeUsage, "aucune restauration de %s à reprendre : sa déclaration est absente — "+
+					"relancer sans --resume", id)
+			case resume && state == nil:
+				return exitf(CodeConflict, "le projet %s existe, et aucune restauration inachevée n'est notée "+
+					"pour lui : rien à reprendre", id)
+			case resume && !state.matches(manifest):
+				return exitf(CodeConflict, "la restauration inachevée de %s vient d'une autre archive (%s, créée le %s) : "+
+					"la reprendre depuis celle-ci", id, state.Archive, state.CreatedAt.Format("02/01/2006 à 15:04"))
+			case !resume && exists && state.matches(manifest):
+				return exitf(CodeConflict, "la restauration de %s depuis cette archive est inachevée : la reprendre, "+
+					"%s ; ou y renoncer, %s", id, resumeLine, exec.ShellLine("ogs", "project", "delete", id))
+			case !resume && exists:
+				return exitf(CodeConflict, "le projet %s existe déjà : le supprimer d'abord", id)
+			}
+			if resume {
+				// La reprise ne vaut que pour la déclaration qu'elle a écrite : les
+				// phases notées ont été faites pour elle.
+				digest, err := app.declarationDigest(id)
+				if err != nil {
+					return wrap(CodeError, err)
+				}
+				if digest != state.Declaration {
+					return exitf(CodeConflict, "la déclaration %s a changé depuis la restauration interrompue : "+
+						"la reprise ne vaut que pour celle que l'archive a rendue — la rétablir, ou renoncer à la "+
+						"restauration : %s", target, exec.ShellLine("ogs", "project", "delete", id))
+				}
+			}
+			question := fmt.Sprintf("restaurer %s ?", id)
+			if resume {
+				question = fmt.Sprintf("reprendre la restauration de %s ?", id)
+			}
+			if err := app.confirm(question); err != nil {
 				return err
 			}
 
-			// La déclaration d'abord : tout le reste s'y adosse.
+			// La déclaration archivée : elle dit les répertoires tels que l'archive
+			// les déclare — la normalisation retire les anciennes entrées logs/ et
+			// .bin/, qui disent pourtant, dans une archive antérieure aux
+			// propriétaires portés, que ces répertoires étaient à root
+			// (RestoredOwner).
 			data, err := archive.ReadFile(path, "project.yaml")
 			if err != nil {
 				return exitf(CodeError, "%v", err)
@@ -1984,132 +2038,181 @@ func newRestoreCommand(app *App) *cobra.Command {
 			if err != nil {
 				return exitf(CodeValidation, "%v", err)
 			}
-			// Les répertoires tels que l'archive les déclare : la normalisation
-			// retire les anciennes entrées logs/ et .bin/, qui disent pourtant, dans
-			// une archive antérieure aux propriétaires portés, que ces répertoires
-			// étaient à root (RestoredOwner).
 			archived := append([]model.Dir(nil), p.Spec.Layout.Dirs...)
-			if err := app.prepare(p); err != nil {
-				return err
+			if resume {
+				if p, err = app.loadProject(id); err != nil {
+					return err
+				}
+				app.printf("= reprise de la restauration notée dans %s\n", app.restoreMarker(id))
+			} else {
+				if err := app.prepare(p); err != nil {
+					return err
+				}
+				// La déclaration archivée doit être celle du projet que le manifeste
+				// nomme : le témoin et la déclaration sont écrits sous ce nom.
+				if p.ID() != id {
+					return exitf(CodeUsage, "%s : le manifeste nomme le projet %s, la déclaration archivée %s",
+						path, id, p.ID())
+				}
+				// Une archive qui déclare « webAccess: acl » serait refusée par
+				// l'apply, après le dépôt de la déclaration : le refus vient avant
+				// tout (D107).
+				if p.Spec.User.WebAccess == webAccessACL {
+					return exitf(CodeValidation, "l'archive de %s déclare spec.user.webAccess « acl », qu'ogs "+
+						"n'implémente pas : rien n'a été restauré.\n  remède : %s", p.ID(), webAccessArchiveFix)
+				}
+				// Une archive d'avant D91 peut déclarer un compte réservé : la
+				// restaurer l'écrirait de nouveau au parc.
+				if err := app.refuseReservedDBAccounts(p); err != nil {
+					return err
+				}
+				// L'archive dit ce que le projet tenait à sa suppression, non ce que
+				// le parc a déclaré depuis : un domaine, une base ou un home repris
+				// entre-temps seraient servis deux fois.
+				if err := app.checkFleetUniqueness(p); err != nil {
+					return err
+				}
+				// Le témoin précède la déclaration : une déclaration en place sans
+				// lui serait une restauration qu'aucune commande ne reprend.
+				// Son empreinte est celle des octets que spec.Save écrira, calculée
+				// avant : le témoin n'existe jamais sans elle.
+				encoded, err := spec.Encode(p)
+				if err != nil {
+					return wrap(CodeError, err)
+				}
+				state = &restoreState{Project: id, Archive: path, CreatedAt: manifest.CreatedAt,
+					Declaration: digestOf(encoded)}
+				if err := app.saveRestoreState(state); err != nil {
+					return wrap(CodeError, err)
+				}
+				if err := spec.Save(target, p); err != nil {
+					app.clearRestoreState(id)
+					return wrap(CodeError, err)
+				}
+				app.printf("✓ déclaration restaurée : %s\n", target)
 			}
-			// Une archive qui déclare « webAccess: acl » serait refusée par l'apply,
-			// après le dépôt de la déclaration : le refus vient avant tout (D107).
-			if p.Spec.User.WebAccess == webAccessACL {
-				return exitf(CodeValidation, "l'archive de %s déclare spec.user.webAccess « acl », qu'ogs "+
-					"n'implémente pas : rien n'a été restauré.\n  remède : %s", p.ID(), webAccessArchiveFix)
+			// Désormais, toute sortie avant la fin laisse la restauration
+			// inachevée : rien n'est retiré — l'apply a compensé ce qu'il a pu, le
+			// reste est nommé —, et l'erreur dit comment la reprendre (R1-54).
+			state.Archive = path
+			finished := false
+			defer func() {
+				if err != nil && !finished {
+					_ = app.Audit.Record(id, "project", "project.restore", "inachevé", path+" : "+err.Error())
+					err = app.unfinishedRestore(err, id, path, p)
+				}
+			}()
+			save := func() error {
+				if err := app.saveRestoreState(state); err != nil {
+					return wrap(CodeError, fmt.Errorf("témoin de restauration : %w", err))
+				}
+				return nil
 			}
-			// Une archive d'avant D91 peut déclarer un compte réservé : la restaurer
-			// l'écrirait de nouveau au parc.
-			if err := app.refuseReservedDBAccounts(p); err != nil {
-				return err
-			}
-			// L'archive dit ce que le projet tenait à sa suppression, non ce que le
-			// parc a déclaré depuis : un domaine, une base ou un home repris entre-temps
-			// seraient servis deux fois.
-			if err := app.checkFleetUniqueness(p); err != nil {
-				return err
-			}
-			if err := spec.Save(target, p); err != nil {
-				return wrap(CodeError, err)
-			}
-			app.printf("✓ déclaration restaurée : %s\n", target)
 
 			if err := app.openStore(); err != nil {
 				return err
 			}
-			// Les secrets sont réinjectés tels quels : ils restent chiffrés par la
-			// même clé maître.
-			secrets, err := archive.Secrets(path)
-			if err != nil {
-				return wrap(CodeError, err)
-			}
-			skipped := 0
-			for name, pair := range secrets {
-				if !restorableSecret(p, name) {
-					if keystoreSecret(name) {
-						skipped++
-					}
-					continue
+			if !state.Secrets {
+				gaps, err := app.restoreSecrets(p, path)
+				if err != nil {
+					return err
 				}
-				if err := app.Store.PutSecret(p.ID(), name, pair[0], pair[1]); err != nil {
-					return wrap(CodeError, err)
-				}
-			}
-			if skipped > 0 {
-				app.printf("= %d preuve(s) de ressources que la déclaration ne nomme plus, non réinjectée(s) : "+
-					"la suppression les avait retirées (D100)\n", skipped)
-			}
-			// Ce que la restauration n'a pas pu rendre, chacun avec son remède : le
-			// projet est en place, il lui manque une partie de ce que l'archive
-			// porte — succès partiel (code 6), jamais « ✓ restauré » ni un audit
-			// « ok » (Q-01).
-			var manques []restoreGap
-			if m := app.restoreEnvFile(p, path, secrets); m != nil {
-				manques = append(manques, *m)
-			}
-			manques = append(manques, app.restoreCertificates(p, path, secrets)...)
-			if len(secrets) > 0 {
-				app.printf("✓ %d secret(s) réinjecté(s)\n", len(secrets))
-				if app.Keys != nil {
-					for name, pair := range secrets {
-						if name == envFileKeptSecret {
-							// Scellée sous le nom du fichier d'environnement.
-							name = appprov.EnvFileSecret
-						}
-						if _, err := app.Keys.Open(p.ID(), name, pair[0], pair[1]); err != nil {
-							app.warnf("⚠ %s est illisible avec la clé maître actuelle : "+
-								"l'archive vient-elle d'un autre serveur ?\n", name)
-							manques = append(manques, restoreGap{
-								fmt.Sprintf("secrets illisibles avec la clé maître actuelle (%s le premier)", name),
-								"rétablir la clé maître d'origine dans " + app.Paths.MasterKey()})
-							break
-						}
-					}
+				state.addGaps(gaps...)
+				state.Secrets = true
+				if err := save(); err != nil {
+					return err
 				}
 			}
 
-			// Puis l'infrastructure, avant de remettre le contenu. Un succès partiel
-			// — une base indisponible, par exemple — ne doit pas empêcher la
-			// restauration des fichiers : le code est conservé et rendu à la fin.
-			if err := app.applyProjects(cmd, []*model.Project{p}); err != nil {
+			// Puis l'infrastructure, avant de remettre le contenu, sans rien lancer
+			// du code du projet : ses instances, son attente de disponibilité, ses
+			// tâches planifiées et « postCreate » attendent le home et les bases
+			// (heldBack). Un succès partiel — une base indisponible, par exemple —
+			// n'empêche pas la restauration des fichiers ; l'apply final le redira.
+			app.holdServices = true
+			err = app.applyProjects(cmd, []*model.Project{p})
+			app.holdServices = false
+			if err != nil && ExitCode(err) != CodePartial {
+				return err
+			}
+			// L'arborescence vient après l'apply, et c'est voulu : le compte existe
+			// alors, et chaque entrée reçoit son propriétaire sur le descripteur de
+			// ce qui vient d'être créé. Extraire avant, dans un home vierge, l'aurait
+			// laissé à root jusqu'à une passe de chown faite après la création du
+			// compte — son code libre de glisser sous un nom un lien dur vers un
+			// fichier du système, que chown lui aurait donné. Ce que l'apply vient
+			// de poser dans le home — le lien du trousseau commun, celui de
+			// l'interpréteur, ~/logs — n'est jamais traversé : l'extraction le
+			// remplace, en tant que lien, par ce que l'archive porte, soit le home
+			// tel que l'utilisateur l'avait laissé ; l'apply suivant le traite selon
+			// ses règles (D61, D70, D71) — c'est lui qui migre l'ancien ~/logs d'une
+			// archive antérieure à D71, rendu à root comme il l'était. Une reprise
+			// extrairait de nouveau sans dommage — l'extraction remplace ce qu'elle
+			// trouve —, mais rendrait le contenu tel que l'archive le porte par-dessus
+			// ce que l'application a pu écrire depuis.
+			if err := interruptedRestore(cmd.Context()); err != nil {
+				return err
+			}
+			if !state.Tree {
+				if err := app.restoreTree(path, p, archived, manifest); err != nil {
+					app.warnf("⚠ restauration de l'arborescence : %v\n", err)
+					state.addGaps(restoreGap{
+						fmt.Sprintf("arborescence incomplète dans %s (%v)", p.Spec.Layout.Root, err),
+						fmt.Sprintf("l'archive %s en garde la copie, sous tree/", path)})
+				}
+				state.Tree = true
+				if err := save(); err != nil {
+					return err
+				}
+			}
+			// Une base non rechargée est un succès partiel : le projet est en place,
+			// sa base vide (D92).
+			if withData && !state.DumpsDone {
+				missing, err := app.restoreDumps(cmd, path, p, manifest, state, save)
+				state.addGaps(missing...)
+				state.DumpsDone = err == nil
+				if serr := save(); serr != nil && err == nil {
+					err = serr
+				}
+				if err != nil {
+					return err
+				}
+			}
+			// La crontab et les tâches at du compte ne sont pas reposées (D107) :
+			// l'archive les porte, la restauration ne les rend pas — un manque
+			// comme un autre (D104), que la reprise nomme aussi.
+			state.addGaps(restoreUserJobs(path, p, manifest)...)
+
+			// Les services, une fois le contenu en place : l'apply qui suit active
+			// et démarre les instances, attend l'application et pose les tâches
+			// planifiées (D113). La confirmation de la restauration vaut pour lui.
+			if err := interruptedRestore(cmd.Context()); err != nil {
+				return err
+			}
+			// « postCreate » ne se lance qu'une fois : noté au témoin dès qu'il
+			// l'est, une reprise ne le relance pas.
+			yes := app.Yes
+			app.Yes = true
+			app.postCreateRan = func(string) bool { return state.PostCreate }
+			app.onPostCreate = func(string) {
+				state.PostCreate = true
+				if err := save(); err != nil {
+					app.warnf("⚠ %v — une reprise relancerait « postCreate »\n", err)
+				}
+			}
+			err = app.applyProjects(cmd, []*model.Project{p})
+			app.Yes = yes
+			app.postCreateRan, app.onPostCreate = nil, nil
+			manques := state.Gaps
+			if err != nil {
 				if ExitCode(err) != CodePartial {
 					return err
 				}
 				manques = append(manques, restoreGap{fmt.Sprintf("apply partiel (%v)", err),
 					"reprendre les étapes en échec : ogs apply " + p.ID()})
 			}
-			// L'arborescence vient après l'apply, et c'est voulu : le compte existe
-			// alors, et chaque entrée reçoit son propriétaire sur le descripteur de
-			// ce qui vient d'être créé. Extraire avant, dans un home vierge, l'aurait
-			// laissé à root jusqu'à une passe de chown faite après la création du
-			// compte — ses services déjà démarrés, son code libre de glisser sous
-			// un nom un lien dur vers un fichier du système, que chown lui aurait
-			// donné. Ce que l'apply vient de poser dans le home — le lien du
-			// trousseau commun, celui de l'interpréteur, ~/logs — n'est jamais
-			// traversé : l'extraction le remplace, en tant que lien, par ce que
-			// l'archive porte, soit le home tel que l'utilisateur l'avait laissé ;
-			// l'apply suivant le traite selon ses règles (D61, D70, D71) — c'est
-			// lui qui migre l'ancien ~/logs d'une archive antérieure à D71, rendu à
-			// root comme il l'était.
-			if err := app.restoreTree(path, p, archived, manifest); err != nil {
-				app.warnf("⚠ restauration de l'arborescence : %v\n", err)
-				manques = append(manques, restoreGap{
-					fmt.Sprintf("arborescence incomplète dans %s (%v)", p.Spec.Layout.Root, err),
-					fmt.Sprintf("l'archive %s en garde la copie, sous tree/", path)})
-			}
-			// Une base non rechargée est un succès partiel : le projet est en place,
-			// sa base vide (D92).
-			if withData {
-				missing, err := app.restoreDumps(cmd, path, p, manifest)
-				if err != nil {
-					return err
-				}
-				manques = append(manques, missing...)
-			}
-			// La crontab et les tâches at du compte ne sont pas reposées (D107) :
-			// l'archive les porte, la restauration ne les rend pas — un manque
-			// comme un autre (D104).
-			manques = append(manques, restoreUserJobs(path, p, manifest)...)
+			finished = true
+			app.clearRestoreState(id)
 			if len(manques) > 0 {
 				// La sortie d'erreur porte chaque manque avec son remède ; le motif
 				// du code 6 et l'audit les nomment.
@@ -2130,7 +2233,73 @@ func newRestoreCommand(app *App) *cobra.Command {
 		},
 	}
 	cmd.Flags().BoolVar(&withData, "with-data", true, "recharger les sauvegardes de bases")
+	cmd.Flags().BoolVar(&resume, "resume", false, "reprendre une restauration inachevée depuis la même archive")
 	return cmd
+}
+
+// interruptedRestore rend l'abandon qu'impose une interruption reçue entre deux
+// phases d'une restauration : la suite ne commence pas, et la restauration reste
+// reprenable.
+func interruptedRestore(ctx context.Context) error {
+	if ctx.Err() == nil {
+		return nil
+	}
+	return exitf(CodeCancelled, "interruption reçue : restauration arrêtée entre deux phases")
+}
+
+// restoreSecrets réinjecte les secrets scellés de l'archive, rend le fichier
+// d'environnement et les certificats, et dit ce qui n'a pas pu l'être.
+func (a *App) restoreSecrets(p *model.Project, path string) ([]restoreGap, error) {
+	// Les secrets sont réinjectés tels quels : ils restent chiffrés par la même
+	// clé maître.
+	secrets, err := archive.Secrets(path)
+	if err != nil {
+		return nil, wrap(CodeError, err)
+	}
+	skipped := 0
+	for name, pair := range secrets {
+		if !restorableSecret(p, name) {
+			if keystoreSecret(name) {
+				skipped++
+			}
+			continue
+		}
+		if err := a.Store.PutSecret(p.ID(), name, pair[0], pair[1]); err != nil {
+			return nil, wrap(CodeError, err)
+		}
+	}
+	if skipped > 0 {
+		a.printf("= %d preuve(s) de ressources que la déclaration ne nomme plus, non réinjectée(s) : "+
+			"la suppression les avait retirées (D100)\n", skipped)
+	}
+	// Ce que la restauration n'a pas pu rendre, chacun avec son remède : le
+	// projet est en place, il lui manque une partie de ce que l'archive porte —
+	// succès partiel (code 6), jamais « ✓ restauré » ni un audit « ok » (Q-01).
+	var manques []restoreGap
+	if m := a.restoreEnvFile(p, path, secrets); m != nil {
+		manques = append(manques, *m)
+	}
+	manques = append(manques, a.restoreCertificates(p, path, secrets)...)
+	if len(secrets) > 0 {
+		a.printf("✓ %d secret(s) réinjecté(s)\n", len(secrets))
+		if a.Keys != nil {
+			for name, pair := range secrets {
+				if name == envFileKeptSecret {
+					// Scellée sous le nom du fichier d'environnement.
+					name = appprov.EnvFileSecret
+				}
+				if _, err := a.Keys.Open(p.ID(), name, pair[0], pair[1]); err != nil {
+					a.warnf("⚠ %s est illisible avec la clé maître actuelle : "+
+						"l'archive vient-elle d'un autre serveur ?\n", name)
+					manques = append(manques, restoreGap{
+						fmt.Sprintf("secrets illisibles avec la clé maître actuelle (%s le premier)", name),
+						"rétablir la clé maître d'origine dans " + a.Paths.MasterKey()})
+					break
+				}
+			}
+		}
+	}
+	return manques, nil
 }
 
 // restoreEnvFile réécrit le fichier d'environnement archivé, et rend ce qui
@@ -2230,18 +2399,19 @@ func (a *App) restoreTree(path string, p *model.Project, archived []model.Dir, m
 	if count > 0 || err == nil {
 		a.printf("✓ %d fichier(s) restauré(s) dans %s\n", count, p.Spec.Layout.Root)
 	}
-	// L'apply de la restauration a précédé l'extraction : l'ancien répertoire des
-	// journaux qu'elle vient de rendre attend l'apply suivant pour être migré. La
-	// déclaration archivée dit s'il en est un ; un répertoire que l'utilisateur
-	// aurait posé à la place du lien n'en est pas un, et la migration le refusera.
+	// Le premier apply de la restauration a précédé l'extraction : l'ancien
+	// répertoire des journaux qu'elle vient de rendre est migré par l'apply qui
+	// suit le contenu (D113). La déclaration archivée dit s'il en est un ; un
+	// répertoire que l'utilisateur aurait posé à la place du lien n'en est pas
+	// un, et la migration le refusera.
 	legacy := model.LegacyLogDir(p.Spec.Layout.Root)
 	for _, d := range archived {
 		if filepath.Clean(d.Path) != model.LogLink || d.Owner != "root" {
 			continue
 		}
 		if info, lerr := os.Lstat(legacy); lerr == nil && info.IsDir() {
-			a.printf("→ l'archive rend l'ancien %s d'un projet antérieur à D71 : « ogs apply %s » en reprendra "+
-				"les journaux sous %s\n", legacy, p.ID(), p.Spec.Layout.LogDir)
+			a.printf("→ l'archive rend l'ancien %s d'un projet antérieur à D71 : l'apply qui suit en reprend "+
+				"les journaux sous %s\n", legacy, p.Spec.Layout.LogDir)
 		}
 		break
 	}
@@ -2251,7 +2421,18 @@ func (a *App) restoreTree(path string, p *model.Project, archived []model.Dir, m
 // restoreDumps recharge les sauvegardes présentes dans l'archive, et rend, pour
 // chacune qui n'a pas pu l'être, ce qui manque et le remède. Une interruption
 // arrête tout et remonte en code 9 : les bases suivantes ne sont pas rechargées.
-func (a *App) restoreDumps(cmd *cobra.Command, path string, p *model.Project, manifest archive.Manifest) ([]restoreGap, error) {
+//
+// state, s'il est donné, note chaque sauvegarde tentée, et save l'écrit : une
+// reprise (D113) saute celles qui l'ont été. Une sauvegarde dont le rechargement
+// a commencé sans que son issue soit notée a été interrompue : MySQL et MariaDB
+// la rechargent de nouveau — mysqldump retire chaque table avant de la recréer —,
+// PostgreSQL non — pg_dump ne retire rien, et le script s'arrêterait sur le
+// premier objet déjà créé : la base est nommée, à moitié chargée.
+func (a *App) restoreDumps(cmd *cobra.Command, path string, p *model.Project, manifest archive.Manifest,
+	state *restoreState, save func() error) ([]restoreGap, error) {
+	if save == nil {
+		save = func() error { return nil }
+	}
 	var missing []restoreGap
 	// Chaque sauvegarde est d'abord rapportée à une base déclarée : le nom vient
 	// du manifeste, que rien n'a validé, et il ne compose de remède — une ligne
@@ -2263,30 +2444,57 @@ func (a *App) restoreDumps(cmd *cobra.Command, path string, p *model.Project, ma
 		entry string
 		decl  *model.Database
 	}
+	// Chaque base déclarée cherche sa sauvegarde sous son moteur, puis sous le
+	// nom seul d'une archive antérieure à D113, qui ne lui est rapportée que si
+	// rien d'autre ne peut la revendiquer : le nom seul rapportait la sauvegarde
+	// MySQL à la base PostgreSQL homonyme, la dernière déclarée (R1-58).
 	var dumps []dump
-	for _, entry := range manifest.Entries {
-		if entry.Kind != "dump" {
-			continue
-		}
-		name := strings.TrimSuffix(filepath.Base(entry.Name), ".sql")
-		var decl *model.Database
-		for i := range p.Spec.Databases {
-			if p.Spec.Databases[i].Name == name && entry.Name == "dumps/"+name+".sql" {
-				decl = &p.Spec.Databases[i]
+	bound := map[string]bool{}
+	ambiguous := map[string]bool{}
+	for i := range p.Spec.Databases {
+		decl := &p.Spec.Databases[i]
+		entry, err := archivedDump(manifest, p, *decl)
+		var amb *ambiguousDumpError
+		switch {
+		case errors.As(err, &amb):
+			if !ambiguous[decl.Name] {
+				ambiguous[decl.Name] = true
+				a.warnf("⚠ %v\n", err)
+				missing = append(missing, restoreGap{
+					fmt.Sprintf("sauvegarde %q non rechargée : %v", legacyDumpEntry(decl.Name), err),
+					amb.remedy(p.ID())})
 			}
-		}
-		if decl == nil {
-			a.warnf("⚠ aucune base déclarée pour la sauvegarde %q : ignorée\n", entry.Name)
-			missing = append(missing, restoreGap{
-				fmt.Sprintf("sauvegarde %q ignorée : la déclaration ne nomme pas cette base", entry.Name),
-				"la déclarer, puis : " + exec.ShellLine("ogs", "db", "restore", p.ID(), name, "--from-archive", path)})
+			continue
+		case err != nil || bound[entry]:
 			continue
 		}
-		dumps = append(dumps, dump{entry.Name, decl})
+		bound[entry] = true
+		if state != nil && state.dumped(entry) {
+			continue
+		}
+		dumps = append(dumps, dump{entry, decl})
+	}
+	for _, entry := range manifest.Entries {
+		if entry.Kind != "dump" || bound[entry.Name] {
+			continue
+		}
+		// Le nom vient du manifeste, que rien n'a validé : il n'entre dans le
+		// remède que cité pour le shell.
+		arg := strings.TrimSuffix(strings.TrimPrefix(entry.Name, "dumps/"), ".sql")
+		if engine, name, ok := strings.Cut(arg, "/"); ok {
+			arg = engine + ":" + name
+		}
+		if ambiguous[arg] {
+			continue
+		}
+		a.warnf("⚠ aucune base déclarée pour la sauvegarde %q : ignorée\n", entry.Name)
+		missing = append(missing, restoreGap{
+			fmt.Sprintf("sauvegarde %q ignorée : la déclaration ne nomme pas cette base", entry.Name),
+			"la déclarer, puis : " + exec.ShellLine("ogs", "db", "restore", p.ID(), arg, "--from-archive", path)})
 	}
 	manque := func(d dump, motif string) {
-		missing = append(missing, restoreGap{fmt.Sprintf("base %s non rechargée (%s)", d.decl.Name, motif),
-			"la recharger depuis l'archive : " + exec.ShellLine("ogs", "db", "restore", p.ID(), d.decl.Name,
+		missing = append(missing, restoreGap{fmt.Sprintf("base %s non rechargée (%s)", dbLabel(*d.decl), motif),
+			"la recharger depuis l'archive : " + exec.ShellLine("ogs", "db", "restore", p.ID(), dbArg(p, *d.decl),
 				"--from-archive", path)})
 	}
 	if len(dumps) == 0 {
@@ -2310,17 +2518,57 @@ func (a *App) restoreDumps(cmd *cobra.Command, path string, p *model.Project, ma
 		return tous(err.Error()), nil
 	}
 	defer os.RemoveAll(dir)
+	done := func(d dump) error {
+		if state == nil {
+			return nil
+		}
+		state.Loading = ""
+		state.Dumps = append(state.Dumps, d.entry)
+		return save()
+	}
 	for _, d := range dumps {
-		name := d.decl.Name
+		name := dbLabel(*d.decl)
+		// Interrompue avant ce rechargement, elle ne le commence pas : la base
+		// n'est pas notée comme entamée.
+		if err := cmd.Context().Err(); err != nil {
+			return missing, exitf(CodeCancelled, "restauration interrompue à la demande avant la base %s : %v",
+				name, err)
+		}
+		if state != nil && state.Loading == d.entry && d.decl.Engine == "postgres" {
+			a.warnf("⚠ %s : rechargement interrompu lors de la restauration précédente — base laissée telle quelle\n",
+				name)
+			missing = append(missing, restoreGap{
+				fmt.Sprintf("base %s peut-être chargée à moitié (rechargement interrompu)", name),
+				"la supprimer — DROP DATABASE, sous le rôle d'administration du cluster : vider un schéma ne " +
+					"retire ni les autres schémas ni les extensions —, la faire recréer vide par « " +
+					exec.ShellLine("ogs", "apply", p.ID()) + " », puis la recharger : " +
+					exec.ShellLine("ogs", "db", "restore", p.ID(), dbArg(p, *d.decl), "--from-archive", path)})
+			if err := done(d); err != nil {
+				return missing, err
+			}
+			continue
+		}
 		// En flux, sans passer en entier par la mémoire : une sauvegarde pèse ce
 		// que pèse la base.
-		tmp := filepath.Join(dir, name+".sql")
+		tmp := filepath.Join(dir, d.decl.Engine+"-"+d.decl.Name+".sql")
 		if err := copyEntryTo(tmp, func(w io.Writer) (int64, error) {
 			return archive.CopyFile(path, d.entry, w)
 		}); err != nil {
 			a.warnf("⚠ %s : %v\n", d.entry, err)
 			manque(d, err.Error())
+			if err := done(d); err != nil {
+				return missing, err
+			}
 			continue
+		}
+		// Le rechargement commence : noté seulement maintenant, une copie
+		// interrompue laisse la base intacte, et la reprise la recharge.
+		if state != nil {
+			state.Loading = d.entry
+			if err := save(); err != nil {
+				_ = os.Remove(tmp)
+				return missing, err
+			}
 		}
 		if err := provs.DB.Restore(cmd.Context(), p, *d.decl, tmp); errors.Is(err, context.Canceled) ||
 			errors.Is(err, context.DeadlineExceeded) {
@@ -2334,6 +2582,9 @@ func (a *App) restoreDumps(cmd *cobra.Command, path string, p *model.Project, ma
 			a.printf("✓ base %s restaurée\n", name)
 		}
 		_ = os.Remove(tmp)
+		if err := done(d); err != nil {
+			return missing, err
+		}
 	}
 	return missing, nil
 }

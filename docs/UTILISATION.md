@@ -600,6 +600,19 @@ Un fichier d'environnement que la restauration n'a pas pu écrire reste scellé 
 `sudo sh -c 'umask 077 && ogs secrets show shopfr app/envfile > /etc/ogs/env/shopfr.env'` le rend tel quel,
 en 0600.
 
+Les services du projet, son attente de disponibilité et ses tâches planifiées ne démarrent qu'une fois le
+home et les bases rendus. Une restauration **interrompue** — un apply en échec, un Ctrl+C — laisse le projet
+déclaré et le dit ; une fois la cause levée, elle se reprend là où elle s'est arrêtée, sur la même archive et
+la déclaration intacte, ou s'abandonne par `ogs project delete` :
+
+```sh
+sudo ogs project restore --resume /var/lib/ogs/archives/shopfr-20260823-143000.tar.zst
+```
+
+Les sauvegardes de bases sont rangées sous leur moteur dans l'archive. Quand deux bases d'un projet portent
+le même nom — une base MySQL et une base PostgreSQL au nom du projet —, une commande les désigne par
+`<moteur>:<base>` : `sudo ogs db restore shopfr postgres:shopfr --from-archive …`.
+
 **Avant la confirmation**, la suppression énumère ensemble tout ce qui la refuse, chaque refus avec ce qui le
 lève ; le code est celui du premier :
 

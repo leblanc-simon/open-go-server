@@ -792,8 +792,20 @@ func (a *App) applyProjects(cmd *cobra.Command, projects []*model.Project) error
 		a.printf(" (audit %s)\n", a.Audit.RunID())
 	}
 
+	// Sous holdServices, le projet n'a pas encore son contenu : « postCreate »
+	// attend l'apply qui le suit (D113).
 	for _, p := range projects {
-		if warned, _ := a.runHook(cmd.Context(), provs.Hooks, p, hook.PostCreate, hook.Context{}); warned {
+		if a.holdServices {
+			break
+		}
+		if a.postCreateRan != nil && a.postCreateRan(p.ID()) {
+			continue
+		}
+		warned, _ := a.runHook(cmd.Context(), provs.Hooks, p, hook.PostCreate, hook.Context{})
+		if a.onPostCreate != nil {
+			a.onPostCreate(p.ID())
+		}
+		if warned {
 			warnings++
 		}
 	}
@@ -881,9 +893,17 @@ func newStatusCommand(app *App) *cobra.Command {
 
 			var rows []statusRow
 			problems := 0
+			restores := app.unfinishedRestores()
 			for _, p := range projects {
 				row := statusRow{Project: p.ID(), Env: p.Metadata.Env, Host: p.Spec.Domains[0].Name,
 					Health: "sain"}
+				// Une restauration inachevée (D113) : le projet est déclaré, son
+				// contenu peut-être pas rendu.
+				if s, ok := restores[p.ID()]; ok {
+					row.Health = "restauration inachevée"
+					row.Problems = append(row.Problems, "restauration inachevée : "+app.restoreRemedy(s))
+					problems++
+				}
 				if len(p.Spec.PHP.Pools) > 0 {
 					row.PHP = p.Spec.PHP.Pools[0].Version
 				}

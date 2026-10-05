@@ -617,7 +617,7 @@ func TestSuppressionAbandonneSurUnDumpEnEchec(t *testing.T) {
 	// L'outil présent, la sauvegarde entre dans l'archive, et la base part.
 	déposer(t, h.path("usr", "bin", "mysqldump"), "#!/bin/sh\n")
 	out = h.mustRunPartial("project", "delete", "shopfr", "--yes")
-	if !strings.Contains(out, "sauvegarde de shopfr incluse") || !moteur.reçu("DROP DATABASE IF EXISTS `shopfr`") {
+	if !strings.Contains(out, "sauvegarde de mysql shopfr incluse") || !moteur.reçu("DROP DATABASE IF EXISTS `shopfr`") {
 		t.Errorf("une base sauvegardée doit être supprimée :\n%s\nrequêtes : %q", out, moteur.requêtes())
 	}
 }

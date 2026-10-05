@@ -305,6 +305,9 @@ func (a *App) buildPlan(ctx context.Context, provs *providers, p *model.Project)
 	if logsFinish != nil {
 		plan.Add(logsFinish)
 	}
+	if a.holdServices {
+		plan.Steps = heldBack(p, plan.Steps)
+	}
 	return plan, nil
 }
 
@@ -864,6 +867,7 @@ func newApplyCommand(app *App) *cobra.Command {
 			if err := app.checkFleetUniqueness(projects...); err != nil {
 				return err
 			}
+			app.warnUnfinishedRestores(projects)
 
 			// Verrou global : deux applications simultanées ne doivent jamais se
 			// croiser sur la configuration du système.

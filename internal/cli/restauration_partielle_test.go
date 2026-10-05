@@ -47,7 +47,7 @@ func TestUneRestaurationSansSaBaseEstUnSuccesPartielNomme(t *testing.T) {
 		t.Fatalf("code %d, %d attendu :\n%s", code, CodePartial, out)
 	}
 	sortie, motif, _ := strings.Cut(out, "\nogs : ")
-	if !strings.Contains(motif, "base shopfr non rechargée") {
+	if !strings.Contains(motif, "base mysql shopfr non rechargée") {
 		t.Errorf("DÉFAUT : le motif du code 6 doit nommer la base : %q", motif)
 	}
 	// Le remède : la sauvegarde reste dans l'archive, et ogs la recharge
@@ -65,7 +65,7 @@ func TestUneRestaurationSansSaBaseEstUnSuccesPartielNomme(t *testing.T) {
 	// Le remède fonctionne, une fois le client installé.
 	déposer(t, h.path("usr", "bin", "mysql"), "#!/bin/sh\n")
 	out = h.mustRun("db", "restore", "shopfr", "shopfr", "--from-archive", archive, "--yes")
-	if !strings.Contains(out, "✓ base shopfr restaurée") {
+	if !strings.Contains(out, "✓ base mysql shopfr restaurée") {
 		t.Errorf("la base doit être rechargée depuis l'archive :\n%s", out)
 	}
 	// Une archive d'un autre projet, ou sans sauvegarde de la base, est refusée.
@@ -87,10 +87,10 @@ func TestUneRestaurationAvecSaBaseLaRecharge(t *testing.T) {
 	h.mustRunPartial("project", "delete", "shopfr", "--yes")
 	déposer(t, h.path("usr", "bin", "mysql"), "#!/bin/sh\n")
 	out := h.mustRunPartial("project", "restore", h.derniereArchive(t), "--yes")
-	if !strings.Contains(out, "✓ base shopfr restaurée") {
+	if !strings.Contains(out, "✓ base mysql shopfr restaurée") {
 		t.Errorf("la base doit être rechargée :\n%s", out)
 	}
-	if strings.Contains(out, "base shopfr non rechargée") {
+	if strings.Contains(out, "base mysql shopfr non rechargée") {
 		t.Errorf("rien ne manque à la base :\n%s", out)
 	}
 }
@@ -275,7 +275,7 @@ func archiveFabriquée(t *testing.T, typ byte) string {
 
 // Une entrée de sauvegarde qui n'est pas un fichier ordinaire — un lien, un
 // répertoire, dans une archive fabriquée — rendait un contenu vide, chargé en
-// annonçant « ✓ base shopfr restaurée », code 0.
+// annonçant « ✓ base mysql shopfr restaurée », code 0.
 func TestUneSauvegardeQuiNEstPasUnFichierEstRefusee(t *testing.T) {
 	h := newHarness(t)
 	h.mustRun("init")
@@ -285,7 +285,7 @@ func TestUneSauvegardeQuiNEstPasUnFichierEstRefusee(t *testing.T) {
 	déposer(t, h.path("usr", "bin", "mysql"), "#!/bin/sh\n")
 	for _, typ := range []byte{tar.TypeSymlink, tar.TypeDir} {
 		out, code := h.run("db", "restore", "shopfr", "shopfr", "--from-archive", archiveFabriquée(t, typ), "--yes")
-		if code != CodeUsage || strings.Contains(out, "✓ base shopfr restaurée") {
+		if code != CodeUsage || strings.Contains(out, "✓ base mysql shopfr restaurée") {
 			t.Errorf("DÉFAUT : type %q : code %d, %d attendu :\n%s", typ, code, CodeUsage, out)
 		}
 	}

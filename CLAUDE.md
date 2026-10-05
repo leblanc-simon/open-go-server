@@ -12,8 +12,8 @@ Les commits ne mentionnent jamais l'assistance d'un outil d'IA.
 
 ## La référence
 
-[`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md) fait autorité : 111 décisions d'architecture
-arbitrées (D1–D111, tableau §2), spécification par module, plan de tests, découpage en lots. **Consulter le
+[`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md) fait autorité : 112 décisions d'architecture
+arbitrées (D1–D111 et D113, D112 réservée ; tableau §2), spécification par module, plan de tests, découpage en lots. **Consulter le
 tableau des décisions avant de proposer une architecture** — la plupart des questions « pourquoi pas
 plutôt… ? » y sont déjà tranchées, avec leur raison. Toute décision nouvelle s'y ajoute.
 
@@ -385,6 +385,14 @@ Ils ont tous coûté un défaut réel ; les tests unitaires ne les voyaient pas.
   retire l'entrée `logs` root, l'ancien `~/logs` revenait à l'utilisateur, et la migration de D71 le
   refusait à chaque apply. Le même parcours par descripteurs vaut pour l'archivage : `filepath.Walk` et
   `os.Open` laissaient l'utilisateur y faire entrer `/etc/ogs/master.key` en substituant un ancêtre.
+- **Une restauration ne lance le code du projet qu'après son contenu, et se reprend** (D113). Son premier
+  apply passe sous `App.holdServices` : `heldBack` retire du plan l'activation des instances, l'attente de
+  disponibilité et le fichier de tâches planifiées, et `postCreate` attend ; un second apply les pose une fois
+  l'arborescence et les bases rendues — l'application démarrait sur un home vide, épuisait `StartLimitBurst`,
+  et rien ne la relançait. Un témoin (`/var/lib/ogs/restores/<id>.json`) court de la déclaration au dernier
+  apply : une erreur entre les deux nomme `--resume` et `project delete`, jamais un retrait sans
+  compensation. Les sauvegardes sont rangées `dumps/<moteur>/<base>.sql` : deux bases homonymes sur deux
+  moteurs partageaient `dumps/<base>.sql`, et la sauvegarde MySQL était rechargée dans PostgreSQL.
 - **Un chemin désigné par l'exploitant** (`db dump -O`, `db restore -i`) est parcouru par
   `fs.OpenParentDir` : un lien n'y est suivi que si seul root a pu le poser — dans un répertoire à root, non
   inscriptible par le groupe ni par les autres, atteint par une chaîne entièrement de ce type —, et seul un

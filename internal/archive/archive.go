@@ -37,8 +37,12 @@ const ManifestName = "manifest.json"
 // secret dans sa charge, le chemin ne suffisant pas à le restituer. Une archive
 // de version supérieure est refusée plutôt que relue de travers : un secret
 // réinjecté sous un nom faux ne se rouvre plus jamais, sa donnée associée le
-// liant à son nom (secret.aad).
-const Version = 2
+// liant à son nom (secret.aad). La 3 range chaque sauvegarde de base sous son
+// moteur, « dumps/<moteur>/<base>.sql » (D113) : un ogs qui ne relit que la 2
+// la cherchait sous « dumps/<base>.sql », n'y trouvait rien, et rendait une
+// restauration sans données en annonçant que la déclaration ne nommait pas la
+// base — il doit refuser l'archive, en demandant sa mise à jour.
+const Version = 3
 
 // checkVersion refuse une archive écrite par un ogs plus récent. Le manifeste est
 // le seul endroit qui dise le format ; une version absente est celle des archives

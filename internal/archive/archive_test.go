@@ -1050,3 +1050,36 @@ func TestReadEntryBorneEtCopyEntryRecopieEnFlux(t *testing.T) {
 		t.Error("DÉFAUT : un lien symbolique n'est pas une entrée")
 	}
 }
+
+// D113 : les sauvegardes passent sous « dumps/<moteur>/<base>.sql ». Un ogs qui
+// ne relit que le format 2 les cherchait sous l'ancien nom et rendait une
+// restauration sans données : le format monte à 3, qu'il refuse en demandant sa
+// mise à jour. Les formats 1 et 2 restent relus.
+func TestLesSauvegardesParMoteurPortentLeFormat3EtLesAnciensRestentRelus(t *testing.T) {
+	if Version < 3 {
+		t.Fatalf("DÉFAUT : une archive aux sauvegardes rangées par moteur doit porter le format 3, porte %d", Version)
+	}
+	for _, v := range []int{0, 1, 2, Version} {
+		path := filepath.Join(t.TempDir(), "ancienne.tar.zst")
+		w, err := Create(path, Manifest{Project: "shopfr", OGSVersion: "test"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := w.AddSecret("mysql/shopfr", []byte("nonce"), []byte("chiffré")); err != nil {
+			t.Fatal(err)
+		}
+		w.manifest.Version = v
+		if _, err := w.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := ReadManifest(path); err != nil {
+			t.Errorf("format %d : %v", v, err)
+		}
+		if s, err := Secrets(path); err != nil || len(s) != 1 {
+			t.Errorf("format %d : secrets %v %v", v, s, err)
+		}
+	}
+	if err := checkVersion("x", 3); err != nil {
+		t.Errorf("le format 3 doit être relu : %v", err)
+	}
+}
