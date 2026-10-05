@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -593,6 +594,14 @@ func (a *App) reloadFunc(provs *providers) func(context.Context, string) error {
 			return a.systemctlBin(ctx, "systemd-tmpfiles", "--create", a.Paths.TmpfilesFile())
 		case strings.HasPrefix(target, "systemd:restart-target:"):
 			id := strings.TrimPrefix(target, "systemd:restart-target:")
+			// Une cible dont l'unité n'existe plus n'a rien à redémarrer : c'est ce
+			// que rencontre l'intention rejouée par le déroulage d'une création
+			// (D105), dont la compensation vient de retirer la cible.
+			if !a.Exec.Simulated() {
+				if _, err := os.Lstat(filepath.Join(a.Paths.SystemdDir(), unit.TargetName(id))); os.IsNotExist(err) {
+					return nil
+				}
+			}
 			a.printf("  ↻ redémarrage des services de %s\n", id)
 			return a.systemctl(ctx, "restart", unit.TargetName(id))
 		case target == "monitoring:telegraf":
@@ -1096,6 +1105,10 @@ func (a *App) reportRollback(report *engine.Report) {
 			"erreur ci-dessus.\n", residue.Step.Summary)
 	case report.RolledBack:
 		a.warnf("↶ rollback effectué : le système est revenu à son état initial.\n")
+	}
+	// Les démons avaient chargé ce que le déroulage a défait (D105).
+	if len(report.Replayed) > 0 {
+		a.warnf("  rechargements rejoués : %s\n", strings.Join(report.Replayed, ", "))
 	}
 	if report.RollbackErr != nil {
 		a.warnf("✗ le rollback a échoué : %v\n", report.RollbackErr)

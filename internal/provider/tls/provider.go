@@ -13,6 +13,7 @@ import (
 
 	"leblanc.io/open-go-server/internal/config"
 	"leblanc.io/open-go-server/internal/engine"
+	"leblanc.io/open-go-server/internal/exec"
 	"leblanc.io/open-go-server/internal/fs"
 	"leblanc.io/open-go-server/internal/model"
 	"leblanc.io/open-go-server/internal/store"
@@ -44,6 +45,9 @@ type Provider struct {
 	// DNSSets fournit les jeux d'identifiants DNS dont les zones font passer une
 	// demande au challenge DNS-01 d'elle-même (D97) ; à défaut, ceux de
 	// /etc/ogs/credentials/dns, lus une fois.
+	// Exec observe l'activation du timer de renouvellement (D105). Nil, rien
+	// n'est observé.
+	Exec      exec.Executor
 	DNSSets   func() []DNSCredentials
 	dnsSets   []DNSCredentials
 	dnsLoaded bool
@@ -1165,5 +1169,77 @@ func (p *Provider) RenewUnitPlan(templates *template.Set, binary, onCalendar str
 		s.Reload = []string{"systemd:daemon-reload", "systemd:enable:ogs-renew.timer"}
 		steps = append(steps, s)
 	}
+	if s := p.renewTimerStep(steps); s != nil {
+		steps = append(steps, s)
+	}
 	return steps, nil
+}
+
+// RenewTimerProblem rend l'état d'un timer de renouvellement installé qui ne
+// tourne pas — « désactivé » ou « arrêté » —, vide s'il tourne, s'il est absent
+// ou si rien n'est observable (exécuteur simulé ou nul). doctor le porte aussi.
+func (p *Provider) RenewTimerProblem(ctx context.Context) string {
+	const timer = "ogs-renew.timer"
+	if p.Exec == nil || p.Exec.Simulated() {
+		return ""
+	}
+	if _, err := os.Stat(filepath.Join(p.Paths.SystemdDir(), timer)); err != nil {
+		return ""
+	}
+	quiet := func(verb string) bool {
+		_, err := p.Exec.Run(ctx, exec.Command{Name: "systemctl", Args: []string{verb, "--quiet", timer}})
+		return err == nil
+	}
+	switch {
+	case !quiet("is-enabled"):
+		return "désactivé"
+	case systemdBooted() && !quiet("is-active"):
+		return "arrêté"
+	}
+	return ""
+}
+
+// systemdBooted dit si systemd est le gestionnaire du système (sd_booted) :
+// sans lui, aucun timer ne tourne, et l'état « actif » n'a pas de sens — c'est
+// le cas des conteneurs d'essai, où un substitut tient lieu de systemctl.
+var systemdBooted = func() bool {
+	info, err := os.Stat("/run/systemd/system")
+	return err == nil && info.IsDir()
+}
+
+// renewTimerStep observe un timer de renouvellement présent mais qui ne tourne
+// pas (R1-49, D105). Son activation n'était tentée qu'à l'écriture de l'unité, et
+// rien ne disait qu'il ne tournait plus : plus aucun certificat ne se
+// renouvelait, sans un mot. Rien n'est observé quand une écriture porte déjà
+// l'activation, ni sur un exécuteur simulé.
+//
+// Désactivé, il n'est pas réactivé : c'est un choix que D89 respecte jusqu'à la
+// réinstallation du paquet, et apply ne passe pas outre. L'étape non bloquante
+// le dit à chaque apply (code 6), avec la commande qui le lève. Activé mais
+// arrêté — un « systemctl stop », qui ne survit pas au redémarrage —, il est
+// démarré : l'activation dit ce que l'administrateur veut.
+func (p *Provider) renewTimerStep(steps []*engine.Step) *engine.Step {
+	const timer = "ogs-renew.timer"
+	for _, s := range steps {
+		if s.Mutates() && slices.Contains(s.Reload, "systemd:enable:"+timer) {
+			return nil
+		}
+	}
+	switch p.RenewTimerProblem(context.Background()) {
+	case "":
+		return nil
+	case "désactivé":
+		s := engine.NewStep("tls/renew/activation", engine.Update,
+			"timer de renouvellement désactivé — aucun certificat ne se renouvelle")
+		s.Critical = false
+		s.Apply = func(context.Context) error {
+			return fmt.Errorf("%s est désactivé et ogs ne le réactive pas : « systemctl enable --now %s » "+
+				"s'il ne l'a pas été volontairement", timer, timer)
+		}
+		return s
+	}
+	s := engine.NewStep("tls/renew/activation", engine.Update,
+		"timer de renouvellement arrêté — démarrage")
+	s.Reload = []string{"systemd:enable:" + timer}
+	return s
 }

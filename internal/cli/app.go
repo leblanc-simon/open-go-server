@@ -395,7 +395,7 @@ func (a *App) buildProviders() (*providers, error) {
 	certStore := tlsprov.Store{Paths: a.Paths}
 	certs := &tlsprov.Provider{
 		Paths: a.Paths, Cfg: a.Cfg, Store: certStore, DB: a.Store,
-		Force: a.Force,
+		Force: a.Force, Exec: a.Exec,
 		Issuer: &tlsprov.ACME{
 			Paths: a.Paths, Store: certStore, Email: a.Cfg.ACME.Email,
 			Directory: a.Cfg.ACME.Directory,

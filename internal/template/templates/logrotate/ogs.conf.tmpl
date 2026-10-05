@@ -1,7 +1,12 @@
 {{- /* Fichier unique pour tout le parc : « create » sans propriétaire reprend
 celui du fichier d'origine, ce qui permet à un seul bloc de couvrir des projets
 appartenant à des utilisateurs différents. « sharedscripts » garantit un seul
-rechargement par rotation, quel que soit le nombre de projets. */ -}}
+rechargement par rotation, quel que soit le nombre de projets. Seul le serveur
+web en reçoit un (D105) : un échec n'arrête pas logrotate, mais il est consigné
+dans le journal du système au lieu d'être jeté. Les journaux des tâches sont
+bornés par la même taille que ceux des serveurs (logs.maxSize, D71) : logrotate
+tourne chaque jour, et maxsize avance la rotation hebdomadaire d'un fichier qui
+la dépasse. */ -}}
 {{- if .ServerLogs }}
 {{ range .ServerLogs }}{{ . }}
 {{ end }}{
@@ -17,8 +22,8 @@ rechargement par rotation, quel que soit le nombre de projets. */ -}}
     create
     sharedscripts
     postrotate
-{{- if .ReloadUnits }}
-        systemctl reload {{ join " " .ReloadUnits }} > /dev/null 2>&1 || true
+{{- range .ReloadUnits }}
+        systemctl reload {{ . }} > /dev/null 2>&1 || logger -t {{ $.Tag }} -p daemon.err "rechargement de {{ . }} en échec après la rotation : voir journalctl -u {{ . }}" || true
 {{- else }}
         true
 {{- end }}
@@ -31,6 +36,7 @@ rechargement par rotation, quel que soit le nombre de projets. */ -}}
 {{ end }}{
     weekly
     rotate 8
+    maxsize {{ .MaxSize }}
     missingok
     notifempty
 {{- if .Compress }}

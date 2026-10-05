@@ -98,11 +98,14 @@ type StepOutcome struct {
 
 // Report est le compte rendu d'une application.
 type Report struct {
-	Project     string
-	Outcomes    []StepOutcome
-	Warnings    []string
-	RolledBack  bool
-	Reloaded    []string
+	Project    string
+	Outcomes   []StepOutcome
+	Warnings   []string
+	RolledBack bool
+	Reloaded   []string
+	// Replayed énumère les intentions rejouées par le déroulage : celles déjà
+	// exécutées pour une étape ensuite compensée.
+	Replayed    []string
 	RollbackErr error
 }
 
@@ -224,44 +227,45 @@ func Execute(ctx context.Context, plan *Plan, opts Options) (*Report, error) {
 	var pending []string
 	attendre := func(intents []string) {
 		for _, r := range intents {
-			deja := false
-			for _, p := range pending {
-				if p == r {
-					deja = true
-					break
-				}
-			}
-			if !deja {
+			if !contient(pending, r) {
 				pending = append(pending, r)
 			}
 		}
 	}
+	// vus retient, pour chaque étape appliquée, les intentions déjà exécutées
+	// pour elle : les démons ont chargé ce qu'elle a écrit. Si elle est
+	// compensée, ils doivent recharger encore, sans quoi ils servent une
+	// configuration que plus aucun fichier ne porte (R1-37, D105).
+	vus := map[*Step]map[string]bool{}
+	var applied []*Step
 	flush := func(ctx context.Context) {
 		if opts.Reload == nil || len(pending) == 0 {
 			return
 		}
 		aFaire := pending
 		pending = nil
-		for _, r := range aFaire {
-			if err := opts.Reload(ctx, r); err != nil {
-				report.Warnings = append(report.Warnings, fmt.Sprintf("rechargement %s : %v", r, err))
-				if opts.OnReloadWarning != nil {
-					opts.OnReloadWarning(r, err)
+		for _, s := range applied {
+			for _, r := range s.Reload {
+				if contient(aFaire, r) {
+					if vus[s] == nil {
+						vus[s] = map[string]bool{}
+					}
+					vus[s][r] = true
 				}
-				continue
 			}
-			report.Reloaded = append(report.Reloaded, r)
+		}
+		for _, r := range aFaire {
+			reload(ctx, r, report, opts)
 		}
 	}
 
-	var applied []*Step
 	for _, s := range plan.Mutating() {
 		if s.FlushReloads {
 			flush(ctx)
 		}
 		if err := ctx.Err(); err != nil {
 			report.Warnings = append(report.Warnings, "exécution interrompue : "+err.Error())
-			compenser(ctx, applied, report, opts)
+			compenser(ctx, applied, vus, report, opts)
 			return report, err
 		}
 		var err error
@@ -295,7 +299,7 @@ func Execute(ctx context.Context, plan *Plan, opts Options) (*Report, error) {
 				opts.Audit(s, "échec", err.Error())
 			}
 			report.Outcomes = append(report.Outcomes, outcome)
-			compenser(ctx, applied, report, opts)
+			compenser(ctx, applied, vus, report, opts)
 			return report, fmt.Errorf("étape %s : %w", s.Resource, err)
 		}
 		report.Outcomes = append(report.Outcomes, outcome)
@@ -332,21 +336,75 @@ const délaiDéroulage = 15 * time.Minute
 // annonce un déroulage. Détacher inconditionnellement est le seul remède fiable :
 // toutes les erreurs d'annulation ne remontent pas telles quelles, une commande
 // tuée en SIGKILL rendant un *ExitError sans trace du contexte.
-func compenser(ctx context.Context, applied []*Step, report *Report, opts Options) {
+func compenser(ctx context.Context, applied []*Step, vus map[*Step]map[string]bool, report *Report, opts Options) {
 	ctx, annuler := context.WithTimeout(context.WithoutCancel(ctx), délaiDéroulage)
 	defer annuler()
-	rollback(ctx, applied, report, opts)
+	rollback(ctx, applied, vus, report, opts)
+}
+
+// reload exécute une intention et en consigne l'issue.
+func reload(ctx context.Context, r string, report *Report, opts Options) {
+	if err := opts.Reload(ctx, r); err != nil {
+		report.Warnings = append(report.Warnings, fmt.Sprintf("rechargement %s : %v", r, err))
+		if opts.OnReloadWarning != nil {
+			opts.OnReloadWarning(r, err)
+		}
+		return
+	}
+	report.Reloaded = append(report.Reloaded, r)
+}
+
+func contient(list []string, v string) bool {
+	for _, x := range list {
+		if x == v {
+			return true
+		}
+	}
+	return false
 }
 
 // rollback compense les étapes appliquées, en ordre inverse. Chacune reçoit son
 // propre délai, pris sur celui du déroulage. Si une compensation échoue, le
 // déroulage s'arrête : l'état exact atteint est remonté plutôt que masqué par des
 // tentatives supplémentaires.
-func rollback(ctx context.Context, applied []*Step, report *Report, opts Options) {
+//
+// Une intention déjà exécutée pour une étape compensée est rejouée (R1-37,
+// D105) : sans quoi FPM gardait le pool défait — ses workers tournant sous le
+// compte que la compensation suivante supprime, userdel échouait — et le serveur
+// web le vhost retiré. Elle l'est dès que la dernière étape compensable qui la
+// porte a été défaite, et non en fin de déroulage : la compensation du compte
+// vient après celle du pool, et les workers doivent être partis avant elle. Une
+// intention restée en attente n'est pas rejouée — les démons n'ont jamais vu ce
+// que l'étape avait écrit.
+func rollback(ctx context.Context, applied []*Step, vus map[*Step]map[string]bool, report *Report, opts Options) {
 	if len(applied) == 0 {
 		return
 	}
 	report.RolledBack = true
+	restantes := map[string]int{}
+	for _, s := range applied {
+		if s.Compensate == nil {
+			continue
+		}
+		for r := range vus[s] {
+			restantes[r]++
+		}
+	}
+	var dues []string
+	rejouer := func(r string) {
+		if opts.Reload == nil {
+			return
+		}
+		report.Replayed = append(report.Replayed, r)
+		reload(ctx, r, report, opts)
+	}
+	// Un déroulage arrêté en route rejoue malgré tout ce que les compensations
+	// abouties ont défait.
+	defer func() {
+		for _, r := range dues {
+			rejouer(r)
+		}
+	}()
 	for i := len(applied) - 1; i >= 0; i-- {
 		s := applied[i]
 		if s.Compensate == nil {
@@ -370,5 +428,30 @@ func rollback(ctx context.Context, applied []*Step, report *Report, opts Options
 		if opts.Audit != nil {
 			opts.Audit(s, "compensé", "")
 		}
+		// Ordre stable : celui des intentions de l'étape.
+		var faites []string
+		for _, r := range s.Reload {
+			if !vus[s][r] || contient(faites, r) {
+				continue
+			}
+			faites = append(faites, r)
+			if !contient(dues, r) {
+				dues = append(dues, r)
+			}
+			if restantes[r]--; restantes[r] == 0 {
+				rejouer(r)
+				dues = retirer(dues, r)
+			}
+		}
 	}
+}
+
+func retirer(list []string, v string) []string {
+	out := list[:0]
+	for _, x := range list {
+		if x != v {
+			out = append(out, x)
+		}
+	}
+	return out
 }

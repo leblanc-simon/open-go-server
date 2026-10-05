@@ -794,6 +794,7 @@ func systemctlAppelés(rec *exec.Recorder) []string {
 // rend les appels à systemctl que produit son rechargement.
 func reloadFPM(t *testing.T, active, pool bool) ([]string, error) {
 	t.Helper()
+	fenêtreCourte(t)
 	prov, paths, _ := fixture(t, "8.5")
 	rec := exec.NewRecorder()
 	if !active {
@@ -818,7 +819,7 @@ func TestReloadRechargeUnFPMActif(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if calls[len(calls)-1] != "reload php8.5-fpm" {
+	if !strings.Contains(strings.Join(calls, " | "), "reload php8.5-fpm") {
 		t.Errorf("un FPM actif se recharge : %v", calls)
 	}
 }

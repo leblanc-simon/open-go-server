@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -121,6 +122,10 @@ type Observed struct {
 	// repris, resté dans l'ancienne version après un « php switch ». Ils ne
 	// sont pas au projet, donc jamais retirés ; ils sont signalés.
 	Leftovers []string
+	// Units porte l'état de l'unité FPM de chaque version qu'emploie le projet
+	// (D105) : un maître mort ou désactivé n'était relevé qu'à l'écriture d'un
+	// pool, donc jamais tant que la déclaration ne changeait pas.
+	Units map[string]UnitState
 }
 
 // Observe inspecte les pools existants du projet, toutes versions confondues.
@@ -131,11 +136,14 @@ type Observed struct {
 // principal du projet shop_api. L'attribution par préfixe faisait retirer au
 // premier apply de shop le pool de son voisin, et tout pool posé à la main
 // selon la convention.
-func (p *Provider) Observe(_ context.Context, proj *model.Project) (Observed, error) {
-	obs := Observed{Files: map[string]fs.State{}}
+func (p *Provider) Observe(ctx context.Context, proj *model.Project) (Observed, error) {
+	obs := Observed{Files: map[string]fs.State{}, Units: map[string]UnitState{}}
 	wanted := map[string]bool{}
 	names := map[string]bool{}
 	for _, pool := range proj.Spec.PHP.Pools {
+		if _, seen := obs.Units[pool.Version]; !seen {
+			obs.Units[pool.Version] = p.Unit(ctx, pool.Version)
+		}
 		name, err := p.poolName(proj, pool)
 		if err != nil {
 			return obs, err
@@ -416,7 +424,43 @@ func (p *Provider) Plan(_ context.Context, proj *model.Project, obs Observed) ([
 			steps = append(steps, discardedStep(bp, warnings))
 		}
 	}
-	return steps, nil
+	return append(steps, unitSteps(obs)...), nil
+}
+
+// unitSteps relève l'unité FPM d'une version employée par le projet quand elle
+// est arrêtée ou désactivée (D105). L'étape n'écrit rien : elle porte
+// l'intention « php:<v> », que Reload traduit en démarrage et activation — le
+// même chemin que celui du premier pool, contrôles compris. Elle n'est pas
+// bloquante : un FPM qui refuse de démarrer est un avertissement du
+// rechargement, comme ailleurs.
+func unitSteps(obs Observed) []*engine.Step {
+	versions := make([]string, 0, len(obs.Units))
+	for v := range obs.Units {
+		versions = append(versions, v)
+	}
+	sort.Strings(versions)
+	var steps []*engine.Step
+	for _, v := range versions {
+		st := obs.Units[v]
+		if st.Healthy() {
+			continue
+		}
+		var etat string
+		switch {
+		case !st.Active && !st.Enabled:
+			etat = "arrêtée et désactivée"
+		case !st.Active:
+			etat = "arrêtée"
+		default:
+			etat = "désactivée : elle ne repartirait pas au démarrage de la machine"
+		}
+		s := engine.NewStep("php/unit/"+v, engine.Update,
+			fmt.Sprintf("unité %s %s — démarrage et activation", config.PHPUnit(v), etat))
+		s.Critical = false
+		s.Reload = []string{"php:" + v}
+		steps = append(steps, s)
+	}
+	return steps
 }
 
 // DeclarationError est le refus d'une déclaration de pool que le plan ne peut
@@ -669,11 +713,18 @@ func (p *Provider) writePool(ctx context.Context, bp *PoolPlan) error {
 	}
 	if err := p.validate(ctx, bp.Version); err != nil {
 		// Restauration immédiate : la configuration ne doit jamais rester dans un
-		// état que FPM refuserait au prochain redémarrage.
+		// état que FPM refuserait au prochain redémarrage. Une remise en place qui
+		// échoue se dit : le pool refusé resterait sinon en place sans un mot, et
+		// le prochain démarrage de FPM tomberait dessus.
+		var restoreErr error
 		if hadPrevious == nil {
-			_ = fs.WriteAtomic(bp.Path, previous, 0o644, fs.KeepOwner)
-		} else {
-			_ = os.Remove(bp.Path)
+			restoreErr = fs.WriteAtomic(bp.Path, previous, 0o644, fs.KeepOwner)
+		} else if rmErr := os.Remove(bp.Path); rmErr != nil && !os.IsNotExist(rmErr) {
+			restoreErr = rmErr
+		}
+		if restoreErr != nil {
+			return fmt.Errorf("%w\n  la remise en place de %s a échoué : %v — "+
+				"FPM refusera de redémarrer tant que ce fichier n'est pas corrigé", err, bp.Path, restoreErr)
 		}
 		return err
 	}
@@ -711,7 +762,19 @@ func (p *Provider) validate(ctx context.Context, version string) error {
 //     prochain démarrage comme à celui-ci.
 //
 // L'unité est donc activée au démarrage et désactivée à l'arrêt : une version
-// sans pool relancée au redémarrage de la machine tomberait en échec.
+// sans pool relancée au redémarrage de la machine tomberait en échec. Une unité
+// qui tourne sans être activée l'est au passage (D105) : elle ne repartirait
+// pas au prochain démarrage de la machine.
+//
+// Le rechargement d'un maître qui tourne est gardé comme celui du serveur web
+// (D105). « systemctl reload » n'envoie qu'un USR2 et rend 0 aussitôt : le
+// maître se ré-exécute ensuite, relit toute sa configuration — pools de
+// l'administrateur compris — et, sur le moindre refus, meurt pour toute la
+// version, Restart=on-failure s'épuisant sur la même cause. Retirer un pool, qui
+// ne passe par aucune écriture donc par aucun « -t », suffisait à le tuer sur un
+// défaut latent d'un voisin, en code 0. D'où « php-fpm -t » avant tout
+// rechargement — refusé, le maître garde la configuration qu'il sert —, puis le
+// constat : un maître mort est relevé et le fait signalé dans tous les cas.
 func (p *Provider) Reload(ctx context.Context, version string) error {
 	if p.Exec.Simulated() {
 		return nil
@@ -731,19 +794,142 @@ func (p *Provider) Reload(ctx context.Context, version string) error {
 		return nil
 	}
 	if p.unitActive(ctx, unit) {
+		if err := p.validate(ctx, version); err != nil {
+			return &RefusedError{Unit: unit, Err: err}
+		}
+		restarts, known := p.restarts(ctx, unit)
 		if res, err := p.systemctl(ctx, "reload", unit); err != nil {
 			return fmt.Errorf("rechargement de %s : %s", unit, firstError(res, err))
 		}
-		return nil
+		if err := p.checkReloaded(ctx, unit, restarts, known); err != nil {
+			return err
+		}
+		return p.ensureEnabled(ctx, unit)
 	}
-	// Arrêtée, jamais démarrée ou morte : le compteur d'échecs est acquitté
-	// d'abord, sans quoi systemd refuse le démarrage passé StartLimitBurst alors
-	// que la cause est levée.
+	// Arrêtée, jamais démarrée ou morte : la configuration est éprouvée d'abord,
+	// pour nommer la cause plutôt que l'échec du démarrage qui en découlerait.
+	if err := p.validate(ctx, version); err != nil {
+		return fmt.Errorf("%w\n  démarrage de %s refusé", err, unit)
+	}
+	// Le compteur d'échecs est acquitté, sans quoi systemd refuse le démarrage
+	// passé StartLimitBurst alors que la cause est levée.
 	_, _ = p.systemctl(ctx, "reset-failed", unit)
 	if res, err := p.systemctl(ctx, "enable", "--now", unit); err != nil {
 		return fmt.Errorf("démarrage de %s : %s", unit, firstError(res, err))
 	}
 	return nil
+}
+
+// RefusedError est un rechargement refusé par « php-fpm -t » : le maître sert
+// encore sa configuration précédente, pools retirés compris (D105).
+type RefusedError struct {
+	Unit string
+	Err  error
+}
+
+func (e *RefusedError) Error() string {
+	return fmt.Sprintf("%v\n  rechargement refusé : %s continue de servir sa configuration précédente",
+		e.Err, e.Unit)
+}
+
+func (e *RefusedError) Unwrap() error { return e.Err }
+
+// délaiConstat est la fenêtre pendant laquelle un maître FPM rechargé est
+// observé. L'unité de la distribution recharge par « kill -USR2 » : systemctl
+// rend la main avant même que le maître se ré-exécute, et c'est dans la seconde
+// qui suit qu'il meurt sur une configuration refusée — puis que Restart=
+// on-failure le relance, et le relance encore. Variable pour les tests.
+var délaiConstat = 2 * time.Second
+
+// checkReloaded constate qu'un maître rechargé vit encore. Il le relève s'il
+// est mort, et le signale dans tous les cas : un FPM qui meurt au rechargement
+// est un incident, même relevé aussitôt. Un redémarrage par systemd pendant la
+// fenêtre (NRestarts) compte comme une mort : les requêtes en cours ont été
+// coupées, et la cause reste à traiter.
+func (p *Provider) checkReloaded(ctx context.Context, unit string, before int, known bool) error {
+	settle := délaiConstat
+	pas := settle / 8
+	alive := true
+	for fin := time.Now().Add(settle); ; {
+		if !p.unitActive(ctx, unit) {
+			alive = false
+			break
+		}
+		if !time.Now().Before(fin) {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(pas):
+		}
+	}
+	if alive {
+		after, ok := p.restarts(ctx, unit)
+		if !known || !ok || after <= before {
+			return nil
+		}
+		return fmt.Errorf("le rechargement a arrêté %s, que systemd a relancé ; "+
+			"la cause reste à traiter (voir « journalctl -u %s »)", unit, unit)
+	}
+	_, _ = p.systemctl(ctx, "reset-failed", unit)
+	if res, err := p.systemctl(ctx, "start", unit); err != nil {
+		return fmt.Errorf("le rechargement a arrêté %s, qui refuse de redémarrer : %s\n"+
+			"  les sites PHP de cette version ne sont plus servis — voir « journalctl -u %s »",
+			unit, firstError(res, err), unit)
+	}
+	return fmt.Errorf("le rechargement a arrêté %s ; le service a été redémarré, "+
+		"mais la cause reste à traiter (voir « journalctl -u %s »)", unit, unit)
+}
+
+// restarts rend le compteur de redémarrages automatiques de l'unité. Faux quand
+// systemd ne le donne pas : le constat se borne alors à l'état de l'unité.
+func (p *Provider) restarts(ctx context.Context, unit string) (int, bool) {
+	res, err := p.systemctl(ctx, "show", unit, "-p", "NRestarts", "--value")
+	if err != nil {
+		return 0, false
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(res.Stdout))
+	if err != nil {
+		return 0, false
+	}
+	return n, true
+}
+
+// ensureEnabled active une unité qui tourne sans être activée.
+func (p *Provider) ensureEnabled(ctx context.Context, unit string) error {
+	if p.unitEnabled(ctx, unit) {
+		return nil
+	}
+	if res, err := p.systemctl(ctx, "enable", unit); err != nil {
+		return fmt.Errorf("activation de %s, qui ne repartirait pas au redémarrage de la machine : %s",
+			unit, firstError(res, err))
+	}
+	return nil
+}
+
+// UnitState est l'état d'une unité FPM tel que systemd le rend.
+type UnitState struct {
+	Active  bool
+	Enabled bool
+}
+
+// Healthy dit que l'unité tourne et repartira au démarrage de la machine.
+func (u UnitState) Healthy() bool { return u.Active && u.Enabled }
+
+// Unit observe l'unité FPM d'une version. Un exécuteur simulé la dit saine : le
+// mode préfixé n'a pas de systemd à interroger.
+func (p *Provider) Unit(ctx context.Context, version string) UnitState {
+	if p.Exec.Simulated() {
+		return UnitState{Active: true, Enabled: true}
+	}
+	unit := config.PHPUnit(version)
+	return UnitState{Active: p.unitActive(ctx, unit), Enabled: p.unitEnabled(ctx, unit)}
+}
+
+// Validate éprouve la configuration FPM d'une version (« php-fpm -t »).
+func (p *Provider) Validate(ctx context.Context, version string) error {
+	return p.validate(ctx, version)
 }
 
 // hasPools dit si FPM trouvera au moins un pool pour cette version : tout
@@ -767,6 +953,11 @@ func (p *Provider) hasPools(version string) (bool, error) {
 
 func (p *Provider) unitActive(ctx context.Context, unit string) bool {
 	_, err := p.Exec.Run(ctx, exec.Command{Name: "systemctl", Args: []string{"is-active", "--quiet", unit}})
+	return err == nil
+}
+
+func (p *Provider) unitEnabled(ctx context.Context, unit string) bool {
+	_, err := p.Exec.Run(ctx, exec.Command{Name: "systemctl", Args: []string{"is-enabled", "--quiet", unit}})
 	return err == nil
 }
 

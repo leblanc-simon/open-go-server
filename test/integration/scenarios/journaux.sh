@@ -129,6 +129,26 @@ sleep 1
 echo "  contenu repris, lien posé, Apache écrit sous $vieux"
 
 echo
+echo "--- un journal de tâche au nom choisi est roté, sous la borne des serveurs (D105) ---"
+ogs cron add shopfr planif --schedule '* * * * *' --command '/bin/echo tic' >/dev/null 2>&1 ||
+    echec "ajout de la tâche"
+decl=/etc/ogs/projects/shopfr.yaml
+awk '{print} /- name: planif$/ {match($0,/^ */); printf "%" RLENGTH+2 "slog: sched.log\n", ""}' $decl >/tmp/decl &&
+    cat /tmp/decl >$decl
+grep -q "log: sched.log" $decl || echec "déclaration du journal de la tâche"
+ogs apply shopfr --yes >/dev/null 2>&1 || echec "apply de la tâche"
+[ -f $dir/sched.log ] || echec "le journal de la tâche n'a pas été pré-créé"
+# La sortie est relue d'un bloc : sous pipefail, « logrotate | grep -q » échoue
+# quand grep, ayant trouvé, ferme le tube avant la fin.
+essai=$(logrotate -d /etc/logrotate.d/ogs 2>&1)
+grep -q "$dir/sched.log" <<<"$essai" || echec "sched.log n'est couvert par aucune rotation"
+[ "$(grep -c 'maxsize' /etc/logrotate.d/ogs)" = 2 ] || echec "le bloc des tâches doit porter maxsize"
+grep -q 'cron-\*' /etc/logrotate.d/ogs && echec "les journaux de tâches sont énumérés, plus désignés par un motif"
+grep -q 'fpm' /etc/logrotate.d/ogs && echec "la rotation ne doit plus signaler FPM"
+grep -i "^error" <<<"$essai" && echec "logrotate refuse le fichier"
+echo "  sched.log roté, borné par maxsize, aucun signal à FPM"
+
+echo
 echo "--- doctor voit une chaîne desserrée ---"
 docteur | grep -i "chaîne des journaux" | grep -q "entièrement à root" || echec "doctor n'accepte pas une chaîne conforme"
 chmod 0777 /var/log/ogs-projects

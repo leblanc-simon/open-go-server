@@ -64,7 +64,6 @@ func (p *Provider) now() time.Time {
 // déclencher les scripts de rotation depuis un compte non géré.
 func (p *Provider) Build(projects []*model.Project, webEngine, webUnit string) ([]byte, error) {
 	var serverLogs, appLogs []string
-	phpVersions := map[string]bool{}
 	for _, proj := range projects {
 		logDir := proj.Spec.Layout.LogDir
 		if logDir == "" {
@@ -74,37 +73,34 @@ func (p *Provider) Build(projects []*model.Project, webEngine, webUnit string) (
 		if err != nil {
 			return nil, err
 		}
+		server := map[string]bool{}
 		if webEngine != "" {
-			serverLogs = append(serverLogs,
-				filepath.Join(logDir, webEngine+"-access.log"),
-				filepath.Join(logDir, webEngine+"-error.log"))
-		}
-		if at.NeedsPHP {
-			serverLogs = append(serverLogs,
-				filepath.Join(logDir, "php-error.log"),
-				filepath.Join(logDir, "php-slow.log"))
-			for _, pool := range proj.Spec.PHP.Pools {
-				phpVersions[pool.Version] = true
+			for _, name := range []string{webEngine + "-access.log", webEngine + "-error.log"} {
+				server[name] = true
+				serverLogs = append(serverLogs, filepath.Join(logDir, name))
 			}
 		}
-		// Les tâches réouvrent leur fichier à chaque exécution : aucun signal
-		// n'est nécessaire après rotation.
-		appLogs = append(appLogs, filepath.Join(logDir, "cron-*.log"))
+		if at.NeedsPHP {
+			// PHP ouvre son error_log à chaque message, FPM son slowlog à chaque
+			// trace : ces journaux n'exigent aucun signal après rotation (D105).
+			for _, name := range []string{"php-error.log", "php-slow.log"} {
+				server[name] = true
+				serverLogs = append(serverLogs, filepath.Join(logDir, name))
+			}
+		}
+		appLogs = append(appLogs, taskLogs(proj, logDir, server)...)
 	}
 	sort.Strings(serverLogs)
 	sort.Strings(appLogs)
 
+	// Seul le serveur web reçoit un signal : il tient ses journaux ouverts. FPM
+	// n'en reçoit plus (D105) — son « reload » est un USR2, une ré-exécution
+	// complète du maître qui coupait chaque nuit les requêtes en cours et, sur
+	// une configuration devenue invalide, le tuait pour toute la version sans
+	// que rien ne le dise.
 	var units []string
 	if webUnit != "" && len(serverLogs) > 0 {
 		units = append(units, webUnit)
-	}
-	versions := make([]string, 0, len(phpVersions))
-	for v := range phpVersions {
-		versions = append(versions, v)
-	}
-	sort.Strings(versions)
-	for _, v := range versions {
-		units = append(units, config.PHPUnit(v))
 	}
 
 	logs := p.Config.Logs
@@ -121,6 +117,7 @@ func (p *Provider) Build(projects []*model.Project, webEngine, webUnit string) (
 		"Rotate":      logs.Rotate,
 		"MaxSize":     logs.MaxSize,
 		"Compress":    logs.Compress,
+		"Tag":         "ogs-logrotate",
 	})
 	if err != nil {
 		return nil, err
@@ -131,6 +128,32 @@ func (p *Provider) Build(projects []*model.Project, webEngine, webUnit string) (
 		Generated: p.now(),
 		Template:  p.Templates.OverridePath("logrotate/ogs.conf"),
 	}, body, "#"), nil
+}
+
+// taskLogs énumère les journaux des tâches d'un projet, du même calcul que le
+// provider cron : le nom que « log: » choisit, sinon cron-<tâche>.log (D71). Un
+// motif « cron-*.log » laissait sans rotation tout nom choisi. Un nom que tient
+// déjà le bloc des serveurs n'est pas répété : logrotate refuse une seconde
+// entrée pour un même fichier.
+func taskLogs(proj *model.Project, logDir string, server map[string]bool) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, decl := range proj.Spec.Crons {
+		if decl.Name == "" {
+			continue
+		}
+		name := decl.Log
+		if name == "" {
+			name = "cron-" + decl.Name + ".log"
+		}
+		name = filepath.Base(name)
+		if server[name] || seen[name] {
+			continue
+		}
+		seen[name] = true
+		out = append(out, filepath.Join(logDir, name))
+	}
+	return out
 }
 
 // Plan renvoie l'étape de mise à jour du fichier de rotation, ou une étape sans

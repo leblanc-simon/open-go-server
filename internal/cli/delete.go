@@ -26,6 +26,7 @@ import (
 	"leblanc.io/open-go-server/internal/model"
 	appprov "leblanc.io/open-go-server/internal/provider/app"
 	"leblanc.io/open-go-server/internal/provider/cron"
+	"leblanc.io/open-go-server/internal/provider/php"
 	"leblanc.io/open-go-server/internal/provider/system"
 	"leblanc.io/open-go-server/internal/provider/unit"
 	"leblanc.io/open-go-server/internal/spec"
@@ -354,6 +355,13 @@ func newDeleteCommand(app *App) *cobra.Command {
 			// groupe et le home en place tout en annonçant un succès.
 			for _, pool := range p.Spec.PHP.Pools {
 				if err := provs.PHP.Reload(cmd.Context(), pool.Version); err != nil {
+					// Refusé, le maître sert encore le pool supprimé : son socket sous
+					// un UID que userdel libère et que useradd redonnera (D105).
+					if refus := (*php.RefusedError)(nil); errors.As(err, &refus) {
+						warn("rechargement de PHP %s refusé : le pool de %s reste servi jusqu'à correction de "+
+							"la cause, puis « systemctl reload %s » :\n  %v", pool.Version, p.ID(), refus.Unit, refus.Err)
+						continue
+					}
 					warn("rechargement de PHP %s : %v", pool.Version, err)
 				}
 			}

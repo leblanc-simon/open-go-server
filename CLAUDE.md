@@ -426,10 +426,12 @@ Ils ont tous coûté un défaut réel ; les tests unitaires ne les voyaient pas.
   partiel et doit être annoncé comme tel : `/etc/passwd` énumère déjà tous les homes. Et « ne desserre
   jamais » mord ici — un `/home` en 0700 ne rend plus un fichier et reste en place ; c'est `doctor` qui
   le dit.
-- **Un rechargement du serveur web peut tuer le serveur.** `apachectl graceful` ne teste pas la
-  configuration : un maître Apache qui relit une configuration invalide meurt, et tous les sites tombent.
-  D'où la revalidation dans `web.Provider.Reload`, en plus de celle de l'écriture — les intentions étant
-  groupées en fin d'apply, un fichier référencé a pu disparaître entre les deux.
+- **Un rechargement du serveur web peut tuer le serveur.** Sur Debian, `apachectl graceful` lance bien
+  `$HTTPD -t` avant de signaler, et refuse une configuration invalide ; mais rien ne garantit la même chose
+  pour nginx selon son unité, et entre ce `-t` et le signal le maître relit ce qui a pu changer — un maître
+  qui relit une configuration invalide meurt, et tous les sites tombent. D'où la revalidation dans
+  `web.Provider.Reload`, en plus de celle de l'écriture — les intentions étant groupées en fin d'apply, un
+  fichier référencé a pu disparaître entre les deux —, et le constat `is-active` après.
 - Aucune vérification en amont d'un rechargement ne couvre tout : `ProtectHome` dans une unité fait voir
   `/home` en lecture seule **au seul service**, là où ogs écrit sans peine. D'où le constat en aval —
   `web.Provider.Reload` vérifie `is-active` après le rechargement, relève le serveur s'il est mort et le
@@ -472,6 +474,21 @@ Ils ont tous coûté un défaut réel ; les tests unitaires ne les voyaient pas.
   il **démarre et active** une unité arrêtée qui a des pools, **arrête et désactive** celle qui n'en a plus —
   recharger un maître sans pool le tue. Le critère est tout `pool.d/*.conf`, pas seulement ceux d'ogs. Le
   substitut `systemctl` démarrait l'unité sur `disable --now` : le scénario `fpm-sans-pool` l'a révélé.
+- **Le `reload` de FPM est un USR2, rendu aussitôt** (D105) : le maître se ré-exécute ensuite, relit toute
+  sa configuration — pools de l'administrateur compris — et meurt sur le moindre refus, `Restart=on-failure`
+  s'épuisant sur la même cause. Retirer un pool ne passe par aucune écriture, donc par aucun `-t` : un pool
+  resté d'un compte supprimé faisait tomber toute la version à la suppression d'un voisin, en code 0. D'où
+  `php-fpm -t` avant tout rechargement et le constat après (`is-active` pendant deux secondes, `NRestarts`).
+  La rotation des journaux, elle, ne signale plus FPM : PHP ouvre `error_log` à chaque message, FPM le
+  `slowlog` à chaque trace, et le `reload … || true` de chaque nuit coupait les requêtes en cours.
+- **Une activation s'observe** (D105) : n'émettre `enable` qu'à l'écriture d'un fichier laisse à jamais
+  arrêté ce qu'un incident a arrêté — FPM tué par la rotation, timer de renouvellement stoppé. Le plan relit
+  `is-active`/`is-enabled` ; « actif » n'a de sens que sous systemd (`/run/systemd/system`), sans quoi le
+  substitut des conteneurs ferait osciller le plan. Un timer **désactivé** est signalé, jamais réactivé :
+  D89 respecte ce choix.
+- **Un déroulage rejoue les rechargements déjà vidés** (D105) : `FlushReloads` a fait charger aux démons ce
+  que la compensation défait. Rejoués en fin de déroulage, ils arriveraient après `userdel`, que les workers
+  du pool défait font échouer : chaque intention l'est dès la compensation de la dernière étape qui la porte.
 - **FPM retient la dernière occurrence d'une directive, sans tenir compte de la casse, et lit son pool en
   root** (D103) : `spec.php.pools[].settings: {user: root}` — ou `User: root` — rendait une seconde ligne
   après celle du template, et le pool tournait en root ; `include` lui fait lire un pool entier ; une valeur portant une fin de ligne y injectait une directive. D'où les clés

@@ -27,6 +27,7 @@ import (
 	"leblanc.io/open-go-server/internal/provider/db"
 	"leblanc.io/open-go-server/internal/provider/hardening"
 	"leblanc.io/open-go-server/internal/provider/monitoring"
+	"leblanc.io/open-go-server/internal/provider/php"
 	"leblanc.io/open-go-server/internal/provider/system"
 	tlsprov "leblanc.io/open-go-server/internal/provider/tls"
 	"leblanc.io/open-go-server/internal/provider/web"
@@ -760,9 +761,66 @@ func (a *App) runChecks(ctx context.Context) []check {
 		for _, f := range provs.System.LogChecks(projects, a.logsRoot()) {
 			add(f.Name, f.Status, f.Detail, f.Fix)
 		}
+		if !a.Exec.Simulated() {
+			fpmUnitChecks(ctx, provs.PHP, projects, add)
+			renewTimerCheck(ctx, provs.TLS, add)
+		}
 		provs.close()
 	}
 	return out
+}
+
+// fpmUnitChecks porte, pour chaque version PHP qu'emploie le parc, l'état de
+// son unité et « php-fpm -t » (D105) : un FPM mort ou dont la configuration est
+// refusée ne se voit d'aucun plan tant qu'aucun pool ne change, et le prochain
+// rechargement le refusera.
+func fpmUnitChecks(ctx context.Context, prov *php.Provider, projects []*model.Project,
+	add func(name, status, detail, fix string)) {
+	versions := map[string]bool{}
+	for _, p := range projects {
+		for _, pool := range p.Spec.PHP.Pools {
+			versions[pool.Version] = true
+		}
+	}
+	list := make([]string, 0, len(versions))
+	for v := range versions {
+		list = append(list, v)
+	}
+	sort.Strings(list)
+	for _, v := range list {
+		unit := config.PHPUnit(v)
+		name := "php-fpm " + v
+		if _, err := os.Stat(prov.Paths.PHPFpmBin(v)); err != nil {
+			add(name, "échec", prov.Paths.PHPFpmBin(v)+" introuvable : PHP "+v+" est déclaré mais absent",
+				"apt install php"+v+"-fpm")
+			continue
+		}
+		st := prov.Unit(ctx, v)
+		if err := prov.Validate(ctx, v); err != nil {
+			add(name, "échec", strings.ReplaceAll(err.Error(), "\n", " ; "),
+				"corriger la configuration, puis « php-fpm"+v+" -t » : tout rechargement est refusé d'ici là")
+			continue
+		}
+		switch {
+		case !st.Active:
+			add(name, "échec", unit+" arrêtée : les sites PHP "+v+" ne sont pas servis",
+				"« journalctl -u "+unit+" », puis « ogs apply »")
+		case !st.Enabled:
+			add(name, "avertissement", unit+" désactivée : elle ne repartira pas au démarrage de la machine",
+				"ogs apply")
+		default:
+			add(name, "ok", unit+" active et activée, configuration acceptée", "")
+		}
+	}
+}
+
+// renewTimerCheck dit qu'un timer de renouvellement installé ne tourne pas : plus
+// aucun certificat ne se renouvelle, sans un mot (R1-49, D105).
+func renewTimerCheck(ctx context.Context, prov *tlsprov.Provider, add func(name, status, detail, fix string)) {
+	if etat := prov.RenewTimerProblem(ctx); etat != "" {
+		add("timer de renouvellement", "échec", "ogs-renew.timer "+etat+" : aucun certificat ne se renouvelle",
+			"ogs apply")
+	}
 }
 
 // firewallChecks porte les contrôles du pare-feu (D72). Une déclaration

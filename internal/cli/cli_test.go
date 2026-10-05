@@ -781,8 +781,9 @@ func TestLogrotateGathersProjectsInOneBlock(t *testing.T) {
 			t.Errorf("« create » ne doit pas fixer de propriétaire : %q", line)
 		}
 	}
-	// L'unité rechargée est bien apache2, pas « apache ».
-	if !strings.Contains(rot, "systemctl reload apache2 php7.4-fpm php8.5-fpm") {
+	// L'unité rechargée est bien apache2, pas « apache » ; FPM n'en reçoit aucun
+	// signal (D105) : son reload ré-exécute le maître.
+	if !strings.Contains(rot, "systemctl reload apache2 >") || strings.Contains(rot, "fpm") {
 		t.Errorf("unités de rechargement inattendues :\n%s", rot)
 	}
 	// Aucun glob sur /home : il embarquerait les répertoires d'utilisateurs humains.
