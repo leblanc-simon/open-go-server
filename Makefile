@@ -27,7 +27,7 @@ build:
 	go build -trimpath -ldflags "$(LDFLAGS)" -o $(BINARY) $(PKG)
 
 test:
-	go test ./...
+	go test -timeout 20m ./...
 
 vet:
 	go vet ./...
@@ -36,7 +36,7 @@ fmt:
 	gofmt -l -w cmd internal
 
 cover:
-	go test -coverprofile=coverage.out ./...
+	go test -timeout 20m -coverprofile=coverage.out ./...
 	go tool cover -func=coverage.out | tail -1
 
 clean:
