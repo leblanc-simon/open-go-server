@@ -710,6 +710,18 @@ func (a *App) runChecks(ctx context.Context) []check {
 				"un rechargement de "+provs.Engine.Unit()+" serait refusé : "+err.Error(),
 				"ogs cert renew <nom> (ou remettre la clé d'origine en place)")
 		}
+		// Bascule de web.engine (D118) : ce qu'ogs a écrit pour l'autre moteur y
+		// reste, servi s'il tourne. Signalé, jamais retiré.
+		if other, files := provs.Web.Leftovers(); len(files) > 0 {
+			// Échec seulement si l'ancien moteur tourne et sert un vhost d'ogs :
+			// une configuration laissée sous un moteur arrêté ne sert rien.
+			status := "avertissement"
+			if provs.Web.LeftoversServed(files) && provs.Web.OtherUnitActive(ctx) {
+				status = "échec"
+			}
+			add("ancien moteur web", status, web.LeftoversAdvice(provs.Engine, other, files),
+				"retirer ces fichiers à la main ; ogs ne le fait pas")
+		}
 		// Surcharges de vhost (D63) : un fichier lu en root par le maître, un
 		// fichier déposé hors de tout contexte donc jamais chargé, un répertoire
 		// qu'aucun vhost ne référence plus. Rien de tout cela ne se voit dans une
@@ -771,6 +783,7 @@ func (a *App) runChecks(ctx context.Context) []check {
 				add("sudoers", "ok", "fichiers de délégation conformes", "")
 			}
 		}
+		webConflictChecks(ctx, provs, projects, add)
 		cronLegacyChecks(provs, projects, add)
 		if a.Prefix == "" && !a.Exec.Simulated() {
 			databaseChecks(ctx, provs, projects, add)
@@ -1481,4 +1494,28 @@ func firstLine(s string) string {
 		}
 	}
 	return s
+}
+
+// webConflictChecks rappelle les domaines d'un projet qu'une autre déclaration
+// sert ou déclare (D118) : servie avant le vhost d'ogs, elle le masque ; morte,
+// elle est sans effet mais trompe qui lit la configuration.
+func webConflictChecks(ctx context.Context, provs *providers, projects []*model.Project,
+	add func(name, status, detail, fix string)) {
+	for _, p := range projects {
+		obs, err := provs.Web.Observe(ctx, p)
+		if err != nil || len(obs.Conflicts) == 0 {
+			continue
+		}
+		served, dead, refusal := provs.Web.ConflictReport(p, obs)
+		nom := "domaines servis " + p.ID()
+		if refusal != nil {
+			add(nom, "avertissement", refusal.Error(), "")
+		}
+		for _, l := range served {
+			add(nom, "avertissement", l, "retirer la déclaration étrangère")
+		}
+		for _, l := range dead {
+			add(nom, "avertissement", l, "retirer la déclaration étrangère")
+		}
+	}
 }

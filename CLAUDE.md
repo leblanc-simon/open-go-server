@@ -12,8 +12,8 @@ Les commits ne mentionnent jamais l'assistance d'un outil d'IA.
 
 ## La référence
 
-[`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md) fait autorité : 119 décisions d'architecture
-arbitrées (D1–D115, D117, D120 à D122, D116 réservée ; tableau §2), spécification par module, plan de tests, découpage en lots. **Consulter le
+[`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md) fait autorité : 120 décisions d'architecture
+arbitrées (D1–D115, D117, D118 et D120 à D122, D116 réservée ; tableau §2), spécification par module, plan de tests, découpage en lots. **Consulter le
 tableau des décisions avant de proposer une architecture** — la plupart des questions « pourquoi pas
 plutôt… ? » y sont déjà tranchées, avec leur raison. Toute décision nouvelle s'y ajoute.
 
@@ -523,6 +523,12 @@ Ils ont tous coûté un défaut réel ; les tests unitaires ne les voyaient pas.
   qui relit une configuration invalide meurt, et tous les sites tombent. D'où la revalidation dans
   `web.Provider.Reload`, en plus de celle de l'écriture — les intentions étant groupées en fin d'apply, un
   fichier référencé a pu disparaître entre les deux —, et le constat `is-active` après.
+- **Un redémarrage est un rechargement sans filet** (D118) : le `restart` qui suit le complément d'unité ne
+  validait rien, et un maître qui refuse de repartir ne laisse pas l'ancien servir. Il porte les contrôles de
+  `Reload` (paires, `-t`, `CheckLogs`), l'observation de 2 s, et refusé, **rend le complément** — sans quoi le
+  plan suivant le dirait conforme et ne redémarrerait jamais. De même, **`Listen` sur un port pris passe
+  `apachectl -t`** et tue le maître au rechargement : le vhost de supervision exige un port libre
+  (`/proc/net/tcp`), et seul lui est refusé.
 - Aucune vérification en amont d'un rechargement ne couvre tout : `ProtectHome` dans une unité fait voir
   `/home` en lecture seule **au seul service**, là où ogs écrit sans peine. D'où le constat en aval —
   `web.Provider.Reload` observe le moteur quelques instants après le rechargement (une mort peut suivre

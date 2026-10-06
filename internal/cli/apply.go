@@ -259,6 +259,9 @@ func (a *App) buildPlan(ctx context.Context, provs *providers, p *model.Project)
 		for _, s := range webSteps {
 			plan.Add(s)
 		}
+		// Une déclaration étrangère morte d'un domaine du projet : information,
+		// jamais un écart (D118).
+		plan.Notes = append(plan.Notes, provs.Web.ConflictNotes(p, webObs)...)
 
 		// Les certificats viennent après le vhost HTTP : le challenge HTTP-01
 		// exige que /.well-known/acme-challenge réponde déjà. Puis le vhost est
@@ -437,6 +440,14 @@ func (a *App) buildGlobalPlanWithout(ctx context.Context, provs *providers, targ
 		plan.Add(s)
 	}
 
+	// Configuration d'ogs restée sous l'autre moteur web, après une bascule de
+	// web.engine (D118) : une information du plan, jamais un écart — la bascule a
+	// pu être voulue —, jamais retirée, et l'ancien moteur jamais arrêté. doctor
+	// porte l'avertissement.
+	if note := provs.Web.LeftoversNote(); note != "" {
+		plan.Notes = append(plan.Notes, note)
+	}
+
 	// Supervision. Le vhost d'état précède les entrées de l'agent, qui s'y
 	// adressent, et le fichier de prisons ferme la marche : fail2ban refuse de
 	// démarrer sur une prison dont aucun journal n'existe, et les journaux des
@@ -561,6 +572,13 @@ func (a *App) announceRollback(fw *firewall.Provider) {
 		"    ogs firewall confirm\n"+
 		"  Sans confirmation, ufw se désactivera de lui-même : une session coupée par le pare-feu\n"+
 		"  ne pourrait pas le faire.\n", fw.Armed)
+}
+
+// printNotes affiche les informations d'un plan, hors décompte (D118).
+func printNotes(app *App, plan *engine.Plan) {
+	for _, n := range plan.Notes {
+		app.printf("  ℹ %s\n", n)
+	}
 }
 
 // parcNonBloquante rend non critiques les étapes de fichiers de portée parc que
@@ -793,11 +811,15 @@ func newPlanCommand(app *App) *cobra.Command {
 			}
 			defer provs.close()
 			var items []planStep
+			var notes []string
 			total := 0
 			for _, p := range projects {
 				plan, err := app.buildPlan(cmd.Context(), provs, p)
 				if err != nil {
 					return err
+				}
+				for _, n := range plan.Notes {
+					notes = append(notes, p.ID()+" : "+n)
 				}
 				for _, s := range plan.Mutating() {
 					items = append(items, planStep{
@@ -808,6 +830,7 @@ func newPlanCommand(app *App) *cobra.Command {
 				total += len(plan.Mutating())
 				if app.Format == "table" {
 					app.printf("projet %s\n%s", p.ID(), plan.String())
+					printNotes(app, plan)
 				}
 			}
 			global, err := app.buildGlobalPlan(cmd.Context(), provs, projects)
@@ -826,8 +849,14 @@ func newPlanCommand(app *App) *cobra.Command {
 					app.printf("parc\n%s", global.String())
 				}
 			}
+			notes = append(notes, global.Notes...)
+			if app.Format == "table" {
+				printNotes(app, global)
+			}
 			if app.Format != "table" {
-				return wrap(CodeError, app.emit("Plan", items, nil, nil))
+				// Les notes ont leur champ : elles ne sont ni des étapes ni des
+				// avertissements (D118).
+				return wrap(CodeError, app.emitNotes("Plan", items, nil, notes, nil))
 			}
 			app.printf("\n%d changement(s) au total.\n", total)
 			return nil

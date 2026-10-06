@@ -45,6 +45,11 @@ type Engine interface {
 	SnippetPath() string
 	// IncludeRoot est la racine des répertoires de surcharge des vhosts (D63).
 	IncludeRoot() string
+	// LoadedConfigs énumère les masques des fichiers que la configuration de
+	// Debian fait charger au moteur, sites-available excepté : ils ne servent
+	// qu'à la détection des domaines déjà servis (R2-44, D118), jamais à
+	// attribuer ni à retirer un fichier (D76).
+	LoadedConfigs() []string
 }
 
 // apacheEngine implémente Engine pour Apache 2.4 sur Debian et Ubuntu.
@@ -68,6 +73,15 @@ func (a apacheEngine) SnippetPath() string { return "" }
 
 func (a apacheEngine) IncludeRoot() string {
 	return filepath.Join(a.prefix, "/etc/apache2/projects")
+}
+
+// LoadedConfigs : apache2.conf inclut conf-enabled/*.conf puis
+// sites-enabled/*.conf, et rien d'autre de ces répertoires.
+func (a apacheEngine) LoadedConfigs() []string {
+	return []string{
+		filepath.Join(a.prefix, "/etc/apache2/conf-enabled/*.conf"),
+		filepath.Join(a.EnabledDir(), "*.conf"),
+	}
 }
 
 func (a apacheEngine) ValidateArgs() (string, []string) {
@@ -118,6 +132,15 @@ func (n nginxEngine) SnippetPath() string {
 
 func (n nginxEngine) IncludeRoot() string {
 	return filepath.Join(n.prefix, "/etc/nginx/projects")
+}
+
+// LoadedConfigs : nginx.conf inclut conf.d/*.conf puis sites-enabled/*, sans
+// extension exigée.
+func (n nginxEngine) LoadedConfigs() []string {
+	return []string{
+		filepath.Join(n.prefix, "/etc/nginx/conf.d/*.conf"),
+		filepath.Join(n.EnabledDir(), "*"),
+	}
 }
 
 func (n nginxEngine) ValidateArgs() (string, []string) {
@@ -194,6 +217,18 @@ func validate(ctx context.Context, e Engine, ex exec.Executor) error {
 	}
 	if _, err := ex.Run(ctx, exec.Command{Name: bin, Args: args}); err != nil {
 		return fmt.Errorf("configuration refusée par %s %v : %w", bin, args, err)
+	}
+	return nil
+}
+
+// otherEngine rend l'autre moteur, sous le même préfixe, nil pour un moteur
+// inconnu.
+func otherEngine(e Engine) Engine {
+	switch v := e.(type) {
+	case apacheEngine:
+		return nginxEngine{prefix: v.prefix}
+	case nginxEngine:
+		return apacheEngine{prefix: v.prefix}
 	}
 	return nil
 }

@@ -5,11 +5,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"leblanc.io/open-go-server/internal/config"
@@ -17,6 +19,7 @@ import (
 	"leblanc.io/open-go-server/internal/exec"
 	"leblanc.io/open-go-server/internal/fs"
 	"leblanc.io/open-go-server/internal/model"
+	"leblanc.io/open-go-server/internal/provider/app"
 	"leblanc.io/open-go-server/internal/provider/php"
 	"leblanc.io/open-go-server/internal/provider/system"
 	tlsprov "leblanc.io/open-go-server/internal/provider/tls"
@@ -47,6 +50,10 @@ type Provider struct {
 	// permet (tls.Provider.CheckPair) : avant tout rechargement, toute
 	// validation, tout redémarrage (D110).
 	CertificatePair func(ctx context.Context, dir string, repair bool) (PairCheck, error)
+	// Listeners énumère les écoutes TCP de la machine (app.ReadListeners), pour
+	// le port du vhost de supervision (R2-37, D118). Nil : /proc/net, ou rien en
+	// mode simulé.
+	Listeners func() ([]app.Listener, error)
 	// ProxyTarget résout la cible d'un vhost de proxy : socket ou adresse locale.
 	ProxyTarget func(*model.Project) (string, bool)
 	Now         func() time.Time
@@ -133,10 +140,7 @@ func (p *Provider) Observe(_ context.Context, proj *model.Project) (Observed, er
 		wanted[filepath.Join(p.Engine.AvailableDir(), p.vhostFile(proj, vh))] = true
 	}
 	entries, err := os.ReadDir(p.Engine.AvailableDir())
-	if err != nil {
-		if os.IsNotExist(err) {
-			return obs, nil
-		}
+	if err != nil && !os.IsNotExist(err) {
 		return obs, err
 	}
 	// Les domaines servis sont ceux de spec.domains et ceux des vhosts, que rien
@@ -149,6 +153,15 @@ func (p *Provider) Observe(_ context.Context, proj *model.Project) (Observed, er
 	for _, vh := range p.vhosts(proj) {
 		for _, d := range vh.Domains {
 			ownDomains[canonicalName(d)] = true
+		}
+	}
+	// Configuration étrangère : on cherche seulement si elle sert l'un de nos
+	// domaines, pour refuser de créer un vhost qui ne serait jamais atteint.
+	conflits := func(path string, data []byte) {
+		for _, name := range servedNames(p.Engine.Name(), string(data)) {
+			if name = canonicalName(name); ownDomains[name] {
+				obs.Conflicts[name] = path
+			}
 		}
 	}
 	for _, e := range entries {
@@ -168,46 +181,102 @@ func (p *Provider) Observe(_ context.Context, proj *model.Project) (Observed, er
 			obs.Stale = append(obs.Stale, path)
 			continue
 		}
-		// Configuration étrangère : on cherche seulement si elle sert l'un de nos
-		// domaines, pour refuser de créer un vhost qui ne serait jamais atteint.
 		data, err := os.ReadFile(path)
 		if err != nil {
 			continue
 		}
-		for _, name := range serverNames(string(data)) {
-			if name = canonicalName(name); ownDomains[name] {
-				obs.Conflicts[name] = path
-			}
-		}
+		conflits(path, data)
 	}
+	p.loadedConflicts(proj, wanted, conflits)
 	sort.Strings(obs.Stale)
 	return obs, nil
 }
 
-// serverNames extrait les noms servis d'une configuration, quel que soit le
-// moteur : ServerName/ServerAlias pour Apache, server_name pour Nginx.
-func serverNames(content string) []string {
-	var out []string
-	for _, line := range strings.Split(content, "\n") {
-		// Un commentaire peut suivre la directive (« server_name a.fr; # ancien
-		// b.fr ») : ce qui le suit n'est pas servi. Le « ; » clôt la directive
-		// nginx.
-		if i := strings.Index(line, "#"); i >= 0 {
-			line = line[:i]
-		}
-		if i := strings.Index(line, ";"); i >= 0 {
-			line = line[:i]
-		}
-		fields := strings.Fields(line)
-		if len(fields) < 2 {
+// loadedConflicts étend la détection aux fichiers que le moteur charge hors de
+// sites-available (Engine.LoadedConfigs) : conf.d, conf-enabled, et les fichiers
+// ordinaires de sites-enabled (R2-44, D118). Un site servi de là n'était pas vu,
+// et le vhost d'ogs, écrit et activé, n'était jamais atteint — le moteur retient
+// la première déclaration d'un nom, et conf.d comme conf-enabled sont chargés
+// avant sites-enabled.
+//
+// Lecture seule : rien de ce qui est trouvé ici n'est attribué au projet ni
+// retiré (D76) — seul sites-available, où ogs écrit, porte des fichiers
+// obsolètes. Le risque est le faux conflit, qui refuserait un site qui marchait :
+// un lien d'activation vers sites-available est écarté (le fichier visé y est
+// déjà jugé, le vhost du projet compris), comme un fichier caché, que glob(3)
+// n'inclut pas, et un fichier qu'ogs a écrit pour ce projet.
+func (p *Provider) loadedConflicts(proj *model.Project, wanted map[string]bool,
+	conflits func(string, []byte)) {
+	available, err := filepath.EvalSymlinks(p.Engine.AvailableDir())
+	if err != nil {
+		available = p.Engine.AvailableDir()
+	}
+	for _, pattern := range p.Engine.LoadedConfigs() {
+		matches, err := filepath.Glob(pattern)
+		if err != nil {
 			continue
 		}
-		switch strings.ToLower(fields[0]) {
-		case "servername", "serveralias", "server_name":
-			out = append(out, fields[1:]...)
+		for _, path := range matches {
+			if strings.HasPrefix(filepath.Base(path), ".") {
+				continue
+			}
+			target, err := filepath.EvalSymlinks(path)
+			if err != nil {
+				// Lien rompu : il ne sert aucun nom — nginx refuserait d'ailleurs
+				// toute sa configuration, ce que sa validation dira.
+				continue
+			}
+			if filepath.Dir(target) == available || wanted[target] {
+				continue
+			}
+			info, err := os.Stat(target)
+			if err != nil || !info.Mode().IsRegular() {
+				continue
+			}
+			if owner, resource, err := fs.ManagedResource(target); err == nil &&
+				owner == proj.ID() && strings.HasPrefix(resource, "web/vhost/") {
+				continue
+			}
+			data, err := readBounded(target, maxConfigRead)
+			if err != nil {
+				continue
+			}
+			conflits(path, data)
 		}
 	}
-	return out
+}
+
+// maxConfigRead borne la lecture d'une configuration étrangère : un fichier de
+// configuration ne pèse jamais un mégaoctet, et la détection n'a pas à lire en
+// mémoire ce qu'on aurait déposé là.
+const maxConfigRead = 1 << 20
+
+// readBounded lit au plus max octets d'un fichier ordinaire.
+func readBounded(path string, max int64) ([]byte, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return io.ReadAll(io.LimitReader(f, max))
+}
+
+// apacheHost retire d'un nom d'Apache le schéma et le port qu'il admet
+// (« https://shop.fr:443 » → « shop.fr »), crochets d'une adresse IPv6 compris.
+func apacheHost(name string) string {
+	if i := strings.Index(name, "://"); i >= 0 {
+		name = name[i+3:]
+	}
+	if strings.HasPrefix(name, "[") {
+		if i := strings.Index(name, "]"); i >= 0 {
+			return name[:i+1]
+		}
+		return name
+	}
+	if i := strings.LastIndex(name, ":"); i >= 0 {
+		return name[:i]
+	}
+	return name
 }
 
 // canonicalName ramène un nom servi à la forme que le moteur compare : sans
@@ -258,12 +327,144 @@ func (p *Provider) checkFile(vh model.VHost) error {
 // réduisait « shop.fr » à « shop », et le projet cherche « shop.conf ». Le
 // désigner suffit ; ogs ne le devine pas, « shop.fr » et « shop.de » ayant pu
 // donner le même nom.
-func conflictHint(proj *model.Project, path string) string {
+//
+// Hors de sites-available (conf.d, conf-enabled, un fichier ordinaire de
+// sites-enabled, D118), l'adoption ne reprendrait rien : l'import ne lit que
+// sites-available. Le remède est alors de retirer le bloc qui sert ce nom.
+func (p *Provider) conflictHint(proj *model.Project, path string) string {
+	if filepath.Dir(path) != filepath.Clean(p.Engine.AvailableDir()) {
+		return fmt.Sprintf("retirer ou désactiver le bloc qui sert ce nom dans %s — le moteur le charge avec "+
+			"les vhosts et retient la première déclaration d'un nom ; l'adoption ne lit que %s",
+			filepath.Base(path), p.Engine.AvailableDir())
+	}
 	if proj.Metadata.Labels["adopted"] == "true" {
 		return fmt.Sprintf("si c'est le fichier d'origine d'un vhost adopté, le désigner par "+
 			"« file: %s » dans spec.web.vhosts ; sinon, retirer cette configuration", filepath.Base(path))
 	}
 	return "retirer cette configuration ou adopter le site avec « ogs import »"
+}
+
+// classifyConflicts juge les conflits d'un projet (D118). Un conflit refuse la
+// création d'un vhost neuf, qui ne serait jamais atteint. Pour un vhost qu'ogs a
+// déjà écrit et activé pour ce projet, le site marche : le plan n'est plus
+// refusé en dur. Reste à savoir laquelle des deux déclarations le moteur sert —
+// la première chargée :
+//   - l'étrangère vient avant (conf.d, conf-enabled, ou un nom qui précède dans
+//     sites-enabled) : c'est elle qui est servie, avertissement non bloquant,
+//     code 6 (warnings, par vhost) ;
+//   - elle vient après, ou n'est pas chargée du tout (un sites-available sans
+//     lien) : configuration morte, une note du plan, que doctor rappelle ;
+//   - dans le doute, le code 6 reste.
+func (p *Provider) classifyConflicts(proj *model.Project, obs Observed) (map[string][]string, []string, error) {
+	warnings := map[string][]string{}
+	var notes []string
+	domains := make([]string, 0, len(obs.Conflicts))
+	for d := range obs.Conflicts {
+		domains = append(domains, d)
+	}
+	sort.Strings(domains)
+	for _, domain := range domains {
+		path := obs.Conflicts[domain]
+		vh, ok := p.vhostServing(proj, domain)
+		if !ok || !p.vhostActive(proj, vh) {
+			return nil, nil, fmt.Errorf("le domaine %s est déjà servi par %s : %s", domain, path,
+				p.conflictHint(proj, path))
+		}
+		ours := filepath.Join(p.Engine.AvailableDir(), p.vhostFile(proj, vh))
+		okey, oknown := p.loadKey(ours)
+		fkey, fknown := p.loadKey(path)
+		switch {
+		case fknown && fkey == "":
+			notes = append(notes, fmt.Sprintf("vhost %s : %s est aussi déclaré par %s, que le moteur ne charge "+
+				"pas — configuration morte, à retirer (D118)", vh.Name, domain, path))
+		case fknown && oknown && okey != "" && fkey > okey:
+			notes = append(notes, fmt.Sprintf("vhost %s : %s est aussi déclaré par %s, chargé après le vhost "+
+				"d'ogs, qui est celui servi — déclaration sans effet, à retirer (D118)", vh.Name, domain, path))
+		default:
+			warnings[vh.Name] = append(warnings[vh.Name], fmt.Sprintf("%s est servi par %s, chargé avant le "+
+				"vhost d'ogs (%s)", domain, path, p.conflictHint(proj, path)))
+		}
+	}
+	return warnings, notes, nil
+}
+
+// ConflictReport rend, pour doctor, les conflits d'un projet : déclarations
+// servies avant le vhost d'ogs, déclarations mortes, et le refus de créer.
+func (p *Provider) ConflictReport(proj *model.Project, obs Observed) (served, dead []string, refusal error) {
+	warnings, notes, err := p.classifyConflicts(proj, obs)
+	names := make([]string, 0, len(warnings))
+	for n := range warnings {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	for _, n := range names {
+		for _, w := range warnings[n] {
+			served = append(served, "vhost "+n+" : "+w)
+		}
+	}
+	return served, notes, err
+}
+
+// ConflictNotes rend les informations du plan sur les déclarations mortes
+// d'un domaine du projet (classifyConflicts), à porter dans engine.Plan.Notes.
+func (p *Provider) ConflictNotes(proj *model.Project, obs Observed) []string {
+	_, notes, _ := p.classifyConflicts(proj, obs)
+	return notes
+}
+
+// loadKey situe un fichier dans l'ordre de chargement du moteur : conf.d ou
+// conf-enabled d'abord (« 0 »), puis sites-enabled par nom (« 1<nom> ») — un
+// fichier de sites-available l'est par le premier lien chargé qui le désigne.
+// Une clé vide dit un fichier que le moteur ne charge pas ; known faux, un
+// emplacement dont l'ordre n'est pas connu.
+func (p *Provider) loadKey(path string) (key string, known bool) {
+	patterns := p.Engine.LoadedConfigs()
+	dir := filepath.Dir(path)
+	loaded := func(name string) bool {
+		if strings.HasPrefix(name, ".") {
+			return false
+		}
+		ok, _ := filepath.Match(filepath.Base(patterns[len(patterns)-1]), name)
+		return ok
+	}
+	switch dir {
+	case filepath.Dir(patterns[0]):
+		return "0", true
+	case filepath.Clean(p.Engine.EnabledDir()):
+		return "1" + filepath.Base(path), true
+	case filepath.Clean(p.Engine.AvailableDir()):
+		first := ""
+		for _, link := range p.linksTo(path) {
+			if name := filepath.Base(link); loaded(name) && (first == "" || name < first) {
+				first = name
+			}
+		}
+		if first == "" {
+			return "", true
+		}
+		return "1" + first, true
+	}
+	return "", false
+}
+
+// vhostServing rend le vhost du projet qui sert domain.
+func (p *Provider) vhostServing(proj *model.Project, domain string) (model.VHost, bool) {
+	for _, vh := range p.vhosts(proj) {
+		for _, d := range vh.Domains {
+			if canonicalName(d) == domain {
+				return vh, true
+			}
+		}
+	}
+	return model.VHost{}, false
+}
+
+// vhostActive dit si ogs a déjà écrit le fichier d'un vhost pour ce projet — sa
+// marque le dit (D76) — et si un lien de sites-enabled le désigne.
+func (p *Provider) vhostActive(proj *model.Project, vh model.VHost) bool {
+	path := filepath.Join(p.Engine.AvailableDir(), p.vhostFile(proj, vh))
+	owner, _, err := fs.ManagedResource(path)
+	return err == nil && owner == proj.ID() && len(p.linksTo(path)) > 0
 }
 
 // FileError signale un nom de fichier de vhost que le moteur de la machine ne
@@ -583,11 +784,9 @@ func (p *Provider) poolFor(proj *model.Project, vh model.VHost) (*php.PoolPlan, 
 
 // Plan calcule les étapes relatives aux vhosts.
 func (p *Provider) Plan(_ context.Context, proj *model.Project, obs Observed) ([]*engine.Step, error) {
-	if len(obs.Conflicts) > 0 {
-		for domain, path := range obs.Conflicts {
-			return nil, fmt.Errorf("le domaine %s est déjà servi par %s : %s", domain, path,
-				conflictHint(proj, path))
-		}
+	actifs, _, err := p.classifyConflicts(proj, obs)
+	if err != nil {
+		return nil, err
 	}
 	var steps []*engine.Step
 	for i, vh := range p.vhosts(proj) {
@@ -606,6 +805,15 @@ func (p *Provider) Plan(_ context.Context, proj *model.Project, obs Observed) ([
 			return nil, err
 		}
 		steps = append(steps, p.vhostStep(proj, bp)...)
+		if motifs := actifs[vh.Name]; len(motifs) > 0 {
+			w := engine.NewStep("web/vhost/"+bp.Name+"/conflit", engine.Update,
+				fmt.Sprintf("vhost %s : %d domaine(s) servi(s) par une autre déclaration", bp.Name, len(motifs)))
+			w.Critical = false
+			w.Apply = func(context.Context) error {
+				return fmt.Errorf("le moteur retient la première déclaration d'un nom : %s", strings.Join(motifs, " ; "))
+			}
+			steps = append(steps, w)
+		}
 		if i == 0 {
 			if s := p.htaccessStep(proj, bp); s != nil {
 				steps = append(steps, s)
@@ -1208,14 +1416,39 @@ func (p *Provider) PlanDropIn(ctx context.Context, projects []*model.Project) ([
 			if p.Exec.Simulated() {
 				return nil
 			}
-			// Un redémarrage charge toutes les clés : une paire dépareillée qu'un
-			// vhost désigne arrêterait le moteur (D110). Une écriture interrompue
-			// s'achève ; sinon le redémarrage est refusé, en le nommant.
-			if err := p.CheckCertificates(ctx, true); err != nil {
-				return fmt.Errorf("redémarrage refusé : %s continue de servir sa configuration précédente ; %w",
-					p.Engine.Unit(), err)
+			// Un redémarrage relit toute la configuration et rouvre tous les
+			// journaux : il porte les contrôles du rechargement, et davantage, car
+			// un « restart » refusé ne laisse pas tourner l'ancien maître (R1-36,
+			// D118). Une paire dépareillée qu'un vhost désigne (D110), une
+			// configuration devenue invalide depuis son écriture, un journal que le
+			// maître ne pourra pas ouvrir (AH00019) : chacun arrêterait tous les
+			// sites. Le refus rend le complément tel qu'il était — le moteur ne
+			// compense jamais l'étape qui échoue, et un complément laissé en place
+			// passerait pour conforme au plan suivant, qui ne rejouerait jamais le
+			// redémarrage.
+			for _, check := range []func(context.Context) error{
+				func(ctx context.Context) error { return p.CheckCertificates(ctx, true) },
+				p.validateConfig,
+				p.CheckLogs,
+			} {
+				if err := check(ctx); err != nil {
+					return p.refusRedemarrage(ctx, verb, restore, err)
+				}
 			}
-			return p.restartUnit(ctx, verb)
+			raison := ""
+			if err := p.restartUnit(ctx, verb); err != nil {
+				raison = err.Error()
+			} else {
+				// Comme après un rechargement : « restart » rend la main avant que
+				// le maître n'ait ouvert ses journaux et ses clés, et sa mort suit.
+				// L'observation part de l'état d'après le redémarrage, dont le
+				// processus principal est neuf.
+				raison = p.diedAfterReload(ctx, p.snapshot(ctx))
+			}
+			if raison == "" {
+				return nil
+			}
+			return p.relever(ctx, "le redémarrage", raison)
 		}
 		steps = append(steps, r)
 	}
@@ -1369,19 +1602,46 @@ func (p *Provider) Reload(ctx context.Context) error {
 	if raison == "" {
 		return nil
 	}
+	return p.relever(ctx, "le rechargement", raison)
+}
+
+// relever relance le moteur qu'une opération a arrêté, compteur d'échecs
+// acquitté, et rend toujours une erreur : un serveur qui meurt à chaque
+// rechargement ou redémarrage est un incident, même relevé aussitôt.
+func (p *Provider) relever(ctx context.Context, operation, raison string) error {
 	if !p.unitActive(ctx) {
 		if err := p.restartUnit(ctx, "start"); err != nil || !p.unitActive(ctx) {
 			if err == nil {
 				err = errors.New("unité toujours inactive")
 			}
-			return fmt.Errorf("le rechargement a arrêté %s (%s), qui refuse de redémarrer : %w\n"+
+			return fmt.Errorf("%s a arrêté %s (%s), qui refuse de redémarrer : %w\n"+
 				"  les sites ne sont plus servis — voir « journalctl -u %s »",
-				p.Engine.Unit(), raison, err, p.Engine.Unit())
+				operation, p.Engine.Unit(), raison, err, p.Engine.Unit())
 		}
 	}
-	return fmt.Errorf("le rechargement a arrêté %s (%s) ; le service a été relevé, "+
+	return fmt.Errorf("%s a arrêté %s (%s) ; le service a été relevé, "+
 		"mais la cause reste à traiter (voir « journalctl -u %s »)",
-		p.Engine.Unit(), raison, p.Engine.Unit())
+		operation, p.Engine.Unit(), raison, p.Engine.Unit())
+}
+
+// refusRedemarrage rend le complément d'unité tel qu'il était quand le
+// redémarrage qui devait le prendre en compte est refusé, et le relit par
+// systemd : le plan suivant le réécrira et rejouera le redémarrage, une fois la
+// cause levée. Le moteur, lui, n'est pas touché.
+func (p *Provider) refusRedemarrage(ctx context.Context, verb string, restore func() error, cause error) error {
+	etat := p.Engine.Unit() + " continue de servir sa configuration précédente"
+	quoi := "redémarrage refusé"
+	if verb == "start" {
+		etat, quoi = p.Engine.Unit()+" reste arrêté", "relance refusée"
+	}
+	rendu := "le complément d'unité est rendu, et le prochain apply rejouera son écriture et le redémarrage"
+	if err := restore(); err != nil {
+		rendu = fmt.Sprintf("le complément d'unité n'a pas pu être rendu (%v) : le plan suivant le dira "+
+			"conforme sans que le service l'ait chargé", err)
+	} else if _, err := p.Exec.Run(ctx, exec.Command{Name: "systemctl", Args: []string{"daemon-reload"}}); err != nil {
+		rendu = fmt.Sprintf("le complément d'unité est rendu, mais systemd ne l'a pas relu (%v)", err)
+	}
+	return fmt.Errorf("%s : %s ; %s — %w", quoi, etat, rendu, cause)
 }
 
 // restartUnit redémarre le moteur. Le compteur d'échecs est acquitté au préalable :

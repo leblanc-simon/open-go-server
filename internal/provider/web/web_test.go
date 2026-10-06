@@ -2735,8 +2735,12 @@ func TestObserveIgnoreLesCommentairesEtLePointFinal(t *testing.T) {
 }
 
 func TestServerNamesLitLesDirectivesSeules(t *testing.T) {
-	got := serverNames("  ServerName a.fr\n\tServerAlias b.fr c.fr\n# ServerName x.fr\nserver_name d.fr e.fr;  # f.fr\nserver_names_hash_bucket_size 64;\n")
-	if strings.Join(got, " ") != "a.fr b.fr c.fr d.fr e.fr" {
-		t.Errorf("noms servis : %q", got)
+	got := servedNames("apache", "<VirtualHost *:80>\n  ServerName a.fr\n\tServerAlias b.fr c.fr\n# ServerName x.fr\n</VirtualHost>\n")
+	if strings.Join(got, " ") != "a.fr b.fr c.fr" {
+		t.Errorf("noms servis (Apache) : %q", got)
+	}
+	got = servedNames("nginx", "server {\nserver_name d.fr e.fr;  # f.fr\nserver_names_hash_bucket_size 64;\n}\n")
+	if strings.Join(got, " ") != "d.fr e.fr" {
+		t.Errorf("noms servis (nginx) : %q", got)
 	}
 }

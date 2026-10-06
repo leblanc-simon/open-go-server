@@ -21,6 +21,11 @@ type systemeReel struct {
 	calls     []string
 	vivant    int // nombre d'« is-active » encore vrais ; -1 : toujours
 	relevable bool
+	// etat est ce que rend « systemctl show -p ActiveState --value », vide par
+	// défaut (substitut sans init).
+	etat string
+	// echecs fait échouer toute commande dont la ligne commence par la clé.
+	echecs map[string]error
 }
 
 func (s *systemeReel) Simulated() bool { return false }
@@ -29,6 +34,11 @@ func (s *systemeReel) Run(_ context.Context, cmd exec.Command) (exec.Result, err
 	defer s.mu.Unlock()
 	ligne := strings.TrimSpace(cmd.Name + " " + strings.Join(cmd.Args, " "))
 	s.calls = append(s.calls, ligne)
+	for prefixe, err := range s.echecs {
+		if strings.HasPrefix(ligne, prefixe) {
+			return exec.Result{ExitCode: 1}, err
+		}
+	}
 	if len(cmd.Args) > 0 && cmd.Name == "systemctl" {
 		switch cmd.Args[0] {
 		case "is-active":
@@ -41,6 +51,10 @@ func (s *systemeReel) Run(_ context.Context, cmd exec.Command) (exec.Result, err
 		case "start":
 			if s.relevable {
 				s.vivant = -1
+			}
+		case "show":
+			if cmd.Args[len(cmd.Args)-1] == "--value" {
+				return exec.Result{Stdout: s.etat + "\n"}, nil
 			}
 		}
 	}

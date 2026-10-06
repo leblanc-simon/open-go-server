@@ -20,18 +20,27 @@ type envelope struct {
 	Kind       string   `json:"kind" yaml:"kind"`
 	Items      any      `json:"items" yaml:"items"`
 	Warnings   []string `json:"warnings" yaml:"warnings"`
+	// Notes porte les informations d'un plan, hors décompte (D118).
+	Notes []string `json:"notes,omitempty" yaml:"notes,omitempty"`
 }
 
 // emit écrit un résultat au format demandé. Le format table est rendu par le
 // rappel fourni, qui reste libre de sa mise en forme.
 func (a *App) emit(kind string, items any, warnings []string, table func(*tabwriter.Writer)) error {
+	return a.emitNotes(kind, items, warnings, nil, table)
+}
+
+// emitNotes est emit avec les informations d'un plan, rendues dans leur champ
+// en JSON et en YAML ; le rendu en table les affiche lui-même.
+func (a *App) emitNotes(kind string, items any, warnings, notes []string, table func(*tabwriter.Writer)) error {
+	env := envelope{APIVersion: "ogs/v1", Kind: kind, Items: items, Warnings: orEmpty(warnings), Notes: notes}
 	switch a.Format {
 	case "json":
 		enc := json.NewEncoder(a.Out)
 		enc.SetIndent("", "  ")
-		return enc.Encode(envelope{APIVersion: "ogs/v1", Kind: kind, Items: items, Warnings: orEmpty(warnings)})
+		return enc.Encode(env)
 	case "yaml":
-		data, err := yaml.Marshal(envelope{APIVersion: "ogs/v1", Kind: kind, Items: items, Warnings: orEmpty(warnings)})
+		data, err := yaml.Marshal(env)
 		if err != nil {
 			return err
 		}

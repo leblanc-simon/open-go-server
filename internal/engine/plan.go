@@ -13,6 +13,10 @@ import (
 type Plan struct {
 	Project string
 	Steps   []*Step
+	// Notes porte des informations que le plan affiche sans les compter : ni
+	// changement, ni écart, ni avertissement — le code de retour n'en dépend pas.
+	// Ce qu'ogs constate sans le gérer, et que l'exploitant a pu vouloir (D118).
+	Notes []string
 }
 
 // Add ajoute une étape non nulle au plan.

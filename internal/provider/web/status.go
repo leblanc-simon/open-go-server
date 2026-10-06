@@ -3,15 +3,19 @@ package web
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"path"
 	"regexp"
 	"sort"
+	"strconv"
+	"strings"
 
 	"leblanc.io/open-go-server/internal/config"
 	"leblanc.io/open-go-server/internal/engine"
 	"leblanc.io/open-go-server/internal/fs"
 	"leblanc.io/open-go-server/internal/model"
+	"leblanc.io/open-go-server/internal/provider/app"
 	"leblanc.io/open-go-server/internal/provider/removal"
 )
 
@@ -129,6 +133,17 @@ func (p *Provider) PlanStatus(ctx context.Context, projects []*model.Project,
 	isEnabled := linkErr == nil
 
 	summary := fmt.Sprintf("vhost de supervision %s sur %s (%d pool(s))", name, listen, len(pools))
+	// Une écoute nouvelle — vhost absent, inactif, ou qui change d'adresse — exige
+	// un port libre (R2-37, D118) : « apachectl -t » ne voit pas un port pris, et
+	// le maître Apache meurt au rechargement suivant en emportant tous les sites ;
+	// nginx garde sa configuration précédente sans un mot. Seul ce vhost est
+	// refusé, d'une étape non critique : le plan global continue, et rien du plan
+	// d'un projet n'en dépend.
+	if (state != fs.StateCurrent || !isEnabled) && !(isEnabled && statusListens(filePath, listen)) {
+		if holder, err := p.portHolder(listen); err != nil || holder != "" {
+			return []*engine.Step{statusPortRefused(summary, listen, holder, err)}, nil
+		}
+	}
 	var steps []*engine.Step
 	if state == fs.StateCurrent {
 		steps = append(steps, engine.NewStep("web/status", engine.NoOp, summary))
@@ -195,6 +210,101 @@ func (p *Provider) PlanStatus(ctx context.Context, projects []*model.Project,
 			"vhost de supervision actif"))
 	}
 	return steps, nil
+}
+
+// statusListens dit si le vhost de supervision en place écoute déjà sur listen :
+// le port est alors celui que le moteur tient pour lui.
+func statusListens(path, listen string) bool {
+	data, err := readBounded(path, maxConfigRead)
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(strings.TrimSuffix(strings.TrimSpace(line), ";"))
+		if len(fields) >= 2 && strings.EqualFold(fields[0], "listen") && sameAddress(fields[1], listen) {
+			return true
+		}
+	}
+	return false
+}
+
+// sameAddress compare deux « adresse:port » après analyse, jamais comme chaînes.
+func sameAddress(a, b string) bool {
+	ha, pa, err := net.SplitHostPort(a)
+	if err != nil {
+		return false
+	}
+	hb, pb, err := net.SplitHostPort(b)
+	if err != nil || pa != pb {
+		return false
+	}
+	ia, ib := net.ParseIP(ha), net.ParseIP(hb)
+	return ia != nil && ia.Equal(ib)
+}
+
+// portHolder nomme l'écoute qui occupe déjà l'adresse du vhost de supervision,
+// vide s'il n'y en a pas. Une écoute joker du même port l'occupe aussi : bind()
+// sur 127.0.0.1 échoue quand 0.0.0.0 est tenu, et « :: » est compté pour l'IPv4
+// comme pour l'IPv6 — IPV6_V6ONLY ne se lit pas dans /proc/net, et un refus à
+// tort ne coûte que la supervision, là où un port pris coûte le parc.
+func (p *Provider) portHolder(listen string) (string, error) {
+	host, portStr, err := net.SplitHostPort(listen)
+	if err != nil {
+		return "", err
+	}
+	ip := net.ParseIP(host)
+	port, err := strconv.Atoi(portStr)
+	if ip == nil || err != nil {
+		return "", fmt.Errorf("adresse d'écoute %q illisible", listen)
+	}
+	listeners, err := p.listeners()
+	if err != nil {
+		return "", err
+	}
+	for _, l := range listeners {
+		if l.Port != port {
+			continue
+		}
+		occupe := l.IP.Equal(ip)
+		if l.IP.IsUnspecified() {
+			v4 := l.IP.To4() != nil
+			occupe = !v4 || ip.To4() != nil
+		}
+		if occupe {
+			return fmt.Sprintf("%s (uid %d)", net.JoinHostPort(l.IP.String(), portStr), l.UID), nil
+		}
+	}
+	return "", nil
+}
+
+// listeners rend les écoutes TCP de la machine, ou rien en mode simulé : un plan
+// calculé sous --prefix ne dépend pas de ce qui tourne sur le poste.
+func (p *Provider) listeners() ([]app.Listener, error) {
+	if p.Listeners != nil {
+		return p.Listeners()
+	}
+	if p.Exec == nil || p.Exec.Simulated() {
+		return nil, nil
+	}
+	return app.ReadListeners(app.ProcNet)
+}
+
+// statusPortRefused est l'étape qui refuse le vhost de supervision sur un port
+// déjà pris, ou que /proc/net n'a pas permis de juger.
+func statusPortRefused(summary, listen, holder string, cause error) *engine.Step {
+	s := engine.NewStep("web/status", engine.Update, summary+" — port déjà pris")
+	s.Critical = false
+	s.Apply = func(context.Context) error {
+		if cause != nil {
+			return fmt.Errorf("vhost de supervision non écrit : l'occupation de %s n'a pas pu être lue (%w) — "+
+				"un port pris arrêterait le maître Apache au rechargement", listen, cause)
+		}
+		return fmt.Errorf("vhost de supervision non écrit : %s est déjà tenu par l'écoute %s — sur un port pris, "+
+			"« Listen » arrête le maître Apache au rechargement suivant, et nginx garde sa configuration "+
+			"précédente ; choisir un port libre (monitoring.status.listen dans /etc/ogs/config.yaml) ou "+
+			"libérer celui-ci (D118)", listen, holder)
+	}
+	return s
 }
 
 // statusPools énumère les pools du parc et la référence de leur point d'écoute.
