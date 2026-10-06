@@ -200,10 +200,12 @@ func (a *App) applyFleet(ctx context.Context, projects []*model.Project, run app
 		}
 		if plan.Empty() {
 			a.printf("= %s : aucun changement\n", p.ID())
+			printNotes(a, plan)
 			continue
 		}
 		t.changes = len(plan.Mutating())
 		a.printf("projet %s\n%s", p.ID(), plan.String())
+		printNotes(a, plan)
 	}
 	preview, previewErr := a.buildGlobalPlan(ctx, provs, standing(targets))
 	switch {
@@ -215,6 +217,10 @@ func (a *App) applyFleet(ctx context.Context, projects []*model.Project, run app
 		a.warnf("⚠ plan du parc incalculable avant les projets : %v\n", previewErr)
 	case !preview.Empty():
 		a.printf("parc\n%s", preview.String())
+		printNotes(a, preview)
+	default:
+		// Informations du plan du parc (D118) : affichées même sans changement.
+		printNotes(a, preview)
 	}
 	shownGlobal := keysOf(preview)
 	if k, ok := run.shown["*"]; ok {

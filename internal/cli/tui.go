@@ -161,6 +161,7 @@ func (b *tuiBackend) Plan(ctx context.Context, p *model.Project) ([]string, erro
 		lines = append(lines, "projet "+p.ID())
 		lines = append(lines, strings.Split(strings.TrimRight(plan.String(), "\n"), "\n")...)
 	}
+	lines = append(lines, noteLines(plan)...)
 	global, err := b.app.buildGlobalPlan(ctx, provs, []*model.Project{p})
 	if err != nil {
 		return nil, fmt.Errorf("plan du parc : %w", err)
@@ -169,6 +170,7 @@ func (b *tuiBackend) Plan(ctx context.Context, p *model.Project) ([]string, erro
 		lines = append(lines, "parc")
 		lines = append(lines, strings.Split(strings.TrimRight(global.String(), "\n"), "\n")...)
 	}
+	lines = append(lines, noteLines(global)...)
 	if b.shown == nil {
 		b.shown = map[string]map[string]planKeys{}
 	}
@@ -228,6 +230,16 @@ func (b *tuiBackend) Diff(ctx context.Context, p *model.Project) ([]string, erro
 		lines = append(lines, diffLines(global)...)
 	}
 	return lines, nil
+}
+
+// noteLines rend les informations d'un plan, hors décompte (D118), comme
+// printNotes les affiche en ligne de commande.
+func noteLines(plan *engine.Plan) []string {
+	var lines []string
+	for _, n := range plan.Notes {
+		lines = append(lines, "  ℹ "+n)
+	}
+	return lines
 }
 
 // diffLines rend les changements d'un plan avec leur diff, ligne par ligne.

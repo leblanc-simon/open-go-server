@@ -131,10 +131,14 @@ func (a *App) readAnswer() (string, error) {
 	}
 	// La lecture reste en vol après une interruption : la commande s'achève
 	// alors, et elle avec.
+	// L'entrée est relevée avant le goroutine : resté en vol après une
+	// interruption, il ne relit plus os.Stdin, qu'un appelant peut avoir
+	// rendu entre-temps.
+	in := os.Stdin
 	ch := make(chan lue, 1)
 	go func() {
 		var answer string
-		_, err := fmt.Fscanln(os.Stdin, &answer)
+		_, err := fmt.Fscanln(in, &answer)
 		ch <- lue{answer, err}
 	}()
 	select {
