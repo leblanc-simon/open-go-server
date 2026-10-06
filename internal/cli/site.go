@@ -178,6 +178,7 @@ func (a *App) buildSite(host string, opts siteOptions) (*model.Project, error) {
 	if opts.phpVersion != "" {
 		p.Spec.PHP.Pools = []model.Pool{{Name: model.MainPoolName, Version: opts.phpVersion}}
 	}
+	a.creationSudo(p)
 	// Première normalisation : l'identifiant et le host effectif en découlent, et
 	// tout le reste s'y adosse.
 	if err := a.prepare(p); err != nil {

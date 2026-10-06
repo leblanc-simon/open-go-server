@@ -2183,6 +2183,14 @@ func newRestoreCommand(app *App) *cobra.Command {
 					return exitf(CodeValidation, "l'archive de %s déclare spec.user.webAccess « acl », qu'ogs "+
 						"n'implémente pas : rien n'a été restauré.\n  remède : %s", p.ID(), webAccessArchiveFix)
 				}
+				// Une archive d'avant D121 peut déclarer un service « app » à côté
+				// de l'application supervisée : l'apply le refuserait après le dépôt
+				// de la déclaration, et « service remove » ne vaut que pour un projet
+				// déposé. Le refus vient avant tout, avec un remède propre à l'archive.
+				if err := validate.ServiceNames(p); err != nil {
+					return exitf(CodeValidation, "l'archive de %s :\n%v\nrien n'a été restauré.\n  remède : %s",
+						p.ID(), err, serviceAppArchiveFix)
+				}
 				// Une archive d'avant D91 peut déclarer un compte réservé : la
 				// restaurer l'écrirait de nouveau au parc.
 				if err := app.refuseReservedDBAccounts(p); err != nil {
@@ -2955,3 +2963,9 @@ func restoreUserJobs(path string, p *model.Project, manifest archive.Manifest) [
 	}
 	return gaps
 }
+
+// serviceAppArchiveFix est le remède du refus d'un service « app » dans une
+// archive (D121) : la déclaration ne se corrige pas avant la restauration.
+const serviceAppArchiveFix = "extraire project.yaml de l'archive (tar --zstd -xOf <archive> project.yaml), y " +
+	"renommer le service « app », le déposer sous /etc/ogs/projects/<id>.yaml, « ogs apply <id> », " +
+	"puis reprendre le home et les bases depuis l'archive à la main"

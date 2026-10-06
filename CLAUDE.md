@@ -12,8 +12,8 @@ Les commits ne mentionnent jamais l'assistance d'un outil d'IA.
 
 ## La référence
 
-[`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md) fait autorité : 118 décisions d'architecture
-arbitrées (D1–D115, D117, D120 et D122, D116 réservée ; tableau §2), spécification par module, plan de tests, découpage en lots. **Consulter le
+[`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md) fait autorité : 119 décisions d'architecture
+arbitrées (D1–D115, D117, D120 à D122, D116 réservée ; tableau §2), spécification par module, plan de tests, découpage en lots. **Consulter le
 tableau des décisions avant de proposer une architecture** — la plupart des questions « pourquoi pas
 plutôt… ? » y sont déjà tranchées, avec leur raison. Toute décision nouvelle s'y ajoute.
 
@@ -474,6 +474,13 @@ Ils ont tous coûté un défaut réel ; les tests unitaires ne les voyaient pas.
   chemin absent fait échouer le service en 226/NAMESPACE avant toute exécution.
 - Les étapes d'unité s'ordonnent par **cycle de vie**, pas par nom : `unit/instance` précède
   `unit/service` dans l'alphabet, ce qui ferait démarrer une instance avant l'écriture de son modèle.
+- **Un lien d'activation ne dit pas qu'une instance tourne** (D121) : une instance morte, ou dont le
+  démarrage avait échoué, passait pour « active » à jamais. L'observation relit l'état systemd et relance
+  ce qui est **`failed`**, jamais ce qui est `inactive` — l'état d'un `service stop` de l'exploitant, que
+  l'arrêt d'ogs garantit par `reset-failed` : un worker qui rend 1 sur SIGTERM en sortait `failed`, et l'apply
+  le relançait ;
+  l'activation démarre avant de poser le lien, et la cible démarre sous `--job-mode=ignore-requirements`,
+  sans quoi elle tire ses `Wants=` et relance une instance arrêtée.
 - La cible d'un projet doit être liée à `multi-user.target`, sinon les services ne repartent pas après un
   redémarrage.
 - **`PartOf` ne propage rien depuis une cible inactive** (D114) : les instances démarrées une à une, la

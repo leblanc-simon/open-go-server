@@ -53,6 +53,23 @@ type File struct {
 	// NonCritical rend non critique le retrait lui-même, pour un provider dont
 	// aucune étape ne doit faire compenser un déploiement (supervision, DKIM).
 	NonCritical bool
+	// Owns, s'il est donné, juge la ressource que porte l'en-tête (D76, D100) :
+	// le fichier n'est retiré que si elle relève encore de l'appelant. Elle est
+	// relue au plan et de nouveau au retrait — un autre provider a pu réécrire le
+	// fichier entre-temps, sous sa propre ressource, dans le même apply (D121) :
+	// l'unité applicative réécrite par-dessus un modèle de service homonyme
+	// partait sur la foi de l'en-tête lu au plan, liens d'activation compris.
+	Owns func(resource string) bool
+}
+
+// foreignResource dit si l'en-tête désigne désormais une ressource que
+// l'appelant ne tient pas : le fichier n'est alors plus le sien à retirer.
+func (f File) foreignResource() bool {
+	if f.Owns == nil {
+		return false
+	}
+	_, resource, err := fs.ManagedResource(f.Path)
+	return err == nil && !f.Owns(resource)
 }
 
 // InspectError signale un fichier dont l'état n'a pas pu être lu au plan. Il
@@ -96,7 +113,7 @@ func (f File) Step() (*engine.Step, error) {
 	if err != nil {
 		return nil, &InspectError{Path: f.Path, Err: err}
 	}
-	if state == fs.StateAbsent {
+	if state == fs.StateAbsent || f.foreignResource() {
 		return nil, nil
 	}
 	if refus := f.refusal(state); refus != nil {
@@ -194,7 +211,7 @@ func (f File) removeStep(summary string) *engine.Step {
 		if err != nil {
 			return err
 		}
-		if state == fs.StateAbsent {
+		if state == fs.StateAbsent || f.foreignResource() {
 			return nil
 		}
 		if refus := f.refusal(state); refus != nil {

@@ -816,6 +816,41 @@ func validateServices(p *model.Project, add func(string, string, ...any)) {
 	}
 }
 
+// AppServiceName est le nom logique du service de l'application supervisée : son
+// unité est ogs-<id>-app@.service, écrite par le provider applicatif. Il double
+// unit.AppServiceName, que validate ne peut pas importer.
+const AppServiceName = "app"
+
+// ServiceNames refuse un service déclaré sous le nom de l'application supervisée
+// d'un projet qui en a une (D121) : les deux s'écrivaient dans le même fichier
+// d'unité, chaque provider réécrivant à chaque apply ce que l'autre venait de
+// poser — unité alternée, services redémarrés à chaque passage. Le nom n'est
+// refusé qu'au plan et à l'apply du projet visé (checkFleetUniqueness), jamais
+// au chargement : un projet PHP qui déclare un service « app » n'a aucune
+// application supervisée et fonctionne, et le refuser au chargement arrêterait
+// tout le parc. « service add » le refuse toujours (ReservedServiceName).
+func ServiceNames(p *model.Project) error {
+	at, err := p.AppType()
+	if err != nil || at.Runtime == "" {
+		return nil
+	}
+	var errs Errors
+	for i, s := range p.Spec.Services {
+		if s.Name == AppServiceName {
+			errs = append(errs, Error{Field: fmt.Sprintf("spec.services[%d].name", i), Message: fmt.Sprintf(
+				"le nom %q est celui de l'application supervisée (ogs-%s-%s@.service) : "+
+					"« ogs service remove %s %s », le redéclarer sous un autre nom (« ogs service add »), "+
+					"puis « ogs apply %s »", s.Name, p.ID(), AppServiceName, p.ID(), s.Name, p.ID())})
+		}
+	}
+	return errs.OrNil()
+}
+
+// ReservedServiceName dit si un nom de service est réservé à la déclaration
+// d'un service neuf, quel que soit le type du projet : un projet peut devenir
+// une application supervisée, et le service prendrait alors son fichier d'unité.
+func ReservedServiceName(name string) bool { return name == AppServiceName }
+
 // CronExpression valide une expression cron à cinq champs.
 func CronExpression(expr string) error {
 	fields := strings.Fields(expr)

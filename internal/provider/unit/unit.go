@@ -83,17 +83,32 @@ type Observed struct {
 	Instances map[string]int
 	// Enabled associe un nom d'instance à sa présence dans la cible.
 	Enabled map[string]bool
+	// Failed nomme les instances que systemd tient en échec (D121) : le lien
+	// d'activation ne dit pas qu'une instance tourne, et une instance morte ou
+	// dont le démarrage a échoué passait pour « active » à jamais. Seul l'état
+	// « failed » compte : « inactive » est aussi celui d'un service que
+	// l'exploitant a arrêté (« service stop », D114), qu'un apply ne relance pas.
+	// Vide en mode simulé, et quand systemd ne répond pas — une lecture en échec
+	// n'est pas un échec des services (Q-20).
+	Failed map[string]bool
 }
 
-// Observe lit les unités activées.
-func (p *Provider) Observe(_ context.Context, proj *model.Project) (Observed, error) {
-	obs := Observed{Instances: map[string]int{}, Enabled: map[string]bool{}}
+// Observe lit les unités activées, puis l'état que systemd tient de chacune.
+func (p *Provider) Observe(ctx context.Context, proj *model.Project) (Observed, error) {
+	obs := Observed{Instances: map[string]int{}, Enabled: map[string]bool{}, Failed: map[string]bool{}}
 	entries, err := os.ReadDir(p.wantsDir(proj.ID()))
 	if err != nil {
 		if os.IsNotExist(err) {
 			return obs, nil
 		}
 		return obs, err
+	}
+	if states, err := p.states(ctx, proj.ID()); err == nil {
+		for unit, state := range states {
+			if state == "failed" {
+				obs.Failed[unit] = true
+			}
+		}
 	}
 	prefix := "ogs-" + proj.ID() + "-"
 	for _, e := range entries {
@@ -294,23 +309,13 @@ func (p *Provider) Plan(_ context.Context, proj *model.Project, obs Observed) ([
 		for i := 1; i <= instances; i++ {
 			name := InstanceName(proj.ID(), svc.Name, i)
 			wanted[name] = true
-			if obs.Enabled[name] {
-				steps = append(steps, engine.NewStep("unit/instance/"+name, engine.NoOp,
-					fmt.Sprintf("instance %s active", name)))
-				continue
-			}
-			steps = append(steps, p.enableStep(proj, name))
+			steps = append(steps, p.instanceStep(proj, obs, name))
 		}
 	}
 	for i := 1; i <= appInstances; i++ {
 		name := InstanceName(proj.ID(), AppServiceName, i)
 		wanted[name] = true
-		if obs.Enabled[name] {
-			steps = append(steps, engine.NewStep("unit/instance/"+name, engine.NoOp,
-				fmt.Sprintf("instance %s active", name)))
-			continue
-		}
-		steps = append(steps, p.enableStep(proj, name))
+		steps = append(steps, p.instanceStep(proj, obs, name))
 	}
 
 	// Le surplus d'instances est désactivé : réduire l'échelle ne doit pas laisser
@@ -406,6 +411,13 @@ func (p *Provider) staleSteps(proj *model.Project, withTarget bool) ([]*engine.S
 	for _, svc := range proj.Spec.Services {
 		declared[filepath.Join(p.Paths.SystemdDir(), ServiceName(proj.ID(), svc.Name))] = true
 	}
+	// Le fichier de l'application supervisée n'est jamais un modèle obsolète,
+	// même marqué « unit/app » par un service « app » d'avant D121 : le provider
+	// applicatif le réécrit sous « app/app » dans le même apply, et le retirer
+	// sur la foi de l'en-tête lu au plan emportait l'unité applicative.
+	if appServiceInstances(proj) > 0 {
+		declared[filepath.Join(p.Paths.SystemdDir(), ServiceName(proj.ID(), AppServiceName))] = true
+	}
 	targetPath := filepath.Join(p.Paths.SystemdDir(), TargetName(proj.ID()))
 	var steps []*engine.Step
 	for _, path := range paths {
@@ -437,6 +449,8 @@ func (p *Provider) staleSteps(proj *model.Project, withTarget bool) ([]*engine.S
 		step.Now = p.now
 		step.Reload = []string{"systemd:daemon-reload"}
 		step.Links = func() []string { return p.linksTo(proj.ID(), path) }
+		// Seuls les fichiers « unit/… » relèvent d'ici ; relu au retrait (D121).
+		step.Owns = func(resource string) bool { return strings.HasPrefix(resource, "unit/") }
 		s, err := step.Step()
 		if err != nil {
 			return nil, err
@@ -636,6 +650,52 @@ func (p *Provider) disableTargetStep(proj *model.Project) *engine.Step {
 	return s
 }
 
+// instanceStep juge une instance voulue : à activer si son lien manque, à
+// relancer si systemd la tient en échec, conforme sinon.
+func (p *Provider) instanceStep(proj *model.Project, obs Observed, name string) *engine.Step {
+	switch {
+	case !obs.Enabled[name]:
+		return p.enableStep(proj, name)
+	case obs.Failed[name]:
+		return p.relaunchStep(proj, name)
+	}
+	return engine.NewStep("unit/instance/"+name, engine.NoOp, fmt.Sprintf("instance %s active", name))
+}
+
+// relaunchStep relance une instance activée que systemd tient en échec (D121) :
+// morte au-delà de StartLimitBurst, ou dont le démarrage a échoué. Le compteur
+// d'échecs est acquitté d'abord, sans quoi systemd refuserait le démarrage. Non
+// critique comme l'activation : un worker qui retombe ne doit pas défaire le
+// déploiement du site. Il retombera en échec, et le plan suivant le relancera
+// encore — c'est l'écart réel, et il reste visible à chaque plan au lieu de
+// passer pour « actif ».
+func (p *Provider) relaunchStep(proj *model.Project, name string) *engine.Step {
+	s := engine.NewStep("unit/instance/"+name, engine.Update,
+		fmt.Sprintf("relance de %s, en échec", name))
+	s.Critical = false
+	// Une unité réécrite dans le même apply doit être relue avant la relance.
+	s.FlushReloads = true
+	s.Apply = func(ctx context.Context) error {
+		if err := p.systemctl(ctx, "reset-failed", name); err != nil {
+			return err
+		}
+		return p.startInstances(ctx, proj.ID(), name)
+	}
+	return s
+}
+
+// startInstances démarre des instances, puis la cible du projet sans ses
+// dépendances (--job-mode=ignore-requirements). La cible démarre avec ses
+// instances (D114) — inactive, elle ne propage ni l'arrêt ni le redémarrage —,
+// mais démarrée ordinairement elle tire chacun de ses Wants= : activer une
+// instance neuve relançait un worker que l'exploitant avait arrêté (D121).
+func (p *Provider) startInstances(ctx context.Context, id string, names ...string) error {
+	if err := p.systemctl(ctx, append([]string{"start"}, names...)...); err != nil {
+		return err
+	}
+	return p.systemctl(ctx, "start", "--job-mode=ignore-requirements", TargetName(id))
+}
+
 // enableStep active une instance : le lien dans le répertoire .wants de la cible
 // est exactement ce que crée « systemctl enable ».
 func (p *Provider) enableStep(proj *model.Project, name string) *engine.Step {
@@ -650,19 +710,27 @@ func (p *Provider) enableStep(proj *model.Project, name string) *engine.Step {
 	// pourtant d'écrire. Le daemon-reload est groupé, il est donc vidé ici.
 	s.FlushReloads = true
 	s.Apply = func(ctx context.Context) error {
+		// Le démarrage précède le lien (D121) : le lien posé d'abord, une
+		// interruption avant le démarrage laissait une instance « activée » que
+		// rien ne lançait, et que le plan tenait pour conforme à jamais. La cible
+		// démarre avec l'instance (D114) : laissée inactive, elle ne propageait ni
+		// l'arrêt ni le redémarrage — « project delete » arrêtait une cible déjà
+		// arrêtée, et userdel échouait sur le worker resté vivant.
+		started := p.startInstances(ctx, proj.ID(), name)
+		if started != nil && ctx.Err() != nil {
+			// Interrompu : rien n'est activé, le plan suivant rejoue l'étape.
+			return started
+		}
+		// Un démarrage refusé laisse l'instance activée : systemd la tient en
+		// échec, et le plan suivant la relance (relaunchStep).
 		if err := fs.EnsureDir(filepath.Dir(link), 0o755, fs.KeepOwner); err != nil {
-			return err
+			return errors.Join(started, err)
 		}
 		target := filepath.Join(p.Paths.SystemdDir(), templateOf(name))
 		if err := os.Symlink(target, link); err != nil && !os.IsExist(err) {
-			return err
+			return errors.Join(started, err)
 		}
-		// La cible démarre avec l'instance (D114) : laissée inactive, elle ne
-		// propageait ni l'arrêt ni le redémarrage à des instances qui tournaient
-		// pourtant — « project delete » arrêtait une cible déjà arrêtée, et userdel
-		// échouait sur le worker resté vivant. Démarrer une cible active ne fait
-		// rien, et l'observation ne lit que les liens : le plan n'en change pas.
-		return p.systemctl(ctx, "start", name, TargetName(proj.ID()))
+		return started
 	}
 	s.Compensate = func(ctx context.Context) error {
 		_ = p.systemctl(ctx, "stop", name)
@@ -683,6 +751,10 @@ func (p *Provider) disableStep(proj *model.Project, name string) *engine.Step {
 		if err := p.systemctl(ctx, "stop", name); err != nil {
 			return err
 		}
+		// Un worker qui rend un code non nul sur SIGTERM sort de l'arrêt
+		// « failed », et systemd garde l'unité désactivée — son modèle parti,
+		// « not-found failed » — à jamais dans list-units (D121).
+		_ = p.systemctl(ctx, "reset-failed", name)
 		if err := os.Remove(link); err != nil && !os.IsNotExist(err) {
 			return err
 		}
@@ -728,7 +800,12 @@ func (p *Provider) ControlID(ctx context.Context, id, verb string) error {
 	case "status":
 		return p.systemctl(ctx, verb, TargetName(id))
 	case "start", "restart":
-		return p.systemctl(ctx, append([]string{verb}, p.Units(id)...)...)
+		units := p.Units(id)
+		// Un worker en échec refuse de démarrer passé StartLimitBurst : le
+		// compteur est acquitté d'abord (D121). Sans objet pour une unité non
+		// chargée, d'où une erreur ignorée.
+		_ = p.systemctl(ctx, append([]string{"reset-failed"}, units...)...)
+		return p.systemctl(ctx, append([]string{verb}, units...)...)
 	case "stop":
 		_, err := p.Stop(ctx, id)
 		return err
@@ -772,6 +849,29 @@ func (p *Provider) Running(ctx context.Context, id string) ([]string, error) {
 	if p.Exec == nil || p.Exec.Simulated() {
 		return p.Units(id), nil
 	}
+	states, err := p.states(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for unit, state := range states {
+		switch state {
+		case "inactive", "failed":
+			continue
+		}
+		out = append(out, unit)
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+// states rend l'état ACTIVE que systemd tient de la cible du projet et de chaque
+// instance de ses modèles (InstancePattern). Rien en mode simulé.
+func (p *Provider) states(ctx context.Context, id string) (map[string]string, error) {
+	out := map[string]string{}
+	if p.Exec == nil || p.Exec.Simulated() {
+		return out, nil
+	}
 	res, err := p.Exec.Run(ctx, exec.Command{Name: "systemctl", Args: []string{
 		"list-units", "--all", "--plain", "--no-legend", "--no-pager", "--full",
 		"--", TargetName(id), InstancePattern(id),
@@ -779,7 +879,6 @@ func (p *Provider) Running(ctx context.Context, id string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	var out []string
 	for _, line := range strings.Split(res.Stdout, "\n") {
 		fields := strings.Fields(line)
 		// Une unité en échec est précédée d'une puce, même sous --plain.
@@ -790,11 +889,7 @@ func (p *Provider) Running(ctx context.Context, id string) ([]string, error) {
 		if len(fields) < 3 || (fields[0] != TargetName(id) && !belongs(fields[0], id)) {
 			continue
 		}
-		switch fields[2] {
-		case "inactive", "failed":
-			continue
-		}
-		out = append(out, fields[0])
+		out[fields[0]] = fields[2]
 	}
 	return out, nil
 }
@@ -813,7 +908,15 @@ func (p *Provider) Stop(ctx context.Context, id string) ([]string, error) {
 	if err != nil || len(running) == 0 {
 		return nil, err
 	}
-	return running, p.systemctl(ctx, append([]string{"stop"}, running...)...)
+	if err := p.systemctl(ctx, append([]string{"stop"}, running...)...); err != nil {
+		return running, err
+	}
+	// Un worker qui rend un code non nul sur SIGTERM — trap « exit 1 », une
+	// JVM — sort de l'arrêt « failed », et l'apply suivant le relançait comme
+	// un service tombé (D121). L'arrêt voulu est acquitté : l'unité redevient
+	// « inactive », l'état que l'apply respecte.
+	_ = p.systemctl(ctx, append([]string{"reset-failed"}, running...)...)
+	return running, nil
 }
 
 // Start relance les unités d'un projet qu'un Stop a rendues, et elles seules.
@@ -863,7 +966,7 @@ func (p *Provider) Scale(ctx context.Context, proj *model.Project, service strin
 		if err := os.Symlink(target, link); err != nil && !os.IsExist(err) {
 			return changed, err
 		}
-		if err := p.systemctl(ctx, "start", name, TargetName(proj.ID())); err != nil {
+		if err := p.startInstances(ctx, proj.ID(), name); err != nil {
 			return changed, err
 		}
 		changed = append(changed, "+"+name)

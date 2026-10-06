@@ -703,6 +703,9 @@ func (a *App) checkFleetUniqueness(projects ...*model.Project) error {
 		if err := validate.CertificateNames(p); err != nil {
 			return exitf(CodeValidation, "projet %s :\n%v", p.ID(), err)
 		}
+		if err := validate.ServiceNames(p); err != nil {
+			return exitf(CodeValidation, "projet %s :\n%v", p.ID(), err)
+		}
 		if err := a.checkPoolDeclarations(p); err != nil {
 			return err
 		}

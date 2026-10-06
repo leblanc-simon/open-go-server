@@ -208,6 +208,9 @@ func newImportAdoptCommand(app *App) *cobra.Command {
 				return exitf(CodeValidation, "%v", err)
 			}
 			notes = withoutReservedDatabases(p, notes, app.reservedDBAccounts())
+			// La délégation du parc vaut pour une déclaration neuve, adoptée
+			// comprise (D121).
+			app.creationSudo(p)
 			path := app.Paths.ProjectFile(p.ID())
 			if _, err := os.Stat(path); err == nil {
 				return exitf(CodeConflict, "le projet %s est déjà déclaré (%s)", p.ID(), path)

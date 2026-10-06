@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -89,6 +90,12 @@ func (p *Provider) Build(proj *model.Project, instances map[string]int) ([]byte,
 	if style == StyleNone {
 		return nil, nil
 	}
+	if style == StyleSystemctl && len(proj.Spec.Services) == 0 && !supervised(proj) {
+		// Rien à piloter : comme pour le style ogs d'un projet sans service, aucun
+		// fichier. Recopié de config.yaml à la création (D121), le style aurait
+		// sinon délégué une cible vide à chaque projet neuf.
+		return nil, nil
+	}
 	user := proj.Spec.User.Name
 	var b strings.Builder
 	fmt.Fprintf(&b, "# Délégation du pilotage des services à %s.\n", user)
@@ -160,8 +167,35 @@ func (p *Provider) Build(proj *model.Project, instances map[string]int) ([]byte,
 	return content, nil
 }
 
-// settings résout le style et les verbes, la déclaration du projet primant sur
-// la configuration globale.
+// CreationSettings rend la délégation que sudo.style et sudo.verbs de
+// config.yaml demandent pour un projet neuf (D121), ou nil quand elle est celle
+// que le provider applique à une déclaration sans réglage — ogs, et les verbes
+// start, stop, restart et status. Ces deux clés sont un défaut de création, comme
+// user.shell (D62) : copiées dans la déclaration d'un projet créé, elles ne
+// valent rien pour un projet existant. Sans quoi changer config.yaml retirerait
+// ou ajouterait des délégations à tout le parc au prochain apply — « style:
+// none » retirant sans un mot les verbes dont un projet se sert.
+func CreationSettings(style string, verbs []string) *model.Sudo {
+	if style == "" {
+		style = StyleOGS
+	}
+	if len(verbs) == 0 {
+		verbs = DefaultVerbs
+	}
+	if style == StyleOGS && slices.Equal(verbs, DefaultVerbs) {
+		return nil
+	}
+	out := &model.Sudo{Style: style}
+	if style != StyleNone {
+		out.Verbs = slices.Clone(verbs)
+	}
+	return out
+}
+
+// settings résout le style et les verbes : ceux de la déclaration, et à défaut
+// la délégation historique. config.yaml n'est jamais lu ici (D121) : une
+// déclaration sans réglage — tout projet créé avant D121, ou quand la
+// configuration demandait ce défaut — garde la délégation qu'elle a toujours eue.
 func (p *Provider) settings(proj *model.Project) (string, []string) {
 	style, verbs := StyleOGS, DefaultVerbs
 	if proj.Spec.Sudo != nil {
@@ -173,6 +207,13 @@ func (p *Provider) settings(proj *model.Project) (string, []string) {
 		}
 	}
 	return style, verbs
+}
+
+// supervised dit si le projet a une application supervisée, dont l'unité
+// rejoint la cible.
+func supervised(proj *model.Project) bool {
+	at, err := proj.AppType()
+	return err == nil && at.Runtime != ""
 }
 
 // checkToken refuse tout élément susceptible d'élargir la délégation. Il vaut

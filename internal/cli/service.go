@@ -16,6 +16,7 @@ import (
 	appprov "leblanc.io/open-go-server/internal/provider/app"
 	"leblanc.io/open-go-server/internal/provider/unit"
 	"leblanc.io/open-go-server/internal/spec"
+	"leblanc.io/open-go-server/internal/validate"
 )
 
 func newServiceCommand(app *App) *cobra.Command {
@@ -59,6 +60,12 @@ func newServiceAddCommand(app *App) *cobra.Command {
 				return err
 			}
 			name := args[1]
+			// « app » est le service de l'application supervisée : son unité
+			// est écrite par le provider applicatif (D121).
+			if validate.ReservedServiceName(name) {
+				return exitf(CodeValidation, "le nom de service %q est réservé à l'application "+
+					"supervisée (ogs-%s-%s@.service) : en choisir un autre", name, p.ID(), name)
+			}
 			for _, s := range p.Spec.Services {
 				if s.Name == name {
 					return exitf(CodeConflict, "le service %s est déjà déclaré", name)

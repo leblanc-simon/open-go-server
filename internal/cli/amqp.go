@@ -200,7 +200,8 @@ func newAMQPMessengerCommand(app *App) *cobra.Command {
 		Short: "Déclarer le transport Symfony Messenger d'un projet",
 		Long: "Produit la configuration attendue par le transport AMQP de Messenger : un\n" +
 			"exchange direct, une file par transport, un binding par clé de routage et une\n" +
-			"file d'échec pour rejouer les messages rejetés.",
+			"file d'échec pour rejouer les messages rejetés. Une déclaration AMQP existante\n" +
+			"est complétée, jamais remplacée : ce qu'elle porte déjà reste tel quel.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			p, err := app.loadProject(args[0])
@@ -219,7 +220,10 @@ func newAMQPMessengerCommand(app *App) *cobra.Command {
 					"(introduit en 4.1) : employer le template rabbitmq-consumer", p.Spec.App.Version)
 			}
 			_ = at
-			p.Spec.AMQP = amqp.Preset(p, transports, !noFailed)
+			// La déclaration existante est complétée, jamais remplacée (D121) : ce
+			// qui la quitte quitte aussi le broker au prochain apply (D100).
+			var notes []string
+			p.Spec.AMQP, notes = amqp.Complete(p.Spec.AMQP, amqp.Preset(p, transports, !noFailed))
 			if err := app.prepare(p); err != nil {
 				return err
 			}
@@ -242,6 +246,13 @@ func newAMQPMessengerCommand(app *App) *cobra.Command {
 			app.printf("  vhost      %s\n", p.Spec.AMQP.Vhost)
 			app.printf("  files      %s\n", strings.Join(queueNames(p.Spec.AMQP), ", "))
 			app.printf("\nAppliquer :\n  ogs apply %s\n", p.ID())
+			if len(notes) > 0 {
+				for _, n := range notes {
+					app.warnf("⚠ %s\n", n)
+				}
+				return exitf(CodePartial, "préréglage Messenger posé en partie : %d objet(s) déjà déclaré(s) "+
+					"autrement, gardé(s) tel(s) quel(s)", len(notes))
+			}
 			return nil
 		},
 	}

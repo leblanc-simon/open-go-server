@@ -144,7 +144,26 @@ for _ in $(seq 1 20); do
     sleep 1
 done
 [ "$(compte)" = "3" ] || { echo "ÉCHEC : les 3 messages ne sont pas comptés dans emails"; exit 1; }
+# « amqp messenger » complète la déclaration sans rien en retirer (D121) : il
+# remplaçait toute la déclaration, et c'est par lui que ce scénario retirait
+# emails. Le retrait se fait désormais à la main, comme le ferait l'exploitant
+# (l'image n'a pas python3-yaml).
 ogs amqp messenger shopfr --transport async >/dev/null
+grep -q 'name: emails$' /etc/ogs/projects/shopfr.yaml ||
+    { echo "ÉCHEC : « amqp messenger » a retiré le transport emails de la déclaration"; exit 1; }
+awk '
+    /^  amqp:/ { dans = 1 }
+    dans && /^  [a-z]/ && !/^  amqp:/ { dans = 0 }
+    function vider() { if (bloc != "" && bloc !~ /(name|queue): emails/) printf "%s", bloc; bloc = "" }
+    dans && /^      - / { vider(); bloc = $0 "\n"; next }
+    dans && bloc != "" && /^        / { bloc = bloc $0 "\n"; next }
+    { vider(); print }
+    END { vider() }
+' /etc/ogs/projects/shopfr.yaml >/tmp/shopfr.yaml && cat /tmp/shopfr.yaml >/etc/ogs/projects/shopfr.yaml
+if grep -q 'emails' <(sed -n '/^  amqp:/,/^  [a-z][a-z]*:$/p' /etc/ogs/projects/shopfr.yaml | sed '1d;$d'); then
+    echo "ÉCHEC : le transport emails n'a pas quitté la déclaration"
+    exit 1
+fi
 sortie=$(ogs apply shopfr --yes --recreate-queues 2>&1)
 code=$?
 echo "$sortie" | grep -Ei "emails|retiré" | head -6

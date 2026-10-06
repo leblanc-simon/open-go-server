@@ -83,6 +83,7 @@ func newProjectCreateCommand(app *App) *cobra.Command {
 				// Un host explicite dissocie le nom servi du host canonique.
 				p.Spec.Domains = []model.Domain{{Name: hostOpt, Role: "primary"}}
 			}
+			app.creationSudo(p)
 			if err := app.prepare(p); err != nil {
 				return err
 			}

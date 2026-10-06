@@ -39,7 +39,13 @@ func TestServiceNomméAppNEstPasLUnitéApplicative(t *testing.T) {
 	h := newHarness(t)
 	h.mustRun("init")
 	h.mustRun("project", "create", "shop.fr", "--kind", "php-symfony", "--app-version", "6.4", "--php", "8.5")
-	h.mustRun("service", "add", "shopfr", "app", "--transport", "async")
+	// « service add » réserve désormais le nom (D121) : la déclaration est celle
+	// d'un projet antérieur, qu'un projet PHP — sans application supervisée —
+	// garde le droit de porter.
+	h.modifierDéclaration(t, "shopfr", func(p *model.Project) {
+		p.Spec.Services = []model.Service{{Name: "app", Template: "symfony-messenger",
+			Instances: 1, Params: map[string]string{"transport": "async"}}}
+	})
 	out, code := h.run("apply", "shopfr", "--yes")
 	t.Logf("code %d\n%s", code, out)
 	path := h.path("etc", "systemd", "system", "ogs-shopfr-app@.service")

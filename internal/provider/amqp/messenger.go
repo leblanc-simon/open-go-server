@@ -2,6 +2,8 @@ package amqp
 
 import (
 	"fmt"
+	"maps"
+	"slices"
 
 	"leblanc.io/open-go-server/internal/model"
 )
@@ -68,6 +70,73 @@ func Preset(proj *model.Project, transports []string, withFailed bool) *model.AM
 		}
 	}
 	return spec
+}
+
+// Complete ajoute à la déclaration AMQP d'un projet ce que le préréglage
+// Messenger demande et qu'elle ne porte pas encore (D121) : exchanges et files
+// absents par leur nom, bindings absents par leur triplet. Elle ne retire ni ne
+// modifie rien — vhost, compte, permissions, policies et objets déjà déclarés
+// restent tels quels. « amqp messenger » remplaçait toute la déclaration : un
+// second transport effaçait le premier, une file ou une policy écrites à la main
+// disparaissaient, et l'apply suivant les retirait du broker, messages compris
+// (D100). Les notes nomment chaque objet du préréglage qu'une déclaration
+// différente sous le même nom empêche de poser.
+func Complete(current, preset *model.AMQP) (*model.AMQP, []string) {
+	if current == nil {
+		return preset, nil
+	}
+	out := *current
+	if out.Vhost == "" {
+		out.Vhost = preset.Vhost
+	}
+	if out.User == "" {
+		out.User = preset.User
+	}
+	if len(out.Permissions) == 0 {
+		out.Permissions = maps.Clone(preset.Permissions)
+	}
+	var notes []string
+	out.Exchanges = slices.Clone(current.Exchanges)
+	for _, want := range preset.Exchanges {
+		i := slices.IndexFunc(out.Exchanges, func(e model.Exchange) bool { return e.Name == want.Name })
+		switch {
+		case i < 0:
+			out.Exchanges = append(out.Exchanges, want)
+		case out.Exchanges[i] != want:
+			notes = append(notes, fmt.Sprintf("exchange %s déjà déclaré autrement (%s) : gardé tel quel",
+				want.Name, out.Exchanges[i].Type))
+		}
+	}
+	out.Queues = slices.Clone(current.Queues)
+	for _, want := range preset.Queues {
+		i := slices.IndexFunc(out.Queues, func(q model.Queue) bool { return q.Name == want.Name })
+		switch {
+		case i < 0:
+			out.Queues = append(out.Queues, want)
+		case !sameQueue(out.Queues[i], want):
+			notes = append(notes, fmt.Sprintf("file %s déjà déclarée autrement : gardée telle quelle", want.Name))
+		}
+	}
+	out.Bindings = slices.Clone(current.Bindings)
+	for _, want := range preset.Bindings {
+		if !slices.Contains(out.Bindings, want) {
+			out.Bindings = append(out.Bindings, want)
+		}
+	}
+	return &out, notes
+}
+
+// sameQueue compare deux déclarations de file, type et arguments compris.
+func sameQueue(a, b model.Queue) bool {
+	if a.Type != b.Type || a.Durable != b.Durable || len(a.Arguments) != len(b.Arguments) {
+		return false
+	}
+	for k, v := range a.Arguments {
+		if w, ok := b.Arguments[k]; !ok || fmt.Sprint(v) != fmt.Sprint(w) {
+			return false
+		}
+	}
+	return true
 }
 
 // TransportDSN construit la chaîne de connexion d'un transport Messenger.

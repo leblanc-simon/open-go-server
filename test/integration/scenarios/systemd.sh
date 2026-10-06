@@ -488,6 +488,94 @@ fi
 echo "  modèle retiré, instance arrêtée, l'autre service toujours actif"
 
 echo
+echo "--- instance en échec relancée par l'apply, instance arrêtée laissée (D121) ---"
+# « Active » voulait dire « lien présent » : une instance morte n'était jamais
+# relancée. L'échec est obtenu sans attendre StartLimitBurst : Restart=no le
+# temps d'un SIGKILL, par un complément volatil.
+complement=/run/systemd/system/ogs-shopfr-veille@1.service.d
+mkdir -p "$complement"
+printf '[Service]\nRestart=no\n' >"$complement/essai.conf"
+systemctl daemon-reload
+systemctl kill -s KILL ogs-shopfr-veille@1.service
+sleep 1
+rm -rf "$complement"
+systemctl daemon-reload
+if [ "$(systemctl is-active ogs-shopfr-veille@1.service)" != "failed" ]; then
+    echo "ÉCHEC : l'état de départ (instance en échec) n'est pas reproduit : $(systemctl is-active ogs-shopfr-veille@1.service)"
+    exit 1
+fi
+plan=$(ogs plan shopfr 2>&1)
+if ! grep -q "relance de ogs-shopfr-veille@1.service" <<<"$plan"; then
+    echo "$plan" | tail -15
+    echo "ÉCHEC : le plan doit relancer l'instance en échec"
+    exit 1
+fi
+ogs apply shopfr --yes >/tmp/apply-relance.log 2>&1
+sleep 1
+if [ "$(systemctl is-active ogs-shopfr-veille@1.service)" != "active" ]; then
+    tail -15 /tmp/apply-relance.log
+    echo "ÉCHEC : l'apply n'a pas relancé l'instance en échec"
+    exit 1
+fi
+if ogs plan shopfr 2>&1 | grep -q "relance de"; then
+    echo "ÉCHEC : l'instance relancée est encore annoncée en échec"
+    exit 1
+fi
+# Arrêtée par l'exploitant, elle est « inactive », non « failed » : l'apply la
+# laisse arrêtée.
+ogs service stop shopfr >/dev/null 2>&1
+ogs apply shopfr --yes >/tmp/apply-arret.log 2>&1
+sleep 1
+if [ "$(systemctl is-active ogs-shopfr-veille@1.service)" != "inactive" ]; then
+    tail -15 /tmp/apply-arret.log
+    echo "ÉCHEC : un service arrêté par l'exploitant a été relancé par l'apply"
+    exit 1
+fi
+ogs service start shopfr >/dev/null 2>&1
+sleep 1
+if [ "$(systemctl is-active ogs-shopfr-veille@1.service)" != "active" ]; then
+    echo "ÉCHEC : « service start » n'a pas relancé l'instance"
+    exit 1
+fi
+echo "  instance en échec relancée, puis laissée arrêtée après « service stop »"
+
+# Un worker qui rend 1 sur SIGTERM (une JVM, un PHP qui intercepte le signal)
+# sort de l'arrêt « failed » : « service stop » acquitte l'échec, sans quoi
+# l'apply suivant le relançait comme un service tombé.
+install -o shopfr -g shopfr -m 0750 /dev/null /home/shop.fr/www/rude.sh
+cat >/home/shop.fr/www/rude.sh <<'S'
+#!/bin/bash
+trap 'exit 1' TERM
+while :; do sleep 1 & wait $!; done
+S
+ogs service add shopfr rude --template worker --command /home/shop.fr/www/rude.sh >/dev/null
+ogs apply shopfr --yes >/tmp/apply-rude.log 2>&1
+sleep 1
+if [ "$(systemctl is-active ogs-shopfr-rude@1.service)" != "active" ]; then
+    tail -15 /tmp/apply-rude.log
+    echo "ÉCHEC : le worker rude n'a pas démarré"
+    exit 1
+fi
+ogs service stop shopfr >/dev/null 2>&1
+sleep 1
+etat=$(systemctl is-active ogs-shopfr-rude@1.service)
+if [ "$etat" != "inactive" ]; then
+    echo "ÉCHEC : après « service stop », un worker sorti en erreur doit être acquitté (état : $etat)"
+    exit 1
+fi
+ogs apply shopfr --yes >/tmp/apply-rude2.log 2>&1
+sleep 1
+if [ "$(systemctl is-active ogs-shopfr-rude@1.service)" != "inactive" ]; then
+    tail -15 /tmp/apply-rude2.log
+    echo "ÉCHEC : l'apply a relancé un worker arrêté par « service stop »"
+    exit 1
+fi
+ogs service start shopfr >/dev/null 2>&1
+ogs service remove shopfr rude >/dev/null
+ogs apply shopfr --yes >/dev/null 2>&1
+echo "  worker sorti en erreur sur SIGTERM : « service stop » le laisse arrêté"
+
+echo
 echo "--- abandon d'une suppression : seul ce qui tournait repart (D114) ---"
 # Deux instances, la seconde arrêtée par l'exploitant. Une archive impossible fait
 # abandonner la suppression : relancer la cible tirait ses Wants=, et la seconde

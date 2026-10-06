@@ -585,6 +585,18 @@ func (a *App) unprefixed(path string) string {
 	return path
 }
 
+// creationSudo pose dans la déclaration d'un projet neuf la délégation que
+// sudo.style et sudo.verbs de config.yaml demandent (D121). C'est un défaut de
+// création, comme user.shell (D62) : appelé aux seules créations — project et
+// site create, import adopt —, jamais au chargement, il ne retire ni n'ajoute de
+// délégation aux projets existants. Une configuration qui demande la délégation
+// historique n'écrit rien : la déclaration reste celle d'avant D121.
+func (a *App) creationSudo(p *model.Project) {
+	if p.Spec.Sudo == nil {
+		p.Spec.Sudo = sudoers.CreationSettings(a.Cfg.Sudo.Style, a.Cfg.Sudo.Verbs)
+	}
+}
+
 // reservedDBAccounts énumère les comptes SGBD que la configuration désigne et
 // qu'aucun projet ne doit déclarer (D91) : ceux de la supervision — le compte
 // MySQL et le rôle PostgreSQL, qui porte le nom de l'utilisateur système de

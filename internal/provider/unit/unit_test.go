@@ -901,8 +901,14 @@ func TestLActivationDUneInstanceDémarreAussiLaCible(t *testing.T) {
 	sd := &systemdFactice{}
 	prov.Exec = sd
 	apply(t, prov, proj)
-	if démarrées := sd.appel("start"); !slices.Contains(démarrées, TargetName("shopfr")) {
-		t.Errorf("la cible doit démarrer avec ses instances : systemctl start %v", démarrées)
+	cible := false
+	for _, a := range sd.appels {
+		if len(a) > 1 && a[0] == "systemctl" && a[1] == "start" && slices.Contains(a, TargetName("shopfr")) {
+			cible = true
+		}
+	}
+	if !cible {
+		t.Errorf("la cible doit démarrer avec ses instances : %v", sd.appels)
 	}
 	// Et le plan suivant n'en change pas.
 	obs, _ := prov.Observe(context.Background(), proj)
