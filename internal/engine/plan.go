@@ -174,6 +174,25 @@ func Partial(err error) error {
 	return &PartialError{Err: err}
 }
 
+// ToleratedError marque l'échec d'une étape critique qui n'a rien laissé
+// derrière elle — elle a rendu elle-même ce qu'elle avait écrit — et qui ne doit
+// pas dérouler le plan : un fichier en place refusé par son validateur (D117).
+// L'échec compte alors comme celui d'une étape non critique : un avertissement,
+// sans intention de rechargement, et l'exécution continue. Une garde neuve
+// n'arrête pas un site qui tournait.
+type ToleratedError struct{ Err error }
+
+func (e *ToleratedError) Error() string { return e.Err.Error() }
+func (e *ToleratedError) Unwrap() error { return e.Err }
+
+// Tolerated enveloppe l'erreur d'une étape qui ne doit pas dérouler le plan.
+func Tolerated(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &ToleratedError{Err: err}
+}
+
 // ResidualError marque l'échec d'une étape qui laisse derrière elle un
 // changement qu'elle n'a pas pu défaire — un vhost dont les liens d'activation
 // n'ont pas pu être rétablis. Le moteur ne compense jamais l'étape en échec :
@@ -283,7 +302,7 @@ func Execute(ctx context.Context, plan *Plan, opts Options) (*Report, error) {
 			if opts.Audit != nil {
 				opts.Audit(s, "ok", "")
 			}
-		case !s.Critical:
+		case !s.Critical || errors.As(err, new(*ToleratedError)):
 			if partial := (*PartialError)(nil); errors.As(err, &partial) {
 				attendre(s.Reload)
 			}

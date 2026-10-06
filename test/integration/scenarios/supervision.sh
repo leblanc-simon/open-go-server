@@ -198,6 +198,20 @@ ogs apply --yes >/dev/null 2>&1
 ogs doctor 2>&1 | grep -i "prisons fail2ban" | head -1
 
 echo
+echo "--- des prisons refusées par fail2ban sont-elles rendues ? (D117) ---"
+cp "$jails" /tmp/prisons-avant
+ogs template extract fail2ban/ogs.conf >/dev/null
+printf '\n[ogs-casse]\nenabled = true\nfilter = nexistepas\nlogpath = /var/log/syslog\n' \
+    >> /etc/ogs/templates/fail2ban/ogs.conf.tmpl
+sortie=$(ogs apply --yes 2>&1); code=$?
+[ "$code" = 6 ] || echec "des prisons refusées doivent rendre le code 6, obtenu $code"
+echo "$sortie" | grep -q "fail2ban-client -t refuse" || echec "le refus de fail2ban n'est pas nommé"
+cmp -s /tmp/prisons-avant "$jails" || echec "les prisons refusées n'ont pas été rendues"
+fail2ban-client -t >/dev/null 2>&1 || echec "la configuration de fail2ban est restée cassée"
+rm /etc/ogs/templates/fail2ban/ogs.conf.tmpl
+echo "  prisons refusées, fichier précédent rendu, fail2ban intact"
+
+echo
 echo "--- la suppression d'un projet retire-t-elle ses entrées ? ---"
 ogs project delete shopfr --yes >/dev/null 2>&1
 grep -q shopfr "$fragment" && echec "le projet supprimé subsiste dans les entrées de l'agent"

@@ -12,8 +12,8 @@ Les commits ne mentionnent jamais l'assistance d'un outil d'IA.
 
 ## La référence
 
-[`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md) fait autorité : 114 décisions d'architecture
-arbitrées (D1–D111, D113 à D115, D112 réservée ; tableau §2), spécification par module, plan de tests, découpage en lots. **Consulter le
+[`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md) fait autorité : 115 décisions d'architecture
+arbitrées (D1–D111, D113 à D115 et D117, D112 et D116 réservées ; tableau §2), spécification par module, plan de tests, découpage en lots. **Consulter le
 tableau des décisions avant de proposer une architecture** — la plupart des questions « pourquoi pas
 plutôt… ? » y sont déjà tranchées, avec leur raison. Toute décision nouvelle s'y ajoute.
 
@@ -334,8 +334,11 @@ vide).
   cible, qui ne touche ogs que par ses commandes. Il a son banc, `test/migration`, lu par `make test`.
 - `internal/tui` : Bubble Tea derrière une interface `Backend`, testable sans terminal.
 - `internal/hook` : hooks de parc (un fichier de `/etc/ogs/hooks` nommé d'après l'événement) ou de projet
-  (`spec.hooks`, qui l'emporte). Un hook s'exécute en root : il doit vivre sous `/etc/ogs/hooks`,
-  appartenir à root et n'être inscriptible par personne d'autre. Sous `--dry-run`, `hook.Runner` le résout,
+  (`spec.hooks`, qui l'emporte — sauf `postCertRenew`, où il s'ajoute à celui du parc, D117). Un hook
+  s'exécute en root : il est désigné sous `/etc/ogs/hooks`, et résolu depuis « / » — chaque répertoire
+  traversé, lien compris, à root et fermé en écriture au groupe et aux autres ; le fichier réel à root,
+  inscriptible par lui seul. Un lien qui sort du répertoire reste admis à ces conditions (`doctor` le
+  signale) : refusé, il coupait des hooks en service. Sous `--dry-run`, `hook.Runner` le résout,
   contrôles compris, et ne le lance pas.
 
 ## Pièges de plateforme à connaître
@@ -420,7 +423,22 @@ Ils ont tous coûté un défaut réel ; les tests unitaires ne les voyaient pas.
   point de surcharge : son unique `server` porte le challenge ACME, qu'un `rewrite` déposé là mettrait par
   terre.
 - `StartLimitBurst` et `StartLimitIntervalSec` appartiennent à **`[Unit]`** ; dans `[Service]`, systemd les
-  ignore en silence.
+  ignore en silence — systemd 257 accepte encore `StartLimitBurst` à cet endroit par compatibilité, mais
+  plus `StartLimitIntervalSec`.
+- **Un validateur se plaint de ce qu'ogs n'a pas écrit** (D117) : `systemd-analyze verify` juge aussi les
+  unités tierces et un binaire pas encore déployé (« is not executable »), `logrotate -d` un journal absent,
+  `fail2ban-client -t` les prisons de l'administrateur. Refuser sur son code de retour bloquerait le parc :
+  seules comptent les lignes localisées dans le fichier d'ogs (`chemin:ligne`), et pour fail2ban la
+  différence avec le fichier précédent rendu. À l'inverse, **logrotate ignore une option inconnue en
+  code 0** (« warning: … unknown option ») : l'avertissement localisé fait refuser. Le fichier refusé est
+  rendu par l'étape qui l'a écrit (`verify.Restore`) ; s'il existait, le refus est toléré
+  (`engine.Tolerated`, code 6) — une garde neuve n'arrête pas un site qui tournait.
+- **Un `%` dans `Environment=` est un spécificateur** : `p%40ss` ou `%2f` font refuser l'affectation entière
+  (« Invalid slot »), la variable manque au service sans autre signe qu'une ligne de journal, et
+  `systemd-analyze verify` refuse l'unité. `systemdEnv` double tout `%` qui n'introduit pas un spécificateur
+  connu de systemd (D117) ; `%i` reste, mais un spécificateur valide au milieu d'une valeur (`p%nss`) est
+  développé comme avant — l'écrire `%%`. `%D`, inconnu de systemd 252, est toujours doublé. Le premier
+  apply réécrit, donc redémarre, les unités dont une valeur portait un `%` non spécificateur.
 - `ReadWritePaths` d'une unité est **facultatif** (préfixe `-`) : `var/` est créé par l'application, et un
   chemin absent fait échouer le service en 226/NAMESPACE avant toute exécution.
 - Les étapes d'unité s'ordonnent par **cycle de vie**, pas par nom : `unit/instance` précède
@@ -711,8 +729,8 @@ Ils ont tous coûté un défaut réel ; les tests unitaires ne les voyaient pas.
   réécrit par ogs. Il l'emporte sur les `Environment=` de l'unité, `PORT` compris.
 - **`Environment=` se découpe sur les blancs** : `K=deux mots` définit `K=deux` et écarte `mots` sans autre
   signe qu'une ligne de journal. La fonction de template `systemdEnv` cite l'affectation **seulement si la
-  valeur l'exige** — une valeur simple garde son rendu, et l'unité n'est ni réécrite ni redémarrée. Les `%`
-  restent des spécificateurs (`INSTANCE=%i`).
+  valeur l'exige** — une valeur simple garde son rendu, et l'unité n'est ni réécrite ni redémarrée. Un `%`
+  reste un spécificateur s'il en introduit un (`INSTANCE=%i`), il est doublé sinon (D117).
 - **Un port de la machine au-dessus de 1024 est à qui le prend** : broker ou plugin de management
   arrêté, l'utilisateur d'un projet ouvre `127.0.0.1:15672` et reçoit l'authentification Basic de
   l'administrateur du broker. Le client vérifie donc **l'autre bout de chaque connexion** (D93) — le socket

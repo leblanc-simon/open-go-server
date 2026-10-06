@@ -12,14 +12,19 @@ import (
 
 	"leblanc.io/open-go-server/internal/config"
 	"leblanc.io/open-go-server/internal/engine"
+	"leblanc.io/open-go-server/internal/exec"
 	"leblanc.io/open-go-server/internal/fs"
 	"leblanc.io/open-go-server/internal/model"
+	"leblanc.io/open-go-server/internal/provider/verify"
 	"leblanc.io/open-go-server/internal/template"
 )
 
 // Provider génère /etc/logrotate.d/ogs.
 type Provider struct {
-	Paths     config.Paths
+	Paths config.Paths
+	// Exec éprouve le fichier écrit par « logrotate -d » (D117). Absent ou
+	// simulé, rien n'est éprouvé.
+	Exec      exec.Executor
 	Templates *template.Set
 	Config    *config.Config
 	Now       func() time.Time
@@ -197,10 +202,9 @@ func (p *Provider) Plan(projects []*model.Project, webEngine, webUnit string) (*
 		return fs.UnifiedDiff(string(current), string(content), path), nil
 	}
 	var previous []byte
-	s.Apply = func(context.Context) error {
-		if data, err := os.ReadFile(path); err == nil {
-			previous = data
-		}
+	s.Apply = func(ctx context.Context) error {
+		var mode os.FileMode
+		previous, mode = verify.ReadPrevious(path)
 		if forced {
 			// Écraser le travail d'un exploitant sans en garder trace rend
 			// l'opération irréversible : la sauvegarde précède l'écriture. Elle
@@ -214,7 +218,21 @@ func (p *Provider) Plan(projects []*model.Project, webEngine, webUnit string) (*
 		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 			return err
 		}
-		return fs.WriteAtomic(path, content, 0o644, fs.KeepOwner)
+		if err := fs.WriteAtomic(path, content, 0o644, fs.KeepOwner); err != nil {
+			return err
+		}
+		// Le moteur ne compense jamais l'étape qui échoue : le fichier refusé est
+		// rendu ici, sans quoi il passerait pour conforme au plan suivant et
+		// logrotate le rejetterait chaque nuit, rotation du parc comprise.
+		// Le refus est toléré (D117), qu'il y ait un fichier précédent ou non :
+		// le reste du plan global — tmpfiles, supervision, recalculés aussi à la
+		// suppression d'un projet — ne tombe pas avec lui. Une vraie erreur
+		// d'écriture reste critique.
+		err := verify.Restore(verify.Logrotate(ctx, p.Exec, path), path, previous, mode)
+		if verify.IsRefused(err) {
+			return engine.Tolerated(err)
+		}
+		return err
 	}
 	s.Compensate = func(context.Context) error {
 		if previous == nil {

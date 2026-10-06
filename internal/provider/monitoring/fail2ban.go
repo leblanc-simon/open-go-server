@@ -1,6 +1,7 @@
 package monitoring
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,6 +11,7 @@ import (
 	"leblanc.io/open-go-server/internal/engine"
 	"leblanc.io/open-go-server/internal/fs"
 	"leblanc.io/open-go-server/internal/model"
+	"leblanc.io/open-go-server/internal/provider/verify"
 )
 
 // Jail est une prison générée : un filtre livré par fail2ban, appliqué aux
@@ -279,6 +281,12 @@ func (p *Provider) planFail2ban(projects []*model.Project) (*engine.Step, error)
 		mode:     0o644,
 		owner:    fs.KeepOwner,
 		reload:   "monitoring:fail2ban",
+		// Le contrôle du rechargement venait après l'écriture, sans retour
+		// arrière : le fichier refusé restait, et fail2ban ne redémarrait plus
+		// au prochain démarrage de la machine (D117).
+		validate: func(ctx context.Context, restore, rewrite func() error) error {
+			return verify.Fail2ban(ctx, p.Exec, p.Paths.Fail2banJailFile(), restore, rewrite)
+		},
 	})
 }
 

@@ -277,14 +277,47 @@ func fpmBooleanKey(key string) bool {
 // écarte « mots » comme une affectation invalide, sans autre signe qu'une ligne
 // de journal. La citation n'est posée que si la valeur l'exige, de sorte qu'une
 // unité aux valeurs simples garde son rendu — et ne soit ni réécrite ni
-// redémarrée. Les « % » restent des spécificateurs : « INSTANCE=%i » est un
-// usage légitime.
+// redémarrée. Un « % » qui introduit un spécificateur reste tel quel :
+// « INSTANCE=%i » est un usage légitime. Tout autre « % » est doublé (D117) :
+// systemd refusait l'affectation entière (« Invalid slot ») — une DATABASE_URL
+// à mot de passe encodé (« p%40ss »), le vhost AMQP par défaut (« %2f ») —, la
+// variable manquait sans autre signe qu'une ligne de journal, et
+// « systemd-analyze verify » refuse désormais l'unité.
 func systemdEnv(key, value string) string {
-	assignment := key + "=" + value
+	assignment := key + "=" + escapePercent(value)
 	if !strings.ContainsAny(value, " \t\"'\\") {
 		return assignment
 	}
 	return `"` + strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(assignment) + `"`
+}
+
+// systemdSpecifiers énumère les lettres que systemd résout après « % » (relevé
+// sur systemd 257, systemd.unit « Specifiers », « %% » compris), moins « D » :
+// systemd 252 (Debian 12) ne le connaît pas, et un mot de passe encodé en URL
+// (« %D0… ») y faisait refuser l'unité. « %D » est donc toujours doublé, littéral
+// partout.
+const systemdSpecifiers = "abcdfghijlmnopqrstuvwyABCEGHIJLMNPRSTUVWY%"
+
+// escapePercent double tout « % » qui n'introduit pas un spécificateur systemd.
+func escapePercent(v string) string {
+	if !strings.Contains(v, "%") {
+		return v
+	}
+	var b strings.Builder
+	for i := 0; i < len(v); i++ {
+		if v[i] != '%' {
+			b.WriteByte(v[i])
+			continue
+		}
+		if i+1 < len(v) && strings.IndexByte(systemdSpecifiers, v[i+1]) >= 0 {
+			b.WriteByte('%')
+			b.WriteByte(v[i+1])
+			i++
+			continue
+		}
+		b.WriteString("%%")
+	}
+	return b.String()
 }
 
 func truncate(n int, s string) string {

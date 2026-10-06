@@ -18,10 +18,23 @@ Un hook est reconnu de deux manières :
 
 Les hooks vivent dans `/etc/ogs/hooks`. Un script n'est exécuté que s'il satisfait toutes ces conditions :
 
-- il se trouve sous `/etc/ogs/hooks` (les liens symboliques qui en sortent sont refusés) ;
-- il est exécutable ;
-- il n'est pas accessible en écriture à tous ;
-- il appartient à root, quand `ogs` tourne en root.
+- il est désigné sous `/etc/ogs/hooks` ;
+- chaque répertoire traversé pour l'atteindre — depuis « / », liens compris, et jusqu'au fichier réel qu'un
+  lien désigne — appartient à root et n'est inscriptible ni par son groupe ni par les autres ;
+- le fichier réel est exécutable, n'est inscriptible que par son propriétaire, et appartient à root, quand
+  `ogs` tourne en root.
+
+Un lien symbolique qui sort de `/etc/ogs/hooks` est **admis** s'il satisfait ces conditions — des parcs en
+dépendent — mais `ogs doctor` le signale : copier le script dans le répertoire est préférable. Un lien vers
+un répertoire qu'un autre compte que root peut modifier (le home d'un projet, `/tmp`) est refusé, avec le
+remède dans le message : ce compte choisirait le script exécuté en root. `ogs doctor` éprouve chaque hook
+comme son exécution l'éprouverait. Sur une Debian mise à niveau depuis la 10 ou avant, `/usr/local` et ses
+sous-répertoires peuvent être restés en `root:staff` 2775 tant que `/etc/staff-group-for-usr-local` existe :
+un hook lié vers `/usr/local/…` y est refusé. Remède : retirer ce fichier, puis
+`chgrp root <répertoire> && chmod g-w,g-s <répertoire>` — ou copier le script sous `/etc/ogs/hooks`.
+
+Le hook est lancé par le nom sous lequel il est désigné, non par le chemin réel de sa cible : un même script
+lié sous plusieurs noms d'événement peut lire l'événement dans `basename "$0"`.
 
 Ces règles ne sont pas de la précaution décorative : un hook s'exécute avec les privilèges de l'outil, donc
 en root. Un script modifiable par un utilisateur de projet serait une élévation de privilèges immédiate.
@@ -36,8 +49,16 @@ en root. Un script modifiable par un utilisateur de projet serait une élévatio
 | `postDelete` | après suppression et archivage, fichiers de parc recalculés | non |
 | `preApply` | avant l'exécution d'un plan, après confirmation | oui |
 | `postApply` | après l'exécution | non |
-| `postCertRenew` | après un renouvellement de certificat, même si un autre a échoué | non |
+| `postCertRenew` | après le rechargement du serveur web qui suit un certificat changé : `cert renew` (même si un autre a échoué), `cert issue`, `apply` | non |
 | `postPhpSwitch` | après un changement de version PHP | non |
+
+`postCertRenew` a deux portées qui s'additionnent : le hook de parc est appelé une fois, sans projet, avec
+tous les certificats changés (`OGS_CERT`, séparés par des virgules) ; le hook qu'un projet déclare dans
+`spec.hooks` l'est **en plus**, pour les certificats qu'il sert — un certificat partagé compte pour chacun
+des projets qui le désignent —, avec le contexte du projet. Pour cet événement, le hook de projet ne remplace
+donc pas celui du parc : un même script désigné aux deux portées s'exécute deux fois, et un certificat
+partagé le fait exécuter une fois par projet qui le sert. `postCertRenew` n'est pas lancé si le serveur web
+n'a pas relu les certificats ; son échec rend le code 6.
 
 Un hook **critique** qui échoue interrompt l'opération : c'est le principe même d'un `pre-` — il garde la
 porte. Un hook non critique qui échoue produit un avertissement ; l'opération est déjà faite, la défaire

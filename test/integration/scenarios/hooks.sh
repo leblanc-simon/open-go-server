@@ -104,6 +104,81 @@ if ! echo "$sortie" | grep -qi "inscriptible\|écriture"; then
 fi
 echo "$sortie" | grep -i "inscriptible\|écriture" | head -1
 
+rm -f /etc/ogs/hooks/pre-create
+
+# D117 : un lien qui sort du répertoire des hooks reste admis vers un script de
+# root dans une chaîne de root, et doctor le signale ; vers un répertoire qu'un
+# autre compte possède, il est refusé — ce compte choisirait le script exécuté
+# en root.
+echo "--- lien sortant vers un script sûr : admis et signalé ---"
+install -o root -g root -m 0750 /dev/null /usr/local/sbin/ogs-notifier
+printf '#!/bin/sh\necho "notifier $OGS_PROJECT" >> /tmp/trace-hooks\n' > /usr/local/sbin/ogs-notifier
+ln -sf /usr/local/sbin/ogs-notifier /etc/ogs/hooks/post-create
+: > $trace
+ogs site create lien.test --kind static --tls=false --yes >/dev/null 2>&1
+if ! grep -q "notifier lientest" $trace; then
+    echo "ÉCHEC : le hook lié vers un script sûr n'a pas été exécuté"
+    exit 1
+fi
+diagnostic=$(ogs doctor 2>&1)
+if ! echo "$diagnostic" | grep -q "hors de /etc/ogs/hooks"; then
+    echo "ÉCHEC : doctor ne signale pas le lien sortant"
+    exit 1
+fi
+echo "lien sûr exécuté, et signalé par doctor"
+
+echo "--- lien sortant vers un répertoire d'un autre compte : refusé ---"
+id intrus >/dev/null 2>&1 || useradd -m intrus
+install -o intrus -g intrus -m 0755 -d /home/intrus/bin
+install -o root -g root -m 0750 /dev/null /home/intrus/bin/notifier
+printf '#!/bin/sh\necho "ce hook ne doit jamais s exécuter" >> /tmp/trace-hooks\n' > /home/intrus/bin/notifier
+ln -sf /home/intrus/bin/notifier /etc/ogs/hooks/post-create
+: > $trace
+sortie=$(ogs site create intrus.test --kind static --tls=false --yes 2>&1)
+if grep -q "ne doit jamais" $trace; then
+    echo "ÉCHEC : un script dont un autre compte contrôle le répertoire a été exécuté"
+    exit 1
+fi
+if ! echo "$sortie" | grep -q "peut être modifié par un autre compte"; then
+    echo "ÉCHEC : le refus n'est pas expliqué :"
+    echo "$sortie" | tail -3
+    exit 1
+fi
+echo "$sortie" | grep -o "le répertoire /home/intrus/bin[^:]*" | head -1
+diagnostic=$(ogs doctor 2>&1)
+if ! echo "$diagnostic" | grep -q "refusé à l'exécution"; then
+    echo "ÉCHEC : doctor ne signale pas le hook qui sera refusé"
+    exit 1
+fi
+
+echo "--- lien vers un répertoire root:staff 2775 (Debian mise à niveau) : refusé, remède nommé ---"
+install -d -o root -g staff -m 2775 /srv/outils
+printf '#!/bin/sh\necho "ce hook ne doit jamais s exécuter" >> /tmp/trace-hooks\n' > /srv/outils/notif
+chmod 0750 /srv/outils/notif
+ln -sf /srv/outils/notif /etc/ogs/hooks/post-create
+diagnostic=$(ogs doctor 2>&1)
+if ! echo "$diagnostic" | grep -q "staff-group-for-usr-local"; then
+    echo "ÉCHEC : doctor ne nomme pas le remède du groupe staff"
+    echo "$diagnostic" | grep -i hook | head -3
+    exit 1
+fi
+echo "groupe staff nommé par doctor avec son remède"
+
+echo "--- un répartiteur lié sous deux noms voit le nom de l'événement ---"
+install -o root -g root -m 0750 /dev/null /etc/ogs/hooks/repartiteur
+printf '#!/bin/sh\necho "evenement $(basename "$0")" >> /tmp/trace-hooks\n' > /etc/ogs/hooks/repartiteur
+ln -sfn repartiteur /etc/ogs/hooks/post-create
+ln -sfn repartiteur /etc/ogs/hooks/pre-create
+: > $trace
+ogs site create trois.test --kind static --tls=false --yes >/dev/null 2>&1
+if ! grep -q "evenement post-create" $trace || ! grep -q "evenement pre-create" $trace; then
+    echo "ÉCHEC : le répartiteur ne voit pas le nom désigné :"
+    cat $trace
+    exit 1
+fi
+echo "répartiteur : $(sort -u $trace | tr '\n' ' ')"
+rm -f /etc/ogs/hooks/post-create /etc/ogs/hooks/pre-create
+
 echo
 echo "RÉSULTAT : les hooks s'exécutent avec le bon contexte, un « pre » refuse,"
 echo "           et un script détournable est écarté."

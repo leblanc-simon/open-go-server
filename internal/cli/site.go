@@ -793,6 +793,12 @@ func (a *App) applyProjects(cmd *cobra.Command, projects []*model.Project) error
 			a.printf(", %d avertissement(s)", len(report.Warnings))
 		}
 		a.printf(" (audit %s)\n", a.Audit.RunID())
+		// Le certificat émis à la création l'est comme par « apply » (D117) ;
+		// après l'intégration de Y9, dans applyTarget (chemin_apply.go).
+		if changed := certsChanged(report); len(changed) > 0 {
+			warnings += a.postCertRenew(cmd.Context(), provs.Hooks, changed,
+				a.certUsersFleet(provs, changed, []*model.Project{p}))
+		}
 	}
 
 	// Sous holdServices, le projet n'a pas encore son contenu : « postCreate »

@@ -124,22 +124,65 @@ func kebab(event string) string {
 }
 
 // Resolve renvoie le script associé à un événement, ou une chaîne vide s'il n'y
-// en a pas. Le chemin est validé : un hook ne peut vivre qu'au sein du
+// en a pas. Le chemin est validé : un hook ne peut être désigné qu'au sein du
 // répertoire prévu, et doit appartenir à root sans être inscriptible par autrui.
 //
 // Deux origines, par ordre de priorité : le script déclaré par le projet, puis
 // celui de portée serveur — un fichier du répertoire des hooks portant le nom de
 // l'événement. Un projet peut donc raccorder son propre traitement sans priver
 // le parc du sien, mais aussi le remplacer.
+//
+// Le chemin rendu est le chemin réel, liens résolus ; le hook est lancé, lui,
+// par le nom désigné (Resolution.Path).
 func (r *Runner) Resolve(proj *model.Project, event string) (string, error) {
-	if r.Disabled {
-		return "", nil
+	res, err := r.inspect(proj, event, true)
+	return res.Real, err
+}
+
+// Resolution décrit un hook résolu : le chemin désigné sous le répertoire des
+// hooks, et le fichier réel qu'il désigne, liens suivis.
+type Resolution struct {
+	Path string
+	Real string
+}
+
+// Outside dit si le fichier réel vit hors du répertoire des hooks : un lien qui
+// en sort (D117).
+func (r Resolution) Outside(dir string) bool {
+	if real, err := filepath.EvalSymlinks(dir); err == nil {
+		dir = real
 	}
-	var script string
+	return r.Real != "" && !under(dir, r.Real)
+}
+
+// Inspect résout le hook d'un événement comme Resolve, en rendant aussi le
+// chemin désigné : « doctor » signale ainsi les liens qui sortent du répertoire.
+func (r *Runner) Inspect(proj *model.Project, event string) (Resolution, error) {
+	return r.inspect(proj, event, true)
+}
+
+// declared rend le script que déclare le projet, sans repli sur celui du parc.
+func declared(proj *model.Project, event string) string {
 	if proj != nil && proj.Spec.Hooks != nil {
-		script = proj.Spec.Hooks[event]
+		return proj.Spec.Hooks[event]
 	}
-	if script == "" {
+	return ""
+}
+
+func under(dir, path string) bool {
+	if dir == "" {
+		return true
+	}
+	rel, err := filepath.Rel(dir, path)
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+func (r *Runner) inspect(proj *model.Project, event string, fleet bool) (Resolution, error) {
+	if r.Disabled {
+		return Resolution{}, nil
+	}
+	script := declared(proj, event)
+	if script == "" && fleet {
 		// Le hook de parc n'est pas déclaré : sa seule présence vaut déclaration,
 		// et son absence n'est pas une erreur. Les deux orthographes sont admises,
 		// celle de la clé YAML et celle qui se lit mieux sur un disque.
@@ -150,56 +193,88 @@ func (r *Runner) Resolve(proj *model.Project, event string) (string, error) {
 				break
 			}
 		}
-		if script == "" {
-			return "", nil
-		}
+	}
+	if script == "" {
+		return Resolution{}, nil
 	}
 	if !filepath.IsAbs(script) {
 		script = filepath.Join(r.Dir, script)
 	}
 	clean := filepath.Clean(script)
-	if r.Dir != "" {
-		rel, err := filepath.Rel(r.Dir, clean)
-		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-			return "", fmt.Errorf("hook %s : le script doit se trouver sous %s (obtenu %q)",
-				event, r.Dir, script)
-		}
+	if !under(r.Dir, clean) {
+		return Resolution{}, fmt.Errorf("hook %s : le script doit se trouver sous %s (obtenu %q)",
+			event, r.Dir, script)
 	}
-	info, err := os.Stat(clean)
+	res := Resolution{Path: clean, Real: clean}
+	if r.RequireRootOwner {
+		// Un lien posé sous le répertoire des hooks vers un fichier de root hors
+		// de lui fonctionnait, et des parcs en dépendent : il reste admis tant que
+		// seul root peut changer ce qui est exécuté — chaque répertoire traversé,
+		// lien compris, à root et fermé en écriture au groupe et aux autres
+		// (D117). Le contrôle portait sur le seul chemin nettoyé, et os.Stat
+		// suivait le lien jusque dans un répertoire qu'un projet possède.
+		real, err := trustedPath(clean)
+		if err != nil {
+			return Resolution{}, fmt.Errorf("hook %s : %s — %w", event, clean, err)
+		}
+		res.Real = real
+	} else if real, err := filepath.EvalSymlinks(clean); err == nil {
+		// Hors root, aucune chaîne à éprouver : le chemin réel sert seulement à
+		// dire si le hook sort du répertoire.
+		res.Real = real
+	}
+	info, err := os.Stat(res.Real)
 	if err != nil {
-		return "", fmt.Errorf("hook %s : %w", event, err)
+		return Resolution{}, fmt.Errorf("hook %s : %w", event, err)
 	}
 	if info.IsDir() {
-		return "", fmt.Errorf("hook %s : %s est un répertoire", event, clean)
+		return Resolution{}, fmt.Errorf("hook %s : %s est un répertoire", event, res.Real)
 	}
 	// Un hook s'exécute en root : s'il est inscriptible par un autre compte, ce
 	// compte obtient une exécution privilégiée.
 	if info.Mode().Perm()&0o022 != 0 {
-		return "", fmt.Errorf("hook %s : %s est inscriptible au-delà de son propriétaire "+
-			"(mode %04o) — corriger avec chmod 0750", event, clean, info.Mode().Perm())
+		return Resolution{}, fmt.Errorf("hook %s : %s est inscriptible au-delà de son propriétaire "+
+			"(mode %04o) — corriger avec chmod 0750", event, res.Real, info.Mode().Perm())
 	}
 	if r.RequireRootOwner {
 		if err := ownedByRoot(info); err != nil {
-			return "", fmt.Errorf("hook %s : %s %w", event, clean, err)
+			return Resolution{}, fmt.Errorf("hook %s : %s %w", event, res.Real, err)
 		}
 	}
 	if info.Mode().Perm()&0o100 == 0 {
-		return "", fmt.Errorf("hook %s : %s n'est pas exécutable", event, clean)
+		return Resolution{}, fmt.Errorf("hook %s : %s n'est pas exécutable", event, res.Real)
 	}
-	return clean, nil
+	return res, nil
 }
 
 // Run exécute le hook associé à un événement. Le contexte est passé en JSON sur
 // l'entrée standard, et les principales valeurs aussi par l'environnement, pour
 // qu'un script court n'ait pas à analyser du JSON.
 func (r *Runner) Run(ctx context.Context, proj *model.Project, event string, hookCtx Context) error {
-	script, err := r.Resolve(proj, event)
+	return r.run(ctx, proj, event, hookCtx, true)
+}
+
+// RunDeclared exécute le seul hook que déclare le projet, sans repli sur celui
+// du parc. « postCertRenew » en a besoin (D117) : le hook de parc y est appelé
+// une fois pour tous les certificats changés, et celui d'un projet en plus,
+// pour les siens.
+func (r *Runner) RunDeclared(ctx context.Context, proj *model.Project, event string, hookCtx Context) error {
+	return r.run(ctx, proj, event, hookCtx, false)
+}
+
+func (r *Runner) run(ctx context.Context, proj *model.Project, event string, hookCtx Context, fleet bool) error {
+	resolved, err := r.inspect(proj, event, fleet)
 	if err != nil {
 		return err
 	}
-	if script == "" {
+	if resolved.Real == "" {
 		return nil
 	}
+	// Le hook est lancé par le nom désigné, non par son chemin réel : un
+	// répartiteur lié sous plusieurs noms d'événement lit « basename "$0" ».
+	// Le contrôle ne se périme pas pour autant : chaque maillon de la chaîne
+	// n'est modifiable que par root (D117).
+	script := resolved.Path
 	if r.DryRun {
 		if r.Log != nil {
 			r.Log("  ↪ hook %s : %s — non exécuté (--dry-run)\n", event, script)

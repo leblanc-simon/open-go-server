@@ -20,6 +20,7 @@ import (
 	"leblanc.io/open-go-server/internal/naming"
 	"leblanc.io/open-go-server/internal/provider/removal"
 	runtimeprov "leblanc.io/open-go-server/internal/provider/runtime"
+	"leblanc.io/open-go-server/internal/provider/verify"
 	"leblanc.io/open-go-server/internal/store"
 	"leblanc.io/open-go-server/internal/template"
 )
@@ -635,10 +636,9 @@ func (p *Provider) unitStep(proj *model.Project, at model.AppType, endpoint Endp
 		}
 		var previous []byte
 		var released []store.Allocation
-		s.Apply = func(context.Context) error {
-			if data, err := os.ReadFile(path); err == nil {
-				previous = data
-			}
+		s.Apply = func(ctx context.Context) error {
+			var mode os.FileMode
+			previous, mode = verify.ReadPrevious(path)
 			if forced {
 				// Écraser le travail d'un exploitant sans en garder trace rend
 				// l'opération irréversible : la sauvegarde précède l'écriture.
@@ -651,6 +651,10 @@ func (p *Provider) unitStep(proj *model.Project, at model.AppType, endpoint Endp
 			}
 			if err := fs.WriteAtomic(path, content, 0o644, fs.KeepOwner); err != nil {
 				return err
+			}
+			// Une unité refusée par systemd est rendue par l'étape même (D117).
+			if err := verify.Restore(verify.SystemdUnit(ctx, p.Exec, path), path, previous, mode); err != nil {
+				return verify.Tolerate(err, previous)
 			}
 			// L'unité ne sert plus que le port de son runtime : celui d'un runtime
 			// quitté est libéré (D100), une fois l'unité réécrite.

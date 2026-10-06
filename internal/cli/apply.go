@@ -957,6 +957,14 @@ func newApplyCommand(app *App) *cobra.Command {
 					app.printf(", %d avertissement(s)", len(report.Warnings))
 				}
 				app.printf(" (audit %s)\n", app.Audit.RunID())
+				// Les certificats émis par ce plan l'ont été avant son rechargement
+				// groupé, achevé ici : « postCertRenew » le dit maintenant (D117).
+				// Après l'intégration de Y9, ce déclenchement va dans applyTarget
+				// (chemin_apply.go), commun à apply et à la création d'un site.
+				if changed := certsChanged(report); len(changed) > 0 {
+					warnings += app.postCertRenew(cmd.Context(), provs.Hooks, changed,
+						app.certUsersFleet(provs, changed, []*model.Project{p}))
+				}
 				// Le hook « postApply » constate : son échec est un avertissement.
 				resources := make([]string, 0, len(report.Outcomes))
 				for _, o := range report.Outcomes {

@@ -166,4 +166,18 @@ archive=$(ls -t /var/lib/ogs/archives/blogfr-*.tar.zst 2>/dev/null | head -1)
 echo "  journaux retirés, archive $(basename "$archive")"
 
 echo
+echo "--- une rotation que logrotate refuse est-elle rendue ? (D117) ---"
+cp /etc/logrotate.d/ogs /tmp/rotation-avant
+ogs template extract logrotate/ogs.conf >/dev/null
+# Une option inconnue : logrotate l'ignore en code 0, et la rotation quotidienne
+# disparaissait sans un mot.
+sed -i 's/^    daily/    dayly/' /etc/ogs/templates/logrotate/ogs.conf.tmpl
+sortie=$(ogs apply --yes 2>&1); code=$?
+[ "$code" = 6 ] || echec "une rotation refusée doit rendre le code 6, obtenu $code"
+echo "$sortie" | grep -q "logrotate -d refuse.*dayly" || echec "le refus de logrotate n'est pas nommé"
+cmp -s /tmp/rotation-avant /etc/logrotate.d/ogs || echec "la rotation refusée n'a pas été rendue"
+rm /etc/ogs/templates/logrotate/ogs.conf.tmpl
+echo "  rotation refusée, fichier précédent rendu"
+
+echo
 echo "=== scénario journaux : succès ==="

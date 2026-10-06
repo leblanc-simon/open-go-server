@@ -52,6 +52,53 @@ if systemd-analyze verify /etc/systemd/system/ogs-shopfr-veille@.service 2>&1 | 
 fi
 
 echo
+echo "--- une unité que systemd refuse est rendue (D117) ---"
+ogs template extract systemd/worker.service >/dev/null
+sed -i 's/^\[Service\]/[Service]\nRestartt=always/' /etc/ogs/templates/systemd/worker.service.tmpl
+cp /etc/systemd/system/ogs-shopfr-veille@.service /tmp/veille-avant
+sortie=$(ogs apply shopfr --yes 2>&1)
+if ! echo "$sortie" | grep -q "systemd-analyze verify refuse.*Restartt"; then
+    echo "ÉCHEC : l'unité fautive n'a pas été refusée :"
+    echo "$sortie" | tail -5
+    exit 1
+fi
+if ! cmp -s /tmp/veille-avant /etc/systemd/system/ogs-shopfr-veille@.service; then
+    echo "ÉCHEC : l'unité refusée n'a pas été rendue"
+    exit 1
+fi
+rm /etc/ogs/templates/systemd/worker.service.tmpl
+plan=$(ogs plan shopfr 2>&1)
+if ! echo "$plan" | grep -q "aucun changement"; then
+    echo "ÉCHEC : le template retiré, le plan doit être vide"
+    echo "$plan" | tail -5
+    exit 1
+fi
+echo "unité refusée par systemd-analyze verify, et rendue"
+
+echo
+echo "--- un « % » dans une variable d'environnement (D117) ---"
+# Un mot de passe encodé dans une URL : systemd refusait l'affectation entière
+# (« Invalid slot »), la variable manquait au service sans un mot, et le
+# validateur aurait refusé l'unité à chaque apply.
+# L'image n'a pas python3-yaml : la déclaration est retouchée à la main, comme
+# le ferait l'exploitant.
+sed -i '/- name: veille/,/params:/ s|^\(      params:\)$|\1\n        env.DATABASE_URL: "mysql://u:p%40ss@h/b"|' \
+    /etc/ogs/projects/shopfr.yaml
+grep -q 'env.DATABASE_URL' /etc/ogs/projects/shopfr.yaml || { echo "ÉCHEC : déclaration non retouchée"; exit 1; }
+sortie=$(ogs apply shopfr --yes 2>&1); code=$?
+if [ "$code" != 0 ]; then
+    echo "ÉCHEC : l'apply d'une valeur à « % » rend le code $code :"
+    echo "$sortie" | tail -5
+    exit 1
+fi
+envi=$(systemctl show -p Environment ogs-shopfr-veille@1.service)
+if ! echo "$envi" | grep -q 'DATABASE_URL=mysql://u:p%40ss@h/b'; then
+    echo "ÉCHEC : la variable n'atteint pas le service telle quelle : $envi"
+    exit 1
+fi
+echo "variable à « % » transmise telle quelle au service"
+
+echo
 echo "--- les instances tournent-elles, et sous quelle identité ? ---"
 for i in 1 2; do
     etat=$(systemctl is-active "ogs-shopfr-veille@$i.service" 2>&1)

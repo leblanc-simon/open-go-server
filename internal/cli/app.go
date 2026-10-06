@@ -460,7 +460,7 @@ func (a *App) buildProviders() (*providers, error) {
 		Hooks:     a.hookRunner(),
 		PHP:       php,
 		Web:       webProv,
-		Logrotate: &logrotate.Provider{Paths: a.Paths, Templates: tmpl, Config: a.Cfg, Force: a.Force},
+		Logrotate: &logrotate.Provider{Paths: a.Paths, Exec: a.Exec, Templates: tmpl, Config: a.Cfg, Force: a.Force},
 		Monitoring: &monitoring.Provider{
 			Paths: a.Paths, Cfg: a.Cfg, Exec: a.Exec, Templates: tmpl,
 			Store: a.Store, Keys: a.Keys,

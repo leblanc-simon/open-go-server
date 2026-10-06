@@ -19,6 +19,7 @@ import (
 	"leblanc.io/open-go-server/internal/fs"
 	"leblanc.io/open-go-server/internal/model"
 	"leblanc.io/open-go-server/internal/provider/removal"
+	"leblanc.io/open-go-server/internal/provider/verify"
 	"leblanc.io/open-go-server/internal/template"
 )
 
@@ -524,10 +525,11 @@ func (p *Provider) fileStepFor(project, resource, path string, content []byte, s
 		return fs.UnifiedDiff(string(current), string(content), path), nil
 	}
 	var previous []byte
-	s.Apply = func(context.Context) error {
-		if data, err := os.ReadFile(path); err == nil {
-			previous = data
-		}
+	s.Apply = func(ctx context.Context) error {
+		// Une seconde exécution de l'étape ne doit pas reprendre le contenu relu
+		// par la première.
+		var mode os.FileMode
+		previous, mode = verify.ReadPrevious(path)
 		if forced {
 			// Écraser le travail d'un exploitant sans en garder trace rend
 			// l'opération irréversible : la sauvegarde précède l'écriture.
@@ -538,7 +540,12 @@ func (p *Provider) fileStepFor(project, resource, path string, content []byte, s
 		if err := fs.EnsureDir(filepath.Dir(path), 0o755, fs.KeepOwner); err != nil {
 			return err
 		}
-		return fs.WriteAtomic(path, content, 0o644, fs.KeepOwner)
+		if err := fs.WriteAtomic(path, content, 0o644, fs.KeepOwner); err != nil {
+			return err
+		}
+		// Le moteur ne compense jamais l'étape qui échoue : une unité refusée est
+		// rendue ici, sans quoi elle passerait pour conforme au plan suivant (D117).
+		return verify.Tolerate(verify.Restore(verify.SystemdUnit(ctx, p.Exec, path), path, previous, mode), previous)
 	}
 	s.Compensate = func(context.Context) error {
 		if previous == nil {

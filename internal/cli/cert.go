@@ -13,7 +13,6 @@ import (
 	"github.com/spf13/cobra"
 
 	"leblanc.io/open-go-server/internal/fs"
-	"leblanc.io/open-go-server/internal/hook"
 	"leblanc.io/open-go-server/internal/model"
 	tlsprov "leblanc.io/open-go-server/internal/provider/tls"
 )
@@ -106,6 +105,7 @@ func newCertIssueCommand(app *App) *cobra.Command {
 			defer provs.close()
 
 			var req tlsprov.Request
+			var issued []*model.Project
 			if tlsprov.IsShared(args[0]) {
 				r, ok := provs.TLS.SharedRequest(args[0])
 				if !ok {
@@ -118,6 +118,7 @@ func newCertIssueCommand(app *App) *cobra.Command {
 				if err != nil {
 					return err
 				}
+				issued = append(issued, p)
 				reqs, err := provs.TLS.Requests(p)
 				if err != nil {
 					return exitf(CodeValidation, "%s", err)
@@ -193,10 +194,17 @@ func newCertIssueCommand(app *App) *cobra.Command {
 			// ne rechargerait rien, et le serveur présenterait indéfiniment le
 			// matériel qu'il garde en mémoire — celui qui ne couvre pas l'alias.
 			app.printf("  ↻ rechargement de %s\n", provs.Engine.Unit())
-			if err := provs.Web.Reload(cmd.Context()); err != nil {
+			reloadErr := provs.Web.Reload(cmd.Context())
+			if reloadErr != nil {
+				app.warnf("⚠ rechargement du serveur web : %v\n", reloadErr)
+			}
+			// Un certificat émis est un certificat changé : « postCertRenew » le
+			// dit, une fois le serveur rechargé, comme après « cert renew » (D117).
+			hookWarned := app.postCertRenewAfterReload(cmd.Context(), provs, reloadErr,
+				[]string{req.Name}, issued)
+			if reloadErr != nil {
 				// Code 6 : le certificat est émis, mais le serveur présente toujours
 				// l'ancien — un succès partiel, non un succès.
-				app.warnf("⚠ rechargement du serveur web : %v\n", err)
 				return exitf(CodePartial, "certificat %s émis, mais le serveur web ne l'a pas relu", req.Name)
 			}
 			app.printf("  activer le TLS sur le vhost :\n    ogs apply\n")
@@ -207,6 +215,9 @@ func newCertIssueCommand(app *App) *cobra.Command {
 			if fallback != nil {
 				return exitf(CodePartial, "certificat %s émis par http-01 : le challenge dns-01 de sa zone a échoué",
 					req.Name)
+			}
+			if hookWarned > 0 {
+				return exitf(CodePartial, "certificat %s émis, mais le hook postCertRenew a échoué", req.Name)
 			}
 			return nil
 		},
@@ -247,6 +258,7 @@ func newCertRenewCommand(app *App) *cobra.Command {
 
 			var requests []tlsprov.Request
 			var refusés []error
+			var examined []*model.Project
 			deferred := 0
 			if all || len(args) == 0 {
 				requests = append(requests, provs.TLS.SharedRequests()...)
@@ -254,6 +266,7 @@ func newCertRenewCommand(app *App) *cobra.Command {
 				if err != nil {
 					return err
 				}
+				examined = projects
 				for _, p := range projects {
 					reqs, err := provs.TLS.Requests(p)
 					if err != nil {
@@ -279,6 +292,7 @@ func newCertRenewCommand(app *App) *cobra.Command {
 					if err != nil {
 						return err
 					}
+					examined = append(examined, p)
 					reqs, err := provs.TLS.Requests(p)
 					if err != nil {
 						return exitf(CodeValidation, "%s", err)
@@ -318,10 +332,8 @@ func newCertRenewCommand(app *App) *cobra.Command {
 			}
 			// Le hook est déclenché même en cas d'échec partiel : les certificats
 			// renouvelés le sont bel et bien, et une supervision doit l'apprendre.
-			if len(done) > 0 {
-				_, _ = app.runHook(cmd.Context(), provs.Hooks, nil, hook.PostCertRenew,
-					hook.Context{Resources: done, Extra: map[string]string{"cert": strings.Join(done, ",")}})
-			}
+			// Il l'est après le rechargement (D117), plus bas : lancé avant, il
+			// annonçait un certificat que le serveur ne présentait pas encore.
 			if len(done) == 0 && len(errs) == 0 {
 				app.printf("= aucun certificat n'arrive à échéance (%d examiné(s))\n", len(requests)+deferred)
 				return nil
@@ -338,6 +350,10 @@ func newCertRenewCommand(app *App) *cobra.Command {
 					app.warnf("⚠ rechargement du serveur web : %v\n", reloadErr)
 				}
 			}
+			hookWarned := 0
+			if len(done) > 0 {
+				hookWarned = app.postCertRenewAfterReload(cmd.Context(), provs, reloadErr, done, examined)
+			}
 			if len(errs) > 0 {
 				// Code 6 : le timer systemd le tolère, un renouvellement en échec ne
 				// doit pas masquer ceux qui ont abouti.
@@ -348,6 +364,11 @@ func newCertRenewCommand(app *App) *cobra.Command {
 			}
 			if reloadErr != nil {
 				return exitf(CodePartial, "certificats renouvelés, mais le serveur web ne les a pas relus")
+			}
+			// Code 6, que le timer tolère : le hook constate, son échec ne défait
+			// rien, mais il ne se tait pas (D117).
+			if hookWarned > 0 {
+				return exitf(CodePartial, "certificats renouvelés, mais le hook postCertRenew a échoué")
 			}
 			return nil
 		},

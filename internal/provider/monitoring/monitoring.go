@@ -27,6 +27,7 @@ import (
 	"leblanc.io/open-go-server/internal/provider/db"
 	"leblanc.io/open-go-server/internal/provider/php"
 	"leblanc.io/open-go-server/internal/provider/removal"
+	"leblanc.io/open-go-server/internal/provider/verify"
 	"leblanc.io/open-go-server/internal/secret"
 	"leblanc.io/open-go-server/internal/store"
 	"leblanc.io/open-go-server/internal/template"
@@ -225,6 +226,12 @@ type managedFile struct {
 	// scellés qu'à l'application de leur étape. Absent, le corps calculé au plan
 	// est écrit tel quel.
 	refresh func() ([]byte, error)
+
+	// validate éprouve le fichier écrit avec l'outil qui le lit (D117). Un refus
+	// fait rendre le fichier précédent par l'étape elle-même : le moteur ne
+	// compense jamais l'étape qui échoue. restore rend l'ancien contenu, rewrite
+	// remet le nouveau quand le défaut n'est pas le sien.
+	validate func(ctx context.Context, restore, rewrite func() error) error
 }
 
 // fileStep construit l'étape d'écriture d'un fichier géré : même mécanique que
@@ -268,7 +275,8 @@ func (p *Provider) fileStep(f managedFile) (*engine.Step, error) {
 		return fs.UnifiedDiff(string(current), string(f.content), f.path), nil
 	}
 	var previous []byte
-	s.Apply = func(context.Context) error {
+	s.Apply = func(ctx context.Context) error {
+		previous = nil
 		content := f.content
 		if f.refresh != nil {
 			refreshed, err := f.refresh()
@@ -291,7 +299,29 @@ func (p *Provider) fileStep(f managedFile) (*engine.Step, error) {
 		if err := fs.EnsureDir(filepath.Dir(f.path), 0o755, fs.KeepOwner); err != nil {
 			return err
 		}
-		return fs.WriteAtomic(f.path, content, f.mode, f.owner)
+		if err := fs.WriteAtomic(f.path, content, f.mode, f.owner); err != nil {
+			return err
+		}
+		if f.validate == nil {
+			return nil
+		}
+		restore := func() error {
+			if previous == nil {
+				if err := os.Remove(f.path); err != nil && !os.IsNotExist(err) {
+					return err
+				}
+				return nil
+			}
+			return fs.WriteAtomic(f.path, previous, f.mode, f.owner)
+		}
+		// Des prisons refusées sont rendues, et le refus est toléré (D117) : le
+		// reste du plan global suit son cours. Une vraie erreur d'écriture reste
+		// critique.
+		err := f.validate(ctx, restore, func() error { return fs.WriteAtomic(f.path, content, f.mode, f.owner) })
+		if verify.IsRefused(err) {
+			return engine.Tolerated(err)
+		}
+		return err
 	}
 	s.Compensate = func(context.Context) error {
 		if previous == nil {

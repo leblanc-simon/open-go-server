@@ -13,7 +13,7 @@ func ownedByRoot(info fs.FileInfo) error {
 	if !ok {
 		return nil
 	}
-	if st.Uid != 0 {
+	if st.Uid != rootUID {
 		return fmt.Errorf("appartient à l'uid %d et non à root : il s'exécuterait pourtant en root", st.Uid)
 	}
 	return nil

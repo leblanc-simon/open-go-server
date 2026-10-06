@@ -225,14 +225,21 @@ func TestLesTemplatesQuiServentUnDocrootLeProtegent(t *testing.T) {
 func TestSystemdEnvQuotesOnlyWhenNeeded(t *testing.T) {
 	cases := map[[2]string]string{
 		// Une valeur simple garde son rendu : les unités existantes ne changent pas.
-		{"APP_ENV", "prod"}:              `APP_ENV=prod`,
-		{"DSN", "amqp://u:p@h:5672/%2f"}: `DSN=amqp://u:p@h:5672/%2f`,
-		{"VIDE", ""}:                     `VIDE=`,
-		{"TITRE", "deux mots"}:           `"TITRE=deux mots"`,
-		{"GUILLEMET", `dit "oui"`}:       `"GUILLEMET=dit \"oui\""`,
-		{"CHEMIN", `C:\temp`}:            `"CHEMIN=C:\\temp"`,
-		{"APOSTROPHE", "l'appli"}:        `"APOSTROPHE=l'appli"`,
-		{"TAB", "a\tb"}:                  "\"TAB=a\tb\"",
+		{"APP_ENV", "prod"}: `APP_ENV=prod`,
+		// Un « % » qui n'introduit aucun spécificateur est doublé : systemd
+		// refusait l'affectation entière (D117).
+		{"DSN", "amqp://u:p@h:5672/%2f"}:         `DSN=amqp://u:p@h:5672/%%2f`,
+		{"DATABASE_URL", "mysql://u:p%40ss@h/b"}: `DATABASE_URL=mysql://u:p%%40ss@h/b`,
+		{"PASSE", "p%D0x"}:                       `PASSE=p%%D0x`,
+		{"INSTANCE", "%i"}:                       `INSTANCE=%i`,
+		{"POURCENT", "100%"}:                     `POURCENT=100%%`,
+		{"ECHAPPE", "a%%b"}:                      `ECHAPPE=a%%b`,
+		{"VIDE", ""}:                             `VIDE=`,
+		{"TITRE", "deux mots"}:                   `"TITRE=deux mots"`,
+		{"GUILLEMET", `dit "oui"`}:               `"GUILLEMET=dit \"oui\""`,
+		{"CHEMIN", `C:\temp`}:                    `"CHEMIN=C:\\temp"`,
+		{"APOSTROPHE", "l'appli"}:                `"APOSTROPHE=l'appli"`,
+		{"TAB", "a\tb"}:                          "\"TAB=a\tb\"",
 	}
 	for in, want := range cases {
 		if got := systemdEnv(in[0], in[1]); got != want {

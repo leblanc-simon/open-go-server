@@ -716,6 +716,8 @@ func (a *App) runChecks(ctx context.Context) []check {
 
 	// Versions PHP en fin de support : signalées, jamais bloquantes.
 	projects, err := a.loadProjects()
+	// Les hooks de parc s'éprouvent même quand un projet ne se charge pas.
+	a.hookChecks(projects, add)
 	if err != nil {
 		add("projets", "avertissement", err.Error(), "")
 		return out
