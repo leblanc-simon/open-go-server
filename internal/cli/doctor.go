@@ -200,6 +200,20 @@ func cronLegacyChecks(provs *providers, projects []*model.Project, add func(name
 	}
 }
 
+// venvChecks nomme les venvs de Python qu'un changement de version a laissés
+// (D123) : ogs les garde pour un retour arrière, dépendances comprises, et ne
+// les retire jamais ; c'est à l'exploitant de le faire quand ils ne servent
+// plus.
+func venvChecks(projects []*model.Project, add func(name, status, detail, fix string)) {
+	for _, p := range projects {
+		for _, v := range appprov.RetiredVenvs(p) {
+			add("runtimes", "avertissement", fmt.Sprintf("projet %s : venv %s conservé — la déclaration demande "+
+				"Python %s ; il permet d'y revenir, dépendances comprises", p.ID(), v, p.Spec.App.Runtime),
+				"le retirer quand il ne sert plus : rm -r "+v)
+		}
+	}
+}
+
 // appListenerChecks vérifie qu'aucun autre compte ne tient le port d'un projet :
 // une écoute qui aboutit ne dit pas qui répond, et le vhost relaie tout à qui
 // tient le port (D94). Le port est relu dans l'unité écrite — doctor n'attribue
@@ -813,6 +827,7 @@ func (a *App) runChecks(ctx context.Context) []check {
 		}
 		webConflictChecks(ctx, provs, projects, add)
 		cronLegacyChecks(provs, projects, add)
+		venvChecks(projects, add)
 		if a.Prefix == "" && !a.Exec.Simulated() {
 			databaseChecks(ctx, provs, projects, add)
 		}

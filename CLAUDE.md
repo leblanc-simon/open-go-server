@@ -360,7 +360,8 @@ vide).
 - `site clone` (D84) recopie `www/` par `fs.CopyTreeGuardedAt` sous une garde (`internal/cli/clone.go`) :
   fichiers de configuration du type retenus (`AppType.Config`, `AppType.Cache`), secrets qu'ogs connaît
   masqués à longueur égale dans la copie comme dans la déclaration, et tout ce qui n'a pas pu être
-  neutralisé nommé, code 6.
+  neutralisé nommé, code 6. Le venv de la source n'est jamais recopié, la signature DKIM ni les numéros de
+  pool imposés ne sont repris, et tout ce que la déclaration pointe est dupliqué, jamais partagé (D123).
 - `docs/migrer.sh` migre un ancien serveur vers une machine gérée (D90) : script à part, exécuté sur la
   cible, qui ne touche ogs que par ses commandes. Il a son banc, `test/migration`, lu par `make test`.
 - `internal/tui` : Bubble Tea derrière une interface `Backend`, testable sans terminal.
@@ -501,6 +502,21 @@ Ils ont tous coûté un défaut réel ; les tests unitaires ne les voyaient pas.
 - Une **application supervisée** est un service comme un autre : le provider applicatif écrit son unité,
   le provider d'unités active et démarre ses instances. Les deux sont nécessaires — l'unité seule ne
   démarre rien.
+- **Le lien d'un runtime ne bascule que vers un binaire présent, et son changement redémarre l'application**
+  (D123). L'installation est non critique : un `nvm install` en échec laissait basculer le lien vers le
+  binaire absent, à la place d'une version qui tournait. Le binaire s'éprouve **à l'application** de
+  l'étape du lien (l'installation du même apply le pose), sauf pour Go, dont le binaire arrive par le
+  déploiement. Un lien changé sans `restart-target` laissait le processus sur l'ancien binaire — et
+  l'attente de disponibilité se taisait, l'ancien répondant au plan : elle se rejoue dès que le plan
+  redémarre le projet. Le venv de Python porte sa version (`~/.venv-<v>`, hors de `www/`, que le clone
+  recopierait) ; l'ancien `www/.venv` ne sert que la version que l'interpréteur pyenv **du même home** a
+  créée.
+- **Un lien vers `<venv>/bin/python` n'active pas le venv** : Python cherche `pyvenv.cfg` à côté du chemin
+  invoqué sans résoudre le lien, et lance l'interpréteur de base — tout module du venv introuvable.
+  `~/.local/bin/python` en est un depuis D70 : l'unité d'une application Python n'a jamais trouvé gunicorn
+  dans le venv, et aucun scénario ne lançait d'application Python. L'unité passe par le lien de
+  **répertoire** `~/.venv` (D123), que Python traverse ; et une application en service ne bascule sur un
+  venv que s'il porte le module que lance son unité — un venv neuf est vide.
 - `ogs harden` restreint les droits de `/etc` (D56, D85). Trois invariants : il **ne desserre jamais** — un
   répertoire déjà plus strict est laissé tel quel, et le mode posé est l'intersection du constaté et de la
   cible, setgid et sticky conservés — ; il **préserve le bit d'exécution** des fichiers, sans quoi il rendrait

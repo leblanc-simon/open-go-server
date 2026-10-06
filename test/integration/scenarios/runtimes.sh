@@ -268,6 +268,77 @@ fi
 echo "le lien de la version en service est intact"
 
 echo
+echo "--- l'application en service, puis une montée de version qui échoue (R4-22, D123) ---"
+# Le socket d'une instance précédente reste sur le disque : l'application le
+# retire avant d'écouter, comme le binaire Go du scénario.
+cat >/home/node.test/www/server.js <<'JSEOF'
+const p = process.env.SOCKET_PATH;
+try { require('fs').unlinkSync(p); } catch (e) {}
+require('http').createServer((q, r) => r.end('node ' + process.version)).listen(p);
+JSEOF
+chown nodetest:nodetest /home/node.test/www/server.js
+unite='ogs-nodetest-app@1.service'
+# Sans server.js, l'instance boucle sur ses relances, ou les a épuisées : elle
+# est relancée à la main, l'apply ne relevant qu'une instance « failed » (D121).
+systemctl reset-failed "$unite" 2>/dev/null
+systemctl restart "$unite"
+sleep 2
+ogs apply nodetest --yes 2>&1 | grep -Ei "lien|attente|⚠|✗" | head -5
+if [ "$(systemctl is-active "$unite")" != "active" ]; then
+    echo "ÉCHEC : l'application Node ne tourne pas"
+    journalctl -u "$unite" --no-pager -n 10 2>&1
+    exit 1
+fi
+repond() { curl -s --unix-socket /run/ogs/nodetest/app.sock http://localhost/; }
+echo "réponse : $(repond)"
+pid_avant=$(systemctl show -p MainPID --value "$unite")
+# La déclaration demande une version qu'aucun miroir ne porte : l'installation
+# échoue, et le lien ne doit pas basculer vers un binaire absent — il désignait
+# une version qui fonctionnait.
+sed -i 's/runtime: 22.14.0/runtime: 999.999.999/' /etc/ogs/projects/nodetest.yaml
+sortie=$(ogs apply nodetest --yes 2>&1); code=$?
+echo "$sortie" | grep -Ei "runtime|lien|⚠" | head -5
+if [ "$code" != 6 ]; then
+    echo "ÉCHEC : une installation en échec doit rendre 6, obtenu $code"
+    exit 1
+fi
+if [ "$(readlink -f /home/node.test/.local/bin/node)" != "$binaire" ]; then
+    echo "ÉCHEC : le lien a basculé vers un binaire absent"
+    ls -l /home/node.test/.local/bin/node
+    exit 1
+fi
+if [ "$(systemctl show -p MainPID --value "$unite")" != "$pid_avant" ] || [ -z "$(repond)" ]; then
+    echo "ÉCHEC : l'application en service a été redémarrée ou ne répond plus"
+    exit 1
+fi
+echo "lien intact, application inchangée, code 6"
+
+echo
+echo "--- une montée de version réussie redémarre l'application (R1-40, D123) ---"
+# Le lien bascule ; le processus en cours gardait l'ancien binaire tant que rien
+# ne le relançait, et l'attente se taisait parce que l'ancien répondait au plan.
+sed -i 's/runtime: 999.999.999/runtime: 20.18.0/' /etc/ogs/projects/nodetest.yaml
+ogs apply nodetest --yes 2>&1 | grep -Ei "runtime|lien|redémarrage|attente|⚠|✗" | head -8
+nouveau=/home/node.test/.nvm/versions/node/v20.18.0/bin/node
+if [ "$(readlink -f /home/node.test/.local/bin/node)" != "$nouveau" ]; then
+    echo "ÉCHEC : le lien ne désigne pas la version installée"
+    ls -l /home/node.test/.local/bin/node
+    exit 1
+fi
+pid_apres=$(systemctl show -p MainPID --value "$unite")
+exe=$(readlink -f /proc/"$pid_apres"/exe)
+echo "processus $pid_avant → $pid_apres, binaire $exe, réponse : $(repond)"
+if [ "$pid_apres" = "$pid_avant" ] || [ "$exe" != "$nouveau" ]; then
+    echo "ÉCHEC : l'application tourne encore sur l'ancien binaire"
+    exit 1
+fi
+if [[ "$(repond)" != "node v20.18.0" ]]; then
+    echo "ÉCHEC : l'application ne répond pas avec la nouvelle version"
+    exit 1
+fi
+echo "l'application a redémarré sur la nouvelle version"
+
+echo
 echo "--- suppression : le runtime part avec le home ---"
 # Sans « --purge » : celui-ci exige une confirmation interactive, car il est sans
 # recours. La suppression ordinaire archive puis démonte.

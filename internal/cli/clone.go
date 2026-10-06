@@ -14,6 +14,7 @@ import (
 
 	"leblanc.io/open-go-server/internal/fs"
 	"leblanc.io/open-go-server/internal/model"
+	appprov "leblanc.io/open-go-server/internal/provider/app"
 	"leblanc.io/open-go-server/internal/provider/db"
 )
 
@@ -81,6 +82,15 @@ func (a *App) cloneGuard(source *model.Project) cloneGuard {
 		for _, p := range at.Cache {
 			g.Paths = append(g.Paths, fs.GuardPath{Pattern: p,
 				Reason: fmt.Sprintf("cache compilé depuis la configuration de %s, que l'application reconstruit",
+					source.ID())})
+		}
+		// Le venv d'avant D123 vivait dans www/ : recopié, il faisait exécuter à
+		// la préproduction l'interpréteur logé dans le home de la production, et
+		// la cassait quand celle-ci changeait de version (R4-25). La
+		// préproduction a le sien, hors de www.
+		if at.Runtime == appprov.RuntimePython {
+			g.Paths = append(g.Paths, fs.GuardPath{Pattern: ".venv",
+				Reason: fmt.Sprintf("venv de %s, dont l'interpréteur vit dans son home : la destination a le sien",
 					source.ID())})
 		}
 	}
@@ -516,6 +526,13 @@ func (a *App) adviseCloneConfig(source, target *model.Project, g cloneGuard, ski
 	if resources {
 		todo = append(todo, line{"chaînes de connexion", "ogs secrets env " + target.ID()})
 	}
+	if at.Runtime == appprov.RuntimePython && appprov.CheckVersion(target.Spec.App.Runtime) == nil {
+		// Le venv n'est jamais recopié (D123) : celui de la destination est créé
+		// vide par son apply, et l'application n'y trouve aucune dépendance.
+		venv := appprov.PythonVenv(target.Spec.Layout.Root, target.Spec.App.Runtime)
+		todo = append(todo, line{"dépendances Python", fmt.Sprintf("%s, créé vide — celui de %s n'est pas "+
+			"recopié : %s", venv, source.ID(), appprov.PipInstall(target, venv))})
+	}
 	if target.Spec.App.EnvFile {
 		todo = append(todo, line{"environnement", fmt.Sprintf("%s, créé vide — celui de %s n'est pas recopié",
 			a.Paths.EnvFile(target.ID()), source.ID())})
@@ -529,7 +546,7 @@ func (a *App) adviseCloneConfig(source, target *model.Project, g cloneGuard, ski
 // describeCloneGuard annonce, pour --dry-run, ce que la garde retiendra de la
 // copie, ce qu'elle y masquera, ce qu'elle reprendra tel quel, et quand le clone
 // rendra le code 6.
-func (a *App) describeCloneGuard(g cloneGuard, declared declaredReview, withData bool) {
+func (a *App) describeCloneGuard(g cloneGuard, declared declaredReview, dropped clonedDrop, withData bool) {
 	row := func(label, text string) { a.printf("  %-22s %s\n", label, text) }
 	a.printf("\ncopie de www :\n")
 	var patterns []string
@@ -560,6 +577,9 @@ func (a *App) describeCloneGuard(g cloneGuard, declared declaredReview, withData
 	if n := len(g.unchecked); n > 0 {
 		certain = append(certain, fmt.Sprintf("%d secret(s) non cherché(s)", n))
 	}
+	if len(dropped.review) > 0 {
+		certain = append(certain, "signature DKIM non reprise")
+	}
 	if len(certain) > 0 {
 		a.printf("le clone rendra le code 6 : %s\n", strings.Join(certain, ", "))
 		return
@@ -569,6 +589,41 @@ func (a *App) describeCloneGuard(g cloneGuard, declared declaredReview, withData
 		what = "l'un de ces fichiers, l'un de ces secrets ou " + what
 	}
 	a.printf("le clone rendra le code 6 si la copie rencontre %s\n", what)
+}
+
+// clonedDrop est ce que le clone ne reprend pas de la déclaration de la
+// source, hors de ce qu'il recalcule pour chaque projet (D123).
+type clonedDrop struct {
+	// review nomme ce qui rend la destination différente de la source d'une
+	// façon que l'exploitant doit connaître : code 6.
+	review []string
+	// notes nomme ce qui est recalculé pour la destination, sans rien lui ôter.
+	notes []string
+}
+
+// cloneDropped dit ce que cloneProject a retiré de la déclaration de source : la
+// signature DKIM, refusée en préproduction (R1-98), et les numéros de pool
+// imposés, qui sont ceux de la source (R4-32).
+func cloneDropped(source, target *model.Project) clonedDrop {
+	var d clonedDrop
+	switch m := source.Spec.Mail; {
+	case m != nil && m.DKIM != nil && m.DKIM.Enabled:
+		d.review = append(d.review, fmt.Sprintf("signature DKIM de %s non reprise : refusée en préproduction, "+
+			"elle y authentifierait des envois de test au nom de %s — %s n'envoie rien en son nom",
+			source.ID(), strings.Join(source.DKIMDomains(), ", "), target.ID()))
+	case m != nil:
+		// Désactivée, la section ne change rien à ce que fait la destination ;
+		// elle est retirée quand même, et le clone le dit.
+		d.notes = append(d.notes, fmt.Sprintf("section mail de %s non reprise (signature DKIM désactivée)",
+			source.ID()))
+	}
+	for _, p := range source.Spec.PHP.Pools {
+		if p.Number != "" && p.Number != "auto" {
+			d.notes = append(d.notes, fmt.Sprintf("numéro de pool %s de %s non repris (pool %s) : %s reçoit le sien",
+				p.Number, source.ID(), p.Name, target.ID()))
+		}
+	}
+	return d
 }
 
 // adviseDisabledTasks nomme les tâches et les services que le clone a repris

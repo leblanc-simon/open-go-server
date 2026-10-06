@@ -107,6 +107,11 @@ func newRuntimeInstallCommand(app *App) *cobra.Command {
 				return exitf(CodeUsage, "le projet %s n'a pas de runtime applicatif "+
 					"(types concernés : go, node, python, ruby)", p.ID())
 			}
+			if at.Runtime != appprov.RuntimeGo && at.Runtime != appprov.RuntimeCustom {
+				if err := appprov.CheckVersion(args[1]); err != nil {
+					return exitf(CodeUsage, "%s", err)
+				}
+			}
 			provs, err := app.certProviders()
 			if err != nil {
 				return err
@@ -116,6 +121,17 @@ func newRuntimeInstallCommand(app *App) *cobra.Command {
 			if err := provs.App.Installer.Install(cmd.Context(), p, at.Runtime, args[1]); err != nil {
 				return wrap(CodeError, err)
 			}
+			app.printf("✓ %s %s installé\n", at.Runtime, args[1])
+			if at.Runtime == appprov.RuntimePython {
+				// Un venv par version (D123) : celui-ci est neuf, sans les dépendances
+				// de l'application. L'apply n'y bascule une application en service
+				// qu'une fois le module de son unité présent : à installer d'abord.
+				venv := appprov.PythonVenv(p.Spec.Layout.Root, args[1])
+				app.printf("\nInstaller d'abord les dépendances de l'application dans le venv %s :\n  %s\n",
+					venv, appprov.PipInstall(p, venv))
+				app.printf("L'apply n'y bascule l'application qu'ensuite ; l'ancien venv reste en place pour un " +
+					"retour arrière (ogs doctor le signale).\n")
+			}
 			// La version déclarée suit : sans cela, le prochain apply remettrait
 			// l'ancienne.
 			p.Spec.App.Runtime = args[1]
@@ -123,7 +139,7 @@ func newRuntimeInstallCommand(app *App) *cobra.Command {
 				return wrap(CodeError, err)
 			}
 			_ = app.Audit.Record(p.ID(), "app/runtime/"+at.Runtime, "runtime.install", "ok", args[1])
-			app.printf("✓ %s %s installé, déclaration mise à jour\n", at.Runtime, args[1])
+			app.printf("✓ déclaration de %s mise à jour : %s %s\n", p.ID(), at.Runtime, args[1])
 			app.printf("\nAppliquer pour mettre à jour le lien et redémarrer :\n  ogs apply %s\n", p.ID())
 			return nil
 		},

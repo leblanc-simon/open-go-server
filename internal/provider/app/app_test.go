@@ -157,11 +157,13 @@ func TestListenPortCanBeForced(t *testing.T) {
 
 func TestBuildUnitPerRuntime(t *testing.T) {
 	cases := map[model.AppKind]struct{ attendu, lien string }{
-		model.KindNode:   {"server.js", LinkName(RuntimeNode)},
-		model.KindPython: {"gunicorn", LinkName(RuntimePython)},
+		model.KindNode: {"server.js", filepath.Join(".local", "bin", LinkName(RuntimeNode))},
+		// Python passe par le lien de répertoire ~/.venv : par .local/bin/python,
+		// le venv n'est pas activé (D123).
+		model.KindPython: {"gunicorn", filepath.Join(".venv", "bin", "python")},
 		// Ruby n'invoque pas son interpréteur mais son lanceur : c'est « bundle »
 		// qui est lié.
-		model.KindRuby: {"puma", LinkBundle},
+		model.KindRuby: {"puma", filepath.Join(".local", "bin", LinkBundle)},
 	}
 	for kind, cas := range cases {
 		prov, proj := fixture(t, kind)
@@ -188,7 +190,7 @@ func TestBuildUnitPerRuntime(t *testing.T) {
 			t.Errorf("%s : le chemin du socket doit être transmis :\n%s", kind, text)
 		}
 		// Le lien géré est employé, jamais un binaire versionné.
-		if !strings.Contains(text, filepath.Join(".local", "bin", cas.lien)) {
+		if !strings.Contains(text, cas.lien) {
 			t.Errorf("%s : le lien géré doit être employé :\n%s", kind, text)
 		}
 		if strings.Contains(text, ".rbenv") || strings.Contains(text, ".nvm") {
@@ -227,7 +229,7 @@ func TestPlanInstallsRuntimeThenLinksThenWaits(t *testing.T) {
 	}
 	// L'attente de disponibilité est rendue à part : elle doit venir après le
 	// démarrage des instances, dont le provider d'unités a la charge.
-	health, err := prov.PlanHealth(ctx, proj, obs)
+	health, err := prov.PlanHealth(ctx, proj, obs, false)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -402,6 +402,13 @@ func newSiteCloneCommand(app *App) *cobra.Command {
 			}
 			app.printf("clone de %s vers %s (%s)\n", source.ID(), target.ID(), to)
 			app.summarizeSite(target)
+			dropped := cloneDropped(source, target)
+			for _, d := range dropped.review {
+				app.warnf("⚠ %s\n", d)
+			}
+			for _, n := range dropped.notes {
+				app.printf("= %s\n", n)
+			}
 			// Ce que la source tient d'ogs ne passe pas à la destination, ni par sa
 			// déclaration — une variable d'environnement du pool, qu'elle recevrait
 			// de FPM avant toute configuration applicative —, ni par la copie de son
@@ -419,7 +426,7 @@ func newSiteCloneCommand(app *App) *cobra.Command {
 				return err
 			}
 			if app.DryRun {
-				app.describeCloneGuard(guard, declared, withData)
+				app.describeCloneGuard(guard, declared, dropped, withData)
 				app.printf("\n--dry-run : rien n'a été écrit.\n")
 				return nil
 			}
@@ -528,6 +535,9 @@ func newSiteCloneCommand(app *App) *cobra.Command {
 			if n := declared.review; n > 0 {
 				guarded = append(guarded, fmt.Sprintf("%d champ(s) de la déclaration à revoir", n))
 			}
+			if len(dropped.review) > 0 {
+				guarded = append(guarded, "signature DKIM non reprise")
+			}
 			app.adviseCloneConfig(source, target, guard, skipped, declared, copied, dataCopied)
 			app.adviseDisabledTasks(source, target)
 			// Ce qui n'a pas été recopié tel quel, ce qui l'a été et qu'ogs sait
@@ -590,6 +600,28 @@ func (a *App) cloneProject(source *model.Project, env naming.Env) (*model.Projec
 	// (reviewDeclared), et ses tâches et services désactivés, sans toucher à ceux
 	// de la source.
 	clone.Spec.App.Env = maps.Clone(source.Spec.App.Env)
+	// Tout ce que la déclaration pointe est dupliqué, jamais partagé (D123) :
+	// une retouche du clone — avant son dépôt, ou par la normalisation —
+	// réécrivait la déclaration de la source, en mémoire.
+	if h := source.Spec.App.Health; h != nil {
+		health := *h
+		clone.Spec.App.Health = &health
+	}
+	if t := source.Spec.Web.TLS; t != nil {
+		tls := *t
+		clone.Spec.Web.TLS = &tls
+	}
+	if s := source.Spec.Sudo; s != nil {
+		sudo := *s
+		sudo.Verbs = slices.Clone(s.Verbs)
+		clone.Spec.Sudo = &sudo
+	}
+	clone.Spec.Hooks = maps.Clone(source.Spec.Hooks)
+	// La signature DKIM n'est pas reprise : refusée en préproduction, où elle
+	// authentifierait des envois de test au nom du domaine de production, elle
+	// faisait refuser tout le clone (code 3) d'un projet qui signe. Le clone le
+	// dit (cloneDropped, code 6).
+	clone.Spec.Mail = nil
 	clone.Spec.PHP.Pools = slices.Clone(source.Spec.PHP.Pools)
 	for i := range clone.Spec.PHP.Pools {
 		clone.Spec.PHP.Pools[i].Env = maps.Clone(clone.Spec.PHP.Pools[i].Env)
@@ -597,6 +629,10 @@ func (a *App) cloneProject(source *model.Project, env naming.Env) (*model.Projec
 		// secrets les réécrit en place — il réécrirait celles de la source.
 		clone.Spec.PHP.Pools[i].Settings = clone.Spec.PHP.Pools[i].Settings.Clone()
 		clone.Spec.PHP.Pools[i].AllowFunctions = slices.Clone(clone.Spec.PHP.Pools[i].AllowFunctions)
+		// Un numéro imposé est celui de la production : la préproduction en
+		// reçoit un à elle (D123). Le preset, lui, est recopié tel quel : seul
+		// le preset hérité descend d'un cran en préproduction (D103).
+		clone.Spec.PHP.Pools[i].Number = "auto"
 	}
 	// Tâches et services partent désactivés : sur une copie des données de la
 	// production, une relance, un envoi ou un import agiraient comme elle — sur
@@ -605,6 +641,10 @@ func (a *App) cloneProject(source *model.Project, env naming.Env) (*model.Projec
 	clone.Spec.Crons = slices.Clone(source.Spec.Crons)
 	for i := range clone.Spec.Crons {
 		clone.Spec.Crons[i].Enabled = disabled()
+		if l := clone.Spec.Crons[i].Lock; l != nil {
+			lock := *l
+			clone.Spec.Crons[i].Lock = &lock
+		}
 	}
 	clone.Spec.Services = slices.Clone(source.Spec.Services)
 	for i := range clone.Spec.Services {

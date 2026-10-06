@@ -113,7 +113,8 @@ func (p *Provider) PreexistingHome(proj *model.Project, obs Observed) error {
 
 // notSkeleton nomme ce qui, dans la racine, n'est pas de ceux qu'ogs y pose :
 // au premier niveau, les répertoires de spec.layout.dirs, ceux des gestionnaires
-// de runtime (.nvm, .rbenv, .pyenv, qu'une saga déroulée laisse), les anciens
+// de runtime (.nvm, .rbenv, .pyenv, et les venvs .venv-<version> de D123 avec
+// leur lien ~/.venv, qu'une saga déroulée laisse), les anciens
 // .bin et logs et le lien ~/logs (D70, D71) ; dans .ssh, la clé de déploiement,
 // known_hosts et le lien vers le trousseau commun (D61) ; dans .local, bin, qui
 // ne porte que des liens (D70). Ni le contenu des répertoires du projet — www/,
@@ -149,6 +150,13 @@ func (p *Provider) notSkeleton(proj *model.Project) ([]string, error) {
 		name := e.Name()
 		switch {
 		case name == model.LogLink && e.Type()&os.ModeSymlink != 0:
+			continue
+		case name == ".venv" && e.Type()&os.ModeSymlink != 0:
+			// Le lien vers le venv de la version déclarée (D123).
+			continue
+		case strings.HasPrefix(name, ".venv-") && e.IsDir():
+			// Le venv d'une version de Python (D123), qu'une saga déroulée laisse
+			// comme .pyenv : son contenu n'est pas jugé, avec la même limite.
 			continue
 		case !dirs[name] || !e.IsDir():
 			if !add(strconv.Quote(name)) {

@@ -159,7 +159,7 @@ func TestUnPortTenuParUnAutreCompteNEstNiAttribueNiTenuPourPret(t *testing.T) {
 	if obs.Foreign == "" {
 		t.Fatal("l'écoute étrangère n'est pas relevée")
 	}
-	step, err := prov.PlanHealth(context.Background(), proj, obs)
+	step, err := prov.PlanHealth(context.Background(), proj, obs, false)
 	if err != nil {
 		t.Fatal(err)
 	}

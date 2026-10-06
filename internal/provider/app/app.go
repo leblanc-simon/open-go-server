@@ -74,6 +74,13 @@ func (p *Provider) setLink(proj *model.Project, name, target string) error {
 	return fs.SymlinkAt(proj.Spec.Layout.Root, model.LinkDir, name, target, p.linkOwner(proj), p.Force)
 }
 
+// setVenvLink pose ~/.venv, à la racine du home, par le même chemin sûr. Il ne
+// remplace jamais autre chose qu'un lien, --force compris : un répertoire réel
+// à ce nom est le venv de quelqu'un (D123).
+func (p *Provider) setVenvLink(proj *model.Project, target string) error {
+	return fs.SymlinkAt(proj.Spec.Layout.Root, ".", VenvLinkName, target, p.linkOwner(proj), false)
+}
+
 // readLink observe un lien géré par le même chemin sûr.
 func readLink(proj *model.Project, name string) string {
 	kind, target, err := fs.LinkStateAt(proj.Spec.Layout.Root, model.LinkDir, name)
@@ -199,6 +206,13 @@ type Observed struct {
 	// BundleLinkTarget est la cible du lien bundle, propre à Ruby : l'unité y
 	// invoque le lanceur, jamais l'interpréteur.
 	BundleLinkTarget string
+	// VenvLinkTarget est la cible de ~/.venv, propre à Python ; VenvLinkOther dit
+	// que ce nom porte autre chose qu'un lien (D123).
+	VenvLinkTarget string
+	VenvLinkOther  bool
+	// UnitUsesVenv dit que l'unité écrite lance déjà ~/.venv/bin/python : elle
+	// n'est jamais ramenée vers ~/.local/bin/python, qui n'active aucun venv.
+	UnitUsesVenv bool
 	// RunDirMode est le mode du répertoire d'exécution, ou zéro s'il est absent.
 	RunDirMode  os.FileMode
 	UnitPresent bool
@@ -251,11 +265,24 @@ func (p *Provider) Observe(_ context.Context, proj *model.Project) (Observed, er
 	if at.Runtime == RuntimeRuby {
 		obs.BundleLinkTarget = readLink(proj, LinkBundle)
 	}
+	if at.Runtime == RuntimePython {
+		kind, target, err := fs.LinkStateAt(proj.Spec.Layout.Root, ".", VenvLinkName)
+		switch {
+		case err != nil:
+		case kind == fs.EntrySymlink:
+			obs.VenvLinkTarget = target
+		case kind == fs.EntryOther:
+			obs.VenvLinkOther = true
+		}
+	}
 	if info, err := os.Stat(p.Paths.ProjectRunDir(proj.ID())); err == nil && info.IsDir() {
 		obs.RunDirMode = info.Mode().Perm()
 	}
 	if _, err := os.Stat(p.unitPath(proj)); err == nil {
 		obs.UnitPresent = true
+		if at.Runtime == RuntimePython {
+			obs.UnitUsesVenv = unitUsesVenv(p.unitPath(proj), proj)
+		}
 	}
 	obs.Listening = p.listening(endpoint)
 	if obs.Foreign, err = p.foreignListener(proj, endpoint); err != nil {
@@ -308,11 +335,17 @@ func (p *Provider) listening(e Endpoint) bool {
 
 // Build calcule le contenu de l'unité applicative.
 func (p *Provider) Build(proj *model.Project, endpoint Endpoint) ([]byte, error) {
+	return p.build(proj, endpoint, false)
+}
+
+// build calcule l'unité ; avec legacyPython, une application Python garde la
+// commande d'avant D123, par ~/.local/bin/python (legacyPythonCommand).
+func (p *Provider) build(proj *model.Project, endpoint Endpoint, legacyPython bool) ([]byte, error) {
 	at, err := proj.AppType()
 	if err != nil {
 		return nil, err
 	}
-	command, err := p.command(proj, at.Runtime, endpoint)
+	command, err := p.command(proj, at.Runtime, endpoint, legacyPython)
 	if err != nil {
 		return nil, err
 	}
@@ -359,7 +392,7 @@ func (p *Provider) Build(proj *model.Project, endpoint Endpoint) ([]byte, error)
 }
 
 // command construit la ligne d'exécution selon le runtime.
-func (p *Provider) command(proj *model.Project, runtime string, endpoint Endpoint) (string, error) {
+func (p *Provider) command(proj *model.Project, runtime string, endpoint Endpoint, legacyPython bool) (string, error) {
 	link := LinkPath(proj.Spec.Layout.Root, runtime)
 	entry := proj.Spec.App.Entrypoint
 	switch runtime {
@@ -389,7 +422,14 @@ func (p *Provider) command(proj *model.Project, runtime string, endpoint Endpoin
 		}
 		// La ligne de commande maîtrise le point d'écoute : contrairement à Node,
 		// il n'y a pas à espérer que le code applicatif lise une variable.
-		return fmt.Sprintf("%s -m gunicorn --bind %s --workers 2 %s", link, bind, entry), nil
+		// L'interpréteur est celui du venv, atteint par le lien de répertoire
+		// ~/.venv : par ~/.local/bin/python, Python ne trouve pas pyvenv.cfg et
+		// lance l'interpréteur de base, sans les modules du venv (D123).
+		python := VenvPython(proj.Spec.Layout.Root)
+		if legacyPython {
+			python = link
+		}
+		return fmt.Sprintf("%s -m %s --bind %s --workers 2 %s", python, AppModule, bind, entry), nil
 	case RuntimeRuby:
 		bind := "tcp://127.0.0.1:" + strconv.Itoa(endpoint.Port)
 		if endpoint.Unix() {
@@ -447,7 +487,7 @@ func (p *Provider) Plan(_ context.Context, proj *model.Project, obs Observed) ([
 	}
 
 	// 4. L'unité.
-	s, err := p.unitStep(proj, at, endpoint)
+	s, err := p.unitStep(proj, at, endpoint, p.legacyPythonCommand(proj, at, obs))
 	if err != nil {
 		return nil, err
 	}
@@ -461,11 +501,19 @@ func (p *Provider) runtimeSteps(proj *model.Project, at model.AppType, obs Obser
 	var steps []*engine.Step
 	// 1. Le runtime. Son installation télécharge depuis Internet : l'étape est non
 	// critique, et son échec laisse le site en place avec le service arrêté.
-	if !obs.RuntimeInstalled {
+	if at.Runtime != RuntimeGo {
 		version := proj.Spec.App.Runtime
 		if version == "" {
 			return nil, fmt.Errorf("le type %s exige une version de runtime (spec.app.runtime)", at.Kind)
 		}
+		// La version compose des chemins du home et le script d'installation
+		// (D123) : refusée au plan du projet visé, jamais au chargement.
+		if err := CheckVersion(version); err != nil {
+			return nil, err
+		}
+	}
+	if !obs.RuntimeInstalled {
+		version := proj.Spec.App.Runtime
 		s := engine.NewStep("app/runtime/"+at.Runtime, engine.Create,
 			fmt.Sprintf("runtime %s %s dans le home du projet", at.Runtime, version))
 		s.Critical = false
@@ -481,19 +529,31 @@ func (p *Provider) runtimeSteps(proj *model.Project, at model.AppType, obs Obser
 	// 2. Le lien géré, qui rend la version effective indépendante de l'unité.
 	target := BinaryPath(proj.Spec.Layout.Root, at.Runtime, proj.Spec.App.Runtime)
 	name := LinkName(at.Runtime)
+	venv := ""
+	if at.Runtime == RuntimePython {
+		venv = PythonVenv(proj.Spec.Layout.Root, proj.Spec.App.Runtime)
+	}
 	if obs.LinkTarget != target {
-		s := engine.NewStep("app/link/"+at.Runtime, engine.Create,
-			fmt.Sprintf("lien %s/%s → %s", model.LinkDir, name, target))
-		if obs.LinkTarget != "" {
-			s.Action = engine.Update
-			previous := obs.LinkTarget
-			s.Compensate = func(context.Context) error { return p.setLink(proj, name, previous) }
+		var checks []linkCheck
+		if at.Runtime != RuntimeGo {
+			checks = append(checks, p.binaryCheck(proj, target))
 		}
-		s.Apply = func(context.Context) error { return p.setLink(proj, name, target) }
-		steps = append(steps, s)
+		// Le lien de l'interpréteur bascule avec ~/.venv : un shell du projet
+		// verrait sinon une version que l'application n'emploie pas.
+		if venv != "" && obs.LinkTarget != "" {
+			checks = append(checks, p.servesCheck(proj, venv))
+		}
+		steps = append(steps, p.linkStep(proj, obs, "app/link/"+at.Runtime, model.LinkDir+"/"+name,
+			obs.LinkTarget, target, func(t string) error { return p.setLink(proj, name, t) }, checks...))
 	} else {
 		steps = append(steps, engine.NewStep("app/link/"+at.Runtime, engine.NoOp,
 			fmt.Sprintf("lien %s/%s", model.LinkDir, name)))
+	}
+
+	// 2 ter. Le venv de Python, par un lien de répertoire que l'unité traverse
+	// (D123).
+	if venv != "" {
+		steps = append(steps, p.venvLinkStep(proj, obs, venv))
 	}
 
 	// 2 bis. Le lanceur de Ruby. L'unité invoque « bundle exec puma » : sans ce
@@ -503,6 +563,161 @@ func (p *Provider) runtimeSteps(proj *model.Project, at model.AppType, obs Obser
 		steps = append(steps, p.bundleLinkStep(proj, obs))
 	}
 	return steps, nil
+}
+
+// linkCheck éprouve, à l'application, ce que désignera un lien : nil s'il peut
+// basculer. plan, s'il n'est pas vide, est ce que le plan en annonce déjà.
+type linkCheck struct {
+	apply func() error
+	plan  string
+}
+
+// simulated dit si les commandes sont simulées : rien n'y est installé, et les
+// contrôles d'un lien n'auraient rien à éprouver.
+func (p *Provider) simulated() bool { return p.Exec != nil && p.Exec.Simulated() }
+
+// binaryCheck exige le binaire target, que l'installation du runtime — étape non
+// critique, qui précède — devait poser (R4-22).
+func (p *Provider) binaryCheck(proj *model.Project, target string) linkCheck {
+	return linkCheck{apply: func() error {
+		if _, err := os.Stat(target); err != nil {
+			return fmt.Errorf("%s absent (installation du runtime en échec ?) — « ogs runtime install %s %s », "+
+				"puis « ogs apply %s »", target, proj.ID(), proj.Spec.App.Runtime, proj.ID())
+		}
+		return nil
+	}}
+}
+
+// servesCheck exige dans venv le module que lance l'unité (B1 de la relecture,
+// D123) : un venv neuf est vide, et y basculer une application qui tournait la
+// fait tomber sur « No module named gunicorn ».
+func (p *Provider) servesCheck(proj *model.Project, venv string) linkCheck {
+	c := linkCheck{apply: func() error {
+		if !VenvServes(venv) {
+			return fmt.Errorf("%s ne porte pas %s, que lance l'unité — installer les dépendances : %s, "+
+				"puis « ogs apply %s »", venv, AppModule, PipInstall(proj, venv), proj.ID())
+		}
+		return nil
+	}}
+	if !p.simulated() && !VenvServes(venv) {
+		c.plan = fmt.Sprintf("attend %s dans %s : %s", AppModule, venv, PipInstall(proj, venv))
+	}
+	return c
+}
+
+// linkStep pose ou bascule un lien géré vers target (D123).
+//
+// Les contrôles portent sur ce que le lien désignera, et s'éprouvent à
+// l'application, non au plan, pour qu'une installation réussie dans le même
+// apply suffise. Un contrôle en échec laisse le lien en place — celui d'une
+// version qui fonctionnait — et l'étape échoue sans dérouler le plan
+// (engine.Tolerated, code 6) : basculer vers rien arrêtait une application en
+// service pour une installation qui avait échoué en réseau (R4-22), ou vers un
+// venv sans dépendances. Go n'a pas de contrôle : son binaire arrive par le
+// déploiement, après le premier apply. Sous préfixe, rien n'est installé :
+// aucun contrôle.
+//
+// Un lien changé redémarre l'application, si son unité existe déjà : l'unité
+// invoque le lien, et le processus en cours garde l'ancien binaire tant qu'il
+// n'est pas relancé (R1-40). Un premier lien n'a rien à redémarrer — les
+// instances démarrent ensuite, par le provider d'unités —, comme une première
+// unité (unitStep).
+func (p *Provider) linkStep(proj *model.Project, obs Observed, resource, label, previous, target string,
+	set func(string) error, checks ...linkCheck) *engine.Step {
+	s := engine.NewStep(resource, engine.Create, fmt.Sprintf("lien %s → %s", label, target))
+	if previous != "" {
+		s.Action = engine.Update
+		s.Compensate = func(context.Context) error { return set(previous) }
+	}
+	if p.simulated() {
+		checks = nil
+	}
+	for _, c := range checks {
+		if c.plan != "" {
+			s.Summary += " — " + c.plan
+		}
+	}
+	s.Apply = func(context.Context) error {
+		for _, c := range checks {
+			if err := c.apply(); err != nil {
+				kept := "aucun lien n'est posé"
+				if previous != "" {
+					kept = "le lien reste sur " + previous
+				}
+				return engine.Tolerated(fmt.Errorf("%s : %s", kept, err))
+			}
+		}
+		return set(target)
+	}
+	if previous != "" && obs.UnitPresent {
+		s.Reload = []string{RestartTargetIntent(proj.ID())}
+	}
+	return s
+}
+
+// venvLinkStep pose ~/.venv vers le venv de la version déclarée (D123). Le venv
+// doit porter son interpréteur ; s'il en remplace un autre — ~/.venv existait,
+// ou l'application tournait déjà par ~/.local/bin/python, avant D123 —, il doit
+// aussi porter le module que lance l'unité : une application en service ne
+// bascule jamais sur un venv vide. Un nom ~/.venv occupé par autre chose qu'un
+// lien n'est jamais remplacé.
+func (p *Provider) venvLinkStep(proj *model.Project, obs Observed, venv string) *engine.Step {
+	resource := "app/link/" + VenvLinkName
+	path := filepath.Join(proj.Spec.Layout.Root, VenvLinkName)
+	if obs.VenvLinkOther {
+		s := engine.NewStep(resource, engine.Update, fmt.Sprintf("lien %s → %s — nom occupé", path, venv))
+		s.Apply = func(context.Context) error {
+			return engine.Tolerated(fmt.Errorf("%s existe et n'est pas un lien : ogs y pose le lien vers le venv "+
+				"de Python %s, que lance l'unité ; le déplacer, puis « ogs apply %s » — l'application reste "+
+				"lancée par %s", path, proj.Spec.App.Runtime, proj.ID(),
+				LinkPath(proj.Spec.Layout.Root, RuntimePython)))
+		}
+		return s
+	}
+	if filepath.Clean(obs.VenvLinkTarget) == venv {
+		return engine.NewStep(resource, engine.NoOp, "lien "+path)
+	}
+	checks := []linkCheck{p.binaryCheck(proj, filepath.Join(venv, "bin", "python"))}
+	if obs.VenvLinkTarget != "" || (obs.UnitPresent && obs.LinkTarget != "") {
+		checks = append(checks, p.servesCheck(proj, venv))
+	}
+	return p.linkStep(proj, obs, resource, path, obs.VenvLinkTarget, venv,
+		func(t string) error { return p.setVenvLink(proj, t) }, checks...)
+}
+
+// unitUsesVenv dit si l'unité écrite à path lance l'interpréteur par ~/.venv.
+func unitUsesVenv(path string, proj *model.Project) bool {
+	data, err := os.ReadFile(path)
+	return err == nil && strings.Contains(string(data), "ExecStart="+VenvPython(proj.Spec.Layout.Root)+" ")
+}
+
+// venvLinkPresent dit si ~/.venv est en place, en lien, au moment de
+// l'application.
+func venvLinkPresent(proj *model.Project) bool {
+	kind, _, err := fs.LinkStateAt(proj.Spec.Layout.Root, ".", VenvLinkName)
+	return err == nil && kind == fs.EntrySymlink
+}
+
+// legacyPythonCommand dit si l'unité d'une application Python garde la commande
+// d'avant D123, par ~/.local/bin/python : le temps que ~/.venv puisse être posé
+// sans arrêter ce qui tourne — l'application tournait sans ~/.venv et son venv
+// ne porte pas encore le module que lance l'unité, ou le nom ~/.venv est occupé.
+// Réécrire l'unité vers un ~/.venv absent l'arrêterait.
+func (p *Provider) legacyPythonCommand(proj *model.Project, at model.AppType, obs Observed) bool {
+	// Une unité déjà passée à ~/.venv n'y renonce jamais : ramenée vers
+	// ~/.local/bin/python, l'application repartirait sans ses dépendances. Un
+	// ~/.venv occupé ou absent fait alors échouer l'étape du lien (code 6), et
+	// l'unité reste telle quelle.
+	if at.Runtime != RuntimePython || obs.VenvLinkTarget != "" || obs.UnitUsesVenv {
+		return false
+	}
+	if obs.VenvLinkOther {
+		return true
+	}
+	if !obs.UnitPresent || obs.LinkTarget == "" || p.simulated() {
+		return false
+	}
+	return !VenvServes(PythonVenv(proj.Spec.Layout.Root, proj.Spec.App.Runtime))
 }
 
 // envFileHeader est le contenu d'un fichier d'environnement créé par ogs. Il
@@ -591,8 +806,12 @@ func (p *Provider) envFileStep(proj *model.Project, obs Observed) *engine.Step {
 // régime que celle du provider d'unités — cinq états, refus nommant --force,
 // sauvegarde avant écrasement : les deux fichiers vivent dans le même
 // répertoire, et le même geste d'exploitation doit y recevoir la même réponse.
-func (p *Provider) unitStep(proj *model.Project, at model.AppType, endpoint Endpoint) (*engine.Step, error) {
-	content, err := p.Build(proj, endpoint)
+func (p *Provider) unitStep(proj *model.Project, at model.AppType, endpoint Endpoint, legacyPython bool) (*engine.Step, error) {
+	content, err := p.build(proj, endpoint, legacyPython)
+	// Une unité en place n'est réécrite vers ~/.venv que si le lien existe à
+	// l'application : l'étape du lien, qui précède, a pu échouer depuis le plan
+	// (D123). Une première unité, elle, n'a rien à protéger.
+	needsVenv := at.Runtime == RuntimePython && !legacyPython && !p.simulated()
 	if err != nil {
 		return nil, err
 	}
@@ -637,6 +856,11 @@ func (p *Provider) unitStep(proj *model.Project, at model.AppType, endpoint Endp
 		var previous []byte
 		var released []store.Allocation
 		s.Apply = func(ctx context.Context) error {
+			if needsVenv && state != fs.StateAbsent && !venvLinkPresent(proj) {
+				return engine.Tolerated(fmt.Errorf("%s absent : l'unité %s n'est pas réécrite vers lui, "+
+					"l'application garde sa commande — voir l'étape du lien %s", filepath.Join(
+					proj.Spec.Layout.Root, VenvLinkName), path, VenvLinkName))
+			}
 			var mode os.FileMode
 			previous, mode = verify.ReadPrevious(path)
 			if forced {
@@ -827,15 +1051,8 @@ func (p *Provider) bundleLinkStep(proj *model.Project, obs Observed) *engine.Ste
 	if obs.BundleLinkTarget == target {
 		return engine.NewStep("app/link/"+LinkBundle, engine.NoOp, "lien "+model.LinkDir+"/"+LinkBundle)
 	}
-	s := engine.NewStep("app/link/"+LinkBundle, engine.Create,
-		fmt.Sprintf("lien %s/%s → %s", model.LinkDir, LinkBundle, target))
-	if obs.BundleLinkTarget != "" {
-		s.Action = engine.Update
-		previous := obs.BundleLinkTarget
-		s.Compensate = func(context.Context) error { return p.setLink(proj, LinkBundle, previous) }
-	}
-	s.Apply = func(context.Context) error { return p.setLink(proj, LinkBundle, target) }
-	return s
+	return p.linkStep(proj, obs, "app/link/"+LinkBundle, model.LinkDir+"/"+LinkBundle, obs.BundleLinkTarget, target,
+		func(t string) error { return p.setLink(proj, LinkBundle, t) }, p.binaryCheck(proj, target))
 }
 
 // RestartTargetIntent est l'intention de redémarrage groupé des unités d'un
@@ -848,7 +1065,12 @@ func RestartTargetIntent(id string) string { return "systemd:restart-target:" + 
 // qu'elle doit venir après le démarrage des instances, dont le provider d'unités
 // a la charge : attendre avant d'avoir lancé quoi que ce soit ne pourrait
 // qu'échouer, en accusant l'application à tort.
-func (p *Provider) PlanHealth(_ context.Context, proj *model.Project, obs Observed) (*engine.Step, error) {
+//
+// restarting dit que le plan redémarre l'application — unité réécrite, lien
+// changé, service modifié : l'écoute vue au plan est alors celle du processus
+// qui va être arrêté, et ne dit rien de celui qui le remplace. Elle est attendue
+// de nouveau, après le redémarrage (R1-40, D123).
+func (p *Provider) PlanHealth(_ context.Context, proj *model.Project, obs Observed, restarting bool) (*engine.Step, error) {
 	at, err := proj.AppType()
 	if err != nil || at.Runtime == "" {
 		return nil, nil
@@ -867,11 +1089,15 @@ func (p *Provider) PlanHealth(_ context.Context, proj *model.Project, obs Observ
 		s.Apply = func(context.Context) error { return foreignError(foreign) }
 		return s, nil
 	}
-	if obs.Listening {
+	if obs.Listening && !restarting {
 		return engine.NewStep("app/health/"+proj.ID(), engine.NoOp, "application à l'écoute"), nil
 	}
 	s := engine.NewStep("app/health/"+proj.ID(), engine.Create,
 		fmt.Sprintf("attente de disponibilité sur %s", describeEndpoint(endpoint)))
+	if obs.Listening {
+		s.Action = engine.Update
+		s.Summary = fmt.Sprintf("attente de disponibilité sur %s, après redémarrage", describeEndpoint(endpoint))
+	}
 	// Sans elle, le premier rechargement du serveur web exposerait une 502 (§7.11.6).
 	s.Critical = false
 	// Les redémarrages en attente doivent avoir eu lieu : autrement on attendrait

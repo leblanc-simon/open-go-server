@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -186,7 +187,17 @@ func (a *App) buildPlan(ctx context.Context, provs *providers, p *model.Project)
 	// avant d'avoir lancé quoi que ce soit ne pourrait qu'échouer, en accusant
 	// l'application à tort.
 	if appprov.Applies(p) {
-		healthStep, err := provs.App.PlanHealth(ctx, p, appObs)
+		// Un redémarrage prévu par le plan — unité réécrite, lien changé, service
+		// modifié — rend caduque l'écoute vue au plan : elle est attendue de
+		// nouveau (R1-40, D123).
+		restarting := false
+		for _, s := range plan.Mutating() {
+			if slices.Contains(s.Reload, appprov.RestartTargetIntent(p.ID())) {
+				restarting = true
+				break
+			}
+		}
+		healthStep, err := provs.App.PlanHealth(ctx, p, appObs, restarting)
 		if err != nil {
 			return nil, wrap(CodeValidation, err)
 		}
