@@ -226,6 +226,17 @@ fi
 echo "cron : a déclenché la tâche ($(tail -1 "$journal"))"
 
 echo
+echo "--- écrire une tâche ne rouvre pas /etc/cron.d (D116) ---"
+ogs cron add shopfr rouvre --schedule "0 4 * * *" --command "/bin/true" >/dev/null
+ogs apply shopfr --yes >/dev/null 2>&1 || true
+grep -q "# rouvre" /etc/cron.d/ogs-shopfr || { echo "ÉCHEC : la tâche n'a pas été écrite — l'essai ne prouve rien"; exit 1; }
+if [ "$(stat -c %a /etc/cron.d)" != 750 ]; then
+    echo "ÉCHEC : /etc/cron.d rouvert en $(stat -c %a /etc/cron.d) par l'écriture d'une tâche"
+    exit 1
+fi
+echo "  /etc/cron.d toujours en 750 après l'écriture d'une tâche"
+
+echo
 echo "--- ogs lui-même fonctionne toujours ---"
 ogs harden 2>&1 | tail -2
 ogs doctor 2>&1 | grep -iE "droits des répertoires"

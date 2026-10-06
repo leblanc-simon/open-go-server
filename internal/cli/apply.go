@@ -39,6 +39,13 @@ import (
 func (a *App) buildPlan(ctx context.Context, provs *providers, p *model.Project) (*engine.Plan, error) {
 	plan := &engine.Plan{Project: p.ID()}
 
+	// Commandes déclarées qui désignent l'ancien ~/.bin (D116) : le plan se
+	// calcule sur une copie réécrite, pour que crons et unités suivent dans cet
+	// apply ; le projet reçu n'est jamais modifié — un second calcul sur lui doit
+	// rendre la même étape —, et la déclaration ne l'est qu'à l'application, en
+	// fin de plan.
+	p, legacyCommands := provs.System.PlanLegacyCommands(p)
+
 	sysObs, err := provs.System.Observe(ctx, p)
 	if err != nil {
 		return nil, wrap(CodeError, err)
@@ -322,7 +329,12 @@ func (a *App) buildPlan(ctx context.Context, provs *providers, p *model.Project)
 
 	// L'ancien répertoire des liens (D70) part en tout dernier : les crons et les
 	// unités qui le désignaient viennent d'être réécrits, et l'étape attend que
-	// systemd les ait relus.
+	// systemd les ait relus. Seul celui d'ogs part (D116).
+	// La déclaration n'est réécrite qu'une fois les liens de ~/.local/bin posés
+	// par ce plan : l'étape vérifie qu'ils y sont avant d'écrire.
+	if legacyCommands != nil {
+		plan.Add(legacyCommands)
+	}
 	if s := provs.System.PlanLegacyBin(p); s != nil {
 		plan.Add(s)
 	}

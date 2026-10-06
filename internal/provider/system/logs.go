@@ -32,6 +32,11 @@ type logFile struct {
 	// workers PHP, les tâches. Sinon il l'est par un maître root, et appartient à
 	// root:<groupe du projet>.
 	user bool
+	// reopened vaut vrai pour les journaux de nginx : à chaque réouverture
+	// (USR1, que logrotate envoie chaque nuit), le maître les donne au compte de
+	// ses workers, www-data, groupe et mode gardés. Exiger root les faisait
+	// réécrire à chaque apply, et le plan n'était plus jamais vide (D116).
+	reopened bool
 }
 
 // logFiles énumère les journaux qu'ogs pré-crée pour un projet. Les pré-créer
@@ -45,8 +50,8 @@ func (p *Provider) logFiles(proj *model.Project) []logFile {
 	var out []logFile
 	if len(proj.Spec.Domains) > 0 && p.WebEngine != "" {
 		out = append(out,
-			logFile{name: p.WebEngine + "-access.log"},
-			logFile{name: p.WebEngine + "-error.log"})
+			logFile{name: p.WebEngine + "-access.log", reopened: p.WebEngine == "nginx"},
+			logFile{name: p.WebEngine + "-error.log", reopened: p.WebEngine == "nginx"})
 	}
 	if len(proj.Spec.PHP.Pools) > 0 {
 		out = append(out,
@@ -90,7 +95,7 @@ func (p *Provider) logSteps(proj *model.Project, obs Observed) []*engine.Step {
 		resource := "system/log/" + proj.ID() + "/" + f.name
 		info, err := os.Lstat(path)
 		if err == nil && info.Mode().IsRegular() && info.Mode().Perm() == 0o640 &&
-			(p.Exec.Simulated() || p.fileOwnerMatches(info, proj, f.user, obs)) {
+			(p.Exec.Simulated() || p.fileOwnerMatches(info, proj, f, obs)) {
 			steps = append(steps, engine.NewStep(resource, engine.NoOp, label))
 			continue
 		}
@@ -108,7 +113,11 @@ func (p *Provider) logSteps(proj *model.Project, obs Observed) []*engine.Step {
 			if f.user {
 				owner = userOwned
 			}
-			_, err = fs.EnsureFile(path, 0o640, owner)
+			var accept []int
+			if f.reopened && obs.WebUID >= 0 && !p.Exec.Simulated() {
+				accept = append(accept, obs.WebUID)
+			}
+			_, err = fs.EnsureFileAccepting(path, 0o640, owner, accept...)
 			return err
 		}
 		if action == engine.Create {
@@ -125,6 +134,28 @@ func (p *Provider) logSteps(proj *model.Project, obs Observed) []*engine.Step {
 	return steps
 }
 
+// nginxUser lit la directive « user » de la configuration principale de nginx.
+var nginxUser = regexp.MustCompile(`(?m)^\s*user\s+([^\s;#]+)`)
+
+// webWorkerUser nomme le compte des workers du serveur web : celui de la
+// directive « user » de nginx.conf sous nginx, www-data sinon — c'est à lui que
+// nginx donne ses journaux en les rouvrant. Sans directive, nginx lance ses
+// workers sous « nobody » ; un fichier illisible fait retenir www-data, le
+// réglage de Debian.
+func (p *Provider) webWorkerUser() string {
+	if p.WebEngine != "nginx" {
+		return WebUser
+	}
+	data, err := os.ReadFile(filepath.Join(p.Paths.Prefix(), "/etc/nginx/nginx.conf"))
+	if err != nil {
+		return WebUser
+	}
+	if m := nginxUser.FindSubmatch(data); m != nil {
+		return string(m[1])
+	}
+	return "nobody"
+}
+
 func ownerLabel(proj *model.Project, user bool) string {
 	if user {
 		return proj.Spec.User.Name + ":" + proj.Spec.User.Group
@@ -133,19 +164,25 @@ func ownerLabel(proj *model.Project, user bool) string {
 }
 
 // fileOwnerMatches compare le propriétaire d'un journal à celui attendu.
-func (p *Provider) fileOwnerMatches(info os.FileInfo, proj *model.Project, user bool, obs Observed) bool {
+// Un journal de nginx peut aussi appartenir au compte de ses workers, qui le
+// reçoit à chaque réouverture : c'est le seul écart admis, et pour nginx seul —
+// un journal d'Apache à www-data reste un écart.
+func (p *Provider) fileOwnerMatches(info os.FileInfo, proj *model.Project, f logFile, obs Observed) bool {
 	uid, gid, ok := OwnerOf(info)
 	if !ok || obs.Group == nil {
 		return true
 	}
 	wantUID := 0
-	if user {
+	if f.user {
 		if obs.User == nil {
 			return true
 		}
 		wantUID = obs.User.UID
 	}
-	return uid == wantUID && gid == obs.Group.GID
+	if gid != obs.Group.GID {
+		return false
+	}
+	return uid == wantUID || (f.reopened && obs.WebUID >= 0 && uid == obs.WebUID)
 }
 
 // logDirStep pose un répertoire de la chaîne des journaux, root de bout en bout.

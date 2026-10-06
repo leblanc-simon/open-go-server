@@ -16,6 +16,7 @@ import (
 	"leblanc.io/open-go-server/internal/fs"
 	"leblanc.io/open-go-server/internal/model"
 	"leblanc.io/open-go-server/internal/naming"
+	"leblanc.io/open-go-server/internal/spec"
 )
 
 // fixture prépare un projet dont la racine est dans un répertoire temporaire,
@@ -1354,9 +1355,13 @@ func TestLAncienBinEstRetireApresLaMigration(t *testing.T) {
 	if err := os.MkdirAll(legacy, 0o710); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Symlink("/usr/bin/php8.3", filepath.Join(legacy, "php")); err != nil {
+	if err := os.Symlink(prov.Paths.PHPBin("8.3"), filepath.Join(legacy, "php")); err != nil {
 		t.Fatal(err)
 	}
+	if err := spec.Save(prov.Paths.ProjectFile(p.ID()), p); err != nil {
+		t.Fatal(err)
+	}
+	liensGeres(t, p, "php")
 	s := prov.PlanLegacyBin(p)
 	if s == nil || s.Action != engine.Delete {
 		t.Fatalf("retrait de l'ancien .bin attendu, obtenu %v", s)
@@ -1377,23 +1382,25 @@ func TestLAncienBinEstRetireApresLaMigration(t *testing.T) {
 }
 
 func TestLAncienBinGardeCeQuOgsNAPasPose(t *testing.T) {
+	// Une entrée qu'ogs n'a pas posée fait laisser le répertoire entier, liens
+	// d'ogs compris : jugée après coup, elle les laissait partir, puis rendait
+	// 6 à chaque apply (D116).
 	p, prov, _, _ := fixture(t)
 	legacy := filepath.Join(p.Spec.Layout.Root, ".bin")
 	if err := os.MkdirAll(legacy, 0o710); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Symlink("/usr/bin/php8.3", filepath.Join(legacy, "php")); err != nil {
+	if err := os.Symlink(prov.Paths.PHPBin("8.3"), filepath.Join(legacy, "php")); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(legacy, "composer"), []byte("#!/bin/sh\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	err := prov.PlanLegacyBin(p).Apply(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "composer") {
-		t.Fatalf("le répertoire doit rester, en nommant ce qu'il contient : %v", err)
+	if s := prov.PlanLegacyBin(p); s != nil {
+		t.Fatalf("aucune étape attendue, obtenu %q", s.Summary)
 	}
-	if _, err := os.Lstat(filepath.Join(legacy, "php")); !os.IsNotExist(err) {
-		t.Error("le lien géré doit être retiré même quand le répertoire reste")
+	if _, err := os.Lstat(filepath.Join(legacy, "php")); err != nil {
+		t.Error("le lien d'ogs doit rester avec le répertoire")
 	}
 }
 

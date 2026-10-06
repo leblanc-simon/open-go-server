@@ -948,3 +948,32 @@ func TestUnRepertoireDeTravailNonVerifiableGardeLaResolution(t *testing.T) {
 		t.Errorf("entrée absente d'un répertoire existant : %s", jobs[0].Command)
 	}
 }
+
+func TestLEcritureDUneTacheNeRouvrePasCronD(t *testing.T) {
+	// R1-51 : « ogs harden » ferme /etc/cron.d en 0750 ; écrire un fichier de
+	// tâche ne doit pas le rouvrir en 0755.
+	prov, proj := fixture(t)
+	dir := filepath.Dir(prov.Path(proj.ID()))
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	proj.Spec.Crons = []model.CronJob{{Name: "scheduler", Schedule: "* * * * *", Command: "bin/console schedule:run"}}
+	ctx := context.Background()
+	steps, err := prov.Plan(ctx, proj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := &engine.Plan{Project: proj.ID()}
+	for _, s := range steps {
+		plan.Add(s)
+	}
+	if _, err := engine.Execute(ctx, plan, engine.Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if info, err := os.Stat(dir); err != nil || info.Mode().Perm() != 0o750 {
+		t.Errorf("%s doit rester en 0750 : %v %v", dir, info.Mode().Perm(), err)
+	}
+}

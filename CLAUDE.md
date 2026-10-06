@@ -765,13 +765,27 @@ Ils ont tous coûté un défaut réel ; les tests unitaires ne les voyaient pas.
   change : ils écrivent par leur descripteur dans le fichier qu'ils ont ouvert.
 - **Deux juges ne doivent jamais régler le même chemin** : ogs pose `/etc/opendkim` et ses tables au
   régime qu'`ogs harden` exige (0750 / 0640 root:opendkim). `fs.EnsureDir` repose le mode d'un répertoire
-  existant : en désaccord, l'apply rouvrirait à chaque passage ce que harden referme.
+  existant : en désaccord, l'apply rouvrirait à chaque passage ce que harden referme — c'était le cas de
+  `/etc/cron.d`, rouvert en 0755 à chaque écriture d'une tâche. Un répertoire de la machine où ogs dépose
+  sans en être le juge passe par **`fs.EnsureSharedDir`**, qui crée mais ne desserre jamais (D116).
 - **Une création défaite doit retirer sa déclaration** (D112) : `site create` dont la saga déroulait tout
   laissait `/etc/ogs/projects/<id>.yaml`, que le plan global lisait aussitôt — la ligne tmpfiles d'un compte
   inexistant faisait rendre 65 à `systemd-tmpfiles`, et l'apply suivant d'un voisin 6 (« Failed to resolve
   user »), vu sur un vrai système et invisible en mode préfixé, où rien n'exécute `systemd-tmpfiles`. Seule
   une création déroulée **sans reste** (ni compensation en échec, ni étape résiduelle) la retire : sinon le
   projet a laissé quelque chose, et c'est `project delete` qui le démonte.
+- **nginx donne ses journaux au compte de ses workers à chaque réouverture** (USR1, chaque nuit par
+  logrotate ; `user` de `nginx.conf`) : exiger root les faisait réécrire à chaque apply, et le plan n'était
+  jamais vide. Ce propriétaire est admis pour les journaux de nginx seuls (D116).
+- **La migration de D70 ne retire que l'ancien `~/.bin` d'ogs**, reconnu à son empreinte — root, 0710 ou
+  0750, liens vers des cibles qu'ogs posait — jamais à son nom : un `.bin` repris d'un home préexistant
+  porte les liens de l'utilisateur. Et les commandes déclarées qui désignaient `.bin/php` (l'ancien §7.5
+  y invitait) sont **réécrites dans la déclaration** avant le retrait : sur une copie dès le plan, dans le
+  fichier à l'application, valeur par valeur (`spec.RewriteValues`, qui garde commentaires et mise en forme
+  et relit le résultat) — `spec.Save` resérialiserait tout. **`buildPlan` ne modifie jamais le projet
+  reçu** : la TUI le calcule puis le recalcule, et la v1 de ce lot, qui réécrivait en place, perdait au
+  second calcul l'étape de réécriture tout en retirant `.bin`. Le retrait relit la déclaration déposée et
+  attend qu'elle ne désigne plus `.bin`, et que chaque lien retiré ait son remplaçant dans `~/.local/bin` — un runtime dont l'installation échoue ne pose pas le sien (D116).
 - **`systemd-tmpfiles --create` ne reçoit que le fichier d'ogs** : sans argument, il traite toute la
   configuration de la machine, crée ce qu'elle déclare et rend 65 sur une ligne en double d'un fichier de
   la distribution.

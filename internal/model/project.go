@@ -706,14 +706,42 @@ const LegacyLinkDir = ".bin"
 // BinDir renvoie le chemin absolu du répertoire des liens gérés d'un projet.
 func BinDir(root string) string { return filepath.Join(root, filepath.FromSlash(LinkDir)) }
 
-// legacyBinDir est l'entrée que les déclarations antérieures à D70 portent pour
-// .bin/. Elle en est retirée à la normalisation, et seulement sous cette forme
-// exacte : un .bin/ déclaré autrement l'a été par l'exploitant.
-var legacyBinDir = Dir{Path: LegacyLinkDir, Mode: "0710", Owner: "root"}
+// legacyDirs sont les entrées que les déclarations antérieures à D70 et D71
+// portent pour .bin/ et logs/. Elles en sont retirées à la normalisation, et
+// seulement sous ces formes exactes : un .bin/ ou un logs/ déclaré autrement
+// l'a été par l'exploitant. Deux modes, parce qu'ogs en a écrit deux : 0750
+// jusqu'à D51, 0710 ensuite — et la normalisation n'écrase jamais une entrée
+// déjà déclarée, si bien qu'un projet créé avant D51 a gardé la première. Ne
+// reconnaître que 0710 faisait passer ce .bin pour celui de l'exploitant :
+// l'arborescence le recréait à chaque apply, et la migration ne le retirait
+// jamais (D116).
+var legacyDirs = []Dir{
+	{Path: LegacyLinkDir, Mode: "0710", Owner: "root"},
+	{Path: LegacyLinkDir, Mode: "0750", Owner: "root"},
+	{Path: "logs", Mode: "0710", Owner: "root"},
+	{Path: "logs", Mode: "0750", Owner: "root"},
+}
 
-// legacyLogsDir est l'entrée que les déclarations antérieures à D71 portent pour
-// logs/. Même règle que pour .bin/ : seule la forme exacte est retirée.
-var legacyLogsDir = Dir{Path: "logs", Mode: "0710", Owner: "root"}
+func isLegacyDir(d Dir) bool {
+	for _, l := range legacyDirs {
+		if d == l {
+			return true
+		}
+	}
+	return false
+}
+
+// DeclaresDir dit si la déclaration porte une entrée de spec.layout.dirs pour
+// ce chemin, relatif à la racine. Après normalisation, une telle entrée pour
+// .bin est celle de l'exploitant : les formes d'ogs en ont été retirées.
+func (p *Project) DeclaresDir(rel string) bool {
+	for _, d := range p.Spec.Layout.Dirs {
+		if path.Clean(d.Path) == path.Clean(rel) {
+			return true
+		}
+	}
+	return false
+}
 
 // LegacyLogDir est l'ancien répertoire des journaux d'un projet, dans son home.
 // Il ne sert plus qu'à la migration, et le nom y devient un lien (D71).
@@ -749,7 +777,7 @@ func (p *Project) defaultDirs(at AppType) []Dir {
 	existing := make(map[string]bool, len(p.Spec.Layout.Dirs))
 	out := make([]Dir, 0, len(want)+len(p.Spec.Layout.Dirs))
 	for _, d := range p.Spec.Layout.Dirs {
-		if d == legacyBinDir || d == legacyLogsDir {
+		if isLegacyDir(d) {
 			continue
 		}
 		existing[path.Clean(d.Path)] = true

@@ -121,3 +121,52 @@ func TestNormalizeEffaceLeMoteurDeProjet(t *testing.T) {
 		t.Errorf("spec.web.engine %q conservé : le moteur ne se choisit pas par projet", p.Spec.Web.Engine)
 	}
 }
+
+func TestLAncienneEntreeBinEn0750EstRetireeAussi(t *testing.T) {
+	// Avant D51, ogs déclarait .bin et logs en 0750 root : ces entrées, gardées
+	// telles quelles par la normalisation, sont les siennes aussi.
+	p := New("shop.fr", naming.EnvProd, KindStatic)
+	p.Spec.Layout.Dirs = []Dir{{Path: ".bin", Mode: "0750", Owner: "root"}, {Path: "logs", Mode: "0750", Owner: "root"}}
+	if err := p.Normalize("/home", "preprod-pp.net"); err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range p.Spec.Layout.Dirs {
+		if d.Path == ".bin" || d.Path == "logs" {
+			t.Errorf("l'ancienne entrée %+v doit disparaître", d)
+		}
+	}
+}
+
+func TestLesReferencesALAncienBin(t *testing.T) {
+	p := New("shop.fr", naming.EnvProd, KindStatic)
+	if err := p.Normalize("/home", "preprod-pp.net"); err != nil {
+		t.Fatal(err)
+	}
+	root := p.Spec.Layout.Root
+	p.Spec.Crons = []CronJob{
+		{Name: "a", Command: root + "/.bin/php x.php && " + root + "/.bin/php y.php"},
+		{Name: "b", Command: root + "/.bin/php8.1 x.php"}, // pas un lien d'ogs
+		{Name: "c", Command: "/opt" + root + "/.bin/php x.php"},
+		{Name: "d", Command: "cd .. && .bin/php x.php"},
+		{Name: "e", Command: `sh -c "${HOME}/.bin/ruby x.rb"`},
+	}
+	refs := p.LegacyBinRefs()
+	got := map[string]LegacyBinRef{}
+	for _, r := range refs {
+		got[r.Field] = r
+	}
+	if r := got["spec.crons[a].command"]; r.Rewritten != root+"/.local/bin/php x.php && "+root+"/.local/bin/php y.php" {
+		t.Errorf("a : %q", r.Rewritten)
+	}
+	for _, f := range []string{"spec.crons[b].command", "spec.crons[c].command"} {
+		if _, ok := got[f]; ok {
+			t.Errorf("%s ne désigne pas l'ancien .bin d'ogs", f)
+		}
+	}
+	if r, ok := got["spec.crons[d].command"]; !ok || r.Rewritten != "" {
+		t.Errorf("d : forme relative nommée sans réécriture attendue, obtenu %+v", r)
+	}
+	if r := got["spec.crons[e].command"]; r.Rewritten != `sh -c "${HOME}/.local/bin/ruby x.rb"` {
+		t.Errorf("e : %q", r.Rewritten)
+	}
+}

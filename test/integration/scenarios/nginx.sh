@@ -958,6 +958,29 @@ ogs project delete neuftest --yes >/dev/null 2>&1
 ogs project delete shoptest --yes >/dev/null 2>&1
 
 echo
+echo "--- la réouverture des journaux les donne à www-data : pas un écart (D116) ---"
+# USR1 — ce que logrotate envoie chaque nuit : le maître rouvre les journaux et
+# les donne au compte de ses workers. L'apply exigeait root et les reprenait à
+# chaque passage.
+kill -USR1 "$(cat /run/nginx.pid)"
+for _ in $(seq 1 20); do
+    [ "$(stat -c %U /var/log/ogs-projects/statictest/nginx-access.log)" = www-data ] && break
+    sleep 0.5
+done
+stat -c '%a %U:%G %n' /var/log/ogs-projects/statictest/nginx-*.log
+if [ "$(stat -c %U /var/log/ogs-projects/statictest/nginx-access.log)" != www-data ]; then
+    echo "ÉCHEC : nginx n'a pas donné le journal à www-data — l'essai ne prouve rien"
+    exit 1
+fi
+plan=$(ogs plan statictest 2>&1)
+if grep -q "journal .*nginx" <<<"$plan"; then
+    echo "ÉCHEC : le plan veut reprendre les journaux de nginx"
+    echo "$plan"
+    exit 1
+fi
+echo "  journaux à www-data après réouverture, plan sans écart sur eux"
+
+echo
 echo "--- suppression : le vhost part et la configuration reste valide ---"
 ogs project delete phptest --yes >/dev/null 2>&1
 if ls /etc/nginx/sites-enabled/ | grep -q phptest; then

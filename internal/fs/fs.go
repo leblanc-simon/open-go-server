@@ -645,6 +645,45 @@ func EnsureDir(path string, mode os.FileMode, owner Owner) error {
 	return nil
 }
 
+// EnsureSharedDir assure un répertoire système partagé — /etc/cron.d — où ogs
+// dépose ses fichiers sans en être le juge : absent, il est créé au mode donné ;
+// présent, il n'est **jamais desserré**. Son mode devient l'intersection du
+// constaté et de mode, setgid et sticky gardés, et son propriétaire n'est pas
+// touché. EnsureDir reposait mode tel quel : chaque écriture d'un fichier de
+// tâche rouvrait en 0755 le /etc/cron.d qu'« ogs harden » venait de fermer en
+// 0750 — deux juges du même chemin (D116, D85). Un lien à sa place est refusé.
+func EnsureSharedDir(path string, mode os.FileMode) error {
+	info, err := os.Lstat(path)
+	switch {
+	case err == nil && info.Mode()&os.ModeSymlink != 0:
+		return fmt.Errorf("%s est un lien symbolique : ogs ne le suit pas", path)
+	case err == nil && !info.IsDir():
+		return fmt.Errorf("%s existe et n'est pas un répertoire", path)
+	case errors.Is(err, fs.ErrNotExist):
+		return EnsureDir(path, mode, KeepOwner)
+	case err != nil:
+		return err
+	}
+	d, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_DIRECTORY, 0)
+	if err != nil {
+		if errors.Is(err, syscall.ELOOP) {
+			return fmt.Errorf("%s est un lien symbolique : ogs ne le suit pas", path)
+		}
+		return fmt.Errorf("ouverture de %s : %w", path, err)
+	}
+	defer d.Close()
+	st, err := d.Stat()
+	if err != nil {
+		return err
+	}
+	current := st.Mode()
+	want := current.Perm() & mode.Perm()
+	if want == current.Perm() {
+		return nil
+	}
+	return d.Chmod(want | current&(os.ModeSetgid|os.ModeSticky|os.ModeSetuid))
+}
+
 // ParseMode lit un mode octal écrit sous forme de chaîne (« 0750 »).
 func ParseMode(s string) (os.FileMode, error) {
 	var m uint32

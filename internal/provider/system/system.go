@@ -70,7 +70,10 @@ type Observed struct {
 	User      *UserInfo
 	Group     *GroupInfo
 	WebMember bool
-	Dirs      map[string]DirState
+	// WebUID est l'UID du compte des workers du serveur web, -1 s'il n'existe
+	// pas : nginx lui donne ses journaux à chaque réouverture (D116).
+	WebUID int
+	Dirs   map[string]DirState
 }
 
 // DirState est l'état d'un répertoire du projet.
@@ -91,7 +94,10 @@ type DirState struct {
 
 // Observe inspecte le système pour un projet donné.
 func (p *Provider) Observe(_ context.Context, proj *model.Project) (Observed, error) {
-	obs := Observed{Dirs: map[string]DirState{}}
+	obs := Observed{Dirs: map[string]DirState{}, WebUID: -1}
+	if w, err := p.Identity.LookupUser(p.webWorkerUser()); err == nil && w != nil {
+		obs.WebUID = w.UID
+	}
 	u, err := p.Identity.LookupUser(proj.Spec.User.Name)
 	if err != nil {
 		return obs, fmt.Errorf("lecture du compte %s : %w", proj.Spec.User.Name, err)

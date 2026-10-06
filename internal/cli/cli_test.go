@@ -4519,7 +4519,7 @@ func TestMigrationDesLiensVersLocalBin(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(home, ".bin"), 0o710); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Symlink("/usr/bin/php8.3", filepath.Join(home, ".bin", "php")); err != nil {
+	if err := os.Symlink(h.path("usr", "bin", "php8.3"), filepath.Join(home, ".bin", "php")); err != nil {
 		t.Fatal(err)
 	}
 

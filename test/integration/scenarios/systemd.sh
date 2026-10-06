@@ -447,11 +447,23 @@ install -d -o root -g shopfr -m 0710 /home/shop.fr/.bin
 ln -s "$(readlink "$lien")" /home/shop.fr/.bin/php
 sed -i 's#^\(\s*\)- path: \.ssh#\1- path: .bin\n\1  mode: "0710"\n\1  owner: root\n\1- path: .ssh#' /etc/ogs/projects/shopfr.yaml
 grep -q "path: .bin" /etc/ogs/projects/shopfr.yaml || { echo "ÉCHEC : déclaration ancienne non reconstituée"; exit 1; }
-ogs apply shopfr --yes 2>&1 | grep -i "ancien" | head -2
+# Une tâche qui l'invoque en chemin absolu, comme l'ancien §7.5 y invitait, et
+# un commentaire de l'exploitant (D116).
+ogs cron add shopfr ancienbin --schedule "0 5 * * *" --command "/home/shop.fr/.bin/php -v" >/dev/null
+sed -i '1i # déclaration commentée par l exploitant' /etc/ogs/projects/shopfr.yaml
+plan=$(ogs plan shopfr 2>&1 || true)
+grep -q "spec.crons\[ancienbin\].command" <<<"$plan" || { echo "ÉCHEC : le plan n'annonce pas la réécriture"; echo "$plan"; exit 1; }
+ogs apply shopfr --yes 2>&1 | grep -iE "ancien|déclaration" | head -3
 if [ -e /home/shop.fr/.bin ]; then
     echo "ÉCHEC : l'ancien .bin/ est resté"
     exit 1
 fi
+grep -q "/home/shop.fr/.local/bin/php -v" /etc/cron.d/ogs-shopfr || { echo "ÉCHEC : la tâche désigne encore .bin"; grep ancienbin -A1 /etc/cron.d/ogs-shopfr; exit 1; }
+grep -q "command: /home/shop.fr/.local/bin/php -v" /etc/ogs/projects/shopfr.yaml || { echo "ÉCHEC : la déclaration n'est pas réécrite"; exit 1; }
+head -1 /etc/ogs/projects/shopfr.yaml | grep -q "commentée" || { echo "ÉCHEC : le commentaire de l'exploitant a disparu"; exit 1; }
+su -s /bin/bash shopfr -c '/home/shop.fr/.local/bin/php -v' >/dev/null || { echo "ÉCHEC : le lien géré ne répond pas"; exit 1; }
+ogs cron remove shopfr ancienbin >/dev/null
+echo "  tâche et déclaration réécrites vers ~/.local/bin, commentaire gardé"
 # La mise à l'échelle précédente a ramené le service à une instance.
 etat=$(systemctl is-active "ogs-shopfr-veille@1.service" 2>&1)
 if [ "$etat" != "active" ]; then
@@ -459,6 +471,18 @@ if [ "$etat" != "active" ]; then
     exit 1
 fi
 echo "  .bin/ retiré, instance toujours active"
+
+echo
+echo "--- un ~/.bin de l'utilisateur n'est pas l'ancien répertoire d'ogs (D116) ---"
+su -s /bin/bash shopfr -c 'mkdir -m 0755 ~/.bin && ln -s /usr/bin/true ~/.bin/php'
+sortie=$(ogs apply shopfr --yes 2>&1 || true)
+if grep -qi "retrait de l'ancien" <<<"$sortie" || [ ! -L /home/shop.fr/.bin/php ]; then
+    echo "ÉCHEC : le .bin de l'utilisateur a été retiré"
+    echo "$sortie" | tail -5
+    exit 1
+fi
+rm -rf /home/shop.fr/.bin
+echo "  .bin de l'utilisateur laissé intact"
 
 echo
 echo "--- service retiré : son modèle part, son instance s'arrête (D100) ---"

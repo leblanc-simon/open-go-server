@@ -633,3 +633,38 @@ func TestCheckOwnerRefuseLeFichierDUnAutreProjet(t *testing.T) {
 		}
 	}
 }
+
+func TestEnsureSharedDirNeDesserreJamais(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "cron.d")
+	if err := EnsureSharedDir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if info, _ := os.Stat(dir); info.Mode().Perm() != 0o755 {
+		t.Errorf("créé en %04o, attendu 0755", info.Mode().Perm())
+	}
+	if err := os.Chmod(dir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := EnsureSharedDir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if info, _ := os.Stat(dir); info.Mode().Perm() != 0o750 {
+		t.Errorf("rouvert en %04o", info.Mode().Perm())
+	}
+	if err := os.Chmod(dir, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if err := EnsureSharedDir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if info, _ := os.Stat(dir); info.Mode().Perm() != 0o755 {
+		t.Errorf("un mode plus ouvert doit être ramené à 0755, obtenu %04o", info.Mode().Perm())
+	}
+	link := dir + ".lien"
+	if err := os.Symlink(dir, link); err != nil {
+		t.Fatal(err)
+	}
+	if err := EnsureSharedDir(link, 0o755); err == nil {
+		t.Error("un lien doit être refusé")
+	}
+}

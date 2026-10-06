@@ -260,6 +260,14 @@ func readDirNames(fd int) ([]string, error) {
 // des journaux d'un projet (D71) — : ailleurs, le nom lui-même serait à la merci
 // de l'utilisateur.
 func EnsureFile(path string, mode os.FileMode, owner Owner) (bool, error) {
+	return EnsureFileAccepting(path, mode, owner)
+}
+
+// EnsureFileAccepting est EnsureFile, un fichier appartenant à l'un des UID
+// acceptés gardant son propriétaire : le journal qu'un démon s'approprie à
+// chaque réouverture — nginx le donne à ses workers — n'est pas un écart à
+// corriger, le lui reprendre n'aurait d'effet que jusqu'à la nuit suivante.
+func EnsureFileAccepting(path string, mode os.FileMode, owner Owner, acceptUIDs ...int) (bool, error) {
 	fd, err := unix.Open(path, unix.O_WRONLY|unix.O_APPEND|unix.O_CREAT|unix.O_NOFOLLOW|unix.O_CLOEXEC|unix.O_NONBLOCK,
 		uint32(mode.Perm()))
 	if err != nil {
@@ -281,6 +289,11 @@ func EnsureFile(path string, mode os.FileMode, owner Owner) (bool, error) {
 		changed = true
 	}
 	uid, gid := owner.UID, owner.GID
+	for _, a := range acceptUIDs {
+		if a >= 0 && uint32(a) == st.Uid {
+			uid = -1
+		}
+	}
 	if (uid >= 0 && uint32(uid) != st.Uid) || (gid >= 0 && uint32(gid) != st.Gid) {
 		if err := unix.Fchown(fd, uid, gid); err != nil {
 			return false, err
@@ -409,6 +422,72 @@ func (d *DirAt) Owner() (uid, gid uint32, err error) {
 		return 0, 0, err
 	}
 	return st.Uid, st.Gid, nil
+}
+
+// Perm rend les bits de mode du répertoire ouvert (droits, setgid, sticky).
+func (d *DirAt) Perm() (os.FileMode, error) {
+	var st unix.Stat_t
+	if err := unix.Fstat(d.fd, &st); err != nil {
+		return 0, err
+	}
+	return os.FileMode(st.Mode & 0o7777), nil
+}
+
+// Names énumère les entrées du répertoire ouvert, triées.
+func (d *DirAt) Names() ([]string, error) {
+	names, err := readDirNames(d.fd)
+	if err != nil {
+		return nil, err
+	}
+	out := names[:0]
+	for _, n := range names {
+		if n != "." && n != ".." {
+			out = append(out, n)
+		}
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+// Readlink rend la cible du lien name, sans le suivre ; isLink est faux si name
+// n'est pas un lien, present faux si rien ne porte ce nom.
+func (d *DirAt) Readlink(name string) (target string, isLink, present bool, err error) {
+	if err := checkName(name); err != nil {
+		return "", false, false, err
+	}
+	var st unix.Stat_t
+	if err := unix.Fstatat(d.fd, name, &st, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		if errors.Is(err, unix.ENOENT) {
+			return "", false, false, nil
+		}
+		return "", false, false, fmt.Errorf("%s : %w", filepath.Join(d.path, name), err)
+	}
+	if st.Mode&unix.S_IFMT != unix.S_IFLNK {
+		return "", false, true, nil
+	}
+	buf := make([]byte, 4096)
+	n, err := unix.Readlinkat(d.fd, name, buf)
+	if err != nil {
+		return "", true, true, fmt.Errorf("%s : %w", filepath.Join(d.path, name), err)
+	}
+	return string(buf[:n]), true, true, nil
+}
+
+// RemoveLink retire le lien name du répertoire ouvert — seulement si c'est un
+// lien, et seulement s'il désigne encore target.
+func (d *DirAt) RemoveLink(name, target string) error {
+	current, isLink, present, err := d.Readlink(name)
+	switch {
+	case err != nil:
+		return err
+	case !present:
+		return nil
+	case !isLink:
+		return fmt.Errorf("%s n'est pas un lien : refus de le supprimer", filepath.Join(d.path, name))
+	case current != target:
+		return fmt.Errorf("%s désigne désormais %s : refus de le supprimer", filepath.Join(d.path, name), current)
+	}
+	return unix.Unlinkat(d.fd, name, 0)
 }
 
 // Entry décrit ce qui occupe name, sans le suivre ; present est faux si rien ne

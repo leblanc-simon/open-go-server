@@ -498,7 +498,9 @@ func (p *Provider) Plan(_ context.Context, proj *model.Project) ([]*engine.Step,
 				return err
 			}
 		}
-		if err := fs.EnsureDir(filepath.Dir(path), 0o755, fs.KeepOwner); err != nil {
+		// /etc/cron.d est à la machine, et « ogs harden » le ferme en 0750 (D56) :
+		// le créer s'il manque, jamais le rouvrir (D116).
+		if err := fs.EnsureSharedDir(filepath.Dir(path), 0o755); err != nil {
 			return err
 		}
 		// 0644 root:root : cron refuse un fichier de /etc/cron.d inscriptible par
