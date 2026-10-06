@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"leblanc.io/open-go-server/internal/archive"
+	"leblanc.io/open-go-server/internal/model"
 )
 
 // siteServi prépare un site PHP avec une tâche planifiée, et rend les chemins
@@ -244,4 +245,30 @@ func TestLaSuppressionNeRefuseQueLeLogDirQuiContientCeluiDUnVoisin(t *testing.T)
 		t.Errorf("blogfr, logé sous shopfr, n'efface rien du voisin : code %d :\n%s", code, out)
 	}
 	intact(t, témoin, "journal de shopfr\n")
+}
+
+// Un pool que la déclaration ne nomme plus part avec le projet (D115) : il est
+// coupé avec les autres, avant l'archive, et non après elle.
+func TestLaCoupureRetireAussiLePoolQueLaDeclarationNeNommePlus(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("project", "create", "shop.fr", "--kind", "php-symfony", "--app-version", "6.4", "--php", "8.5")
+	h.mustRun("apply", "--yes")
+	pool := h.path("etc", "php", "8.5", "fpm", "pool.d", "shopfr.conf")
+	h.modifierDéclaration(t, "shopfr", func(p *model.Project) {
+		p.Spec.App.Kind = model.KindStatic
+		p.Spec.App.Version = ""
+		p.Spec.PHP.Pools = nil
+	})
+	présent := true
+	out, _ := h.runEpie(context.Background(), "archive créée", func() {
+		_, err := os.Stat(pool)
+		présent = err == nil
+	}, "project", "delete", "shopfr", "--yes")
+	if présent {
+		t.Errorf("le pool non déclaré doit être coupé avant l'archive :\n%s", out)
+	}
+	if _, err := os.Stat(pool); !os.IsNotExist(err) {
+		t.Errorf("le pool doit être parti : %v", err)
+	}
 }

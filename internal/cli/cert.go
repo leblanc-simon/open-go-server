@@ -324,6 +324,8 @@ func newCertRenewCommand(app *App) *cobra.Command {
 				app.warnf("⚠ %v\n", e)
 				var pk *tlsprov.ProductionKeptError
 				if errors.As(e, &pk) {
+					// Renew l'a aussi rangé dans done : il est rechargé, et
+					// postCertRenew le reçoit (D117).
 					kept++
 					_ = app.Audit.Record("", "tls/certificate/"+pk.Name, "cert.renew", "avertissement", e.Error())
 					continue

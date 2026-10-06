@@ -78,6 +78,16 @@ func (a *App) siteFiles(provs *providers, p *model.Project, removing []string) (
 			pools[path] = pool.Version
 		}
 	}
+	// Et tout pool que l'en-tête attribue au projet sans que la déclaration le
+	// nomme (D115) : il tourne sous le compte, et part de toute façon.
+	for _, path := range provs.PHP.OwnedPools(p.ID()) {
+		if _, ok := pools[path]; ok || !set[path] {
+			continue
+		}
+		if v := filepath.Base(filepath.Dir(filepath.Dir(filepath.Dir(path)))); filepath.Dir(path) == a.Paths.PHPPoolDir(v) {
+			pools[path] = v
+		}
+	}
 	if path := filepath.Join(a.Paths.CronDir(), cron.FileName(p.ID())); set[path] {
 		cronFile = path
 	}

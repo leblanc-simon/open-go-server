@@ -199,10 +199,6 @@ ogs service add svcfr veille --template worker --command /home/svc.fr/www/veille
     echec "déclaration du service"
 ogs apply svcfr --yes >/dev/null 2>&1 || echec "apply de svc.fr"
 [ "$(systemctl is-active ogs-svcfr-veille@1.service)" = active ] || echec "le worker doit tourner avant la suppression"
-# Contournement de R1-16 (lot Y13, à retirer à son intégration) : la cible du projet n'est jamais
-# démarrée (les instances le sont une à une), et la suppression, qui arrête la
-# cible, laisse tourner les instances liées par PartOf — userdel échoue alors.
-systemctl stop ogs-svcfr-veille@1.service
 sortie=$(ogs project delete svcfr --no-dump --yes 2>&1) || { echo "$sortie" | grep -E "⚠|✗"; echec "suppression de svc.fr"; }
 systemctl reset-failed 'ogs-svcfr-*' >/dev/null 2>&1
 archive=$(archive_de svcfr)
@@ -220,7 +216,6 @@ echo "  worker démarré une fois, après le contenu"
 
 echo
 echo "--- une restauration interrompue se reprend (D113) ---"
-systemctl stop ogs-svcfr-veille@1.service
 sortie=$(ogs project delete svcfr --no-dump --yes 2>&1) || { echo "$sortie" | grep -E "⚠|✗"; echec "seconde suppression de svc.fr"; }
 archive=$(archive_de svcfr)
 pool=/etc/php/$version/fpm/pool.d/svcfr.conf
