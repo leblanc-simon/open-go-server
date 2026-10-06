@@ -179,6 +179,110 @@ fi
 echo "répartiteur : $(sort -u $trace | tr '\n' ' ')"
 rm -f /etc/ogs/hooks/post-create /etc/ogs/hooks/pre-create
 
+# D112 : le plan du parc a ses hooks à lui, pre-apply-fleet et post-apply-fleet.
+# Une archive expirée lui donne une purge à faire ; un pre-apply-fleet qui
+# refuse l'arrête.
+echo "--- pre-apply-fleet garde le plan du parc ---"
+cat > /etc/ogs/hooks/pre-apply-fleet <<'HOOK'
+#!/bin/sh
+echo "plan du parc refusé" >&2
+exit 1
+HOOK
+chmod 0750 /etc/ogs/hooks/pre-apply-fleet
+mkdir -p /var/lib/ogs/archives
+vieille=/var/lib/ogs/archives/ancien-20200101-0000.tar.zst
+echo "archive expirée" > $vieille
+touch -d '3 years ago' $vieille
+sortie=$(ogs apply --yes 2>&1)
+code=$?
+if [ "$code" -eq 0 ] || [ ! -f $vieille ]; then
+    echo "ÉCHEC : le plan du parc est passé outre le refus de pre-apply-fleet (code $code) :"
+    echo "$sortie" | tail -5
+    exit 1
+fi
+if ! grep -q "purge de 1 archive" <<<"$sortie"; then
+    echo "ÉCHEC : le plan du parc n'a pas été montré avant le hook :"
+    echo "$sortie" | tail -5
+    exit 1
+fi
+rm -f /etc/ogs/hooks/pre-apply-fleet
+if ! ogs apply --yes >/dev/null 2>&1 || [ -f $vieille ]; then
+    echo "ÉCHEC : la purge confirmée n'a pas eu lieu"
+    exit 1
+fi
+echo "le refus de pre-apply-fleet a gardé le plan du parc, levé il le laisse passer"
+
+# Relecture de D112 : un post-apply écrit pour un projet n'est jamais appelé sans
+# projet. Appelé avec OGS_ROOT vide, il vidait /var/cache de la machine.
+echo "--- post-apply n'est appelé que pour un projet ---"
+mkdir -p /var/cache/temoin-exploitant
+echo x > /var/cache/temoin-exploitant/f
+cat > /etc/ogs/hooks/post-apply <<'HOOK'
+#!/bin/sh
+echo "post-apply projet=[$OGS_PROJECT]" >> /tmp/trace-apply
+rm -rf "$OGS_ROOT"/var/cache/*
+HOOK
+chmod 0750 /etc/ogs/hooks/post-apply
+ogs site create neuf.test --kind static --tls=false --yes --quiet >/dev/null 2>&1
+rm -f /etc/ogs/hooks/post-apply
+if [ ! -f /var/cache/temoin-exploitant/f ] || grep -q "projet=\[\]" /tmp/trace-apply; then
+    echo "ÉCHEC : post-apply appelé sans projet :"
+    cat /tmp/trace-apply
+    exit 1
+fi
+echo "post-apply appelé pour le seul projet : $(cat /tmp/trace-apply)"
+
+# Relecture de D112 : une création refusée avant le premier geste — par
+# pre-apply, ou à la confirmation — ne laisse pas sa déclaration.
+echo "--- une création refusée ne laisse pas sa déclaration ---"
+cat > /etc/ogs/hooks/pre-apply <<'HOOK'
+#!/bin/sh
+echo "refusé" >&2
+exit 1
+HOOK
+chmod 0750 /etc/ogs/hooks/pre-apply
+ogs site create refus1.test --kind static --tls=false --yes >/dev/null 2>&1
+rm -f /etc/ogs/hooks/pre-apply
+echo n | ogs site create refus2.test --kind static --tls=false >/dev/null 2>&1
+for id in refus1test refus2test; do
+    if [ -f /etc/ogs/projects/$id.yaml ]; then
+        echo "ÉCHEC : la déclaration de $id, création refusée, est restée"
+        exit 1
+    fi
+done
+sortie=$(ogs apply neuftest --yes 2>&1)
+code=$?
+if [ "$code" -ne 0 ]; then
+    echo "ÉCHEC : l'apply d'un voisin après deux créations refusées rend $code :"
+    echo "$sortie" | tail -3
+    exit 1
+fi
+echo "les créations refusées n'ont rien laissé au parc"
+
+# D112 : postCreate au premier apply réussi d'un projet que « project create » a
+# déclaré — le cycle documenté —, et une seule fois.
+echo "--- postCreate du cycle « project create » puis « apply » ---"
+cat > /etc/ogs/hooks/post-create <<'HOOK'
+#!/bin/sh
+echo "parc postCreate $OGS_PROJECT" >> /tmp/trace-hooks
+HOOK
+chmod 0750 /etc/ogs/hooks/post-create
+ogs project create cycle.test --kind static --quiet >/dev/null 2>&1
+if grep -q "parc postCreate cycletest" $trace; then
+    echo "ÉCHEC : postCreate lancé avant tout apply"
+    exit 1
+fi
+ogs apply cycletest --yes --quiet >/dev/null 2>&1
+ogs apply cycletest --yes --quiet >/dev/null 2>&1
+n=$(grep -c "parc postCreate cycletest" $trace)
+if [ "$n" != 1 ]; then
+    echo "ÉCHEC : postCreate attendu une fois au premier apply, obtenu $n"
+    exit 1
+fi
+echo "postCreate lancé une fois, au premier apply"
+
 echo
 echo "RÉSULTAT : les hooks s'exécutent avec le bon contexte, un « pre » refuse,"
-echo "           et un script détournable est écarté."
+echo "           un script détournable est écarté, pre-apply-fleet garde le plan du parc,"
+echo "           post-apply n'est jamais appelé sans projet, une création refusée ne reste pas"
+echo "           et postCreate suit le premier apply."

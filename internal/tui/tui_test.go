@@ -24,6 +24,9 @@ type fakeBackend struct {
 	created   []WizardAnswers
 	applyErr  error
 	diffLines []string
+	// planLines est le plan montré avant d'appliquer ; nil vaut un changement.
+	planLines []string
+	planned   []string
 }
 
 func (f *fakeBackend) PrepDomain() string { return "preprod-pp.net" }
@@ -47,6 +50,14 @@ func (f *fakeBackend) Apply(_ context.Context, p *model.Project) (string, error)
 
 func (f *fakeBackend) Diff(_ context.Context, p *model.Project) ([]string, error) {
 	return f.diffLines, nil
+}
+
+func (f *fakeBackend) Plan(_ context.Context, p *model.Project) ([]string, error) {
+	f.planned = append(f.planned, p.ID())
+	if f.planLines == nil {
+		return []string{"projet " + p.ID(), "  + utilisateur " + p.ID(), "parc", "  ~ rotation des journaux"}, nil
+	}
+	return f.planLines, nil
 }
 
 func (f *fakeBackend) Restart(_ context.Context, p *model.Project) error {
@@ -410,5 +421,30 @@ func TestHealthSymbolsDistinguishStates(t *testing.T) {
 		if got := styles.health(state); !strings.HasPrefix(got, symbol) {
 			t.Errorf("état %q : %q, symbole %q attendu", state, got, symbol)
 		}
+	}
+}
+
+// La confirmation d'un apply montre ce qu'il fera — le plan du projet et celui
+// du parc —, comme la ligne de commande ; sans changement, rien n'est demandé
+// (D112, R1-39).
+func TestApplyMontreLePlanAvantDeConfirmer(t *testing.T) {
+	backend := &fakeBackend{projects: []*model.Project{project(t, "shop.fr", naming.EnvProd)}}
+	m := New(backend)
+	_ = drive(m, m.Init()())
+	view := drive(m, key("a"))
+	for _, attendu := range []string{"+ utilisateur shopfr", "parc", "~ rotation des journaux", "appliquer les changements"} {
+		if !strings.Contains(view, attendu) {
+			t.Errorf("la confirmation doit montrer %q :\n%s", attendu, view)
+		}
+	}
+	drive(m, key("x"))
+
+	backend.planLines = []string{}
+	view = drive(m, key("a"))
+	if strings.Contains(view, "appliquer les changements") || len(backend.applied) != 0 {
+		t.Errorf("sans changement, rien n'est à confirmer :\n%s", view)
+	}
+	if !strings.Contains(m.Status(), "aucun changement") {
+		t.Errorf("l'absence de changement doit être dite : %q", m.Status())
 	}
 }

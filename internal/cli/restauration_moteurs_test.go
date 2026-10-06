@@ -100,17 +100,38 @@ func TestLaRestaurationDemarreLesServicesApresLeContenu(t *testing.T) {
 func TestUneRestaurationInachevéeSeReprend(t *testing.T) {
 	h := newHarness(t)
 	h.mustRun("init")
-	h.mustRun("site", "create", "shop.fr", "--kind", "php-plain", "--php", "8.5", "--tls=false", "--yes")
+	h.mustRun("site", "create", "shop.fr", "--kind", "php-plain", "--php", "8.5", "--tls=false",
+		"--cron", "*/5 * * * *:echo tâche", "--yes")
 	h.mustRunPartial("project", "delete", "shopfr", "--yes")
 	archivePath := h.derniereArchive(t)
 
-	// Un pool que ogs n'a pas écrit occupe la place de celui du projet : l'apply
-	// de la restauration échoue.
+	// Un pool que ogs n'a pas écrit occupe la place de celui du projet : le
+	// premier apply échoue, et c'est une création défaite (D112) — déclaration
+	// et témoin retirés, la restauration se relance telle quelle.
 	pool := h.path("etc", "php", "8.5", "fpm", "pool.d", "shopfr.conf")
 	déposer(t, pool, "[shopfr]\n; pool de l'administrateur\n")
 	out, code := h.run("project", "restore", archivePath, "--yes")
 	if code == CodeOK || code == CodePartial {
 		t.Fatalf("l'apply devait échouer (code %d) :\n%s", code, out)
+	}
+	if _, err := os.Stat(h.path("etc", "ogs", "projects", "shopfr.yaml")); !os.IsNotExist(err) {
+		t.Errorf("DÉFAUT : un premier apply défait doit retirer la déclaration (D112) :\n%s", out)
+	}
+	if _, err := os.Stat(h.path("var", "lib", "ogs", "restores", "shopfr.json")); !os.IsNotExist(err) {
+		t.Errorf("DÉFAUT : un premier apply défait doit retirer le témoin : %v", err)
+	}
+	if err := os.Remove(pool); err != nil {
+		t.Fatal(err)
+	}
+
+	// Une tâche planifiée que ogs n'a pas écrite occupe la place de celle du
+	// projet : seul l'apply final la pose (D113), il échoue — le contenu est
+	// rendu, la restauration est inachevée et se reprend.
+	tâches := h.path("etc", "cron.d", "ogs-shopfr")
+	déposer(t, tâches, "# tâches de l'administrateur\n")
+	out, code = h.run("project", "restore", archivePath, "--yes")
+	if code == CodeOK || code == CodePartial {
+		t.Fatalf("l'apply final devait échouer (code %d) :\n%s", code, out)
 	}
 	if !strings.Contains(out, exec.ShellLine("ogs", "project", "restore", "--resume", archivePath)) ||
 		!strings.Contains(out, "ogs project delete shopfr") {
@@ -158,7 +179,7 @@ func TestUneRestaurationInachevéeSeReprend(t *testing.T) {
 	}
 
 	// La cause levée, la reprise achève la restauration.
-	if err := os.Remove(pool); err != nil {
+	if err := os.Remove(tâches); err != nil {
 		t.Fatal(err)
 	}
 	out, code = h.run("project", "restore", "--resume", archivePath, "--yes")
@@ -168,8 +189,8 @@ func TestUneRestaurationInachevéeSeReprend(t *testing.T) {
 	if strings.Contains(out, "secret(s) réinjecté(s)") {
 		t.Errorf("la réinjection aboutie ne se rejoue pas :\n%s", out)
 	}
-	if !strings.Contains(out, "fichier(s) restauré(s)") {
-		t.Errorf("l'arborescence, jamais extraite, doit l'être :\n%s", out)
+	if strings.Contains(out, "fichier(s) restauré(s)") {
+		t.Errorf("l'arborescence extraite ne se rejoue pas :\n%s", out)
 	}
 	if _, err := os.Stat(h.path("var", "lib", "ogs", "restores", "shopfr.json")); !os.IsNotExist(err) {
 		t.Errorf("le témoin doit partir avec la restauration achevée : %v", err)

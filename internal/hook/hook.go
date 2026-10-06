@@ -25,12 +25,19 @@ const (
 	PostApply     = "postApply"
 	PostCertRenew = "postCertRenew"
 	PostPHPSwitch = "postPhpSwitch"
+	// PreApplyFleet et PostApplyFleet encadrent le plan du parc — fichiers communs
+	// à tous les projets (D112). Ils ne valent que pour le parc : appelés sans
+	// projet, ils ne sont jamais ceux d'un projet, et preApply/postApply ne sont
+	// jamais appelés sans projet — un hook écrit pour un projet, appelé avec
+	// OGS_ROOT vide, avait vidé /var/cache de la machine.
+	PreApplyFleet  = "preApplyFleet"
+	PostApplyFleet = "postApplyFleet"
 )
 
 // Events énumère les événements connus.
 func Events() []string {
 	return []string{PreCreate, PostCreate, PreDelete, PostDelete,
-		PreApply, PostApply, PostCertRenew, PostPHPSwitch}
+		PreApply, PostApply, PostCertRenew, PostPHPSwitch, PreApplyFleet, PostApplyFleet}
 }
 
 // Critical indique si l'échec d'un hook doit interrompre l'opération. Les hooks
@@ -38,7 +45,7 @@ func Events() []string {
 // « post » constatent, et leur échec est un avertissement.
 func Critical(event string) bool {
 	switch event {
-	case PreCreate, PreDelete, PreApply:
+	case PreCreate, PreDelete, PreApply, PreApplyFleet:
 		return true
 	}
 	return false

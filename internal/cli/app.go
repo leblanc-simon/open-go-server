@@ -76,14 +76,14 @@ type App struct {
 	amqpWarned bool
 	// holdServices fait différer par le plan d'un projet ce qui exécute son
 	// code — démarrage des instances, attente de disponibilité, tâches
-	// planifiées — et par applyProjects le hook « postCreate » : la restauration
-	// remet le home et les bases avant de les lancer (D113).
+	// planifiées : la restauration remet le home et les bases avant de les lancer
+	// (D113).
 	holdServices bool
-	// postCreateRan dit, pour un projet, que son « postCreate » a déjà été lancé
-	// — une restauration reprise ne le relance pas —, et onPostCreate le fait
-	// noter dès qu'il l'est (D113).
-	postCreateRan func(id string) bool
-	onPostCreate  func(id string)
+	// declaredBefore garde la ligne d'état qu'une création a remplacée, pour la
+	// rendre si la création est défaite (D112).
+	declaredBefore map[string]*store.ProjectRow
+	// undone nomme les créations défaites, déclaration retirée (D112).
+	undone map[string]bool
 }
 
 // nowFunc est isolé pour rester substituable en test.

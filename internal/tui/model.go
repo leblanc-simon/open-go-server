@@ -22,6 +22,10 @@ type Backend interface {
 	Apply(ctx context.Context, p *model.Project) (string, error)
 	// Diff renvoie les écarts d'un projet, ligne par ligne.
 	Diff(ctx context.Context, p *model.Project) ([]string, error)
+	// Plan renvoie ce qu'Apply ferait — le plan du projet, puis celui du parc —,
+	// ligne par ligne, pour être montré avant la confirmation ; aucune ligne,
+	// rien à appliquer (D112).
+	Plan(ctx context.Context, p *model.Project) ([]string, error)
 	// Restart redémarre les services d'un projet.
 	Restart(ctx context.Context, p *model.Project) error
 	// RenewCertificate renouvelle le certificat d'un projet.
@@ -100,9 +104,11 @@ type Model struct {
 	quitting  bool
 }
 
-// confirmation porte une action à confirmer.
+// confirmation porte une action à confirmer, et ce qu'elle fera : le plan
+// d'un apply est montré avant la question, comme en ligne de commande.
 type confirmation struct {
 	question string
+	lines    []string
 	action   func(ctx context.Context) tea.Msg
 }
 
@@ -201,7 +207,12 @@ type (
 		id       string
 		snapshot Snapshot
 	}
-	diffMsg   struct{ lines []string }
+	diffMsg struct{ lines []string }
+	planMsg struct {
+		project *model.Project
+		lines   []string
+		err     error
+	}
 	outputMsg struct {
 		lines []string
 		err   error
@@ -274,6 +285,35 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.done()
 		m.diff = msg.lines
 		m.mode = modeDiff
+		return m, nil
+
+	case planMsg:
+		m.done()
+		// Une action lancée entre-temps, ou un autre écran, l'emporte : le plan
+		// n'est plus celui qu'on allait confirmer.
+		if m.running || m.mode != modeList {
+			return m, nil
+		}
+		p := msg.project
+		switch {
+		case msg.err != nil:
+			m.status = "plan de " + p.ID() + " incalculable : " + msg.err.Error()
+			return m, nil
+		case len(msg.lines) == 0:
+			m.status = "aucun changement pour " + p.ID()
+			return m, nil
+		}
+		// Toute action mutante passe par une confirmation, le plan sous les yeux :
+		// la TUI n'est qu'un pilote du même moteur, sans chemin privilégié (D112).
+		m.mode = modeConfirm
+		m.confirm = confirmation{
+			question: fmt.Sprintf("appliquer les changements de %s ?", p.ID()),
+			lines:    msg.lines,
+			action: func(ctx context.Context) tea.Msg {
+				out, err := m.backend.Apply(ctx, p)
+				return outputMsg{lines: strings.Split(strings.TrimRight(out, "\n"), "\n"), err: err}
+			},
+		}
 		return m, nil
 
 	case outputMsg:
@@ -414,17 +454,13 @@ func (m *Model) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if p == nil || m.refuseWhileRunning() {
 			return m, nil
 		}
-		// Toute action mutante passe par une confirmation : la TUI n'est qu'un
-		// pilote du même moteur, sans chemin privilégié.
-		m.mode = modeConfirm
-		m.confirm = confirmation{
-			question: fmt.Sprintf("appliquer les changements de %s ?", p.ID()),
-			action: func(ctx context.Context) tea.Msg {
-				out, err := m.backend.Apply(ctx, p)
-				return outputMsg{lines: strings.Split(strings.TrimRight(out, "\n"), "\n"), err: err}
-			},
-		}
-		return m, nil
+		// Le plan d'abord, projet et parc : la confirmation le montre (D112).
+		ctx := m.ctx
+		m.status = "calcul du plan de " + p.ID() + "…"
+		return m, m.read(func() tea.Msg {
+			lines, err := m.backend.Plan(ctx, p)
+			return planMsg{project: p, lines: lines, err: err}
+		})
 	case "s":
 		p := m.current()
 		if p == nil || m.refuseWhileRunning() {

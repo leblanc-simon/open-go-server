@@ -218,11 +218,11 @@ func TestEventsAreExhaustive(t *testing.T) {
 	// La liste sert à la documentation et à la validation : elle doit couvrir tous
 	// les points du cycle de vie.
 	events := Events()
-	if len(events) != 8 {
+	if len(events) != 10 {
 		t.Errorf("%d événements : %v", len(events), events)
 	}
 	for _, want := range []string{PreCreate, PostCreate, PreDelete, PostDelete,
-		PreApply, PostApply, PostCertRenew, PostPHPSwitch} {
+		PreApply, PostApply, PostCertRenew, PostPHPSwitch, PreApplyFleet, PostApplyFleet} {
 		found := false
 		for _, e := range events {
 			if e == want {

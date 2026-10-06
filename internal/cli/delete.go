@@ -137,6 +137,9 @@ func newDeleteCommand(app *App) *cobra.Command {
 			if err := refused.err(p.ID()); err != nil {
 				return err
 			}
+			// Le plan du parc qui suivra la suppression est montré avant la
+			// confirmation, qui le couvre (D112).
+			shownGlobal := app.previewFleetWithout(cmd.Context(), provs, p.ID())
 			// Ce que --force lève est nommé avant la confirmation : sans quoi le
 			// drapeau donné pour le compte emportait aussi, sans un mot, les bases
 			// qu'un import avait rattachées à tort.
@@ -480,8 +483,10 @@ func newDeleteCommand(app *App) *cobra.Command {
 			// autres prisons tombent avec elle —, et le vhost de supervision
 			// proxifierait un socket FPM qui n'existe plus.
 			signalInterruption()
-			if err := app.refreshGlobal(cmd.Context(), provs); err != nil {
+			if w, err := app.refreshFleet(cmd.Context(), provs, shownGlobal); err != nil {
 				warn("mise à jour des fichiers de parc : %v", err)
+			} else {
+				warnings += w
 			}
 			// Les clés DKIM partent une fois les tables d'OpenDKIM rechargées sans
 			// elles : retirées avant, le démon les désignerait encore, et retiendrait
@@ -537,28 +542,57 @@ func newDeleteCommand(app *App) *cobra.Command {
 
 // refreshGlobal recalcule et applique les fichiers de portée parc après le
 // retrait d'un projet. Le plan est recalculé depuis les fichiers restants : le
-// projet supprimé a déjà quitté /etc/ogs/projects.
+// projet supprimé a déjà quitté /etc/ogs/projects. Il s'exécute comme celui
+// d'« ogs apply » (D112) : étapes affichées, audit, rechargements en échec
+// affichés, retour d'ufw annoncé.
 func (a *App) refreshGlobal(ctx context.Context, provs *providers) error {
+	_, err := a.refreshFleet(ctx, provs, nil)
+	return err
+}
+
+// previewFleetWithout affiche, avant la confirmation d'une suppression, le plan
+// du parc tel qu'il sera sans le projet (D112) : la suppression le recalcule et
+// l'exécute, purge des archives et pare-feu compris, et rien de cela ne se
+// faisait sans avoir été montré.
+func (a *App) previewFleetWithout(ctx context.Context, provs *providers, id string) planKeys {
+	plan, err := a.buildGlobalPlanWithout(ctx, provs, nil, id)
+	// Le plan du parc passe la base en aperçu (D100) ; la suppression, elle, doit
+	// pouvoir libérer les numéros du projet : sous l'aperçu, Release n'écrit rien.
+	a.Store.PreviewAllocations(false)
+	if err != nil {
+		a.warnf("⚠ plan du parc incalculable : %v\n", err)
+		return planKeys{}
+	}
+	if !plan.Empty() {
+		a.printf("parc, sans %s\n%s", id, plan.String())
+	}
+	return keysOf(plan)
+}
+
+// refreshFleet recalcule et exécute le plan du parc, et en rend les
+// avertissements. Avec shown — le plan affiché avant la confirmation —, une
+// purge d'archives qui n'y figurait pas demande sa propre confirmation.
+func (a *App) refreshFleet(ctx context.Context, provs *providers, shown planKeys) (int, error) {
 	plan, err := a.buildGlobalPlan(ctx, provs, nil)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if plan.Empty() {
-		return nil
+		return 0, nil
 	}
-	_, err = engine.Execute(ctx, plan, engine.Options{
-		OnStep: func(s *engine.Step, stepErr error) {
-			if stepErr == nil {
-				a.printf("  ✓ %s\n", s.Summary)
-			}
-		},
-		OnWarning: func(s *engine.Step, stepErr error) {
-			a.warnf("  ⚠ %s : %v\n", s.Summary, stepErr)
-		},
-		Reload:          a.reloadFunc(provs),
-		OnReloadWarning: a.reloadWarning,
-	})
-	return err
+	skipped := 0
+	if shown != nil {
+		// Le pare-feu et le reste découlent de la suppression, passée le point de
+		// non-retour : seule une purge d'archives apparue depuis l'affichage se
+		// reconfirme, et refusée, elle seule est écartée.
+		purge := func(s *engine.Step) bool { return strings.HasPrefix(s.Resource, "archive/") }
+		plan, skipped = a.settleExtras(plan, beyond(plan, shown, purge), false)
+		if plan.Empty() {
+			return skipped, nil
+		}
+	}
+	_, warnings, err := a.runGlobal(ctx, provs, plan, "apply.")
+	return warnings + skipped, err
 }
 
 // generatedFiles énumère les chemins où ogs écrit les fichiers d'un projet, dans
@@ -2148,6 +2182,12 @@ func newRestoreCommand(app *App) *cobra.Command {
 				if err := app.checkFleetUniqueness(p); err != nil {
 					return err
 				}
+				// Une restauration est une création : preCreate garde la porte avant
+				// que rien ne soit écrit, comme pour site create et site clone (D112).
+				// Une reprise ne le relance pas : la déclaration est déjà là.
+				if _, err := app.runHook(cmd.Context(), app.hookRunner(), p, hook.PreCreate, hook.Context{}); err != nil {
+					return err
+				}
 				// Le témoin précède la déclaration : une déclaration en place sans
 				// lui serait une restauration qu'aucune commande ne reprend.
 				// Son empreinte est celle des octets que spec.Save écrira, calculée
@@ -2207,9 +2247,18 @@ func newRestoreCommand(app *App) *cobra.Command {
 			// n'empêche pas la restauration des fichiers, mais reste un manque :
 			// l'apply final ne redit pas tout — l'annonce d'un compte adopté recréé
 			// (D111) ne vaut que pour l'apply qui le recrée.
+			// Par le chemin d'« ogs apply » (D112) : création au seul premier apply
+			// d'une restauration neuve — défaite entière, elle retire sa
+			// déclaration et son témoin, et se relance telle quelle ; sous --resume,
+			// la déclaration reste.
 			app.holdServices = true
-			err = app.applyProjects(cmd, []*model.Project{p})
+			err = app.applyFleet(cmd.Context(), []*model.Project{p}, applyRun{creation: !resume, recap: true})
 			app.holdServices = false
+			if err != nil && app.creationUndone(id) {
+				app.clearRestoreState(id)
+				finished = true
+				return err
+			}
 			if err != nil {
 				if ExitCode(err) != CodePartial {
 					return err
@@ -2274,20 +2323,13 @@ func newRestoreCommand(app *App) *cobra.Command {
 			if err := interruptedRestore(cmd.Context()); err != nil {
 				return err
 			}
-			// « postCreate » ne se lance qu'une fois : noté au témoin dès qu'il
-			// l'est, une reprise ne le relance pas.
+			// L'apply final passe par le chemin d'« ogs apply » (D112) : ce n'est plus
+			// une création — la déclaration reste quoi qu'il arrive, la reprise en
+			// dépend.
 			yes := app.Yes
 			app.Yes = true
-			app.postCreateRan = func(string) bool { return state.PostCreate }
-			app.onPostCreate = func(string) {
-				state.PostCreate = true
-				if err := save(); err != nil {
-					app.warnf("⚠ %v — une reprise relancerait « postCreate »\n", err)
-				}
-			}
-			err = app.applyProjects(cmd, []*model.Project{p})
+			err = app.applyFleet(cmd.Context(), []*model.Project{p}, applyRun{recap: true})
 			app.Yes = yes
-			app.postCreateRan, app.onPostCreate = nil, nil
 			manques := state.Gaps
 			if err != nil {
 				if ExitCode(err) != CodePartial {
@@ -2295,6 +2337,19 @@ func newRestoreCommand(app *App) *cobra.Command {
 				}
 				manques = append(manques, restoreGap{fmt.Sprintf("apply partiel (%v)", err),
 					"reprendre les étapes en échec : ogs apply " + p.ID()})
+			}
+			// « postCreate » une fois le contenu rendu et l'apply final passé, non
+			// avant (D112) ; noté au témoin dès qu'il est lancé : une reprise ne le
+			// relance pas (D113).
+			if !state.PostCreate {
+				warned, _ := app.runHook(cmd.Context(), app.hookRunner(), p, hook.PostCreate, hook.Context{})
+				state.PostCreate = true
+				if err := save(); err != nil {
+					app.warnf("⚠ %v — une reprise relancerait « postCreate »\n", err)
+				}
+				if warned {
+					manques = append(manques, restoreGap{"hook postCreate en échec", "voir son erreur ci-dessus"})
+				}
 			}
 			finished = true
 			app.clearRestoreState(id)

@@ -30,7 +30,16 @@ sudo ogs diff shopfr           # l'écart restant : « conforme » après un app
 sudo ogs status                # vue d'ensemble du parc
 ```
 
-`ogs site create` fait les trois premiers temps d'un coup : déclaration, plan, application. Le fichier du
+`ogs apply` montre le plan de chaque projet visé **et celui du parc** — rotation des journaux, répertoires
+d'exécution, supervision, pare-feu, purge des archives expirées —, puis demande une seule confirmation pour
+le tout ; `--dry-run` montre les deux et n'applique rien. Un projet en échec n'arrête que lui : les autres
+s'appliquent, puis le plan du parc. Sans `--yes`, en mode non interactif (`--non-interactive`, ou sans
+terminal), `ogs apply` rend **9** dès qu'il y a quelque chose à confirmer — y compris quand seul le plan du parc
+change : un cron qui comptait sur `ogs apply` pour purger les archives expirées doit passer `--yes`. `ogs apply -f <fichier>` n'applique qu'un projet déjà inscrit dans
+`/etc/ogs/projects` : hors inventaire, il serait effacé des fichiers de parc au prochain apply d'un voisin.
+
+`ogs site create` fait les trois premiers temps d'un coup : déclaration, plan, application ; une création
+que la saga défait entière retire sa déclaration, et se relance telle quelle. Le fichier du
 projet reste ensuite la référence : on l'édite à la main (ou par les commandes `ogs cron add`,
 `ogs service add`…), puis on relance `ogs apply`. Rejouer un `apply` sans rien changer ne fait rien.
 

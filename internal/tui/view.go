@@ -173,9 +173,29 @@ func (m *Model) viewLines(title string, lines []string, empty string) string {
 
 // viewConfirm rend la demande de confirmation.
 func (m *Model) viewConfirm() string {
-	return m.styles.title("ogs") + "\n\n" +
-		m.confirm.question + "\n\n" +
-		m.styles.help("o pour confirmer, toute autre touche pour annuler")
+	var b strings.Builder
+	b.WriteString(m.styles.title("ogs") + "\n\n")
+	// Le plan tient dans l'écran : au-delà, ce qui manque est compté plutôt que
+	// rogné en silence.
+	lines := m.confirm.lines
+	room := m.height - 8
+	if room < 3 {
+		room = 3
+	}
+	if len(lines) > room {
+		hidden := len(lines) - room + 1
+		lines = append(append([]string(nil), lines[:room-1]...),
+			fmt.Sprintf("… et %d ligne(s) de plus (« d » sur le projet pour le détail)", hidden))
+	}
+	for _, l := range lines {
+		b.WriteString(l + "\n")
+	}
+	if len(lines) > 0 {
+		b.WriteString("\n")
+	}
+	b.WriteString(m.confirm.question + "\n\n")
+	b.WriteString(m.styles.help("o pour confirmer, toute autre touche pour annuler"))
+	return b.String()
 }
 
 // viewWizard rend l'assistant.

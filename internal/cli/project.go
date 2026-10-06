@@ -139,6 +139,8 @@ func newProjectCreateCommand(app *App) *cobra.Command {
 			}
 			if err := app.openStore(); err == nil {
 				_ = app.Audit.Record(p.ID(), "project", "project.create", "ok", path)
+				// Le hook postCreate attend le premier apply réussi (D112).
+				app.markDeclared(p)
 			}
 			at, _ := p.AppType()
 			app.printf("✓ projet %s déclaré : %s\n", p.ID(), path)

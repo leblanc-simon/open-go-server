@@ -43,13 +43,15 @@ en root. Un script modifiable par un utilisateur de projet serait une élévatio
 
 | Événement | Moment | Critique |
 |---|---|---|
-| `preCreate` | avant la création d'un projet | oui |
-| `postCreate` | après la création complète | non |
+| `preCreate` | avant le dépôt de la déclaration d'un projet neuf : `project create`, `site create`, `site clone`, `project restore`, assistant de `ogs tui` | oui |
+| `postCreate` | au **premier apply réussi** d'un projet déclaré par `project create`, `site create` ou l'assistant — que cet apply vienne de la commande elle-même ou d'un `ogs apply` ultérieur —, une fois le plan du parc exécuté ; pour `site clone`, après la copie du contenu ; pour `project restore`, après l'apply final qui suit le contenu, une seule fois — une reprise par `--resume` ne le relance pas. Jamais pour un projet adopté par `ogs import` | non |
 | `preDelete` | avant la suppression, une fois les refus d'entrée levés et la confirmation donnée, services encore actifs | oui |
 | `postDelete` | après suppression et archivage, fichiers de parc recalculés | non |
-| `preApply` | avant l'exécution d'un plan, après confirmation | oui |
-| `postApply` | après l'exécution | non |
-| `postCertRenew` | après le rechargement du serveur web qui suit un certificat changé : `cert renew` (même si un autre a échoué), `cert issue`, `apply` | non |
+| `preApply` | après la confirmation, avant le premier geste, une fois par projet à changer — **toujours pour un projet**. Un refus arrête tout l'apply | oui |
+| `postApply` | après chaque projet appliqué — toujours pour un projet | non |
+| `preApplyFleet` | après la confirmation, avant le premier geste, quand le **plan du parc** a quelque chose à faire ; sans projet. Un refus arrête tout l'apply | oui |
+| `postApplyFleet` | après l'exécution du plan du parc ; sans projet | non |
+| `postCertRenew` | après le rechargement du serveur web qui suit un certificat changé : `cert renew` (même si un autre a échoué), `cert issue`, et tout apply — `ogs apply`, `site create`, `site clone`, `project restore`, interface —, une fois le plan du projet appliqué et rechargé, avant `postApply` | non |
 | `postPhpSwitch` | après un changement de version PHP | non |
 
 `postCertRenew` a deux portées qui s'additionnent : le hook de parc est appelé une fois, sans projet, avec
@@ -59,6 +61,17 @@ des projets qui le désignent —, avec le contexte du projet. Pour cet événem
 donc pas celui du parc : un même script désigné aux deux portées s'exécute deux fois, et un certificat
 partagé le fait exécuter une fois par projet qui le sert. `postCertRenew` n'est pas lancé si le serveur web
 n'a pas relu les certificats ; son échec rend le code 6.
+
+`ogs apply`, `site create`, `site clone`, `project restore` et `ogs tui` empruntent le même chemin : les
+mêmes hooks s'y déclenchent aux mêmes moments. Le **plan du parc** — rotation des journaux, répertoires
+d'exécution, supervision, pare-feu, purge des archives — a ses propres événements, `preApplyFleet` et
+`postApplyFleet` (fichiers `pre-apply-fleet`, `post-apply-fleet`), qui n'existent qu'en portée serveur et
+reçoivent un contexte sans projet : `OGS_PROJECT` et `OGS_ROOT` y sont vides. `preApply` et `postApply`, eux,
+ne sont jamais appelés sans projet — un script qui y vide `"$OGS_ROOT"/var/cache` ne vise jamais la racine de
+la machine. `postCreate` attend que le plan du parc ait réussi ; en échec, il viendra au prochain apply qui
+aboutit. Les projets déclarés avant cette règle, ou après une perte de la base d'état, ne reçoivent pas de
+`postCreate` à leur premier apply : sa marque vit dans la base d'état, et son absence fait manquer le hook
+plutôt que de le lancer sur un site qui tourne.
 
 Un hook **critique** qui échoue interrompt l'opération : c'est le principe même d'un `pre-` — il garde la
 porte. Un hook non critique qui échoue produit un avertissement ; l'opération est déjà faite, la défaire

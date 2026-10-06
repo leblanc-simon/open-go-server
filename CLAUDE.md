@@ -12,8 +12,8 @@ Les commits ne mentionnent jamais l'assistance d'un outil d'IA.
 
 ## La référence
 
-[`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md) fait autorité : 115 décisions d'architecture
-arbitrées (D1–D111, D113 à D115 et D117, D112 et D116 réservées ; tableau §2), spécification par module, plan de tests, découpage en lots. **Consulter le
+[`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md) fait autorité : 116 décisions d'architecture
+arbitrées (D1–D115 et D117, D116 réservée ; tableau §2), spécification par module, plan de tests, découpage en lots. **Consulter le
 tableau des décisions avant de proposer une architecture** — la plupart des questions « pourquoi pas
 plutôt… ? » y sont déjà tranchées, avec leur raison. Toute décision nouvelle s'y ajoute.
 
@@ -127,6 +127,18 @@ tous les verrous de tâches échouaient. Le **fragment nginx**, lui, a fait le c
 `$connection_upgrade`, dont dépend tout vhost de proxy, et le laisser au plan global le posait *après* les
 vhosts qui l'emploient — sur une machine neuve, le premier site applicatif faisait échouer `nginx -t` et
 l'apply n'aboutissait jamais. Il est écrit dans le plan de projet, comme le complément d'unité (D59).
+
+**Un seul chemin d'apply** (D112) : `ogs apply`, `site create`, `site clone`, `project restore` et la TUI
+passent par `applyFleet` (`internal/cli/chemin_apply.go`), `project delete` et la bascule DKIM par
+`runGlobal`. Quatre copies de la boucle « projets puis plan global » avaient chacune perdu quelque chose — plan
+global ni affiché ni confirmé (activation d'ufw, purge d'archives), parc privé de ses fichiers communs par un
+seul projet en échec, TUI sans hooks ni plan global. Le chemin : plans des projets **et du parc** affichés sans
+rien réserver, **une seule confirmation**, les `preApply` des projets et `preApplyFleet` du parc — jamais
+`preApply` sans projet : un `post-apply` écrit pour un projet, appelé avec `OGS_ROOT` vide, a vidé
+`/var/cache` de la machine —, puis chaque
+projet **recalculé** — ce qui s'est ajouté depuis l'affichage se reconfirme — et le plan global, exécuté même
+si un projet a échoué, où un projet en échec figure par la déclaration du parc et jamais par sa version
+refusée. Ne jamais réécrire cette boucle ailleurs : un appelant neuf passe par `applyFleet`.
 
 ### Les rechargements, groupés mais pas naïvement
 
@@ -688,6 +700,12 @@ Ils ont tous coûté un défaut réel ; les tests unitaires ne les voyaient pas.
 - **Deux juges ne doivent jamais régler le même chemin** : ogs pose `/etc/opendkim` et ses tables au
   régime qu'`ogs harden` exige (0750 / 0640 root:opendkim). `fs.EnsureDir` repose le mode d'un répertoire
   existant : en désaccord, l'apply rouvrirait à chaque passage ce que harden referme.
+- **Une création défaite doit retirer sa déclaration** (D112) : `site create` dont la saga déroulait tout
+  laissait `/etc/ogs/projects/<id>.yaml`, que le plan global lisait aussitôt — la ligne tmpfiles d'un compte
+  inexistant faisait rendre 65 à `systemd-tmpfiles`, et l'apply suivant d'un voisin 6 (« Failed to resolve
+  user »), vu sur un vrai système et invisible en mode préfixé, où rien n'exécute `systemd-tmpfiles`. Seule
+  une création déroulée **sans reste** (ni compensation en échec, ni étape résiduelle) la retire : sinon le
+  projet a laissé quelque chose, et c'est `project delete` qui le démonte.
 - **`systemd-tmpfiles --create` ne reçoit que le fichier d'ogs** : sans argument, il traite toute la
   configuration de la machine, crée ce qu'elle déclare et rend 65 sur une ligne en double d'un fichier de
   la distribution.

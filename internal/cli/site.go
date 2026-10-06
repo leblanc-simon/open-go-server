@@ -15,7 +15,6 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"leblanc.io/open-go-server/internal/engine"
 	"leblanc.io/open-go-server/internal/fs"
 	"leblanc.io/open-go-server/internal/hook"
 	"leblanc.io/open-go-server/internal/model"
@@ -116,6 +115,8 @@ func newSiteCreateCommand(app *App) *cobra.Command {
 			}
 			if err := app.openStore(); err == nil {
 				_ = app.Audit.Record(p.ID(), "site", "site.create", "ok", path)
+				// postCreate attend le premier apply réussi, ici ou plus tard (D112).
+				app.markDeclared(p)
 			}
 			app.printf("\n✓ déclaration écrite : %s\n", path)
 			if !opts.apply {
@@ -539,6 +540,12 @@ func newSiteCloneCommand(app *App) *cobra.Command {
 				}
 				partial = exitf(CodePartial, "%s", review)
 			}
+			// postCreate une fois le contenu en place, non avant (D112) : c'est le
+			// site cloné qu'il trouve, pas une arborescence vide.
+			if warned, _ := app.runHook(cmd.Context(), app.hookRunner(), target, hook.PostCreate,
+				hook.Context{}); warned && partial == nil {
+				partial = exitf(CodePartial, "hook postCreate en échec")
+			}
 			outcome, detail := "ok", "depuis "+source.ID()
 			if partial != nil {
 				outcome, detail = "avertissement", detail+" : "+partial.Error()
@@ -722,146 +729,13 @@ func (a *App) cloneData(cmd *cobra.Command, source, target *model.Project) error
 	return nil
 }
 
-// applyProjects applique une liste de projets, avec verrou et rapport.
+// applyProjects applique les projets qu'une commande de création vient de
+// déclarer — site create, site clone —, par le chemin unique
+// d'« ogs apply » (D112) : plans du projet et du parc affichés et confirmés
+// ensemble, hooks preApply et postApply, plan du parc exécuté même si le projet
+// échoue. Une création que la saga a défaite entière retire sa déclaration.
 func (a *App) applyProjects(cmd *cobra.Command, projects []*model.Project) error {
-	lock, err := engine.Acquire(a.Paths.GlobalLock())
-	if err != nil {
-		return wrap(CodeLocked, err)
-	}
-	defer lock.Release()
-	// Chaque appelant éprouve déjà l'unicité avant d'écrire la déclaration ; la
-	// reprendre sous le verrou ferme la fenêtre où un autre projet aurait été
-	// déclaré entre-temps.
-	if err := a.checkFleetUniqueness(projects...); err != nil {
-		return err
-	}
-	if err := a.openStore(); err != nil {
-		return err
-	}
-	provs, err := a.buildProviders()
-	if err != nil {
-		return err
-	}
-	defer provs.close()
-	reload := a.reloadFunc(provs)
-	warnings := 0
-	for _, p := range projects {
-		mark := a.Store.AllocationMark()
-		plan, err := a.buildPlan(cmd.Context(), provs, p)
-		if err != nil {
-			_ = a.Store.CancelAllocations(mark)
-			return err
-		}
-		if plan.Empty() {
-			a.printf("= %s : aucun changement\n", p.ID())
-			continue
-		}
-		a.printf("\n%s\n", plan.String())
-		// Un plan refusé ou déroulé n'a rien écrit : ses numéros reviennent à la
-		// plage (D100).
-		if err := a.confirm(fmt.Sprintf("appliquer %d changement(s) sur %s ?",
-			len(plan.Mutating()), p.ID())); err != nil {
-			_ = a.Store.CancelAllocations(mark)
-			return err
-		}
-		report, err := engine.Execute(cmd.Context(), plan, engine.Options{
-			OnStep: func(s *engine.Step, stepErr error) {
-				a.stepf("  ", s, stepErr)
-			},
-			OnWarning: func(s *engine.Step, stepErr error) {
-				a.warnf("  ⚠ %s : %v\n", s.Summary, stepErr)
-			},
-			Audit: func(s *engine.Step, outcome, detail string) {
-				_ = a.Audit.Record(p.ID(), s.Resource, "apply."+s.Action.String(), outcome, detail)
-			},
-			Reload:          reload,
-			OnReloadWarning: a.reloadWarning,
-		})
-		warnings += len(report.Warnings)
-		if err != nil {
-			if report.RolledBack && report.RollbackErr == nil {
-				_ = a.Store.CancelAllocations(mark)
-			}
-			a.reportRollback(report)
-			return wrap(CodeError, err)
-		}
-		if err := a.recordState(p); err != nil {
-			return err
-		}
-		a.printf("✓ %s : %d étape(s) appliquée(s)", p.ID(), report.Applied())
-		if len(report.Warnings) > 0 {
-			a.printf(", %d avertissement(s)", len(report.Warnings))
-		}
-		a.printf(" (audit %s)\n", a.Audit.RunID())
-		// Le certificat émis à la création l'est comme par « apply » (D117) ;
-		// après l'intégration de Y9, dans applyTarget (chemin_apply.go).
-		if changed := certsChanged(report); len(changed) > 0 {
-			warnings += a.postCertRenew(cmd.Context(), provs.Hooks, changed,
-				a.certUsersFleet(provs, changed, []*model.Project{p}))
-		}
-	}
-
-	// Sous holdServices, le projet n'a pas encore son contenu : « postCreate »
-	// attend l'apply qui le suit (D113).
-	for _, p := range projects {
-		if a.holdServices {
-			break
-		}
-		if a.postCreateRan != nil && a.postCreateRan(p.ID()) {
-			continue
-		}
-		warned, _ := a.runHook(cmd.Context(), provs.Hooks, p, hook.PostCreate, hook.Context{})
-		if a.onPostCreate != nil {
-			a.onPostCreate(p.ID())
-		}
-		if warned {
-			warnings++
-		}
-	}
-
-	global, err := a.buildGlobalPlan(cmd.Context(), provs, projects)
-	if err != nil {
-		return err
-	}
-	if !global.Empty() {
-		if _, err := engine.Execute(cmd.Context(), global, engine.Options{
-			OnStep: func(s *engine.Step, stepErr error) {
-				if stepErr == nil {
-					a.printf("  ✓ %s\n", s.Summary)
-				}
-			},
-			OnWarning: func(s *engine.Step, stepErr error) {
-				a.warnf("  ⚠ %s : %v\n", s.Summary, stepErr)
-			},
-			// Les rechargements du plan global comptent autant que ceux d'un projet :
-			// c'est là que les répertoires d'exécution sont créés et que le timer de
-			// renouvellement est activé.
-			Reload:          a.reloadFunc(provs),
-			OnReloadWarning: a.reloadWarning,
-		}); err != nil {
-			return wrap(CodeError, err)
-		}
-	}
-
-	// Récapitulatif : les chaînes de connexion sont ce que l'exploitant doit
-	// reporter dans la configuration applicative.
-	for _, p := range projects {
-		if len(p.Spec.Databases) == 0 && p.Spec.AMQP == nil {
-			continue
-		}
-		entries, err := provs.DB.Env(cmd.Context(), p)
-		if err != nil || len(entries) == 0 {
-			continue
-		}
-		a.printf("\nchaînes de connexion de %s :\n", p.ID())
-		for _, e := range entries {
-			a.printf("  %s=%q\n", e.Name, e.Value)
-		}
-	}
-	if warnings > 0 {
-		return exitf(CodePartial, "terminé avec %d avertissement(s)", warnings)
-	}
-	return nil
+	return a.applyFleet(cmd.Context(), projects, applyRun{creation: true, recap: true})
 }
 
 // statusRow est la vue consolidée d'un projet.

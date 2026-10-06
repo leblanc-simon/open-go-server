@@ -17,7 +17,6 @@ import (
 	"leblanc.io/open-go-server/internal/engine"
 	"leblanc.io/open-go-server/internal/exec"
 	"leblanc.io/open-go-server/internal/fs"
-	"leblanc.io/open-go-server/internal/hook"
 	"leblanc.io/open-go-server/internal/model"
 	appprov "leblanc.io/open-go-server/internal/provider/app"
 	"leblanc.io/open-go-server/internal/provider/firewall"
@@ -359,9 +358,26 @@ func (a *App) ownerGone(err error) error {
 // mémoire des projets visés, qui peut n'être pas encore sur le disque (« -f »,
 // création).
 func (a *App) buildGlobalPlan(ctx context.Context, provs *providers, targeted []*model.Project) (*engine.Plan, error) {
+	return a.buildGlobalPlanWithout(ctx, provs, targeted, "")
+}
+
+// buildGlobalPlanWithout calcule le plan du parc sans le projet nommé : celui
+// que « project delete » s'apprête à retirer, pour en montrer le plan avant la
+// confirmation (D112).
+func (a *App) buildGlobalPlanWithout(ctx context.Context, provs *providers, targeted []*model.Project,
+	without string) (*engine.Plan, error) {
 	projects, err := a.loadProjects()
 	if err != nil {
 		return nil, err
+	}
+	if without != "" {
+		kept := projects[:0]
+		for _, p := range projects {
+			if p.ID() != without {
+				kept = append(kept, p)
+			}
+		}
+		projects = kept
 	}
 	for _, p := range targeted {
 		projects = withProject(projects, p)
@@ -862,158 +878,40 @@ func newApplyCommand(app *App) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "apply [id...]",
 		Short: "Appliquer l'état désiré au système",
-		Long: "Calcule le plan, demande confirmation, puis applique en saga : une étape\n" +
-			"critique en échec déclenche le déroulage des étapes déjà appliquées. Une étape\n" +
-			"non critique en échec produit un avertissement et l'exécution continue.",
+		Long: "Calcule le plan de chaque projet visé et celui du parc — fichiers communs à tous\n" +
+			"les projets : rotation, répertoires d'exécution, supervision, pare-feu, purge des\n" +
+			"archives —, les affiche, demande une seule confirmation pour le tout, puis applique\n" +
+			"chaque projet en saga : une étape critique en échec déclenche le déroulage des\n" +
+			"étapes déjà appliquées de ce projet, qui seul échoue. Une étape non critique en\n" +
+			"échec produit un avertissement et l'exécution continue. Le plan du parc vient après\n" +
+			"les projets, même si l'un a échoué. Sous --dry-run, les plans sont affichés seulement.\n" +
+			"Avec -f, le fichier doit déclarer un projet de l'inventaire (/etc/ogs/projects).",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			projects, err := app.targets(args, file)
 			if err != nil {
 				return err
 			}
-			if err := app.checkFleetUniqueness(projects...); err != nil {
-				return err
+			// Une déclaration hors de l'inventaire n'est pas un projet du parc :
+			// appliquée, elle était en service, mais le plan global de l'apply
+			// suivant d'un voisin, qui lit /etc/ogs/projects, l'effaçait des
+			// fichiers de parc — rotation, répertoires d'exécution, supervision
+			// (R1-42, D112).
+			if file != "" {
+				for _, p := range projects {
+					if _, err := os.Stat(app.Paths.ProjectFile(p.ID())); os.IsNotExist(err) {
+						return exitf(CodeValidation, "%s déclare le projet %s, absent de l'inventaire (%s) : "+
+							"un projet appliqué hors de l'inventaire serait effacé des fichiers de parc au "+
+							"prochain apply d'un voisin.\n  remède : « ogs project create » pour le déclarer, ou "+
+							"déposer la déclaration dans %s, puis « ogs apply %s »",
+							file, p.ID(), app.Paths.ProjectsDir(), app.Paths.ProjectFile(p.ID()), p.ID())
+					}
+				}
 			}
 			app.warnUnfinishedRestores(projects)
-
-			// Verrou global : deux applications simultanées ne doivent jamais se
-			// croiser sur la configuration du système.
-			lock, err := engine.Acquire(app.Paths.GlobalLock())
-			if err != nil {
-				var locked engine.ErrLocked
-				if errors.As(err, &locked) {
-					return wrap(CodeLocked, err)
-				}
-				return wrap(CodeError, err)
-			}
-			defer lock.Release()
-
-			if err := app.openStore(); err != nil {
-				return err
-			}
-			// --dry-run calcule sans rien réserver (D100).
-			app.Store.PreviewAllocations(app.DryRun)
-			provs, err := app.buildProviders()
-			if err != nil {
-				return err
-			}
-			defer provs.close()
-			reload := app.reloadFunc(provs)
-			warnings := 0
-			for _, p := range projects {
-				mark := app.Store.AllocationMark()
-				plan, err := app.buildPlan(cmd.Context(), provs, p)
-				if err != nil {
-					_ = app.Store.CancelAllocations(mark)
-					return err
-				}
-				if plan.Empty() {
-					app.printf("= %s : aucun changement\n", p.ID())
-					continue
-				}
-				app.printf("projet %s\n%s", p.ID(), plan.String())
-				if app.DryRun {
-					app.printf("--dry-run : rien n'a été appliqué.\n")
-					continue
-				}
-				// Un plan refusé n'a rien écrit : les numéros qu'il a réservés
-				// reviennent à la plage (D100).
-				if err := app.confirm(fmt.Sprintf("appliquer %d changement(s) sur %s ?",
-					len(plan.Mutating()), p.ID())); err != nil {
-					_ = app.Store.CancelAllocations(mark)
-					return err
-				}
-				// Le hook « preApply » garde la porte : son refus arrête l'opération.
-				if _, err := app.runHook(cmd.Context(), provs.Hooks, p, hook.PreApply, hook.Context{}); err != nil {
-					_ = app.Store.CancelAllocations(mark)
-					return err
-				}
-				report, err := engine.Execute(cmd.Context(), plan, engine.Options{
-					OnStep: func(s *engine.Step, stepErr error) {
-						app.stepf("  ", s, stepErr)
-					},
-					OnWarning: func(s *engine.Step, stepErr error) {
-						app.warnf("  ⚠ %s : %v\n", s.Summary, stepErr)
-					},
-					Audit: func(s *engine.Step, outcome, detail string) {
-						_ = app.Audit.Record(p.ID(), s.Resource, "apply."+s.Action.String(), outcome, detail)
-					},
-					Reload:          reload,
-					OnReloadWarning: app.reloadWarning,
-				})
-				warnings += len(report.Warnings)
-				if err != nil {
-					if report.RolledBack && report.RollbackErr == nil {
-						// Déroulé, le plan n'a laissé aucun fichier qui serve ses numéros.
-						_ = app.Store.CancelAllocations(mark)
-					}
-					app.reportRollback(report)
-					return wrap(CodeError, err)
-				}
-				if err := app.recordState(p); err != nil {
-					return err
-				}
-				app.printf("✓ %s : %d étape(s) appliquée(s)", p.ID(), report.Applied())
-				if len(report.Warnings) > 0 {
-					app.printf(", %d avertissement(s)", len(report.Warnings))
-				}
-				app.printf(" (audit %s)\n", app.Audit.RunID())
-				// Les certificats émis par ce plan l'ont été avant son rechargement
-				// groupé, achevé ici : « postCertRenew » le dit maintenant (D117).
-				// Après l'intégration de Y9, ce déclenchement va dans applyTarget
-				// (chemin_apply.go), commun à apply et à la création d'un site.
-				if changed := certsChanged(report); len(changed) > 0 {
-					warnings += app.postCertRenew(cmd.Context(), provs.Hooks, changed,
-						app.certUsersFleet(provs, changed, []*model.Project{p}))
-				}
-				// Le hook « postApply » constate : son échec est un avertissement.
-				resources := make([]string, 0, len(report.Outcomes))
-				for _, o := range report.Outcomes {
-					resources = append(resources, o.Step.Resource)
-				}
-				if warned, _ := app.runHook(cmd.Context(), provs.Hooks, p, hook.PostApply,
-					hook.Context{Resources: resources}); warned {
-					warnings++
-				}
-			}
-			// Rotation des journaux : elle porte sur tout le parc, donc après les
-			// projets et une seule fois.
-			if !app.DryRun {
-				global, err := app.buildGlobalPlan(cmd.Context(), provs, projects)
-				if err != nil {
-					return err
-				}
-				if !global.Empty() {
-					report, err := engine.Execute(cmd.Context(), global, engine.Options{
-						OnStep: func(s *engine.Step, stepErr error) {
-							if stepErr == nil {
-								app.printf("  ✓ %s\n", s.Summary)
-							}
-						},
-						OnWarning: func(s *engine.Step, stepErr error) {
-							app.warnf("  ⚠ %s : %v\n", s.Summary, stepErr)
-						},
-						Audit: func(s *engine.Step, outcome, detail string) {
-							_ = app.Audit.Record("", s.Resource, "apply."+s.Action.String(), outcome, detail)
-						},
-						// Sans cette fonction, les rechargements du plan global n'étaient
-						// jamais exécutés : systemd-tmpfiles ne créait pas les répertoires
-						// d'exécution — les verrous de tâches échouaient donc tous — et le
-						// timer de renouvellement des certificats n'était jamais activé.
-						Reload:          reload,
-						OnReloadWarning: app.reloadWarning,
-					})
-					if err != nil {
-						app.reportRollback(report)
-						return wrap(CodeError, err)
-					}
-					warnings += len(report.Warnings)
-					app.announceRollback(provs.Firewall)
-				}
-			}
-			if warnings > 0 {
-				return exitf(CodePartial, "terminé avec %d avertissement(s)", warnings)
-			}
-			return nil
+			// Le chemin unique (D112) : unicité contre le parc sous le verrou,
+			// projets et parc affichés, une seule confirmation, hooks, puis chaque
+			// projet et le parc.
+			return app.applyFleet(cmd.Context(), projects, applyRun{})
 		},
 	}
 	cmd.Flags().StringVarP(&file, "file", "f", "", "appliquer un fichier de projet précis")

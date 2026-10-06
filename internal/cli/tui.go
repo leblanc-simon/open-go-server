@@ -13,6 +13,7 @@ import (
 	"golang.org/x/term"
 
 	"leblanc.io/open-go-server/internal/engine"
+	"leblanc.io/open-go-server/internal/hook"
 	"leblanc.io/open-go-server/internal/model"
 	"leblanc.io/open-go-server/internal/provider/tls"
 	"leblanc.io/open-go-server/internal/spec"
@@ -53,6 +54,8 @@ type tuiBackend struct {
 	app *App
 	cmd *cobra.Command
 	mu  sync.Mutex
+	// shown retient, par projet, les plans que Plan a montrés.
+	shown map[string]map[string]planKeys
 }
 
 // PrepDomain renvoie le domaine de préproduction configuré.
@@ -132,63 +135,68 @@ func (b *tuiBackend) Snapshot(ctx context.Context, p *model.Project) (tui.Snapsh
 	return snapshot, nil
 }
 
+// Plan calcule ce qu'Apply ferait : le plan du projet, puis celui du parc,
+// sans rien réserver, et le retient pour qu'Apply n'exécute rien qui n'ait été
+// montré (D112).
+func (b *tuiBackend) Plan(ctx context.Context, p *model.Project) ([]string, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.app.Store.PreviewAllocations(true)
+	defer b.app.Store.PreviewAllocations(false)
+	provs, err := b.app.buildProviders()
+	if err != nil {
+		return nil, err
+	}
+	defer provs.close()
+	plan, err := b.app.buildPlan(ctx, provs, p)
+	if err != nil {
+		return nil, err
+	}
+	var lines []string
+	if !plan.Empty() {
+		lines = append(lines, "projet "+p.ID())
+		lines = append(lines, strings.Split(strings.TrimRight(plan.String(), "\n"), "\n")...)
+	}
+	global, err := b.app.buildGlobalPlan(ctx, provs, []*model.Project{p})
+	if err != nil {
+		return nil, fmt.Errorf("plan du parc : %w", err)
+	}
+	if !global.Empty() {
+		lines = append(lines, "parc")
+		lines = append(lines, strings.Split(strings.TrimRight(global.String(), "\n"), "\n")...)
+	}
+	if b.shown == nil {
+		b.shown = map[string]map[string]planKeys{}
+	}
+	b.shown[p.ID()] = map[string]planKeys{p.ID(): keysOf(plan), "*": keysOf(global)}
+	return lines, nil
+}
+
+// Apply passe par le chemin d'« ogs apply » (D112) : unicité contre le parc
+// sous le verrou, hooks preApply et postApply, plan du parc, rechargements en
+// échec affichés, postCreate au premier apply d'un projet que l'assistant a
+// déclaré. La confirmation est celle de l'interface, donnée sur le plan que Plan
+// a montré : ce qui s'y ajoute depuis est refusé, faute de pouvoir le demander.
 func (b *tuiBackend) Apply(ctx context.Context, p *model.Project) (string, error) {
 	// La sortie est capturée pour être rendue dans l'interface : l'utilisateur
 	// doit voir exactement ce que la ligne de commande aurait affiché.
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	var buf bytes.Buffer
-	previousOut, previousYes := b.app.Out, b.app.Yes
-	b.app.Out, b.app.Yes = &buf, true
-	defer func() { b.app.Out, b.app.Yes = previousOut, previousYes }()
-
-	lock, err := engine.Acquire(b.app.Paths.GlobalLock())
-	if err != nil {
-		return buf.String(), err
-	}
-	defer lock.Release()
-	// Le même contrôle que « ogs apply <id> », sous le même verrou : l'unicité
-	// contre le parc entier, jamais contre le seul projet affiché (D94).
-	if err := b.app.checkFleetUniqueness(p); err != nil {
-		return buf.String(), err
-	}
-	provs, err := b.app.buildProviders()
-	if err != nil {
-		return buf.String(), err
-	}
-	defer provs.close()
-	plan, err := b.app.buildPlan(ctx, provs, p)
-	if err != nil {
-		return buf.String(), err
-	}
-	if plan.Empty() {
-		return "aucun changement", nil
-	}
-	report, err := engine.Execute(ctx, plan, engine.Options{
-		OnStep: func(s *engine.Step, stepErr error) {
-			if annonceÉtape(s, stepErr) {
-				fmt.Fprintln(&buf, issueDÉtape(s, stepErr))
-			}
-		},
-		OnWarning: func(s *engine.Step, stepErr error) {
-			fmt.Fprintf(&buf, "⚠ %s : %v\n", s.Summary, stepErr)
-		},
-		Audit: func(s *engine.Step, outcome, detail string) {
-			_ = b.app.Audit.Record(p.ID(), s.Resource, "tui.apply."+s.Action.String(), outcome, detail)
-		},
-		Reload: b.app.reloadFunc(provs),
+	a := b.app
+	previousOut, previousErr := a.Out, a.Err
+	previousYes, previousNI := a.Yes, a.NonInteractive
+	a.Out, a.Err, a.Yes, a.NonInteractive = &buf, &buf, false, true
+	defer func() {
+		a.Out, a.Err, a.Yes, a.NonInteractive = previousOut, previousErr, previousYes, previousNI
+		// Le plan du parc laisse la base en aperçu ; l'interface continue.
+		a.Store.PreviewAllocations(false)
+	}()
+	err := a.applyFleet(ctx, []*model.Project{p}, applyRun{
+		confirmed: true, shown: b.shown[p.ID()], audit: "tui.apply.",
 	})
-	if err != nil {
-		if report.RolledBack {
-			fmt.Fprintln(&buf, "↶ rollback effectué")
-		}
-		return buf.String(), err
-	}
-	if err := b.app.recordState(p); err != nil {
-		return buf.String(), err
-	}
-	fmt.Fprintf(&buf, "\n%d étape(s) appliquée(s)", report.Applied())
-	return buf.String(), nil
+	delete(b.shown, p.ID())
+	return buf.String(), err
 }
 
 func (b *tuiBackend) Diff(ctx context.Context, p *model.Project) ([]string, error) {
@@ -205,6 +213,21 @@ func (b *tuiBackend) Diff(ctx context.Context, p *model.Project) ([]string, erro
 	if err != nil {
 		return nil, err
 	}
+	lines := diffLines(plan)
+	// Le parc aussi : c'est ce qu'Apply exécutera après le projet (D112).
+	global, err := b.app.buildGlobalPlan(ctx, provs, []*model.Project{p})
+	if err != nil {
+		return nil, fmt.Errorf("plan du parc : %w", err)
+	}
+	if !global.Empty() {
+		lines = append(lines, "", "parc")
+		lines = append(lines, diffLines(global)...)
+	}
+	return lines, nil
+}
+
+// diffLines rend les changements d'un plan avec leur diff, ligne par ligne.
+func diffLines(plan *engine.Plan) []string {
 	var lines []string
 	for _, s := range plan.Mutating() {
 		lines = append(lines, s.String())
@@ -217,7 +240,7 @@ func (b *tuiBackend) Diff(ctx context.Context, p *model.Project) ([]string, erro
 			}
 		}
 	}
-	return lines, nil
+	return lines
 }
 
 func (b *tuiBackend) Restart(ctx context.Context, p *model.Project) error {
@@ -299,12 +322,31 @@ func (b *tuiBackend) Create(ctx context.Context, answers tui.WizardAnswers) (str
 	if _, err := os.Stat(path); err == nil {
 		return "", fmt.Errorf("le projet %s existe déjà", p.ID())
 	}
-	if err := b.app.checkFleetUniqueness(p); err != nil {
-		return "", err
+	// Les gardes de « site create », dans le même ordre : unicité contre le parc
+	// (D94), comptes réservés (D91), home tenu par un autre compte (D95), puis le
+	// hook preCreate, qui peut refuser avant que rien ne soit écrit (D112).
+	var buf bytes.Buffer
+	a := b.app
+	previousOut, previousErr := a.Out, a.Err
+	a.Out, a.Err = &buf, &buf
+	defer func() { a.Out, a.Err = previousOut, previousErr }()
+	if err := a.checkFleetUniqueness(p); err != nil {
+		return buf.String(), err
+	}
+	if err := a.refuseReservedDBAccounts(p); err != nil {
+		return buf.String(), err
+	}
+	if err := a.preexistingHome(ctx, p); err != nil {
+		return buf.String(), err
+	}
+	if _, err := a.runHook(ctx, a.hookRunner(), p, hook.PreCreate, hook.Context{}); err != nil {
+		return buf.String(), err
 	}
 	if err := spec.Save(path, p); err != nil {
-		return "", err
+		return buf.String(), err
 	}
-	_ = b.app.Audit.Record(p.ID(), "site", "tui.site.create", "ok", path)
-	return fmt.Sprintf("projet %s déclaré : %s\n\nappuyer sur « a » pour l'appliquer", p.ID(), path), nil
+	_ = a.Audit.Record(p.ID(), "site", "tui.site.create", "ok", path)
+	// postCreate attend le premier apply réussi (D112).
+	a.markDeclared(p)
+	return buf.String() + fmt.Sprintf("projet %s déclaré : %s\n\nappuyer sur « a » pour l'appliquer", p.ID(), path), nil
 }

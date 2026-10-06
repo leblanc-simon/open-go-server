@@ -65,6 +65,11 @@ func lancer(t *testing.T, m *Model, keys ...tea.Msg) tea.Cmd {
 	var cmd tea.Cmd
 	for _, k := range keys {
 		_, cmd = m.Update(k)
+		// « a » calcule d'abord le plan que la confirmation montre (D112) : cette
+		// lecture revient avant la touche suivante.
+		if km, ok := k.(tea.KeyMsg); ok && km.String() == "a" && cmd != nil {
+			_, cmd = m.Update(cmd())
+		}
 	}
 	return cmd
 }
