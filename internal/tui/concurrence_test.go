@@ -2,9 +2,11 @@ package tui
 
 import (
 	"context"
+	"errors"
 	"io"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -238,5 +240,55 @@ func TestCtrlCTardifNeFaitPasRendreLeCode9(t *testing.T) {
 	}
 	if m.Interrupted() {
 		t.Error("une action aboutie ne rend pas le code 9")
+	}
+}
+
+// SIGHUP d'une session ssh coupée (D122) : main annule le contexte, et la
+// lecture du terminal échoue en EIO. Bubble Tea sortait alors de Run sur
+// l'erreur de lecture, sans attendre l'action en vol : le processus sortait
+// sous la saga.
+func TestTerminalFerméAttendLaFinDeLAction(t *testing.T) {
+	b := nouveauBackendBloquant(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	inR, inW := io.Pipe()
+	type fin struct {
+		err error
+		// terminés est relevé au retour de run, avant toute autre chose.
+		terminés int32
+	}
+	done := make(chan fin, 1)
+	go func() {
+		_, err := run(ctx, b, tea.WithInput(inR), tea.WithOutput(io.Discard))
+		done <- fin{err, b.terminés.Load()}
+	}()
+	time.Sleep(100 * time.Millisecond)
+	for _, k := range []string{"a", "o"} {
+		if _, err := inW.Write([]byte(k)); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	select {
+	case <-b.démarré:
+	case <-time.After(5 * time.Second):
+		t.Fatal("l'action n'a pas démarré")
+	}
+	// Le terminal disparaît d'abord, le signal arrive ensuite : la lecture a
+	// échoué avant que l'interruption n'atteigne le modèle.
+	_ = inW.CloseWithError(syscall.EIO)
+	time.Sleep(100 * time.Millisecond)
+	cancel()
+	select {
+	case f := <-done:
+		if f.terminés != 1 || !b.annulé.Load() {
+			t.Errorf("le programme est sorti avant la fin de l'action : terminés=%d annulé=%v",
+				f.terminés, b.annulé.Load())
+		}
+		if !errors.Is(f.err, ErrInterrupted) {
+			t.Errorf("une interruption doit rendre le code 9 : %v", f.err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("le programme ne s'est pas fermé après l'interruption")
 	}
 }

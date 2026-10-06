@@ -1,6 +1,7 @@
 package db
 
 import (
+	"bufio"
 	"bytes"
 	"compress/gzip"
 	"context"
@@ -69,27 +70,100 @@ func (p *Provider) dump(ctx context.Context, decl model.Database, output string,
 	if dir != nil {
 		defer dir.Close()
 	}
-	res, err := p.Exec.Run(ctx, exec.Command{Name: tool, Args: args})
+	// La sortie du client va au fil de l'eau dans la destination : retenue en
+	// mémoire, puis recopiée en chaîne et compressée d'un bloc, une base de
+	// plusieurs gigaoctets y passait trois fois (R1-57, D122).
+	out, err := createDump(output, dir, name)
 	if err != nil {
 		return "", err
 	}
-	f, err := openDump(output, dir, name)
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
+	var w io.Writer = out
+	var gz *gzip.Writer
 	if compress {
-		gz := gzip.NewWriter(f)
-		if _, err := gz.Write([]byte(res.Stdout)); err != nil {
-			return "", err
-		}
-		if err := gz.Close(); err != nil {
-			return "", err
-		}
-	} else if _, err := f.WriteString(res.Stdout); err != nil {
+		gz = gzip.NewWriter(out)
+		w = gz
+	}
+	_, err = p.Exec.Run(ctx, exec.Command{Name: tool, Args: args, Stdout: w})
+	if err == nil && gz != nil {
+		err = gz.Close()
+	}
+	if err == nil {
+		err = out.commit()
+	}
+	if err != nil {
+		out.abort()
 		return "", err
 	}
 	return output, nil
+}
+
+// dumpFile est la destination d'une sauvegarde en cours d'écriture.
+type dumpFile struct {
+	*os.File
+	// dir, tmp et name désignent le fichier temporaire et le nom final ; dir est
+	// nul pour un flux standard, écrit directement.
+	dir       *fs.Dir
+	tmp, name string
+	output    string
+}
+
+// createDump ouvre la destination d'une sauvegarde. Un fichier ordinaire est
+// écrit sous un nom temporaire du même répertoire, puis renommé une fois la
+// sauvegarde complète : écrite à sa place, une sauvegarde qui échoue en
+// chemin — moteur arrêté, disque plein, interruption — aurait déjà détruit la
+// précédente, que le dump tenu en mémoire laissait en place jusqu'au bout.
+func createDump(output string, dir *fs.Dir, name string) (*dumpFile, error) {
+	if dir == nil {
+		f, err := openStream(output)
+		if err != nil {
+			return nil, err
+		}
+		return &dumpFile{File: f, output: output}, nil
+	}
+	for attempt := 0; ; attempt++ {
+		var alea [8]byte
+		if _, err := rand.Read(alea[:]); err != nil {
+			return nil, err
+		}
+		tmp := "." + name + ".ogs-" + hex.EncodeToString(alea[:])
+		// Création exclusive, sans suivre de lien (fs.Dir.Create) : le répertoire
+		// peut appartenir à l'utilisateur d'un projet.
+		f, err := dir.Create(tmp, 0o600, fs.KeepOwner)
+		if err == nil {
+			return &dumpFile{File: f, dir: dir, tmp: tmp, name: name, output: output}, nil
+		}
+		if !errors.Is(err, os.ErrExist) || attempt >= 3 {
+			return nil, err
+		}
+	}
+}
+
+// commit ferme la sauvegarde et la met à sa place, une fois le nom de nouveau
+// jugé (checkDumpEntry) : il a pu changer pendant la sauvegarde. Le renommage
+// remplace l'entrée elle-même, jamais ce qu'un lien désignerait.
+func (d *dumpFile) commit() error {
+	if d.dir == nil {
+		return d.File.Close()
+	}
+	if err := d.File.Sync(); err != nil {
+		return err
+	}
+	if err := d.File.Close(); err != nil {
+		return err
+	}
+	if err := checkDumpEntry(d.dir, d.name, d.output); err != nil {
+		return err
+	}
+	return d.dir.Rename(d.tmp, d.name)
+}
+
+// abort abandonne une sauvegarde inachevée : le temporaire est retiré, la
+// sauvegarde précédente reste.
+func (d *dumpFile) abort() {
+	_ = d.File.Close()
+	if d.dir != nil {
+		_ = d.dir.Remove(d.tmp)
+	}
 }
 
 // outputStreams sont les destinations qu'ogs ouvre par leur nom, sans parcours :
@@ -154,44 +228,26 @@ func checkDumpEntry(dir *fs.Dir, name, output string) error {
 		"pas de sauvegarde", output)
 }
 
-// openDump ouvre la destination d'une sauvegarde, avec des permissions
-// restrictives : un dump contient l'intégralité des données de l'application.
-//
-// Sur un fichier ordinaire, le retrait préalable et la création exclusive
-// interdisent d'écrire dans un inode qu'on n'a pas créé soi-même : réutiliser un
-// fichier préexistant lui laisserait son propriétaire et son mode, le 0600
-// annoncé ici ne s'appliquant qu'à la création — et une course sur le retrait
-// échoue franchement au lieu de livrer les données dans l'inode d'un autre. Le
-// retrait et la création passent par le descripteur du répertoire, sans suivre
-// de lien : O_EXCL refuse un lien reposé entre les deux (fs.Dir.Create).
-//
-// Un flux standard est ouvert par son nom et écrit à travers, sans jamais être
-// délié. Il peut mener à un fichier ordinaire — « -O /dev/stdout » sous une
-// redirection — : l'ouverture sans O_TRUNC y laisserait la queue d'un contenu
-// plus long, et tronquer n'a de sens que là, un périphérique ou un tube ne se
-// tronquant pas.
-func openDump(output string, dir *fs.Dir, name string) (*os.File, error) {
-	if dir == nil {
-		f, err := os.OpenFile(output, os.O_WRONLY, 0)
-		if err != nil {
+// openStream ouvre un flux standard désigné comme destination d'une sauvegarde
+// (outputStreams), par son nom, et écrit à travers, sans jamais le délier. Il
+// peut mener à un fichier ordinaire — « -O /dev/stdout » sous une redirection — :
+// l'ouverture sans O_TRUNC y laisserait la queue d'un contenu plus long, et
+// tronquer n'a de sens que là, un périphérique ou un tube ne se tronquant pas.
+// Un fichier ordinaire passe par createDump : création exclusive en 0600 sous
+// un nom temporaire — réutiliser un fichier préexistant lui laisserait son
+// propriétaire et son mode —, puis renommage.
+func openStream(output string) (*os.File, error) {
+	f, err := os.OpenFile(output, os.O_WRONLY, 0)
+	if err != nil {
+		return nil, err
+	}
+	if st, err := f.Stat(); err == nil && st.Mode().IsRegular() {
+		if err := f.Truncate(0); err != nil {
+			f.Close()
 			return nil, err
 		}
-		if st, err := f.Stat(); err == nil && st.Mode().IsRegular() {
-			if err := f.Truncate(0); err != nil {
-				f.Close()
-				return nil, err
-			}
-		}
-		return f, nil
 	}
-	// Le nom a pu changer pendant la sauvegarde : il est jugé de nouveau.
-	if err := checkDumpEntry(dir, name, output); err != nil {
-		return nil, err
-	}
-	if err := dir.Remove(name); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return nil, err
-	}
-	return dir.Create(name, 0o600, fs.KeepOwner)
+	return f, nil
 }
 
 // OpenInput ouvre, en lecture, la sauvegarde qu'une restauration doit charger.
@@ -330,11 +386,7 @@ func (p *Provider) Restore(ctx context.Context, proj *model.Project, decl model.
 	if err != nil {
 		return err
 	}
-	data, err := io.ReadAll(f)
-	f.Close()
-	if err != nil {
-		return fmt.Errorf("lecture de %s : %w", input, err)
-	}
+	defer f.Close()
 	account, delegated, err := restoreAccount(proj, decl)
 	if err != nil {
 		return err
@@ -352,11 +404,14 @@ func (p *Provider) Restore(ctx context.Context, proj *model.Project, decl model.
 	if _, err := os.Stat(cmd.Name); err != nil {
 		return fmt.Errorf("%s est absent : installer les outils clients du moteur %s", cmd.Name, decl.Engine)
 	}
+	// La sauvegarde est lue au fil de l'eau, confinée ligne à ligne, et passée
+	// au client sans jamais être tenue en entier en mémoire (R1-57, D122).
+	var data io.Reader
 	switch decl.Engine {
 	case "postgres":
-		data = confinePostgresDump(data)
+		data = confinePostgresStream(f)
 	default:
-		data = confineMySQLDump(data)
+		data = confineMySQLStream(f)
 	}
 	unit := ""
 	if delegated {
@@ -371,7 +426,7 @@ func (p *Provider) Restore(ctx context.Context, proj *model.Project, decl model.
 		// Le répertoire courant de root peut être fermé à l'utilisateur du projet.
 		cmd.Dir = "/"
 	}
-	cmd.Stdin = data
+	cmd.StdinStream = data
 	_, err = p.Exec.Run(ctx, cmd)
 	// Une interruption tue systemd-run, pas l'unité qu'il a lancée : hors du
 	// groupe de processus d'ogs, le client continuait de charger la base après
@@ -637,14 +692,29 @@ var mysqlDDLDefiner = regexp.MustCompile("^((?:CREATE |/\\*!\\d{5} CREATE\\*/ )?
 // des lignes qui commencent par « ( », mysqldump sur celle de l'INSERT, et les
 // fins de ligne des valeurs sont échappées.
 func confineMySQLDump(data []byte) []byte {
-	if !bytes.Contains(data, []byte("DEFINER=`")) {
-		return data
-	}
-	lines := bytes.SplitAfter(data, []byte("\n"))
-	for i, line := range lines {
-		lines[i] = mysqlDDLDefiner.ReplaceAll(line, []byte("${1}"))
-	}
-	return bytes.Join(lines, nil)
+	return confineAll(confineMySQLStream(bytes.NewReader(data)))
+}
+
+// confineMySQLStream est confineMySQLDump au fil de l'eau.
+func confineMySQLStream(r io.Reader) io.Reader {
+	return newLineFilter(r, func(head []byte, whole bool) []byte {
+		if !bytes.Contains(head, []byte("DEFINER=`")) {
+			return head
+		}
+		loc := mysqlDDLDefiner.FindSubmatchIndex(head)
+		// Sur une tête tronquée (ligne plus longue que le tampon), une clause qui
+		// toucherait la coupure n'est pas une clause entière : la ligne passe
+		// telle quelle. Les identifiants d'une clause DEFINER, bornés par le
+		// moteur, tiennent toujours loin en deçà de lineHead.
+		if loc == nil || (!whole && loc[1] == len(head)) {
+			return head
+		}
+		// Le motif est ancré : une seule clause, remplacée par son groupe 1. La
+		// tête désigne le tampon du lecteur, d'où une copie.
+		out := make([]byte, 0, len(head)-(loc[1]-loc[3]))
+		out = append(out, head[:loc[3]]...)
+		return append(out, head[loc[1]:]...)
+	})
 }
 
 // pgExtensionComment est l'instruction complète que pg_dump écrit pour le
@@ -662,14 +732,14 @@ var pgExtensionComment = regexp.MustCompile(`^COMMENT ON EXTENSION ("[^"]+"|[a-z
 // devant elle (« -- Name: EXTENSION x; Type: COMMENT; … ») : la même ligne dans
 // le corps d'une fonction, entre $$, ou dans un bloc de données COPY, reste.
 func confinePostgresDump(data []byte) []byte {
-	if !bytes.Contains(data, []byte("COMMENT ON EXTENSION ")) {
-		return data
-	}
-	lines := bytes.SplitAfter(data, []byte("\n"))
-	out := lines[:0]
+	return confineAll(confinePostgresStream(bytes.NewReader(data)))
+}
+
+// confinePostgresStream est confinePostgresDump au fil de l'eau.
+func confinePostgresStream(r io.Reader) io.Reader {
 	header := false
-	for _, line := range lines {
-		trimmed := bytes.TrimRight(line, "\r\n")
+	return newLineFilter(r, func(head []byte, whole bool) []byte {
+		trimmed := bytes.TrimRight(head, "\r\n")
 		switch {
 		case bytes.HasPrefix(trimmed, []byte("-- Name: EXTENSION ")) &&
 			bytes.Contains(trimmed, []byte("; Type: COMMENT;")):
@@ -678,11 +748,72 @@ func confinePostgresDump(data []byte) []byte {
 			// Les lignes de commentaire et le blanc entre l'en-tête et l'instruction.
 		case header:
 			header = false
-			if pgExtensionComment.Match(line) {
-				continue
+			// Une ligne plus longue que le tampon n'est jamais ce commentaire.
+			if whole && pgExtensionComment.Match(head) {
+				return nil
 			}
 		}
-		out = append(out, line)
+		return head
+	})
+}
+
+// confineAll lit tout un flux confiné : les tests et les appelants qui tiennent
+// déjà la sauvegarde en mémoire.
+func confineAll(r io.Reader) []byte {
+	data, _ := io.ReadAll(r)
+	return data
+}
+
+// lineHead est la longueur au-delà de laquelle une ligne n'est plus examinée :
+// ce qui la suit passe tel quel. Une ligne de données de mysqldump — un INSERT
+// étendu — peut peser des mégaoctets, et les deux filtres ne jugent que la tête
+// d'une ligne : une clause DEFINER, aux identifiants bornés par le moteur, ou
+// une ligne de commentaire.
+const lineHead = 64 << 10
+
+// lineFilter applique un filtre à la tête de chaque ligne d'un flux.
+type lineFilter struct {
+	src *bufio.Reader
+	// filter reçoit la tête d'une ligne — la ligne entière, fin de ligne
+	// comprise, si whole — et rend ce qui la remplace, nil pour la retirer.
+	filter  func(head []byte, whole bool) []byte
+	pending []byte
+	// inLine dit que la tête de la ligne courante est passée : la suite est
+	// recopiée telle quelle.
+	inLine bool
+	err    error
+}
+
+func newLineFilter(r io.Reader, filter func(head []byte, whole bool) []byte) *lineFilter {
+	return &lineFilter{src: bufio.NewReaderSize(r, lineHead), filter: filter}
+}
+
+func (l *lineFilter) Read(p []byte) (int, error) {
+	for len(l.pending) == 0 {
+		if l.err != nil {
+			return 0, l.err
+		}
+		chunk, err := l.src.ReadSlice('\n')
+		full := errors.Is(err, bufio.ErrBufferFull)
+		switch {
+		case full:
+			err = nil
+		case err != nil && len(chunk) == 0:
+			l.err = err
+			continue
+		}
+		if l.inLine {
+			l.pending = chunk
+		} else {
+			// Une ligne finale sans fin de ligne est entière, elle aussi.
+			l.pending = l.filter(chunk, !full)
+		}
+		l.inLine = full
+		l.err = err
 	}
-	return bytes.Join(out, nil)
+	// pending désigne, au plus, le tampon du lecteur : il est vidé avant toute
+	// nouvelle lecture.
+	n := copy(p, l.pending)
+	l.pending = l.pending[n:]
+	return n, nil
 }

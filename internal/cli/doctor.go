@@ -592,6 +592,15 @@ func (a *App) runChecks(ctx context.Context) []check {
 		}
 	}
 
+	// Changement d'identité : tout ce qu'ogs lance sous le compte d'un projet —
+	// tâche, installation de runtime, restauration d'une base — passe par
+	// setpriv, runuser à défaut, jamais par su (D122).
+	if tool, err := exec.UserSwitcher(); err != nil {
+		add("changement d'identité", "échec", err.Error(), "apt install util-linux")
+	} else {
+		add("changement d'identité", "ok", tool, "")
+	}
+
 	// Clusters PostgreSQL : l'accès d'administration passe par l'authentification
 	// « peer », qui exige un rôle au nom de l'utilisateur système. Une installation
 	// neuve n'en comporte pas, et le défaut ne se découvrirait qu'à la création

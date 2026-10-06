@@ -103,10 +103,10 @@ func Installed(root, runtime, version string) bool {
 
 // Install pose le runtime dans le home du projet. Les gestionnaires de versions
 // étant des scripts shell conçus pour un shell interactif, ils sont invoqués par
-// « su -s /bin/bash », et jamais depuis une unité systemd (§7.11.2).
+// « /bin/bash -c » sous l'identité du projet, et jamais depuis une unité
+// systemd (§7.11.2).
 func (i *Installer) Install(ctx context.Context, proj *model.Project, runtime, version string) error {
 	root := proj.Spec.Layout.Root
-	user := proj.Spec.User.Name
 	switch runtime {
 	case RuntimeGo:
 		return fmt.Errorf("le runtime go n'a pas de gestionnaire de versions : " +
@@ -120,7 +120,7 @@ func (i *Installer) Install(ctx context.Context, proj *model.Project, runtime, v
 				`{ curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash; }; `+
 				`. "$NVM_DIR/nvm.sh"; nvm install %s`,
 			managerDir(root, runtime), version)
-		return i.runAs(ctx, user, script)
+		return i.runAs(ctx, proj, script)
 	case RuntimeRuby:
 		script := fmt.Sprintf(
 			`export RBENV_ROOT=%q; [ -d "$RBENV_ROOT" ] || `+
@@ -129,7 +129,7 @@ func (i *Installer) Install(ctx context.Context, proj *model.Project, runtime, v
 				`git clone --depth 1 https://github.com/rbenv/ruby-build.git "$RBENV_ROOT/plugins/ruby-build"; `+
 				`"$RBENV_ROOT/bin/rbenv" install -s %s`,
 			managerDir(root, runtime), version)
-		return i.runAs(ctx, user, script)
+		return i.runAs(ctx, proj, script)
 	case RuntimePython:
 		// pyenv fournit l'interpréteur, ogs crée le venv du projet : c'est lui que
 		// le lien désigne, afin que les dépendances suivent.
@@ -139,19 +139,24 @@ func (i *Installer) Install(ctx context.Context, proj *model.Project, runtime, v
 				`"$PYENV_ROOT/bin/pyenv" install -s %s; `+
 				`"$PYENV_ROOT/versions/%s/bin/python" -m venv %q`,
 			managerDir(root, runtime), version, version, filepath.Join(root, "www", ".venv"))
-		return i.runAs(ctx, user, script)
+		return i.runAs(ctx, proj, script)
 	}
 	return fmt.Errorf("runtime %q inconnu (gérés : %s)", runtime, strings.Join(Runtimes(), ", "))
 }
 
-// runAs exécute un script sous l'identité du projet. « su -s » force le shell :
-// le compte peut en avoir un fermé (D62), et un su ordinaire échouerait alors.
-func (i *Installer) runAs(ctx context.Context, user, script string) error {
+// runAs exécute un script sous l'identité du projet, par bash nommé
+// explicitement : le compte peut avoir un shell fermé (D62), et
+// exec.Command.AsUser n'en emploie aucun (D122). Le répertoire courant est la
+// racine du projet, comme pour ses tâches.
+func (i *Installer) runAs(ctx context.Context, proj *model.Project, script string) error {
 	if i.Exec == nil || i.Exec.Simulated() {
 		return nil
 	}
 	_, err := i.Exec.Run(ctx, exec.Command{
-		Name: "su", Args: []string{"-s", "/bin/bash", "-c", script, user},
+		Name: "/bin/bash", Args: []string{"-c", script},
+		AsUser: proj.Spec.User.Name, Dir: proj.Spec.Layout.Root,
+		// Le téléchargement suit le mandataire d'ogs ; lui seul le reçoit (D122).
+		Env: exec.ProxyEnv(),
 	})
 	return err
 }

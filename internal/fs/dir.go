@@ -381,6 +381,23 @@ func (d *Dir) Remove(name string) error {
 	return nil
 }
 
+// Rename remplace l'entrée newname par oldname, toutes deux dans ce répertoire,
+// sans suivre de lien : un lien qui occuperait newname est remplacé, lui, et non
+// ce qu'il désigne ; un répertoire ne l'est jamais.
+func (d *Dir) Rename(oldname, newname string) error {
+	if _, err := d.child(oldname); err != nil {
+		return err
+	}
+	p, err := d.child(newname)
+	if err != nil {
+		return err
+	}
+	if err := unix.Renameat(d.fd, oldname, d.fd, newname); err != nil {
+		return fmt.Errorf("renommage vers %s : %w", p, err)
+	}
+	return nil
+}
+
 // setOwnerMode pose le propriétaire puis le mode d'un inode par son descripteur.
 // Le propriétaire d'abord : un chown efface les bits setuid et setgid, et c'est
 // au mode demandé d'avoir le dernier mot.

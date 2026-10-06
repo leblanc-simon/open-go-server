@@ -108,33 +108,150 @@ func TestLocalRunKillsChildProcesses(t *testing.T) {
 	}
 }
 
-func TestAsUserPreservesQuotedArguments(t *testing.T) {
-	// su attend un script, non un argv : recoller les arguments avec de simples
-	// espaces ferait redécouper par le shell tout argument qui en contient. Le cas
-	// réel est « ogs cron run », qui exécute « sh -c "flock … sh -c 'date …'" ».
-	if os.Getuid() != 0 {
-		t.Skip("su exige root")
-	}
+// faussesIdentités remplace la résolution des comptes et les outils de
+// changement d'identité : setpriv est un script qui note ses arguments puis
+// exécute la commande à sa place, comme le vrai — sans changer d'identité, ce
+// qu'un test sans privilège ne peut pas.
+func faussesIdentités(t *testing.T, outil string) (trace string) {
+	t.Helper()
 	dir := t.TempDir()
-	if err := os.Chmod(dir, 0o777); err != nil {
+	trace = filepath.Join(dir, "arguments")
+	script := filepath.Join(dir, outil)
+	corps := "#!/bin/sh\nprintf '%s\\n' \"$@\" > " + trace + "\n" +
+		"while [ \"$1\" != -- ]; do shift; done\nshift\nexec \"$@\"\n"
+	if err := os.WriteFile(script, []byte(corps), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	cible := filepath.Join(dir, "trace")
+	anciensSetpriv, anciensRunuser, ancienLookup := setprivPaths, runuserPaths, lookupAccount
+	t.Cleanup(func() { setprivPaths, runuserPaths, lookupAccount = anciensSetpriv, anciensRunuser, ancienLookup })
+	setprivPaths, runuserPaths = []string{filepath.Join(dir, "absent")}, []string{filepath.Join(dir, "absent")}
+	if outil == "setpriv" {
+		setprivPaths = []string{script}
+	} else {
+		runuserPaths = []string{script}
+	}
+	lookupAccount = func(name string) (account, error) {
+		if name != "shopfr" {
+			return account{}, errors.New("inconnu")
+		}
+		return account{name: "shopfr", uid: "1004", gid: "1005", home: "/home/shop.fr"}, nil
+	}
+	return trace
+}
+
+// R4-27 : sous « su -c », la commande d'un compte vivait dans une nouvelle
+// session, hors du groupe de processus que l'annulation tue : une installation
+// de runtime ou « ogs cron run » interrompus continuaient sans ogs. setpriv
+// exécute la commande à sa place, et le petit-fils meurt avec le groupe.
+func TestAsUserMeurtAvecLeGroupe(t *testing.T) {
+	faussesIdentités(t, "setpriv")
+	dir := t.TempDir()
+	démarré, orphelin := filepath.Join(dir, "démarré"), filepath.Join(dir, "orphelin")
 	l := &Local{}
-	_, err := l.Run(context.Background(), Command{
-		Name:   "/bin/sh",
-		Args:   []string{"-c", "/bin/sh -c 'echo imbriqué > " + cible + "'"},
-		AsUser: "nobody",
-	})
-	if err != nil {
-		t.Fatalf("exécution : %v", err)
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	_, err := l.Run(ctx, Command{Name: "/bin/sh", AsUser: "shopfr", Args: []string{"-c",
+		"touch " + démarré + "; /bin/sh -c 'sleep 1; touch " + orphelin + "' & sleep 30"}})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("l'annulation doit se reconnaître : %v", err)
 	}
-	data, err := os.ReadFile(cible)
-	if err != nil {
-		t.Fatalf("la commande imbriquée n'a rien écrit : %v", err)
+	if _, err := os.Stat(démarré); err != nil {
+		t.Fatalf("la commande n'a pas tourné : %v", err)
 	}
-	if strings.TrimSpace(string(data)) != "imbriqué" {
-		t.Errorf("contenu = %q", data)
+	time.Sleep(1500 * time.Millisecond)
+	if _, err := os.Stat(orphelin); err == nil {
+		t.Error("le petit-fils a survécu à l'annulation")
+	}
+}
+
+// R4-27 : setpriv reçoit l'uid, le gid et les groupes du compte, et l'argv tel
+// quel — aucun shell ne le redécoupe, ni ne s'impose (D62).
+func TestAsUserPasseParSetpriv(t *testing.T) {
+	trace := faussesIdentités(t, "setpriv")
+	l := &Local{}
+	res, err := l.Run(context.Background(), Command{Name: "/bin/sh", AsUser: "shopfr",
+		Args: []string{"-c", "/bin/sh -c 'echo imbriqué'"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(res.Stdout) != "imbriqué" {
+		t.Errorf("sortie %q", res.Stdout)
+	}
+	data, err := os.ReadFile(trace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "--reuid=1004\n--regid=1005\n--init-groups\n--\n/bin/sh\n-c\n/bin/sh -c 'echo imbriqué'\n"
+	if string(data) != want {
+		t.Errorf("arguments de setpriv :\n%s\nattendu :\n%s", data, want)
+	}
+}
+
+// Sans setpriv, runuser -u, qui n'emploie pas de shell non plus.
+func TestAsUserSeReplieSurRunuser(t *testing.T) {
+	trace := faussesIdentités(t, "runuser")
+	l := &Local{}
+	if _, err := l.Run(context.Background(), Command{Name: "/bin/true", AsUser: "shopfr"}); err != nil {
+		t.Fatal(err)
+	}
+	data, _ := os.ReadFile(trace)
+	if string(data) != "-u\nshopfr\n--\n/bin/true\n" {
+		t.Errorf("arguments de runuser : %q", data)
+	}
+}
+
+// Ni l'un ni l'autre : refus nommé, jamais su.
+func TestAsUserSansOutilRefuse(t *testing.T) {
+	faussesIdentités(t, "setpriv")
+	setprivPaths = []string{"/inexistant/setpriv"}
+	l := &Local{}
+	_, err := l.Run(context.Background(), Command{Name: "/bin/true", AsUser: "shopfr"})
+	if err == nil || !strings.Contains(err.Error(), "util-linux") {
+		t.Errorf("refus attendu : %v", err)
+	}
+	if Missing(err) {
+		t.Error("l'absence de l'outil ne doit pas passer pour celle de la commande, que certains appelants taisent")
+	}
+	if _, err := l.Run(context.Background(), Command{Name: "/bin/true", AsUser: "inconnu"}); err == nil {
+		t.Error("un compte introuvable doit être refusé")
+	}
+}
+
+// R4-27, D92 : l'environnement d'une commande lancée sous un compte est construit
+// de toutes pièces. Sous « su » sans « -l », tout celui de root passait — un
+// MYSQL_PWD, un PGPASSWORD, SSH_AUTH_SOCK.
+func TestAsUserNHeritePasDeRoot(t *testing.T) {
+	faussesIdentités(t, "setpriv")
+	t.Setenv("MYSQL_PWD", "secret-de-root")
+	t.Setenv("SSH_AUTH_SOCK", "/tmp/agent")
+	t.Setenv("LANG", "fr_FR.UTF-8")
+	// Le mandataire ne passe pas : ses identifiants seraient lisibles du projet.
+	// Seule l'installation d'un runtime le demande (ProxyEnv).
+	t.Setenv("https_proxy", "http://id:secret@mandataire:3128")
+	t.Setenv("NO_PROXY", "localhost")
+	l := &Local{}
+	res, err := l.Run(context.Background(), Command{Name: "/bin/sh", AsUser: "shopfr",
+		Args: []string{"-c", "env; pwd"}, Env: []string{"PGPASSWORD=voulu", "PATH=/usr/bin:/bin"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, absent := range []string{"MYSQL_PWD", "SSH_AUTH_SOCK", "secret-de-root", "mandataire", "NO_PROXY"} {
+		if strings.Contains(res.Stdout, absent) {
+			t.Errorf("%s hérité de root :\n%s", absent, res.Stdout)
+		}
+	}
+	for _, présent := range []string{"HOME=/home/shop.fr\n", "USER=shopfr\n", "LOGNAME=shopfr\n",
+		"SHELL=/bin/sh\n", "LANG=fr_FR.UTF-8\n",
+		"PGPASSWORD=voulu\n", "PATH=/usr/bin:/bin\n"} {
+		if !strings.Contains(res.Stdout, présent) {
+			t.Errorf("%q absent :\n%s", présent, res.Stdout)
+		}
+	}
+	if strings.Contains(res.Stdout, "PATH="+UserPath) {
+		t.Error("le PATH fourni par l'appelant doit l'emporter")
+	}
+	if !strings.HasSuffix(res.Stdout, "\n/\n") {
+		t.Errorf("le répertoire courant doit être « / » à défaut : %q", res.Stdout)
 	}
 }
 
@@ -227,5 +344,115 @@ func TestShellLineCiteLesMetacaracteres(t *testing.T) {
 	want := `ogs db restore shopfr 'x;rm -rf /' '/var/lib/ogs/a b.tar.zst' 'l'\''x' ''`
 	if got != want {
 		t.Errorf("ShellLine : %s, attendu %s", got, want)
+	}
+}
+
+// R1-57 : une entrée fournie en flux est lue au fil de l'eau par la commande ;
+// le Recorder la consomme et la retient dans Stdin pour les assertions.
+func TestEntréeEnFlux(t *testing.T) {
+	l := &Local{}
+	res, err := l.Run(context.Background(), Command{Name: "wc", Args: []string{"-c"},
+		StdinStream: io.LimitReader(zeros{}, 64<<20)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(res.Stdout) != "67108864" {
+		t.Errorf("octets lus : %q", res.Stdout)
+	}
+	r := NewRecorder()
+	if _, err := r.Run(context.Background(), Command{Name: "mysql", StdinStream: strings.NewReader("CREATE")}); err != nil {
+		t.Fatal(err)
+	}
+	if c := r.Calls()[0]; string(c.Stdin) != "CREATE" || c.StdinStream != nil {
+		t.Errorf("entrée retenue : %+v", c)
+	}
+}
+
+type zeros struct{}
+
+func (zeros) Read(p []byte) (int, error) {
+	clear(p)
+	return len(p), nil
+}
+
+// B1 (D122) : sous AsUser, une nouvelle session — pas de terminal de contrôle,
+// et le groupe de processus a le pid de la commande, que l'annulation tue — ;
+// une commande root garde la session d'ogs.
+func TestUneCommandeDeProjetOuvreSaSession(t *testing.T) {
+	if a := procAttr(true); !a.Setsid || a.Setpgid {
+		t.Errorf("sous AsUser : %+v", a)
+	}
+	if a := procAttr(false); a.Setsid || !a.Setpgid {
+		t.Errorf("commande root : %+v", a)
+	}
+	faussesIdentités(t, "setpriv")
+	l := &Local{}
+	res, err := l.Run(context.Background(), Command{Name: "/bin/sh", AsUser: "shopfr",
+		Args: []string{"-c", `set -- $(cut -d' ' -f1,6 /proc/$$/stat); [ "$1" = "$2" ] && echo chef`}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(res.Stdout) != "chef" {
+		t.Errorf("la commande doit être chef de sa session : %q", res.Stdout)
+	}
+}
+
+// B1 (D122) : un fichier de root — le terminal de l'exploitant — n'est jamais
+// passé tel quel à une commande de projet : elle reçoit un tube.
+func TestUneCommandeDeProjetNeRecoitPasLesDescripteursDeRoot(t *testing.T) {
+	faussesIdentités(t, "setpriv")
+	f, err := os.CreateTemp(t.TempDir(), "sortie")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	l := &Local{}
+	if _, err := l.Run(context.Background(), Command{Name: "/bin/sh", AsUser: "shopfr",
+		Args: []string{"-c", "readlink /proc/self/fd/1"}, Stdout: f}); err != nil {
+		t.Fatal(err)
+	}
+	data, _ := os.ReadFile(f.Name())
+	if !strings.HasPrefix(string(data), "pipe:") {
+		t.Errorf("la sortie de la commande doit être un tube : %q", data)
+	}
+}
+
+// Le mandataire n'est rendu qu'à qui le demande.
+func TestProxyEnv(t *testing.T) {
+	t.Setenv("https_proxy", "http://id:secret@mandataire:3128")
+	t.Setenv("NO_PROXY", "localhost")
+	t.Setenv("MYSQL_PWD", "x")
+	got := strings.Join(ProxyEnv(), " ")
+	if !strings.Contains(got, "https_proxy=http://id:secret@mandataire:3128") ||
+		!strings.Contains(got, "NO_PROXY=localhost") || strings.Contains(got, "MYSQL_PWD") {
+		t.Errorf("ProxyEnv : %q", got)
+	}
+}
+
+// Sous AsUser, une entrée qui est un fichier ouvert — un terminal, un tube
+// jamais fermé — bloquait Wait au-delà de WaitDelay : elle est refusée.
+func TestAsUserRefuseUnFichierEnEntrée(t *testing.T) {
+	faussesIdentités(t, "setpriv")
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	defer w.Close()
+	l := &Local{}
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	début := time.Now()
+	_, err = l.Run(ctx, Command{Name: "/bin/cat", AsUser: "shopfr", StdinStream: r})
+	if err == nil || !strings.Contains(err.Error(), "fichier ouvert en entrée") {
+		t.Errorf("refus attendu : %v", err)
+	}
+	if time.Since(début) > 2*time.Second {
+		t.Error("le refus doit précéder toute exécution")
+	}
+	// Un lecteur qui se termine passe.
+	if _, err := l.Run(context.Background(), Command{Name: "/bin/cat", AsUser: "shopfr",
+		StdinStream: strings.NewReader("x")}); err != nil {
+		t.Errorf("un lecteur ordinaire doit passer : %v", err)
 	}
 }

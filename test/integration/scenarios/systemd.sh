@@ -260,6 +260,100 @@ fi
 echo "une commande au nom nu passe par le PATH"
 
 echo
+echo "--- tâche sous l'identité du projet : environnement et interruption (D122) ---"
+# L'environnement est construit de toutes pièces : sous « su » sans « -l », une
+# variable de root passait à la tâche.
+ogs cron add shopfr environnement --schedule "0 0 1 1 *" --command "env" >/dev/null
+ogs cron add shopfr longue --schedule "0 0 1 1 *" \
+    --command "/bin/sh -c 'sleep 301 & sleep 302'" >/dev/null
+ogs apply shopfr --yes -q >/dev/null 2>&1
+sortie=$(OGS_TEMOIN=fuite MYSQL_PWD=fuite ogs cron run shopfr environnement 2>&1)
+if echo "$sortie" | grep -q "fuite"; then
+    echo "ÉCHEC : l'environnement de root est passé à la tâche :"
+    echo "$sortie" | grep fuite
+    exit 1
+fi
+if ! echo "$sortie" | grep -qx "HOME=/home/shop.fr" || ! echo "$sortie" | grep -qx "USER=shopfr"; then
+    echo "ÉCHEC : HOME et USER du compte attendus :"
+    echo "$sortie"
+    exit 1
+fi
+echo "la tâche ne reçoit que l'environnement du compte"
+# Interrompue, la tâche meurt avec tout ce qu'elle a lancé : « su -c » l'ouvrait
+# dans une nouvelle session, hors du groupe de processus qu'ogs tue (R4-27).
+# SIGHUP — la session ssh coupée — l'interrompt comme SIGTERM (R1-69).
+setsid ogs cron run shopfr longue >/tmp/longue.log 2>&1 &
+lanceur=$!
+for _ in $(seq 1 50); do
+    pgrep -u shopfr -f "^sleep 30[12]$" >/dev/null && break
+    sleep 0.1
+done
+if ! pgrep -u shopfr -f "^sleep 30[12]$" >/dev/null; then
+    echo "ÉCHEC : la tâche longue n'a pas démarré"
+    cat /tmp/longue.log
+    exit 1
+fi
+kill -HUP "$(pgrep -f "ogs cron run shopfr longue" | head -1)"
+wait "$lanceur"
+rc=$?
+sleep 1
+if [ "$rc" != 9 ]; then
+    echo "ÉCHEC : SIGHUP doit interrompre « cron run » en code 9 (obtenu $rc)"
+    cat /tmp/longue.log
+    exit 1
+fi
+if pgrep -u shopfr -f "^sleep 30[12]$" >/dev/null; then
+    echo "ÉCHEC : des processus de la tâche ont survécu à l'interruption :"
+    ps -o pid,pgid,sid,user,args -u shopfr
+    exit 1
+fi
+echo "SIGHUP interrompt la tâche en code 9, et rien d'elle ne survit"
+ogs cron remove shopfr environnement >/dev/null
+ogs cron remove shopfr longue >/dev/null
+ogs apply shopfr --yes -q >/dev/null 2>&1
+
+echo
+echo "--- terminal coupé à la question de confirmation (D122) ---"
+# Le vrai chemin d'une session ssh coupée : le maître du pseudo-terminal se
+# ferme, le noyau envoie SIGHUP au groupe de premier plan, et toute écriture
+# vers le terminal rend EIO. ogs mourait sur-le-champ ; il refuse et rend 9.
+ogs cron add shopfr coupure --schedule "0 0 1 1 *" --command "true" >/dev/null
+rm -f /tmp/entree /tmp/coupure.rc
+mkfifo /tmp/entree
+sleep 120 > /tmp/entree &
+tenue=$!
+# Le shell intermédiaire garde un gestionnaire (pas « trap '' » : un signal
+# ignoré passe à ogs, qui le respecterait comme sous nohup) et note le code.
+script -qfec "sh -c 'trap : HUP; ogs apply shopfr; echo \$? > /tmp/coupure.rc'" /dev/null \
+    < /tmp/entree > /tmp/coupure.log 2>&1 &
+terminal=$!
+for _ in $(seq 1 100); do
+    grep -q "\[o/N\]" /tmp/coupure.log 2>/dev/null && break
+    sleep 0.1
+done
+if ! grep -q "\[o/N\]" /tmp/coupure.log; then
+    echo "ÉCHEC : la question n'est pas venue"
+    cat /tmp/coupure.log
+    exit 1
+fi
+kill -KILL "$terminal"
+for _ in $(seq 1 50); do
+    [ -s /tmp/coupure.rc ] && break
+    sleep 0.1
+done
+kill "$tenue" 2>/dev/null
+if [ "$(cat /tmp/coupure.rc 2>/dev/null)" != 9 ]; then
+    echo "ÉCHEC : le terminal coupé doit faire rendre le code 9 (obtenu « $(cat /tmp/coupure.rc 2>/dev/null) »)"
+    exit 1
+fi
+if grep -q coupure /etc/cron.d/ogs-shopfr; then
+    echo "ÉCHEC : la modification a été appliquée sans confirmation"
+    exit 1
+fi
+echo "terminal coupé : ogs refuse en code 9, rien n'est appliqué"
+ogs cron remove shopfr coupure >/dev/null
+
+echo
 echo "--- tâche planifiée : déclenchement réel par cron ---"
 journal=/var/log/ogs-projects/shopfr/cron-horodate.log
 : > "$journal"

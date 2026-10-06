@@ -284,6 +284,11 @@ func newCronRunCommand(app *App) *cobra.Command {
 			if res.Stdout != "" {
 				fmt.Fprint(app.Out, res.Stdout)
 			}
+			// Interrompue, la tâche est tuée avec tout ce qu'elle a lancé : elle
+			// tourne dans le groupe de processus d'ogs (D122).
+			if err != nil && cmd.Context().Err() != nil {
+				return exitf(CodeCancelled, "tâche %s interrompue à la demande : %v", args[1], err)
+			}
 			if err != nil {
 				return exitf(CodeError, "%v", err)
 			}

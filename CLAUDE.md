@@ -12,8 +12,8 @@ Les commits ne mentionnent jamais l'assistance d'un outil d'IA.
 
 ## La référence
 
-[`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md) fait autorité : 117 décisions d'architecture
-arbitrées (D1–D115, D117 et D120, D116 réservée ; tableau §2), spécification par module, plan de tests, découpage en lots. **Consulter le
+[`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md) fait autorité : 118 décisions d'architecture
+arbitrées (D1–D115, D117, D120 et D122, D116 réservée ; tableau §2), spécification par module, plan de tests, découpage en lots. **Consulter le
 tableau des décisions avant de proposer une architecture** — la plupart des questions « pourquoi pas
 plutôt… ? » y sont déjà tranchées, avec leur raison. Toute décision nouvelle s'y ajoute.
 
@@ -261,10 +261,19 @@ seul `cert renew` tourne sur une base en mémoire (`store.OpenMemory`), en le di
 
 ### Exécution de commandes
 
-`internal/exec` est le seul chemin vers le système. `Command.AsUser` passe par `su -s /bin/bash -c` et
-**cite chaque argument** — recoller un argv en script shell sans citation fait redécouper tout argument
-contenant une espace. Les processus sont placés dans leur propre groupe et l'annulation tue le groupe
-entier. `exec.Recorder` (mode préfixé) simule tout et permet aux tests d'assertion sur les commandes.
+`internal/exec` est le seul chemin vers le système, et aucune commande n'y passe par un shell. Les
+processus sont placés dans leur propre groupe et l'annulation tue le groupe entier. `Command.AsUser` passe
+par **`setpriv --reuid --regid --init-groups`**, `runuser -u` à défaut, **jamais par `su`** (D122) :
+`su -c` ouvre une nouvelle session (setsid) dans un processus fils, hors du groupe que l'annulation tue — une
+installation de runtime ou `ogs cron run` interrompus continuaient sans ogs —, et sans `-l` il transmettait
+tout l'environnement de root. **Ce setsid était aussi une protection**, qu'ogs refait lui-même
+(`exec.procAttr` : `Setsid` sous `AsUser`, voir les pièges). L'argv passe tel quel, l'environnement est construit de toutes pièces
+(`exec.userEnv` : `HOME`, `USER`, `LOGNAME`, `SHELL=/bin/sh`, le `PATH` des crons, la langue, puis
+`Command.Env` ; le mandataire HTTP, qui peut porter des identifiants, n'est relayé qu'à l'installation
+des runtimes par `exec.ProxyEnv`), le répertoire courant est `Dir`, « / » à défaut ; qui veut un shell le nomme
+(`/bin/bash -c`). Ce qui pèse ce que pèse une base passe en flux (`Command.Stdout`, `Command.StdinStream`).
+`exec.Recorder` (mode préfixé) simule tout, consomme un `StdinStream` dans `Stdin`, et permet aux tests
+d'assertion sur les commandes.
 
 ### Supervision : deux fichiers dérivés du parc
 
@@ -615,7 +624,8 @@ Ils ont tous coûté un défaut réel ; les tests unitaires ne les voyaient pas.
   réécrirait le shell de tout le parc au prochain apply ; le shell déclaré est **réconcilié** par `usermod`,
   dans la **même étape** que la correction du home, deux étapes de même ressource se marchant dessus dans le
   plan comme dans l'audit ; et un projet **adopté garde son shell réel**, l'import le reprenant du système.
-  `su -s /bin/bash` reste nécessaire dans `internal/exec` : un parc peut avoir refermé le shell.
+  `internal/exec` ne passe par aucun shell (D122) : qui en veut un le nomme, un parc pouvant avoir refermé
+  celui du compte.
 - **Un lien symbolique n'a pas de droits propres** sous Linux : son mode est 0777 et immuable. Le
   `.ssh/authorized_keys` lié au trousseau commun `/opt/default_authorized_keys` (D61) en dépend
   entièrement — sshd **résout le lien** avant tout contrôle, donc ce sont les droits de la cible qui
@@ -816,7 +826,7 @@ Ils ont tous coûté un défaut réel ; les tests unitaires ne les voyaient pas.
 - **Une restauration est un script, et le client l'exécute** (D92) : `\!` lance une commande shell sous
   mysql comme sous psql. `db restore`, `site clone` et `project restore` chargent donc sous le **compte de
   la base**, par un client lancé **sous l'utilisateur Linux du projet** (`AsUser`), environnement construit
-  de toutes pièces — `su` sans `-l` garde `MYSQL_PWD` et `PGPASSWORD`. Deux conséquences : une clause
+  de toutes pièces (`exec.userEnv`, D122) — `su` sans `-l` gardait `MYSQL_PWD` et `PGPASSWORD`. Deux conséquences : une clause
   `DEFINER` nommant un autre compte exige `SET_USER_ID`, d'où son retrait ; et
   `COMMENT ON EXTENSION` exige d'être propriétaire de l'extension, créée sous le rôle d'administration,
   d'où le retrait de la seule instruction que pg_dump pose sous son en-tête — sous `ON_ERROR_STOP`, la
@@ -868,8 +878,22 @@ Ils ont tous coûté un défaut réel ; les tests unitaires ne les voyaient pas.
   un partage NFS ou un `mount --bind` sous le home était vidé pour tous ceux qui s'en servent. La racine et
   les journaux sont éprouvés à l'entrée de `project delete`, au point de non-retour, puis juste avant
   l'effacement.
-- **Une interruption annule le contexte, elle n'arrête pas le processus** (`signal.NotifyContext` dans
-  `main`, SIGINT et SIGTERM — pas SIGHUP). Une commande longue qui franchit un point de non-retour consulte
+- **Une commande de projet ne doit jamais garder le terminal de contrôle de root** (D122). `setpriv`
+  change d'identité sans changer de session : la commande ouvrait `/dev/tty` et y poussait par
+  `ioctl(TIOCSTI)` une ligne que le shell root exécutait au retour d'ogs (noyau < 6.2, ou
+  `dev.tty.legacy_tiocsti=1`) — par `cron run`, par le `nvm.sh` qu'un runtime source, par le `\!` d'un
+  dump restauré. Le `setsid` de `su -c` était la protection d'util-linux contre cela ; remplacer `su` l'a
+  retirée. Sous `AsUser`, `exec.Local` lance donc la commande en **nouvelle session** (`Setsid`, son
+  groupe a son pid : l'annulation l'atteint toujours) et ne lui passe **aucun descripteur de root** — un
+  `*os.File` en sortie est masqué pour qu'os/exec pose un tube, et refusé en entrée : la copie d'un
+  terminal ou d'un tube jamais fermé bloquait `Wait` au-delà de `WaitDelay`. `TestAsUserSansTerminalDeControle` le vérifie en
+  root, sous `docker run -t`. Une commande root (`journalctl --no-pager`) garde la session d'ogs.
+- **Une interruption annule le contexte, elle n'arrête pas le processus** (`cmd/ogs/signaux.go` : SIGINT,
+  SIGTERM et **SIGHUP**, D122 — la session ssh coupée tuait ogs au milieu d'une saga). Un signal ignoré au
+  lancement le reste (`nohup` : Go le rétablit sinon dès qu'on s'y abonne), un second est dit, et SIGPIPE
+  est capté **sans** annuler — Go tue sinon le programme qui écrit vers une sortie fermée sur les
+  descripteurs 1 et 2, et un client SGBD qui s'arrête lève le même signal sur son entrée. Une question à
+  l'exploitant (`readAnswer`) rend la main dès l'interruption. Une commande longue qui franchit un point de non-retour consulte
   `ctx.Err()` juste avant, et y voit un abandon (code 9) qui défait ce qu'elle a arrêté ; au-delà, elle se
   détache (`context.WithoutCancel`), sans quoi chaque commande échoue sur « context canceled ».
   `project delete` laissait ainsi un home effacé sous un compte et des workers FPM vivants, et des fichiers
@@ -985,7 +1009,9 @@ Ils ont tous coûté un défaut réel ; les tests unitaires ne les voyaient pas.
   action : la saga était abandonnée entre deux étapes, le processus sortant sous elle. La TUI écarte son
   gestionnaire de signaux (`tea.WithoutSignalHandler`), reçoit l'interruption par le contexte de la commande,
   n'admet qu'une action à la fois et ne se ferme qu'après elle ; `tuiBackend` sérialise ses appels, qui
-  partagent l'App (Q-101). `go test -race ./internal/tui/ ./internal/cli/` le verrouille.
+  partagent l'App (Q-101). `go test -race ./internal/tui/ ./internal/cli/` le verrouille. Bubble Tea sort
+  aussi **sur une lecture du terminal en échec** — EIO, terminal d'une session ssh coupée —, sans attendre :
+  `tui.run` annule alors l'action et l'attend (`actionGate`) avant de rendre la main (D122).
 - **`--dry-run` est une option globale, donc reçue par des commandes qui ne la lisaient pas** (D88) :
   `project delete --dry-run` supprimait pour de bon — archive, bases, vhost, compte, home, `preDelete` et
   `postDelete` en root — et rendait 0 ; `project restore` et `cert renew` de même. La conduite de toute

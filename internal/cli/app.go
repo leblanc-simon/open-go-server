@@ -94,6 +94,9 @@ type App struct {
 	// stateLost compte les déclarations d'un parc dont state.db a disparu,
 	// quand la commande tourne sur une base éphémère (D120).
 	stateLost int
+	// ctx est le contexte de la commande, qu'une interruption annule (D122) :
+	// une question posée à l'exploitant rend la main dès qu'il l'est.
+	ctx context.Context
 }
 
 // nowFunc est isolé pour rester substituable en test.

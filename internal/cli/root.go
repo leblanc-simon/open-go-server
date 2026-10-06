@@ -26,6 +26,7 @@ func NewRootCommand() *cobra.Command {
 			// Les sorties suivent celles de cobra, ce qui permet de les capturer en test.
 			app.Out, app.Err = cmd.OutOrStdout(), cmd.ErrOrStderr()
 			app.command = cmd.CommandPath()
+			app.ctx = cmd.Context()
 			// La complétion est interrogée par le shell, sous l'identité de
 			// l'utilisateur : elle ne peut ni exiger root ni ouvrir la base.
 			if isCompletionRequest(cmd) {

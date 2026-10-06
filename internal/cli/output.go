@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -100,6 +101,48 @@ func (a *App) stepf(indent string, s *engine.Step, stepErr error) {
 	a.printf("%s", line)
 }
 
+// readAnswer lit la réponse de l'exploitant à une question. Une interruption
+// — Ctrl+C, SIGTERM, SIGHUP — y répond « non » sur-le-champ (D122) : captés par
+// ogs, ces signaux ne coupent plus la lecture, qui attendait Entrée, et la
+// réponse tapée ensuite faisait poursuivre une commande annulée. Une entrée
+// fermée ou en erreur — le terminal d'une session ssh coupée rend EIO — vaut
+// refus, comme avant.
+func (a *App) readAnswer() (string, error) {
+	ctx := a.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if ctx.Err() != nil {
+		fmt.Fprintln(a.Out)
+		return "", exitf(CodeCancelled, "opération annulée : interruption reçue")
+	}
+	type lue struct {
+		answer string
+		err    error
+	}
+	// La lecture reste en vol après une interruption : la commande s'achève
+	// alors, et elle avec.
+	ch := make(chan lue, 1)
+	go func() {
+		var answer string
+		_, err := fmt.Fscanln(os.Stdin, &answer)
+		ch <- lue{answer, err}
+	}()
+	select {
+	case r := <-ch:
+		if ctx.Err() != nil {
+			return "", exitf(CodeCancelled, "opération annulée : interruption reçue")
+		}
+		if r.err != nil {
+			return "", exitf(CodeCancelled, "opération annulée")
+		}
+		return r.answer, nil
+	case <-ctx.Done():
+		fmt.Fprintln(a.Out)
+		return "", exitf(CodeCancelled, "opération annulée : interruption reçue")
+	}
+}
+
 // confirm demande une confirmation. En mode non interactif, l'absence de --yes
 // est une erreur explicite plutôt qu'un accord tacite.
 func (a *App) confirm(question string) error {
@@ -110,9 +153,9 @@ func (a *App) confirm(question string) error {
 		return exitf(CodeCancelled, "confirmation requise pour %s : ajouter --yes en mode non interactif", question)
 	}
 	fmt.Fprintf(a.Out, "%s [o/N] ", question)
-	var answer string
-	if _, err := fmt.Fscanln(os.Stdin, &answer); err != nil {
-		return exitf(CodeCancelled, "opération annulée")
+	answer, err := a.readAnswer()
+	if err != nil {
+		return err
 	}
 	switch strings.ToLower(strings.TrimSpace(answer)) {
 	case "o", "oui", "y", "yes":

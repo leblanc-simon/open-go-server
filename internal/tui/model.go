@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -102,6 +103,36 @@ type Model struct {
 	// attend que l'action ait rendu la main (Q-101).
 	quitAfter bool
 	quitting  bool
+	// gate tient l'action en vol : la fermeture du programme l'attend (D122).
+	gate *actionGate
+}
+
+// actionGate fait attendre la fermeture de l'interface la fin de l'action en
+// vol, et refuse ensuite d'en lancer une. Bubble Tea sort de Run dès que la
+// lecture du terminal échoue — EIO, sur le terminal d'une session ssh coupée —,
+// sans attendre ses commandes : la saga était abandonnée entre deux étapes,
+// le processus sortant sous elle, ce que Q-101 avait fermé pour SIGTERM seul.
+type actionGate struct {
+	mu     sync.Mutex
+	closed bool
+}
+
+// run exécute f, sauf si la porte est fermée ; il dit s'il l'a fait.
+func (g *actionGate) run(f func()) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.closed {
+		return false
+	}
+	f()
+	return true
+}
+
+// close ferme la porte, une fois l'action en vol revenue.
+func (g *actionGate) close() {
+	g.mu.Lock()
+	g.closed = true
+	g.mu.Unlock()
 }
 
 // confirmation porte une action à confirmer, et ce qu'elle fera : le plan
@@ -130,6 +161,7 @@ func NewWithContext(ctx context.Context, backend Backend) *Model {
 		width:     100,
 		height:    30,
 		ctx:       ctx,
+		gate:      &actionGate{},
 	}
 }
 
@@ -158,7 +190,11 @@ func (m *Model) start(status string, action func(ctx context.Context) tea.Msg) t
 	m.status = status
 	return func() tea.Msg {
 		defer cancel()
-		return action(ctx)
+		var msg tea.Msg
+		if !m.gate.run(func() { msg = action(ctx) }) {
+			return outputMsg{err: context.Canceled}
+		}
+		return msg
 	}
 }
 

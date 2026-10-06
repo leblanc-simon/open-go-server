@@ -2822,9 +2822,9 @@ func (a *App) confirmExact(expected, question string) error {
 			"cette opération exige une confirmation interactive : elle est sans recours")
 	}
 	fmt.Fprintf(a.Out, "%s : ", question)
-	var answer string
-	if _, err := fmt.Fscanln(os.Stdin, &answer); err != nil {
-		return exitf(CodeCancelled, "opération annulée")
+	answer, err := a.readAnswer()
+	if err != nil {
+		return err
 	}
 	if strings.TrimSpace(answer) != expected {
 		return exitf(CodeCancelled, "saisie incorrecte : opération annulée")

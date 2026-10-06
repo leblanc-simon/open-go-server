@@ -42,7 +42,16 @@ func run(ctx context.Context, backend Backend, opts ...tea.ProgramOption) (*Mode
 	stop := context.AfterFunc(ctx, func() { program.Send(interruptMsg{}) })
 	defer stop()
 	final, err := program.Run()
+	// Le programme a pu sortir sans attendre l'action en vol : sa lecture du
+	// terminal a échoué (EIO, session ssh coupée). Elle est annulée, et
+	// attendue, avant de rendre la main — sans quoi le processus sortirait sous
+	// la saga (D122). Un terminal perdu vaut interruption : code 9.
+	m.cancel()
+	m.gate.close()
 	if err != nil {
+		if ctx.Err() != nil || errors.Is(err, tea.ErrProgramKilled) {
+			return nil, fmt.Errorf("%w : %w", ErrInterrupted, err)
+		}
 		return nil, fmt.Errorf("interface interrompue : %w", err)
 	}
 	fm, _ := final.(*Model)

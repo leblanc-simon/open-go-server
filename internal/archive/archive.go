@@ -171,17 +171,41 @@ func (w *Writer) AddBytes(kind, name, origin string, data []byte, mode os.FileMo
 	return nil
 }
 
-// AddFile ajoute un fichier du système.
+// AddFile ajoute un fichier du système, recopié en flux : c'est par elle que
+// passe la sauvegarde d'une base, qui pèse ce que pèse la base — lue en entier,
+// elle tenait toute en mémoire (R1-57, D122). Comme pour AddTree, la taille est
+// celle du descripteur ouvert : un fichier qui grandit n'en donne pas davantage,
+// un fichier raccourci est complété de zéros.
 func (w *Writer) AddFile(kind, name, origin string) error {
-	data, err := os.ReadFile(origin)
+	f, err := os.Open(origin)
 	if err != nil {
 		return err
 	}
-	mode := os.FileMode(0o644)
-	if info, err := os.Stat(origin); err == nil {
-		mode = info.Mode().Perm()
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return err
 	}
-	return w.AddBytes(kind, name, origin, data, mode)
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("%s n'est pas un fichier ordinaire", origin)
+	}
+	if err := w.tar.WriteHeader(&tar.Header{
+		Name: name, Mode: int64(info.Mode().Perm()), Size: info.Size(),
+		ModTime: time.Now(), Typeflag: tar.TypeReg,
+	}); err != nil {
+		return err
+	}
+	written, err := io.CopyN(w.tar, f, info.Size())
+	if errors.Is(err, io.EOF) {
+		_, err = io.CopyN(w.tar, zeros{}, info.Size()-written)
+	}
+	if err != nil {
+		return err
+	}
+	w.manifest.Entries = append(w.manifest.Entries,
+		Entry{Kind: kind, Name: name, Origin: origin, Bytes: info.Size()})
+	w.manifest.Bytes += info.Size()
+	return nil
 }
 
 // AddTree ajoute une arborescence. Les liens symboliques sont conservés tels

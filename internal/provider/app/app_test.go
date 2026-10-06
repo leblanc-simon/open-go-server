@@ -324,8 +324,9 @@ func TestGoRuntimeHasNoVersionManager(t *testing.T) {
 }
 
 func TestInstallUsesForcedShell(t *testing.T) {
-	// Le compte du projet peut avoir un shell fermé (D62) : « su -s » le force,
-	// sans quoi l'installation échouerait.
+	// Le compte du projet peut avoir un shell fermé (D62) : bash est nommé, et la
+	// commande passe sous l'identité du projet par AsUser — jamais par « su -c »,
+	// qui la sortait du groupe de processus tué à l'annulation (D122).
 	prefix := t.TempDir()
 	rec := exec.NewRecorder()
 	installer := &Installer{Exec: &realExecutor{rec}}
@@ -333,6 +334,9 @@ func TestInstallUsesForcedShell(t *testing.T) {
 	if err := proj.Normalize(filepath.Join(prefix, "home"), "preprod-pp.net"); err != nil {
 		t.Fatal(err)
 	}
+	// Le téléchargement suit le mandataire d'ogs : seule l'installation le
+	// reçoit (D122).
+	t.Setenv("https_proxy", "http://mandataire:3128")
 	if err := installer.Install(context.Background(), proj, RuntimeNode, "22.11.0"); err != nil {
 		t.Fatal(err)
 	}
@@ -340,13 +344,16 @@ func TestInstallUsesForcedShell(t *testing.T) {
 	if len(calls) != 1 {
 		t.Fatalf("%d appels : %+v", len(calls), calls)
 	}
-	if calls[0].Name != "su" {
-		t.Errorf("commande : %q", calls[0].Name)
+	if !slices.Contains(calls[0].Env, "https_proxy=http://mandataire:3128") {
+		t.Errorf("le mandataire doit suivre l'installation : %q", calls[0].Env)
+	}
+	if calls[0].Name != "/bin/bash" || len(calls[0].Args) != 2 || calls[0].Args[0] != "-c" {
+		t.Errorf("commande : %q %q", calls[0].Name, calls[0].Args)
+	}
+	if calls[0].AsUser != proj.Spec.User.Name || calls[0].Dir != proj.Spec.Layout.Root {
+		t.Errorf("identité %q, répertoire %q", calls[0].AsUser, calls[0].Dir)
 	}
 	joined := strings.Join(calls[0].Args, " ")
-	if !strings.Contains(joined, "-s /bin/bash") {
-		t.Errorf("le shell doit être forcé : %q", joined)
-	}
 	if !strings.Contains(joined, "nvm install 22.11.0") {
 		t.Errorf("commande d'installation : %q", joined)
 	}
