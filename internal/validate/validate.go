@@ -89,6 +89,35 @@ func EOLDate(version string) (string, bool) {
 	return d, ok
 }
 
+// Placement contrôle que l'arborescence et les journaux d'un projet vivent sous
+// les racines de la configuration : spec.layout.root sous naming.homeRoot (sauf
+// projet adopté, qui décrit l'existant), spec.layout.logDir sous logs.root —
+// dont « doctor » contrôle la chaîne de propriété ; ailleurs, rien ne garantit
+// qu'aucun composant n'appartienne à l'utilisateur (D71). Les deux racines sont
+// des défauts de création : la déclaration porte les chemins qu'elle a reçus,
+// et Normalize ne les remplit que vides. Ce contrôle n'est donc jamais fait au
+// chargement — changer l'une des racines alors que des projets existent rendait
+// tout le parc invalide, renouvellement des certificats compris —, mais au plan
+// et à l'apply, et par « doctor » (D120).
+func Placement(p *model.Project, homeRoot, logsRoot string) error {
+	var errs Errors
+	root := filepath.Clean(p.Spec.Layout.Root)
+	if p.Metadata.Labels["adopted"] != "true" && filepath.IsAbs(root) && !isUnder(root, homeRoot) {
+		errs = append(errs, Error{Field: "spec.layout.root", Message: fmt.Sprintf("doit être sous %s, obtenu %q "+
+			"(un projet adopté peut y échapper : voir « ogs import »)", homeRoot, root)})
+	}
+	logsRoot = filepath.Clean(logsRoot)
+	if dir := filepath.Clean(p.Spec.Layout.LogDir); filepath.IsAbs(dir) &&
+		!strings.HasPrefix(dir, logsRoot+string(filepath.Separator)) {
+		errs = append(errs, Error{Field: "spec.layout.logDir", Message: fmt.Sprintf("%s doit vivre sous %s "+
+			"(logs.root, D71)", dir, logsRoot)})
+	}
+	if len(errs) == 0 {
+		return nil
+	}
+	return errs
+}
+
 // Project valide un projet déjà normalisé.
 func Project(p *model.Project, homeRoot string) error {
 	var errs Errors
@@ -165,14 +194,11 @@ func Project(p *model.Project, homeRoot string) error {
 		// (D60).
 		add("spec.layout.root", "ne peut pas valoir la racine des homes elle-même (%s) : "+
 			"elle appartient à root et n'est le home d'aucun projet (D60)", homeRoot)
-	case !isUnder(root, homeRoot):
-		// Un projet adopté décrit l'existant : son arborescence peut vivre hors de
-		// la racine conventionnelle, et la refuser rendrait l'import inutilisable.
-		if !adopted {
-			add("spec.layout.root", "doit être sous %s, obtenu %q "+
-				"(un projet adopté peut y échapper : voir « ogs import »)", homeRoot, root)
-		}
 	}
+	// L'appartenance de la racine à naming.homeRoot n'est pas jugée ici, mais par
+	// Placement, au plan et à l'apply : elle compare la déclaration à la
+	// configuration, et un changement de celle-ci rendait au chargement tout le
+	// parc invalide, renouvellement des certificats compris (D120).
 	if p.Spec.User.Home != root {
 		add("spec.user.home", "doit valoir spec.layout.root (%q), obtenu %q", root, p.Spec.User.Home)
 	}

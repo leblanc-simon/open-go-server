@@ -480,3 +480,35 @@ func TestAperçuRéservationEtAnnulation(t *testing.T) {
 		t.Errorf("l'annulation doit retirer e et rendre 18502 à b : %v", list)
 	}
 }
+
+// La base en mémoire du renouvellement sans state.db (D120) est migrée comme
+// l'autre, ne laisse aucun fichier et se dit éphémère.
+func TestOpenMemoryNeCreeAucunFichier(t *testing.T) {
+	dir := t.TempDir()
+	wd, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(wd)
+	s, err := OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if !s.Ephemeral() {
+		t.Error("la base en mémoire doit se dire éphémère")
+	}
+	if v, err := s.SchemaVersion(); err != nil || v != len(migrations) {
+		t.Errorf("schéma %d (%v), attendu %d", v, err, len(migrations))
+	}
+	if err := s.UpsertProject(ProjectRow{ID: "shopfr", Host: "shop.fr", Env: "prod", EffectiveHost: "shop.fr",
+		Home: "/home/shopfr", AppKind: "static"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Project("shopfr"); err != nil {
+		t.Errorf("la base en mémoire doit relire ce qu'elle a reçu : %v", err)
+	}
+	if entries, _ := os.ReadDir(dir); len(entries) != 0 {
+		t.Errorf("aucun fichier ne doit être créé, trouvé %d entrée(s)", len(entries))
+	}
+}

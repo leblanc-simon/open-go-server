@@ -35,6 +35,7 @@ func newTUICommand(app *App) *cobra.Command {
 			if err := app.openStore(); err != nil {
 				return err
 			}
+			app.tolerateFleet = true
 			err := tui.Run(cmd.Context(), &tuiBackend{app: app, cmd: cmd})
 			if errors.Is(err, tui.ErrInterrupted) {
 				return exitf(CodeCancelled, "interruption reçue : l'action en cours a été annulée")
@@ -64,7 +65,10 @@ func (b *tuiBackend) PrepDomain() string { return b.app.Cfg.PrepDomain() }
 func (b *tuiBackend) Projects() ([]*model.Project, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return b.app.loadProjects()
+	// L'inspecteur montre le parc lisible ; une déclaration refusée est nommée,
+	// et toute action repasse par checkFleetUniqueness, qui refuse (D120).
+	list, _, err := b.app.loadFleetNamed()
+	return list, err
 }
 
 func (b *tuiBackend) Snapshot(ctx context.Context, p *model.Project) (tui.Snapshot, error) {

@@ -25,6 +25,7 @@ func NewRootCommand() *cobra.Command {
 		PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
 			// Les sorties suivent celles de cobra, ce qui permet de les capturer en test.
 			app.Out, app.Err = cmd.OutOrStdout(), cmd.ErrOrStderr()
+			app.command = cmd.CommandPath()
 			// La complétion est interrogée par le shell, sous l'identité de
 			// l'utilisateur : elle ne peut ni exiger root ni ouvrir la base.
 			if isCompletionRequest(cmd) {
@@ -47,7 +48,10 @@ func NewRootCommand() *cobra.Command {
 			if err := app.setup(); err != nil {
 				return err
 			}
-			return app.configKeysPolicy(cmd)
+			if err := app.configKeysPolicy(cmd); err != nil {
+				return err
+			}
+			return app.stateGuard(cmd)
 		},
 		PersistentPostRun: func(*cobra.Command, []string) { app.close() },
 		RunE: func(cmd *cobra.Command, _ []string) error {

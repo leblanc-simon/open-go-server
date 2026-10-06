@@ -219,7 +219,9 @@ func newProjectListCommand(app *App) *cobra.Command {
 		Aliases: []string{"ls"},
 		Short:   "Lister les projets déclarés",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			projects, err := app.loadProjects()
+			// Un voisin refusé ne cache pas le reste du parc : il est nommé à part
+			// et compte dans le code 6 (D120).
+			projects, refused, err := app.loadFleetNamed()
 			if err != nil {
 				return err
 			}
@@ -227,7 +229,7 @@ func newProjectListCommand(app *App) *cobra.Command {
 			for _, p := range projects {
 				items = append(items, summarize(p))
 			}
-			return wrap(CodeError, app.emit("ProjectList", items, nil, func(tw *tabwriter.Writer) {
+			err = wrap(CodeError, app.emit("ProjectList", items, nil, func(tw *tabwriter.Writer) {
 				if len(items) == 0 {
 					fmt.Fprintln(app.Out, "aucun projet déclaré")
 					return
@@ -237,6 +239,10 @@ func newProjectListCommand(app *App) *cobra.Command {
 					fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", it.ID, it.Host, it.Env, it.Kind, it.Home)
 				}
 			}))
+			if err == nil && refused > 0 {
+				return exitf(CodePartial, "%d déclaration(s) refusée(s), absente(s) de la liste", refused)
+			}
+			return err
 		},
 	}
 }

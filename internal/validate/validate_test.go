@@ -110,13 +110,28 @@ func TestProjectAcceptsEOLPHP(t *testing.T) {
 	}
 }
 
-func TestProjectRejectsHomeOutsideRoot(t *testing.T) {
+// Un home hors de naming.homeRoot est refusé par Placement, au plan et à
+// l'apply, jamais par Project, qui suit chaque chargement (D120) : changer la
+// racine dans config.yaml rendait sinon tout le parc invalide.
+func TestPlacementRejectsHomeOutsideRoot(t *testing.T) {
 	p := newProject(t, "shop.fr", naming.EnvProd, model.KindStatic)
 	p.Spec.Layout.Root = "/srv/shop.fr"
 	p.Spec.User.Home = "/srv/shop.fr"
-	err := Project(p, "/home")
+	p.Spec.Layout.Docroot = "/srv/shop.fr/www"
+	if err := Project(p, "/home"); err != nil {
+		t.Fatalf("Project ne juge pas l'appartenance à la racine des homes : %v", err)
+	}
+	err := Placement(p, "/home", model.DefaultLogsRoot)
 	if err == nil || !strings.Contains(err.Error(), "doit être sous /home") {
 		t.Fatalf("un home hors racine doit être refusé, obtenu : %v", err)
+	}
+	p.Metadata.Labels = map[string]string{"adopted": "true"}
+	if err := Placement(p, "/home", model.DefaultLogsRoot); err != nil {
+		t.Errorf("un projet adopté peut vivre hors de la racine des homes : %v", err)
+	}
+	p.Spec.Layout.LogDir = "/srv/journaux/shopfr"
+	if err := Placement(p, "/home", model.DefaultLogsRoot); err == nil || !strings.Contains(err.Error(), "logs.root") {
+		t.Errorf("des journaux hors de logs.root doivent être refusés, adopté compris : %v", err)
 	}
 }
 
@@ -342,11 +357,14 @@ func TestAdoptedProjectMayLiveOutsideHomeRoot(t *testing.T) {
 	p.Spec.User.Home = "/var/www/boutique"
 	p.Spec.Layout.Docroot = "/var/www/boutique/public"
 	p.Spec.Layout.LogDir = "/var/www/boutique/logs"
-	if err := Project(p, "/home"); err == nil {
+	if err := Placement(p, "/home", "/var/www/boutique"); err == nil {
 		t.Fatal("sans marque d'adoption, un home hors racine doit être refusé")
 	}
 	p.Metadata.Labels = map[string]string{"adopted": "true"}
 	if err := Project(p, "/home"); err != nil {
+		t.Fatalf("un projet adopté doit être accepté : %v", err)
+	}
+	if err := Placement(p, "/home", "/var/www/boutique"); err != nil {
 		t.Fatalf("un projet adopté doit être accepté : %v", err)
 	}
 }

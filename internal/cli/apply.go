@@ -228,7 +228,15 @@ func (a *App) buildPlan(ctx context.Context, provs *providers, p *model.Project)
 		// répertoire que le moteur ne peut pas atteindre arrête le serveur au
 		// rechargement, donc avant que le plan global n'ait eu son tour. Il énumère
 		// les journaux de tout le parc, l'unité étant partagée.
-		all, err := a.loadProjects()
+		// Une consultation (status, la TUI) le calcule sur le parc lisible : les
+		// déclarations refusées y sont nommées à part, et rien n'est écrit. Un
+		// apply, lui, a déjà refusé le parc par checkFleetUniqueness (D120).
+		var all []*model.Project
+		if a.tolerateFleet {
+			all, _, err = a.loadFleet()
+		} else {
+			all, err = a.loadProjects()
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -381,6 +389,13 @@ func (a *App) buildGlobalPlanWithout(ctx context.Context, provs *providers, targ
 	}
 	for _, p := range targeted {
 		projects = withProject(projects, p)
+	}
+	// Tout recalcul du parc passe ici — apply, création, suppression d'un voisin,
+	// « mail dkim activate » : la rotation et les prisons y décrivent les journaux
+	// de chaque projet, et un répertoire hors de logs.root n'y entre jamais (D71,
+	// D120). Le refus est le même qu'au plan et à l'apply.
+	if err := a.checkPlacement(projects); err != nil {
+		return nil, err
 	}
 	// Le plan global lit les pools de tout le parc (vhost d'état, Telegraf) : il
 	// n'en réserve aucun numéro. Celui d'un projet qu'aucun apply n'a encore visé
@@ -703,6 +718,12 @@ func (a *App) checkFleetUniqueness(projects ...*model.Project) error {
 	for _, p := range projects {
 		fleet = withProject(fleet, p)
 		ids = append(ids, p.ID())
+	}
+	// Les racines se jugent sur le parc entier, projets visés compris (D120) :
+	// une racine changée dans config.yaml laisse tout le parc sous l'ancienne,
+	// et le projet neuf se poserait seul sous la nouvelle.
+	if err := a.checkPlacement(fleet); err != nil {
+		return err
 	}
 	if err := validate.UniquenessFor(fleet, a.Cfg.PrepDomain(), ids...); err != nil {
 		return exitf(CodeConflict, "conflit avec le parc existant :\n%v", err)

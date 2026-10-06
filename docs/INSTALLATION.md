@@ -74,6 +74,15 @@ d'orthographe, dont le réglage serait perdu — est nommée par son chemin (`ar
 commandes qui écrivent la refusent (code 3), les consultations et le renouvellement des certificats l'annoncent
 sur la sortie d'erreur sans s'arrêter, et `ogs doctor` la compte en échec (D101).
 
+`naming.homeRoot` et `logs.root` sont des **défauts de création** : chaque déclaration porte le home
+(`spec.layout.root`) et le répertoire de journaux (`spec.layout.logDir`) qu'elle a reçus, et ogs ne déplace
+ni un home, ni un compte, ni des journaux. Changer l'une de ces racines alors que des projets existent est
+donc refusé (D120) : le plan et l'apply — d'un projet comme du parc, création comprise — et
+`project delete` rendent le code 3 en nommant les projets restés sous l'ancienne racine, et `ogs doctor` le
+compte en échec. L'ancienne valeur se lit dans les déclarations — le répertoire qui contient leurs homes ou
+leurs journaux — et le remède est de la remettre dans `config.yaml`. Le renouvellement des certificats, lui,
+continue : rien n'en dépend.
+
 Les identifiants d'administration n'y figurent pas : ils vivent en 0600 sous `/etc/ogs/credentials/`.
 MySQL et PostgreSQL n'en demandent aucun — ogs s'y connecte en root par le socket local. RabbitMQ et OVH,
 eux, en exigent :
@@ -146,6 +155,8 @@ Les migrations de schéma de la base d'état sont appliquées par le paquet lui-
 `ogs init --quiet` : un échec y est affiché, jamais fatal. Si la clé maître a disparu, le paquet ne relance
 pas `init` — il en engendrerait une neuve, et les secrets scellés ne se reliraient plus — et le dit, avec
 les deux remèdes : la restaurer depuis sa sauvegarde, ou lancer `ogs init` pour repartir d'une clé neuve.
+De même pour la base d'état disparue d'un parc qui compte des projets : `init` la recréerait vide, le paquet
+ne le relance pas et le dit (voir « Sauvegarde »).
 Une mise à jour ne touche pas au timer de renouvellement ; un timer d'ogs trouvé désactivé est signalé,
 sans passer outre. Les messages du paquet commencent par « `ogs :` ».
 
@@ -474,8 +485,26 @@ données de clients.
 Trois choses, par ordre d'importance :
 
 1. `/etc/ogs/master.key` — irremplaçable ;
-2. `/etc/ogs/projects/` — les déclarations, qui suffisent à reconstruire le serveur ;
-3. `/var/lib/ogs/state.db` — l'historique et les empreintes ; utile, non indispensable.
+2. `/etc/ogs/projects/` — les déclarations, qui décrivent le serveur ;
+3. `/var/lib/ogs/state.db` — les mots de passe scellés des bases, d'AMQP et de supervision, les clés DKIM,
+   les preuves de propriété des ressources partagées (D91, D93), les numéros attribués, les empreintes et
+   l'audit. Les déclarations ne suffisent pas à la reconstruire.
+
+**Une base d'état disparue n'est jamais recréée en silence** (D120). Tant que des projets sont déclarés,
+les commandes qui en dépendent refusent en code 5 et `ogs doctor` le compte en échec ; seul le
+renouvellement des certificats tourne sans elle — il ne réserve rien —, sur une base éphémère, et rend le
+code 6 en la nommant, pour qu'aucun certificat ne périme pendant qu'on cherche la sauvegarde. Le remède :
+restaurer `state.db` (arrêter le timer `ogs-renew` le temps de la copie) ; à défaut, `ogs init` la recrée
+vide et le dit. Les numéros de ports et de pools écrits dans les fichiers sont alors repris au prochain apply
+(D94) ; les mots de passe scellés ne le sont pas, et ce qu'ils prouvaient — bases, comptes, vhosts AMQP créés
+par ogs — passe pour étranger : chaque refus le nomme.
+
+**Reconstruire un serveur** à partir de la clé maître et des déclarations, sans `state.db` : installer le
+paquet, déposer `/etc/ogs/master.key` et `/etc/ogs/projects/`, puis lancer `ogs init` à la main — le paquet
+ne le fait pas quand il trouve des déclarations sans base, et toute commande qui écrit refuse en code 5
+jusque-là. `init` dit qu'il recrée la base d'un parc existant, puis `ogs doctor` et `ogs plan` avant
+`ogs apply`. Les bases et comptes SGBD d'origine, sans leurs mots de passe scellés, sont refusés comme
+étrangers (D91), et chaque refus le nomme.
 
 Les données des sites (homes, bases) relèvent de la politique de sauvegarde habituelle. `ogs db dump` et les
 archives produites par `ogs project delete` ne s'y substituent pas.

@@ -509,6 +509,11 @@ func (a *App) runChecks(ctx context.Context) []check {
 				"base d'état illisible : "+firstLine(err.Error())+
 					" — les contrôles qui en dépendent sont omis", "ogs init")
 		}
+	} else if n := a.lostState(); n > 0 {
+		// Disparue d'un parc qui compte des projets : les commandes qui en
+		// dépendent refusent en code 5, et rien ne la recrée sans un mot (D120).
+		add("base d'état", "échec", a.lostStateMessage(n),
+			"restaurer "+a.Paths.StateDB()+" depuis sa sauvegarde ; à défaut, ogs init")
 	}
 	a.addStateJournalChecks(add, journaux)
 
@@ -715,14 +720,25 @@ func (a *App) runChecks(ctx context.Context) []check {
 	}
 
 	// Versions PHP en fin de support : signalées, jamais bloquantes.
-	projects, err := a.loadProjects()
+	// Une déclaration refusée est nommée, et les contrôles suivants tournent sur
+	// le reste du parc : s'arrêter sur elle taisait tout ce qui suit (R1-41).
+	projects, refused, err := a.loadFleet()
 	// Les hooks de parc s'éprouvent même quand un projet ne se charge pas.
 	a.hookChecks(projects, add)
 	if err != nil {
 		add("projets", "avertissement", err.Error(), "")
 		return out
 	}
-	add("projets", "ok", fmt.Sprintf("%d déclaré(s)", len(projects)), "")
+	for _, err := range refused {
+		add("projets", "échec", err.Error(), "corriger la déclaration : le plan et l'apply du parc la refusent, "+
+			"le renouvellement des certificats la saute (code 6)")
+	}
+	add("projets", "ok", fmt.Sprintf("%d déclaré(s) et lisible(s)", len(projects)), "")
+	// Les racines de config.yaml se comparent à celles que portent les
+	// déclarations : un changement est refusé au plan et à l'apply (D120).
+	for _, p := range a.placementProblems(projects) {
+		add("racines du parc", "échec", p.what, p.fix)
+	}
 	certificateDeclarationChecks(projects, add)
 	fleetUniquenessChecks(projects, a.Cfg.PrepDomain(), add)
 

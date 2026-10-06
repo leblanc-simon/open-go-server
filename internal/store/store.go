@@ -41,7 +41,10 @@ type freshAllocation struct {
 // ErrNotFound signale une ligne absente.
 var ErrNotFound = errors.New("enregistrement absent")
 
-// Open ouvre la base et applique les migrations.
+// Open ouvre la base et applique les migrations. Elle la crée si elle manque :
+// c'est à l'appelant de ne l'ouvrir ainsi que sur une machine neuve ou sous
+// « ogs init » — recréée vide sous un parc existant, elle ferait passer pour
+// absent tout ce qu'elle portait (App.openStore, D120).
 func Open(path string) (*Store, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
 		return nil, err
@@ -83,6 +86,32 @@ func Open(path string) (*Store, error) {
 	}
 	return s, nil
 }
+
+// OpenMemory ouvre une base d'état éphémère, en mémoire, migrée comme l'autre
+// et oubliée à la fermeture (D120). Elle sert au seul renouvellement des
+// certificats quand state.db a disparu d'un parc qui compte des projets : Open
+// la recréerait vide, sans un mot, et les commandes qui écrivent la refusent
+// alors jusqu'à « ogs init ». Le renouvellement n'y réserve rien et n'y lit que
+// le suivi des échecs et l'empreinte du dernier apply, dont l'absence le rend
+// seulement plus prudent ; il ne doit pas laisser périmer les certificats du
+// parc pendant que l'exploitant n'a pas encore vu le message.
+func OpenMemory() (*Store, error) {
+	db, err := sql.Open("sqlite", "file::memory:?_pragma=foreign_keys(1)")
+	if err != nil {
+		return nil, err
+	}
+	// Une seule connexion : chaque connexion à « :memory: » a sa propre base.
+	db.SetMaxOpenConns(1)
+	s := &Store{db: db, path: ":memory:"}
+	if err := s.migrate(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migration de la base en mémoire : %w", err)
+	}
+	return s, nil
+}
+
+// Ephemeral dit si la base est la base en mémoire d'OpenMemory.
+func (s *Store) Ephemeral() bool { return s.path == ":memory:" }
 
 // Close ferme la base.
 func (s *Store) Close() error { return s.db.Close() }

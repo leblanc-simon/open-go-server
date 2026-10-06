@@ -55,6 +55,14 @@ retablir_timer() {
     fi
 }
 
+# projets_declares dit si le parc compte au moins une déclaration.
+projets_declares() {
+    for f in /etc/ogs/projects/*.yaml; do
+        [ -e "$f" ] && return 0
+    done
+    return 1
+}
+
 case "$1" in
 configure)
     if [ ! -f /etc/ogs/config.yaml ]; then
@@ -67,6 +75,14 @@ configure)
         # l'administrateur sauvegarderait. Le choix lui revient.
         echo "ogs : clé maître absente (/etc/ogs/master.key) : « ogs init » n'est pas relancé, il en engendrerait une nouvelle." >&2
         echo "  La restaurer depuis sa sauvegarde — les secrets scellés ne se relisent qu'avec elle —, ou lancer « ogs init » pour repartir d'une clé neuve." >&2
+    elif [ ! -e /var/lib/ogs/state.db ] && projets_declares; then
+        # La base d'état a disparu d'un parc qui compte des projets. « ogs init »
+        # la recréerait vide, et sous --quiet sans un mot : les mots de passe
+        # scellés et les preuves de propriété ne se retrouveraient plus, et les
+        # commandes d'ogs, qui la refusent jusque-là (D120), repartiraient sur
+        # elle. Le choix revient à l'administrateur.
+        echo "ogs : base d'état absente (/var/lib/ogs/state.db) alors que des projets sont déclarés : « ogs init » n'est pas relancé, il la recréerait vide." >&2
+        echo "  La restaurer depuis sa sauvegarde — elle porte les secrets scellés —, ou lancer « ogs init » pour la recréer ; d'ici là, seul le renouvellement des certificats tourne (code 6)." >&2
     else
         # Mise à jour ou réinstallation. « ogs init » est idempotent : il crée
         # les répertoires qu'attend la version nouvelle et migre la base d'état.

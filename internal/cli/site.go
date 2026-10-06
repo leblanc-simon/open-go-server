@@ -759,7 +759,17 @@ func newStatusCommand(app *App) *cobra.Command {
 			"Le code de retour est non nul dès qu'un problème est détecté, ce qui rend la\n" +
 			"commande utilisable en supervision.",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			projects, err := app.targets(args, "")
+			// Sans argument, le parc lisible : une déclaration refusée est nommée
+			// et comptée parmi les problèmes, sans cacher l'état des autres (D120).
+			var projects []*model.Project
+			var refused int
+			var err error
+			app.tolerateFleet = true
+			if len(args) == 0 {
+				projects, refused, err = app.loadFleetNamed()
+			} else {
+				projects, err = app.targets(args, "")
+			}
 			if err != nil {
 				return err
 			}
@@ -775,7 +785,7 @@ func newStatusCommand(app *App) *cobra.Command {
 			defer provs.close()
 
 			var rows []statusRow
-			problems := 0
+			problems := refused
 			restores := app.unfinishedRestores()
 			for _, p := range projects {
 				row := statusRow{Project: p.ID(), Env: p.Metadata.Env, Host: p.Spec.Domains[0].Name,

@@ -484,7 +484,11 @@ func newDeleteCommand(app *App) *cobra.Command {
 			// proxifierait un socket FPM qui n'existe plus.
 			signalInterruption()
 			if w, err := app.refreshFleet(cmd.Context(), provs, shownGlobal); err != nil {
-				warn("mise à jour des fichiers de parc : %v", err)
+				// Le plus souvent, une déclaration voisine refusée (D120) : les fichiers
+				// de parc désignent encore le projet supprimé — rotation, tmpfiles,
+				// prisons, supervision. Le remède est nommé, rien ne le rejouera seul.
+				warn("mise à jour des fichiers de parc : %v — logrotate, tmpfiles, fail2ban et la supervision "+
+					"désignent encore %s : corriger la cause (ogs doctor), puis relancer « ogs apply »", err, p.ID())
 			} else {
 				warnings += w
 			}
@@ -883,13 +887,21 @@ func (rs refusals) constat() string {
 // que --force lève. Sous --keep-data, ni le compte, ni les bases, ni
 // l'arborescence ne sont touchés : seule l'archive s'en garde (archiveExclusions).
 func (a *App) deletionRefusals(provs *providers, p *model.Project, o deleteOptions) refusals {
+	// Une racine changée dans config.yaml (D120) : l'effacement chercherait les
+	// journaux et le home sous la nouvelle, le recalcul du parc les décrirait
+	// sous l'ancienne. Refusé, --keep-data compris, comme le plan et l'apply.
+	var rs refusals
+	fleet, _, _ := a.loadFleet()
+	for _, pb := range a.placementProblems(withProject(fleet, p)) {
+		rs = append(rs, &refusal{code: CodeValidation, what: pb.what, remedy: pb.fix})
+	}
 	if o.keepData {
-		return nil
+		return rs
 	}
 	// Les journaux partent avec le projet (D71), par le même effacement récursif :
 	// leurs points de montage sont cherchés avec ceux de la racine, et nommés dans
 	// le même refus — un seul passage d'umount.
-	rs := a.rootRefusals(p, p.Spec.Layout.LogDir)
+	rs = append(rs, a.rootRefusals(p, p.Spec.Layout.LogDir)...)
 	if r := a.keptFilesRefusal(provs, p); r != nil {
 		rs = append(rs, r)
 	}

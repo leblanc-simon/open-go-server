@@ -12,8 +12,8 @@ Les commits ne mentionnent jamais l'assistance d'un outil d'IA.
 
 ## La référence
 
-[`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md) fait autorité : 116 décisions d'architecture
-arbitrées (D1–D115 et D117, D116 réservée ; tableau §2), spécification par module, plan de tests, découpage en lots. **Consulter le
+[`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md) fait autorité : 117 décisions d'architecture
+arbitrées (D1–D115, D117 et D120, D116 réservée ; tableau §2), spécification par module, plan de tests, découpage en lots. **Consulter le
 tableau des décisions avant de proposer une architecture** — la plupart des questions « pourquoi pas
 plutôt… ? » y sont déjà tranchées, avec leur raison. Toute décision nouvelle s'y ajoute.
 
@@ -167,10 +167,17 @@ d'un certificat est un nom de répertoire, unique dans le parc, et l'identifiant
 réservé : c'est celui de son certificat implicite. Une clé d'unicité se calcule sur **tout ce que le provider
 écrit ou sert**, jamais sur une partie de la déclaration (D106) : les domaines des vhosts déclarés comme
 ceux de `spec.domains`, le répertoire de surcharge (nom du vhost) comme le fichier, `mariadb` comme
-`mysql` — chacune de ces omissions laissait un projet prendre la ressource d'un voisin. **Ce que `validate.Project` refuse arrête le parc entier**
-— il suit chaque chargement, donc `cert renew --all`, `status` et le recalcul du parc à la suppression d'un
-voisin : une règle neuve qui rendrait invalide une déclaration jusque-là acceptée se porte au plan et à
-l'apply du projet visé (`checkFleetUniqueness`) et à `doctor`, jamais au chargement.
+`mysql` — chacune de ces omissions laissait un projet prendre la ressource d'un voisin. **Ce que `validate.Project` refuse arrête tout calcul de parc**
+— il suit chaque chargement : `loadProjects` refuse en code 3 le plan et l'apply de tous les projets, voisins
+compris, en nommant chaque déclaration fautive ; `cert renew`, `doctor` et les consultations qui ne
+recalculent aucun fichier du parc (`project list`, `status`, la TUI, `ogs my`) passent par `loadFleet`, qui
+les met à part (code 6 pour le renouvellement, D120). Tout recalcul du parc (`buildGlobalPlan`) éprouve les
+racines. Une règle neuve qui rendrait invalide une déclaration
+jusque-là acceptée se porte donc au plan et à l'apply du projet visé (`checkFleetUniqueness`) et à `doctor`,
+jamais au chargement. C'est le cas des **racines** : un home hors de `naming.homeRoot` ou des journaux hors de
+`logs.root` (`validate.Placement`) se jugent sur le parc entier au plan, à l'apply et à `project delete`
+(`checkPlacement`) — changer l'une de ces racines dans `config.yaml` rendait sinon tout le parc invalide,
+timer de renouvellement compris (D120).
 
 ### Fichiers gérés
 
@@ -246,7 +253,10 @@ servi par tous les templates de vhost**, pas seulement ceux des sites PHP.
 ### Secrets et état
 
 `internal/secret` chiffre en AES-256-GCM avec une donnée associée qui lie le secret à sa portée ;
-`internal/store` est une base SQLite (`modernc.org/sqlite`, pur Go) migrée au démarrage ;
+`internal/store` est une base SQLite (`modernc.org/sqlite`, pur Go) migrée au démarrage — **jamais recréée
+en silence** : disparue d'un parc initialisé (clé maître présente) qui compte des projets, toute commande qui écrit
+refuse en code 5 avant d'écrire (`stateGuard`), `openStore` aussi, jusqu'à `ogs init`, et
+seul `cert renew` tourne sur une base en mémoire (`store.OpenMemory`), en le disant (D120) ;
 `internal/audit` journalise chaque étape avec un identifiant d'exécution.
 
 ### Exécution de commandes

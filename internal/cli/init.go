@@ -72,6 +72,9 @@ func newInitCommand(app *App) *cobra.Command {
 				app.printf("= clé maître déjà présente : %s\n", keyPath)
 			}
 
+			// Une base disparue d'un parc qui compte des projets n'est recréée qu'ici,
+			// et en le disant : les autres commandes la refusent en code 5 (D120).
+			lost := app.lostState()
 			st, err := store.Open(app.Paths.StateDB())
 			if err != nil {
 				return wrap(CodeError, err)
@@ -81,14 +84,27 @@ func newInitCommand(app *App) *cobra.Command {
 			if err != nil {
 				return wrap(CodeError, err)
 			}
-			app.printf("✓ base d'état : %s (schéma v%d)\n", st.Path(), v)
+			if lost > 0 {
+				app.printf("✓ base d'état recréée vide : %s (schéma v%d)\n", st.Path(), v)
+				app.warnf("  ⚠ %d projet(s) déclaré(s) : les numéros écrits dans les fichiers seront repris au "+
+					"prochain apply (D94), mais les mots de passe scellés et les preuves de propriété sont perdus — "+
+					"les bases et comptes d'ogs passeront pour étrangers (D91, D93). Restaurer plutôt la sauvegarde "+
+					"de la base, si elle existe, avant tout apply.\n", lost)
+			} else {
+				app.printf("✓ base d'état : %s (schéma v%d)\n", st.Path(), v)
+			}
 			app.printf("✓ %d répertoire(s) créé(s), %d déjà présent(s)\n", created, existing)
 			if app.Format != "table" {
 				return app.emit("InitResult", map[string]any{
 					"config": cfgPath, "masterKey": keyPath, "stateDB": st.Path(), "schema": v,
 				}, nil, nil)
 			}
-			if !app.Quiet {
+			switch {
+			case app.Quiet:
+			case lost > 0:
+				// Le parc existe : il reste à le réappliquer, non à le créer.
+				fmt.Fprintln(app.Out, "\nBase recréée. Vérifier puis réappliquer le parc :\n  ogs doctor\n  ogs plan")
+			default:
 				fmt.Fprintln(app.Out, "\nogs est prêt. Créer un premier projet :\n  ogs project create shop.fr --kind php-symfony")
 			}
 			return nil

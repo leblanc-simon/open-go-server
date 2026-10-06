@@ -400,7 +400,10 @@ func (a *App) callerProject() (*model.Project, error) {
 	if err != nil {
 		return nil, exitf(CodeUsage, "aucun compte d'uid %d", uid)
 	}
-	projects, err := a.loadProjects()
+	// Un voisin refusé ne retire à personne sa délégation (D120) : le parc
+	// lisible suffit à trouver l'appelant, et le détail des déclarations des
+	// autres ne lui est pas montré.
+	projects, refused, err := a.loadFleet()
 	if err != nil {
 		return nil, err
 	}
@@ -408,6 +411,10 @@ func (a *App) callerProject() (*model.Project, error) {
 		if p.Spec.User.Name == u.Username {
 			return p, nil
 		}
+	}
+	if len(refused) > 0 {
+		return nil, exitf(CodeValidation, "le compte %s ne correspond à aucun projet lisible : une déclaration "+
+			"est refusée, peut-être la sienne — s'adresser à l'administrateur (ogs doctor)", u.Username)
 	}
 	return nil, exitf(CodePermission,
 		"le compte %s ne correspond à aucun projet géré par ogs", u.Username)

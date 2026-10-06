@@ -93,7 +93,9 @@ func certsChanged(report *engine.Report) []string {
 // « apply -f » applique une version qui n'est pas encore celle du disque, et
 // c'est celle-là dont les certificats viennent de changer.
 func (a *App) certUsersFleet(provs *providers, names []string, known []*model.Project) []certsDuProjet {
-	fleet, err := a.loadProjects()
+	// Un voisin refusé n'efface pas les autres utilisateurs d'un certificat :
+	// le parc lisible y est repris (D120).
+	fleet, _, err := a.loadFleet()
 	if err != nil {
 		return certUsers(provs, names, known)
 	}

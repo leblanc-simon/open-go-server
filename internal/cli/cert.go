@@ -260,13 +260,25 @@ func newCertRenewCommand(app *App) *cobra.Command {
 			var refusés []error
 			var examined []*model.Project
 			deferred := 0
+			// Une base d'état disparue ne prive pas le parc de ses certificats : le
+			// renouvellement tourne sur une base éphémère, et le dit en code 6 —
+			// jamais en silence, le timer serait seul à le savoir (D120).
+			if app.stateLost > 0 {
+				refusés = append(refusés, fmt.Errorf("%s", app.lostStateMessage(app.stateLost)))
+			}
 			if all || len(args) == 0 {
 				requests = append(requests, provs.TLS.SharedRequests()...)
-				projects, err := app.loadProjects()
+				// Une déclaration refusée ne coûte que son propre certificat : elle est
+				// sautée, nommée, et compte dans le code 6. La refuser au chargement
+				// arrêtait le renouvellement de tout le parc (R1-41, D120).
+				projects, refused, err := app.loadFleet()
 				if err != nil {
 					return err
 				}
 				examined = projects
+				for _, err := range refused {
+					refusés = append(refusés, fmt.Errorf("certificat non examiné, %w", err))
+				}
 				for _, p := range projects {
 					reqs, err := provs.TLS.Requests(p)
 					if err != nil {

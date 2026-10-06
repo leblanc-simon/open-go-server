@@ -254,6 +254,48 @@ fi
 echo "redirection depuis 203.0.113.10 servie en HTTP, site renouvelé"
 
 echo
+echo "--- une déclaration illisible ne coûte pas le renouvellement du parc (D120) ---"
+# Un seul fichier de projet refusé au chargement arrêtait « cert renew --all »
+# en code 3, le timer compris, et plus aucun certificat ne se renouvelait.
+printf 'metadata: [\n' >/etc/ogs/projects/casse.yaml
+serie_avant=$(openssl x509 -in "$cert/fullchain.pem" -noout -serial)
+ogs cert renew --all --force >/tmp/renew.log 2>&1
+code=$?
+tail -3 /tmp/renew.log
+if [ "$code" != 6 ] || ! grep -q "casse.yaml" /tmp/renew.log ||
+    [ "$(openssl x509 -in "$cert/fullchain.pem" -noout -serial)" = "$serie_avant" ]; then
+    cat /tmp/renew.log
+    echo "ÉCHEC : la déclaration illisible arrête le renouvellement (code $code)"
+    exit 1
+fi
+rm -f /etc/ogs/projects/casse.yaml
+echo "casse.yaml nommée, acmetest renouvelé, code 6"
+
+echo
+echo "--- une base d'état disparue : refus en code 5, renouvellement maintenu (D120) ---"
+mkdir -p /tmp/etat
+mv /var/lib/ogs/state.db* /tmp/etat/
+code=0
+ogs plan acmetest >/tmp/plan.log 2>&1 || code=$?
+if [ "$code" != 5 ] || [ -e /var/lib/ogs/state.db ]; then
+    cat /tmp/plan.log
+    echo "ÉCHEC : sans base d'état, plan rend $code ou la recrée"
+    exit 1
+fi
+serie_avant=$(openssl x509 -in "$cert/fullchain.pem" -noout -serial)
+ogs cert renew acmetest --force >/tmp/renew.log 2>&1
+code=$?
+tail -2 /tmp/renew.log
+if [ "$code" != 6 ] || ! grep -q "state.db" /tmp/renew.log || [ -e /var/lib/ogs/state.db ] ||
+    [ "$(openssl x509 -in "$cert/fullchain.pem" -noout -serial)" = "$serie_avant" ]; then
+    cat /tmp/renew.log
+    echo "ÉCHEC : sans base d'état, le renouvellement rend $code, ou recrée la base, ou ne renouvelle rien"
+    exit 1
+fi
+mv /tmp/etat/state.db* /var/lib/ogs/
+echo "plan refusé (code 5), certificat renouvelé sans recréer la base (code 6)"
+
+echo
 echo "--- idempotence ---"
 ogs diff acmetest 2>&1 | tail -3
 

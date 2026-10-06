@@ -84,6 +84,16 @@ type App struct {
 	declaredBefore map[string]*store.ProjectRow
 	// undone nomme les créations défaites, déclaration retirée (D112).
 	undone map[string]bool
+	// command est le chemin de la commande en cours (« ogs cert renew ») : la
+	// base d'état disparue n'est tolérée que par le renouvellement (D120).
+	command string
+	// tolerateFleet laisse une consultation (status, la TUI) calculer sur le parc
+	// lisible, les déclarations refusées nommées à part (D120). Jamais posé par
+	// une commande qui écrit.
+	tolerateFleet bool
+	// stateLost compte les déclarations d'un parc dont state.db a disparu,
+	// quand la commande tourne sur une base éphémère (D120).
+	stateLost int
 }
 
 // nowFunc est isolé pour rester substituable en test.
@@ -211,12 +221,112 @@ func (a *App) configKeysPolicy(cmd *cobra.Command) error {
 		"sur un réglage perdu (D101)", err)
 }
 
+// stateTolerant énumère les commandes qui tournent sans state.db quand elle a
+// disparu d'un parc qui compte des projets, sur une base éphémère en mémoire
+// (D120). Le renouvellement seul : le timer le lance sans personne pour lire un
+// refus, il ne réserve aucun numéro, et un certificat ne doit pas périmer
+// pendant que l'exploitant n'a pas encore vu le message.
+//
+// S'y ajoutent les commandes d'incident, qu'un exploitant doit pouvoir lancer
+// pendant qu'il cherche la sauvegarde : le serveur web (« web reload », « web
+// test »), les modèles (« template extract »), le pare-feu (« firewall
+// status », « confirm », « apply », « ban », « unban ») et « harden ». Celles qui
+// ouvrent la base — pour l'audit seulement — reçoivent la base éphémère, et le
+// disent sur la sortie d'erreur.
+var stateTolerant = map[string]bool{
+	"ogs cert renew":       true,
+	"ogs web reload":       true,
+	"ogs web test":         true,
+	"ogs template extract": true,
+	"ogs firewall status":  true,
+	"ogs firewall confirm": true,
+	"ogs firewall apply":   true,
+	"ogs firewall ban":     true,
+	"ogs firewall unban":   true,
+	"ogs harden":           true,
+}
+
+// lostState dit combien de déclarations porte un parc dont la base d'état a
+// disparu : zéro si elle est là, si le parc est vide, ou si la machine n'a
+// jamais été initialisée — sans clé maître, que seul « ogs init » engendre, il
+// n'y a ni secret scellé ni preuve à perdre, et la première commande qui ouvre
+// la base la crée, comme avant D120 ; « ogs init » reste la première étape
+// documentée, et sans clé maître aucun secret ne se scelle.
+func (a *App) lostState() int {
+	if _, err := os.Lstat(a.Paths.StateDB()); !os.IsNotExist(err) {
+		return 0
+	}
+	if _, err := os.Lstat(a.Paths.MasterKey()); os.IsNotExist(err) {
+		return 0
+	}
+	entries, _ := os.ReadDir(a.Paths.ProjectsDir())
+	n := 0
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".yaml") {
+			n++
+		}
+	}
+	return n
+}
+
+// stateGuard refuse en code 5, avant toute écriture, une commande qui écrit
+// quand la base d'état a disparu d'un parc initialisé (D120) : « site create »
+// déposait sinon sa déclaration avant que l'apply ne refuse. Les consultations
+// passent — celles qui ouvrent la base refusent à ce moment-là —, ainsi que
+// « init », qui la recrée, « doctor », qui la nomme, ce que stateTolerant
+// énumère, et ce qui ne fait que démarrer ou arrêter des services
+// (configTolerant) : ils passent la garde, mais « service » et « my » ouvrent la
+// base et refusent alors en code 5. L'inspecteur, « ogs » nu comme « ogs tui »,
+// passe aussi la garde et refuse en code 5 à l'ouverture de la base.
+func (a *App) stateGuard(cmd *cobra.Command) error {
+	path := cmd.CommandPath()
+	if path == "ogs doctor" || path == "ogs tui" || stateTolerant[path] || configTolerant[path] || !cmd.HasParent() ||
+		dryRunConductOf(cmd) == dryRunReadOnly || !cmd.Runnable() {
+		return nil
+	}
+	if n := a.lostState(); n > 0 {
+		return exitf(CodeDependency, "%s", a.lostStateMessage(n))
+	}
+	return nil
+}
+
+// lostStateMessage décrit la base d'état disparue et son remède (D120).
+func (a *App) lostStateMessage(n int) string {
+	return fmt.Sprintf("base d'état %s absente alors que %d projet(s) sont déclarés : elle porte les mots de "+
+		"passe scellés, les preuves de propriété des bases et des comptes, les numéros attribués et "+
+		"l'empreinte du dernier apply, que rien ne recrée. La restaurer depuis sa sauvegarde ; à défaut, "+
+		"« ogs init » la recrée vide — les numéros écrits dans les fichiers sont repris au prochain apply "+
+		"(D94), les secrets non (D120)", a.Paths.StateDB(), n)
+}
+
 // openStore ouvre la base d'état et le keystore.
+//
+// La base n'est jamais recréée ici quand elle a disparu d'un parc qui compte
+// des projets (D120) : store.Open la recréait vide, sans un mot, et ce qu'elle
+// portait — secrets scellés, preuves de propriété, empreintes — passait pour
+// absent, donc à refaire. La commande refuse en code 5 jusqu'à « ogs init » ;
+// le renouvellement des certificats tourne sur une base éphémère, et le dit.
 func (a *App) openStore() error {
 	if a.Store != nil {
 		return nil
 	}
-	st, err := store.Open(a.Paths.StateDB())
+	var st *store.Store
+	var err error
+	if n := a.lostState(); n > 0 {
+		if !stateTolerant[a.command] {
+			return exitf(CodeDependency, "%s", a.lostStateMessage(n))
+		}
+		st, err = store.OpenMemory()
+		a.stateLost = n
+		// Le renouvellement le compte lui-même dans son code 6 ; les autres le
+		// disent ici, une fois.
+		if a.command != "ogs cert renew" {
+			a.warnf("⚠ %s — cette commande tourne sur une base éphémère, oubliée à sa sortie\n",
+				a.lostStateMessage(n))
+		}
+	} else {
+		st, err = store.Open(a.Paths.StateDB())
+	}
 	if err != nil {
 		return wrap(CodeError, err)
 	}
@@ -281,19 +391,81 @@ func (a *App) loadProject(id string) (*model.Project, error) {
 	return p, nil
 }
 
-// loadProjects charge tous les projets actifs.
+// loadProjects charge tous les projets actifs, et refuse en code 3 si une
+// seule déclaration l'est : c'est le chargement de ce qui calcule pour tout le
+// parc — plan global, unicité, pare-feu —, dont un fichier recalculé sans un
+// projet effacerait ses entrées. Toutes les déclarations refusées sont nommées
+// d'un coup : un refus qui en masque un autre fait corriger, relancer, et
+// découvrir le suivant. Ce qui peut avancer sans le projet fautif — le
+// renouvellement des certificats, doctor — passe par loadFleet (D120).
 func (a *App) loadProjects() ([]*model.Project, error) {
-	list, err := spec.LoadAll(a.Paths.ProjectsDir())
+	list, refused, err := a.loadFleet()
 	if err != nil {
-		return nil, wrap(CodeError, err)
+		return nil, err
 	}
-	for _, p := range list {
-		if err := a.prepare(p); err != nil {
-			return nil, err
+	if len(refused) > 0 {
+		return nil, fleetRefusedError(refused)
+	}
+	return list, nil
+}
+
+// loadFleet charge le parc sans s'arrêter à la première déclaration refusée :
+// illisible, ou refusée par prepare. Elle est rendue à part, nommée, et le reste
+// du parc est chargé (R1-41, D120). Seule une lecture impossible du répertoire
+// des projets est une erreur.
+func (a *App) loadFleet() ([]*model.Project, []error, error) {
+	dir := a.Paths.ProjectsDir()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil, nil
 		}
+		return nil, nil, wrap(CodeError, err)
+	}
+	var list []*model.Project
+	var refused []error
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".yaml") {
+			continue
+		}
+		p, err := spec.Load(filepath.Join(dir, e.Name()))
+		if err != nil {
+			refused = append(refused, fmt.Errorf("déclaration illisible : %w", err))
+			continue
+		}
+		if err := a.prepare(p); err != nil {
+			refused = append(refused, err)
+			continue
+		}
+		list = append(list, p)
 	}
 	sort.Slice(list, func(i, j int) bool { return list[i].ID() < list[j].ID() })
-	return list, nil
+	return list, refused, nil
+}
+
+// loadFleetNamed charge le parc pour une consultation : chaque déclaration
+// refusée est nommée sur la sortie d'erreur, et le reste du parc est rendu avec
+// leur nombre, que l'appelant compte dans son code de retour (D120).
+func (a *App) loadFleetNamed() ([]*model.Project, int, error) {
+	list, refused, err := a.loadFleet()
+	if err != nil {
+		return nil, 0, err
+	}
+	for _, err := range refused {
+		a.warnf("⚠ déclaration refusée, ignorée ici : %v\n", err)
+	}
+	return list, len(refused), nil
+}
+
+// fleetRefusedError réunit les déclarations refusées du parc en un refus de
+// code 3.
+func fleetRefusedError(refused []error) error {
+	parts := make([]string, len(refused))
+	for i, err := range refused {
+		parts[i] = err.Error()
+	}
+	return exitf(CodeValidation, "%d déclaration(s) refusée(s) ; ce calcul porte sur tout le parc, "+
+		"il ne se fait pas sans elles :\n%s", len(refused), strings.Join(parts, "\n"))
 }
 
 // prepare normalise puis valide un projet.
@@ -313,14 +485,101 @@ func (a *App) prepare(p *model.Project) error {
 	if err := validate.Project(p, homeRoot); err != nil {
 		return exitf(CodeValidation, "projet %s :\n%v", p.ID(), err)
 	}
-	// Le répertoire des journaux doit vivre sous logs.root, dont « doctor »
-	// contrôle la chaîne de propriété : ailleurs, rien ne garantit qu'aucun de ses
-	// composants n'appartienne à l'utilisateur (D71).
-	if dir := filepath.Clean(p.Spec.Layout.LogDir); !strings.HasPrefix(dir, logsRoot+string(filepath.Separator)) {
-		return exitf(CodeValidation, "projet %s :\nspec.layout.logDir : %s doit vivre sous %s (logs.root, D71)",
-			p.ID(), dir, logsRoot)
-	}
+	// L'appartenance de la racine à naming.homeRoot et des journaux à logs.root
+	// n'est pas jugée ici, mais au plan et à l'apply (checkPlacement) et par
+	// doctor : changer l'une des racines dans config.yaml rendait sinon tout le
+	// parc invalide au chargement, renouvellement des certificats compris (D120).
 	return nil
+}
+
+// placementProblem est un écart entre les racines que portent les déclarations
+// et celles de config.yaml (D120).
+type placementProblem struct {
+	what, fix string
+}
+
+// placementProblems compare chaque déclaration aux racines de la configuration
+// (validate.Placement). La déclaration porte les chemins reçus à sa création —
+// Normalize ne remplit que les vides —, et c'est d'elle qu'ogs tire l'ancienne
+// valeur d'une racine changée : le répertoire parent de ces chemins. ogs ne
+// déplace ni un home, ni un compte, ni des journaux : changer la racine alors
+// que des projets existent est refusé, et le remède est de remettre l'ancienne
+// valeur. Un seul projet hors de la racine peut aussi être une déclaration
+// retouchée : le remède nomme les deux.
+func (a *App) placementProblems(fleet []*model.Project) []placementProblem {
+	homeRoot, logsRoot := a.homeRoot(), a.logsRoot()
+	var roots, logs []*model.Project
+	for _, p := range fleet {
+		err := validate.Placement(p, homeRoot, logsRoot)
+		if err == nil {
+			continue
+		}
+		for _, e := range err.(validate.Errors) {
+			switch e.Field {
+			case "spec.layout.root":
+				roots = append(roots, p)
+			case "spec.layout.logDir":
+				logs = append(logs, p)
+			}
+		}
+	}
+	var out []placementProblem
+	describe := func(key, field, current, reason string, list []*model.Project, path func(*model.Project) string) {
+		if len(list) == 0 {
+			return
+		}
+		var names []string
+		parents := map[string]bool{}
+		for _, p := range list {
+			names = append(names, fmt.Sprintf("%s (%s)", p.ID(), path(p)))
+			parents[a.unprefixed(filepath.Dir(filepath.Clean(path(p))))] = true
+		}
+		olds := make([]string, 0, len(parents))
+		for d := range parents {
+			olds = append(olds, d)
+		}
+		sort.Strings(olds)
+		out = append(out, placementProblem{
+			what: fmt.Sprintf("%s vaut %s, mais %s de %d projet(s) vit ailleurs : %s — %s ; ogs ne déplace pas "+
+				"un projet existant (D120)", key, a.unprefixed(current), field, len(list), strings.Join(names, ", "),
+				reason),
+			fix: fmt.Sprintf("si %s a changé, lui rendre son ancienne valeur, %s, dans %s ; sinon, corriger "+
+				"%s de la déclaration", key, strings.Join(olds, " ou "), a.Paths.ConfigFile(), field),
+		})
+	}
+	describe("naming.homeRoot", "spec.layout.root", homeRoot, "un projet neuf se poserait sous la nouvelle "+
+		"racine, le parc sous l'ancienne", roots, func(p *model.Project) string { return p.Spec.Layout.Root })
+	describe("logs.root", "spec.layout.logDir", logsRoot, "seule la chaîne de logs.root est contrôlée (D71)",
+		logs, func(p *model.Project) string { return p.Spec.Layout.LogDir })
+	return out
+}
+
+// checkPlacement refuse en code 3 un parc dont une déclaration vit hors des
+// racines de la configuration (D120). Il vaut au plan et à l'apply, du projet
+// visé comme du parc, et à toute écriture d'une déclaration : un projet neuf se
+// poserait sous la nouvelle racine pendant que le parc reste sous l'ancienne.
+func (a *App) checkPlacement(fleet []*model.Project) error {
+	problems := a.placementProblems(fleet)
+	if len(problems) == 0 {
+		return nil
+	}
+	parts := make([]string, len(problems))
+	for i, p := range problems {
+		parts[i] = p.what + "\n  → " + p.fix
+	}
+	return exitf(CodeValidation, "%s", strings.Join(parts, "\n"))
+}
+
+// unprefixed retire le préfixe du mode d'essai d'un chemin : le remède cite la
+// valeur à écrire dans config.yaml, qui ne le porte pas.
+func (a *App) unprefixed(path string) string {
+	if a.Prefix == "" {
+		return path
+	}
+	if rel, ok := strings.CutPrefix(path, filepath.Clean(a.Prefix)); ok && strings.HasPrefix(rel, "/") {
+		return rel
+	}
+	return path
 }
 
 // reservedDBAccounts énumère les comptes SGBD que la configuration désigne et

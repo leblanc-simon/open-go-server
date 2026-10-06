@@ -491,6 +491,34 @@ func TestPostinstNEngendrePasUneCleMaitrePerdue(t *testing.T) {
 	}
 }
 
+// Une instance configurée a perdu sa base d'état alors que des projets sont
+// déclarés : « ogs init » la recréerait vide, sans un mot sous --quiet, et les
+// commandes d'ogs, qui la refusent jusque-là (D120), repartiraient sur une base
+// sans secrets. Le paquet le dit et ne la recrée pas. Sans projet, init tourne.
+func TestPostinstNeRecreePasUneBaseDEtatPerdue(t *testing.T) {
+	b := nouveauBac(t)
+	b.configurer()
+	b.ecrire(filepath.Join(b.paths.ProjectsDir(), "shopfr.yaml"), "metadata:\n  host: shop.fr\n", 0o600)
+	_, erreurs := b.lancer("postinst", "configure", "0.0.4")
+	if strings.Contains(b.appels(), "ogs init") {
+		t.Errorf("le postinst lance « ogs init » sur une base d'état perdue :\n%s", b.appels())
+	}
+	for _, attendu := range []string{b.paths.StateDB(), "sauvegarde", "ogs init"} {
+		if !strings.Contains(erreurs, attendu) {
+			t.Errorf("le postinst ne dit pas %q : %q", attendu, erreurs)
+		}
+	}
+
+	b = nouveauBac(t)
+	b.configurer()
+	b.ecrire(filepath.Join(b.paths.ProjectsDir(), "shopfr.yaml"), "metadata:\n  host: shop.fr\n", 0o600)
+	b.ecrire(b.paths.StateDB(), "", 0o600)
+	b.lancer("postinst", "configure", "0.0.4")
+	if !strings.Contains(b.appels(), "ogs init --quiet") {
+		t.Errorf("base présente : le postinst doit migrer par « ogs init » :\n%s", b.appels())
+	}
+}
+
 // Sur une machine neuve, le paquet n'engendre pas la clé maître à l'insu de
 // l'administrateur : il annonce « ogs init », et ne touche à rien d'autre.
 func TestPostinstSurMachineNeuveAnnonceInit(t *testing.T) {
@@ -563,7 +591,7 @@ func TestLesScriptsEmploientLesCheminsDOgs(t *testing.T) {
 	temoin := filepath.Join(p.Lib(), "ogs-renew.timer.avant-retrait")
 	communs := []string{fs.Marker, p.SystemdDir() + "/", temoin}
 	attendus := map[string][]string{
-		"postinstall.sh": append([]string{p.ConfigFile(), p.MasterKey()}, communs...),
+		"postinstall.sh": append([]string{p.ConfigFile(), p.MasterKey(), p.StateDB(), p.ProjectsDir() + "/"}, communs...),
 		"preremove.sh":   communs,
 		"postremove.sh":  append([]string{p.ArchivesDir(), p.Etc(), p.Lib() + " ", p.LogDir()}, communs...),
 	}
