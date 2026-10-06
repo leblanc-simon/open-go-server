@@ -379,6 +379,21 @@ func (a *App) applyTarget(ctx context.Context, provs *providers, t *fleetTarget,
 			return 0, err
 		}
 	}
+	// Le dernier rechargement du serveur web suit toute émission de certificat :
+	// l'étape d'émission en porte l'intention, exécutée après elle. Son échec
+	// tait « postCertRenew », comme sous « cert renew » et « cert issue » : le
+	// hook annoncerait un certificat que le serveur ne présente pas.
+	var webReloadErr error
+	trackedReload := reload
+	if reload != nil {
+		trackedReload = func(ctx context.Context, target string) error {
+			err := reload(ctx, target)
+			if strings.HasPrefix(target, "web:") {
+				webReloadErr = err
+			}
+			return err
+		}
+	}
 	report, err := executeProjectPlan(ctx, plan, engine.Options{
 		OnStep: func(s *engine.Step, stepErr error) {
 			a.stepf("  ", s, stepErr)
@@ -389,7 +404,7 @@ func (a *App) applyTarget(ctx context.Context, provs *providers, t *fleetTarget,
 		Audit: func(s *engine.Step, outcome, detail string) {
 			_ = a.Audit.Record(p.ID(), s.Resource, run.audit+s.Action.String(), outcome, detail)
 		},
-		Reload:          reload,
+		Reload:          trackedReload,
 		OnReloadWarning: a.reloadWarning,
 	})
 	warnings := len(report.Warnings)
@@ -419,10 +434,8 @@ func (a *App) applyTarget(ctx context.Context, provs *providers, t *fleetTarget,
 	// apply », site create, site clone, la restauration et l'interface. Un
 	// certificat nommé par deux étapes ne compte qu'une fois : le hook d'un
 	// projet ne reçoit pas deux fois le même certificat partagé.
-	if changed := uniqueNames(certsChanged(report)); len(changed) > 0 {
-		warnings += a.postCertRenew(ctx, provs.Hooks, changed,
-			a.certUsersFleet(provs, changed, []*model.Project{p}))
-	}
+	warnings += a.postCertRenewAfterReload(ctx, provs, webReloadErr,
+		uniqueNames(certsChanged(report)), []*model.Project{p})
 	// Le hook « postApply » constate : son échec est un avertissement.
 	if warned, _ := a.runHook(ctx, provs.Hooks, p, hook.PostApply,
 		hook.Context{Resources: resourcesOf(report)}); warned {

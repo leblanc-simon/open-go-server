@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
@@ -491,5 +492,61 @@ func TestUneRestaurationMalDerouleeResteReprenable(t *testing.T) {
 	}
 	if !strings.Contains(out, "--resume") || !strings.Contains(out, "ogs project delete shopfr") {
 		t.Errorf("DÉFAUT : la sortie doit nommer la reprise et l'abandon :\n%s", out)
+	}
+}
+
+// Ajustement d'intégration de D112 : « postCertRenew » partait d'applyTarget
+// même quand le serveur web n'avait pas relu le certificat émis, là où
+// « cert renew » et « cert issue » le taisent en le disant — le hook annonçait
+// un certificat que le serveur ne présentait pas.
+func TestApplyTaitPostCertRenewSiLeServeurWebNARienRelu(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("project", "create", "shop.fr", "--kind", "static")
+	h.poserHooksDeCertificat(t)
+	app := h.ouvrirApp(t, true)
+	var out bytes.Buffer
+	app.Quiet, app.Out, app.Err = false, &out, &out
+	provs, err := app.buildProviders()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer provs.close()
+	p, err := app.loadProject("shopfr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	app.Store.PreviewAllocations(true)
+	plan, err := app.buildPlan(context.Background(), provs, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	app.Store.PreviewAllocations(false)
+	target := &fleetTarget{p: p, shown: keysOf(plan)}
+	normal := app.reloadFunc(provs)
+	webTente := false
+	reload := func(ctx context.Context, cible string) error {
+		if strings.HasPrefix(cible, "web:") {
+			webTente = true
+			return errors.New("configuration refusée")
+		}
+		return normal(ctx, cible)
+	}
+	warnings, err := app.applyTarget(context.Background(), provs, target, applyRun{audit: "apply."}, reload)
+	if err != nil {
+		t.Fatalf("apply : %v\n%s", err, out.String())
+	}
+	if !webTente {
+		t.Fatalf("le plan devait recharger le serveur web :\n%s", out.String())
+	}
+	if strings.Contains(out.String(), "↪ hook postCertRenew") {
+		t.Errorf("DÉFAUT : postCertRenew lancé alors que le serveur web n'a pas relu le certificat :\n%s", out.String())
+	}
+	if !strings.Contains(out.String(), "hook postCertRenew non lancé") {
+		t.Errorf("le silence du hook doit être dit :\n%s", out.String())
+	}
+	// Le rechargement en échec et le hook tu comptent chacun.
+	if warnings < 2 {
+		t.Errorf("avertissements : %d, au moins 2 attendus :\n%s", warnings, out.String())
 	}
 }
