@@ -941,3 +941,30 @@ func TestUnicitéNommeLeDomaineDéclaré(t *testing.T) {
 		t.Errorf("un nom déjà canonique n'est pas répété : %v", err)
 	}
 }
+
+func TestUnicitéDesRépertoiresDeJournaux(t *testing.T) {
+	// Les journaux partent avec le projet par un effacement récursif (D71) : un
+	// logDir recopié d'un voisin, ou logé sous le sien, faisait effacer ses
+	// journaux à la suppression (R1-26, D114).
+	a := newProject(t, "shop.fr", naming.EnvProd, model.KindStatic)
+	b := newProject(t, "blog.fr", naming.EnvProd, model.KindStatic)
+	if a.Spec.Layout.LogDir == "" || a.Spec.Layout.LogDir == b.Spec.Layout.LogDir {
+		t.Fatalf("journaux attendus distincts : %q, %q", a.Spec.Layout.LogDir, b.Spec.Layout.LogDir)
+	}
+	if err := Uniqueness([]*model.Project{a, b}, "preprod-pp.net"); err != nil {
+		t.Fatalf("deux projets ordinaires doivent cohabiter : %v", err)
+	}
+	for _, logDir := range []string{a.Spec.Layout.LogDir, a.Spec.Layout.LogDir + "/", a.Spec.Layout.LogDir + "/blog"} {
+		b.Spec.Layout.LogDir = logDir
+		err := UniquenessFor([]*model.Project{a, b}, "preprod-pp.net", "blogfr")
+		if err == nil || !strings.Contains(err.Error(), "répertoire de journaux") ||
+			!strings.Contains(err.Error(), "shopfr") {
+			t.Errorf("logDir %q : le conflit avec les journaux de shopfr doit être nommé : %v", logDir, err)
+		}
+	}
+	// Un nom qui en prolonge un autre n'est pas imbriqué.
+	b.Spec.Layout.LogDir = a.Spec.Layout.LogDir + "-ancien"
+	if err := Uniqueness([]*model.Project{a, b}, "preprod-pp.net"); err != nil {
+		t.Errorf("deux répertoires voisins doivent cohabiter : %v", err)
+	}
+}

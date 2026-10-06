@@ -104,6 +104,9 @@ func newProjectCreateCommand(app *App) *cobra.Command {
 			if _, err := os.Stat(path); err == nil {
 				return exitf(CodeConflict, "le projet %s existe déjà (%s)", p.ID(), path)
 			}
+			if err := naming.CheckCreatable(p.ID()); err != nil {
+				return exitf(CodeValidation, "%v", err)
+			}
 			// Seuls comptent les conflits qui touchent le nouveau projet : une collision
 			// entre deux voisins ne bloque pas une création sans rapport (D94).
 			if err := app.checkFleetUniqueness(p); err != nil {

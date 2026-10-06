@@ -627,7 +627,10 @@ func (a *App) reloadFunc(provs *providers) func(context.Context, string) error {
 				}
 			}
 			a.printf("  ↻ redémarrage des services de %s\n", id)
-			return a.systemctl(ctx, "restart", unit.TargetName(id))
+			// La cible et chaque instance, nommées (D114) : une cible jamais
+			// démarrée ne propage pas le redémarrage, et l'unité modifiée restait
+			// sur son ancienne définition.
+			return provs.Unit.ControlID(ctx, id, "restart")
 		case target == "monitoring:telegraf":
 			a.printf("  ↻ rechargement de telegraf\n")
 			return provs.Monitoring.ReloadTelegraf(ctx)

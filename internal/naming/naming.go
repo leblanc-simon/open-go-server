@@ -267,6 +267,27 @@ func ValidateIdentifier(id string) error {
 	return nil
 }
 
+// unitPrefixes énumère les identifiants que les unités de parc d'ogs prolongent :
+// ogs-ufw-rollback (le retour automatique du pare-feu, D72), ogs-restauration-<hex>
+// (les restaurations de bases), ogs-renew (le renouvellement des certificats).
+// Un projet de ce nom verrait ses unités côtoyer celles du parc sous le même
+// préfixe (D114).
+var unitPrefixes = []string{"ufw", "restauration", "renew"}
+
+// CheckCreatable refuse, à la création d'un projet seulement, un identifiant que
+// prolonge une unité de parc d'ogs (D114). Jamais au chargement : un projet
+// déclaré avant cette règle doit continuer de s'appliquer, et ses unités sont
+// de toute façon tenues à l'écart de celles du parc par leur motif.
+func CheckCreatable(id string) error {
+	for _, r := range unitPrefixes {
+		if id == r {
+			return fmt.Errorf("identifiant %q réservé : les unités systemd d'ogs portent le préfixe ogs-%s- "+
+				"(choisir un autre identifiant avec --id)", id, id)
+		}
+	}
+	return nil
+}
+
 // reservedNames énumère les comptes système qu'un projet ne doit jamais usurper.
 var reservedNames = []string{
 	"root", "daemon", "bin", "sys", "sync", "games", "man", "lp", "mail", "news",

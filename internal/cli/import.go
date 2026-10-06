@@ -11,6 +11,7 @@ import (
 
 	"leblanc.io/open-go-server/internal/importer"
 	"leblanc.io/open-go-server/internal/model"
+	"leblanc.io/open-go-server/internal/naming"
 	"leblanc.io/open-go-server/internal/provider/db"
 	"leblanc.io/open-go-server/internal/provider/mail"
 	"leblanc.io/open-go-server/internal/spec"
@@ -210,6 +211,9 @@ func newImportAdoptCommand(app *App) *cobra.Command {
 			path := app.Paths.ProjectFile(p.ID())
 			if _, err := os.Stat(path); err == nil {
 				return exitf(CodeConflict, "le projet %s est déjà déclaré (%s)", p.ID(), path)
+			}
+			if err := naming.CheckCreatable(p.ID()); err != nil {
+				return exitf(CodeValidation, "%v", err)
 			}
 			// L'adoption est une porte d'entrée du parc au même titre que « site
 			// create » et « project create » : sans ce contrôle, deux adoptions

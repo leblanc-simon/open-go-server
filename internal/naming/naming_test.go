@@ -341,3 +341,17 @@ func contientEnv(liste []Env, e Env) bool {
 	}
 	return false
 }
+
+func TestLesIdentifiantsDesUnitésDeParcNeSontPasCréables(t *testing.T) {
+	for _, id := range []string{"ufw", "restauration", "renew"} {
+		if err := CheckCreatable(id); err == nil {
+			t.Errorf("%q doit être réservé à la création", id)
+		}
+		if err := ValidateIdentifier(id); err != nil {
+			t.Errorf("%q doit rester valide au chargement : %v", id, err)
+		}
+	}
+	if err := CheckCreatable("ufwfr"); err != nil {
+		t.Errorf("ufwfr n'est le préfixe d'aucune unité : %v", err)
+	}
+}

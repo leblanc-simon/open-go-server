@@ -3,6 +3,7 @@ package unit
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -649,7 +650,12 @@ func (p *Provider) enableStep(proj *model.Project, name string) *engine.Step {
 		if err := os.Symlink(target, link); err != nil && !os.IsExist(err) {
 			return err
 		}
-		return p.systemctl(ctx, "start", name)
+		// La cible démarre avec l'instance (D114) : laissée inactive, elle ne
+		// propageait ni l'arrêt ni le redémarrage à des instances qui tournaient
+		// pourtant — « project delete » arrêtait une cible déjà arrêtée, et userdel
+		// échouait sur le worker resté vivant. Démarrer une cible active ne fait
+		// rien, et l'observation ne lit que les liens : le plan n'en change pas.
+		return p.systemctl(ctx, "start", name, TargetName(proj.ID()))
 	}
 	s.Compensate = func(ctx context.Context) error {
 		_ = p.systemctl(ctx, "stop", name)
@@ -697,14 +703,135 @@ func (p *Provider) systemctl(ctx context.Context, args ...string) error {
 	return err
 }
 
-// Control applique un verbe à la cible d'un projet, donc à tous ses services.
+// Control applique un verbe à tous les services d'un projet.
 func (p *Provider) Control(ctx context.Context, proj *model.Project, verb string) error {
+	return p.ControlID(ctx, proj.ID(), verb)
+}
+
+// ControlID applique un verbe à la cible d'un projet ET à chacune de ses
+// instances, nommées (D114). La cible seule ne suffit pas : PartOf ne propage
+// l'arrêt et le redémarrage que depuis une cible active, et une cible jamais
+// démarrée — les instances l'étaient une à une — laissait tourner ses workers
+// sous « stop », et les gardait sur leur ancienne définition sous « restart ».
+// L'arrêt vise en outre toute unité du projet que systemd tient encore active,
+// déclarée ou non : une instance retirée de .wants à la main, une unité dont le
+// fichier est parti (« not-found active running »).
+func (p *Provider) ControlID(ctx context.Context, id, verb string) error {
 	switch verb {
-	case "start", "stop", "restart", "status":
+	case "status":
+		return p.systemctl(ctx, verb, TargetName(id))
+	case "start", "restart":
+		return p.systemctl(ctx, append([]string{verb}, p.Units(id)...)...)
+	case "stop":
+		_, err := p.Stop(ctx, id)
+		return err
 	default:
 		return fmt.Errorf("verbe %q inconnu (start, stop, restart ou status)", verb)
 	}
-	return p.systemctl(ctx, verb, TargetName(proj.ID()))
+}
+
+// Units énumère les unités d'un projet : sa cible, puis les instances activées
+// dans son répertoire .wants, dans l'ordre du nom.
+func (p *Provider) Units(id string) []string {
+	units := []string{TargetName(id)}
+	entries, err := os.ReadDir(p.wantsDir(id))
+	if err != nil {
+		return units
+	}
+	for _, e := range entries {
+		if belongs(e.Name(), id) {
+			units = append(units, e.Name())
+		}
+	}
+	return units
+}
+
+// InstancePattern est le motif des instances d'un projet : toute unité qu'ogs
+// fait tourner pour lui est l'instance d'un modèle ogs-<id>-<nom>@.service —
+// services déclarés comme application supervisée. L'identifiant ne contient pas
+// de tiret (naming), et le « @ » écarte les unités de parc d'ogs : sans lui, le
+// motif d'un projet « ufw » retenait ogs-ufw-rollback.timer, le retour
+// automatique du pare-feu (D72, D86), et celui d'un projet « restauration » les
+// unités transitoires de db/dump.go.
+func InstancePattern(id string) string { return "ogs-" + id + "-*@*.service" }
+
+// Running énumère les unités du projet que systemd tient actives — ou en cours
+// d'activation, de rechargement ou d'arrêt : un worker en redémarrage
+// automatique est « activating » —, sans se fier à l'état de la cible : sa
+// cible, et toute instance de ses modèles (InstancePattern), déclarée ou non.
+// En mode simulé, la cible et ses instances sont réputées actives : c'est ce qui
+// laisse aux essais l'arrêt et la relance à observer.
+func (p *Provider) Running(ctx context.Context, id string) ([]string, error) {
+	if p.Exec == nil || p.Exec.Simulated() {
+		return p.Units(id), nil
+	}
+	res, err := p.Exec.Run(ctx, exec.Command{Name: "systemctl", Args: []string{
+		"list-units", "--all", "--plain", "--no-legend", "--no-pager", "--full",
+		"--", TargetName(id), InstancePattern(id),
+	}})
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, line := range strings.Split(res.Stdout, "\n") {
+		fields := strings.Fields(line)
+		// Une unité en échec est précédée d'une puce, même sous --plain.
+		if len(fields) > 0 && !strings.HasPrefix(fields[0], "ogs-") {
+			fields = fields[1:]
+		}
+		// UNIT LOAD ACTIVE SUB DESCRIPTION
+		if len(fields) < 3 || (fields[0] != TargetName(id) && !belongs(fields[0], id)) {
+			continue
+		}
+		switch fields[2] {
+		case "inactive", "failed":
+			continue
+		}
+		out = append(out, fields[0])
+	}
+	return out, nil
+}
+
+// belongs dit si une unité est une instance d'un modèle du projet.
+func belongs(unit, id string) bool {
+	ok, _ := filepath.Match(InstancePattern(id), unit)
+	return ok
+}
+
+// Stop arrête toutes les unités actives du projet (Running) d'une seule
+// commande, et les rend : ce sont elles qu'un abandon relance (Start), et elles
+// seules — un worker que l'exploitant avait arrêté le reste.
+func (p *Provider) Stop(ctx context.Context, id string) ([]string, error) {
+	running, err := p.Running(ctx, id)
+	if err != nil || len(running) == 0 {
+		return nil, err
+	}
+	return running, p.systemctl(ctx, append([]string{"stop"}, running...)...)
+}
+
+// Start relance les unités d'un projet qu'un Stop a rendues, et elles seules.
+// Les instances sont démarrées par leur nom ; la cible, si elle tournait, sans
+// ses dépendances (--job-mode=ignore-requirements) : démarrée ordinairement,
+// elle tire chacun de ses Wants= et relançait un worker que l'exploitant avait
+// arrêté (D114).
+func (p *Provider) Start(ctx context.Context, id string, units []string) error {
+	var instances []string
+	target := false
+	for _, u := range units {
+		if u == TargetName(id) {
+			target = true
+		} else {
+			instances = append(instances, u)
+		}
+	}
+	var errs []error
+	if len(instances) > 0 {
+		errs = append(errs, p.systemctl(ctx, append([]string{"start"}, instances...)...))
+	}
+	if target {
+		errs = append(errs, p.systemctl(ctx, "start", "--job-mode=ignore-requirements", TargetName(id)))
+	}
+	return errors.Join(errs...)
 }
 
 // Scale ajuste le nombre d'instances d'un service en base, sans passer par le
@@ -729,7 +856,7 @@ func (p *Provider) Scale(ctx context.Context, proj *model.Project, service strin
 		if err := os.Symlink(target, link); err != nil && !os.IsExist(err) {
 			return changed, err
 		}
-		if err := p.systemctl(ctx, "start", name); err != nil {
+		if err := p.systemctl(ctx, "start", name, TargetName(proj.ID())); err != nil {
 			return changed, err
 		}
 		changed = append(changed, "+"+name)

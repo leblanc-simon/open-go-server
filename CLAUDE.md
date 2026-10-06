@@ -12,8 +12,8 @@ Les commits ne mentionnent jamais l'assistance d'un outil d'IA.
 
 ## La référence
 
-[`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md) fait autorité : 112 décisions d'architecture
-arbitrées (D1–D111 et D113, D112 réservée ; tableau §2), spécification par module, plan de tests, découpage en lots. **Consulter le
+[`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md) fait autorité : 113 décisions d'architecture
+arbitrées (D1–D111, D113 et D114, D112 réservée ; tableau §2), spécification par module, plan de tests, découpage en lots. **Consulter le
 tableau des décisions avant de proposer une architecture** — la plupart des questions « pourquoi pas
 plutôt… ? » y sont déjà tranchées, avec leur raison. Toute décision nouvelle s'y ajoute.
 
@@ -427,6 +427,18 @@ Ils ont tous coûté un défaut réel ; les tests unitaires ne les voyaient pas.
   `unit/service` dans l'alphabet, ce qui ferait démarrer une instance avant l'écriture de son modèle.
 - La cible d'un projet doit être liée à `multi-user.target`, sinon les services ne repartent pas après un
   redémarrage.
+- **`PartOf` ne propage rien depuis une cible inactive** (D114) : les instances démarrées une à une, la
+  cible jamais, `systemctl stop ogs-<id>.target` laissait tourner les workers — `userdel` échouait à la
+  suppression, et le redémarrage après une unité modifiée ne relançait rien. Arrêt et redémarrage nomment
+  la cible et chaque instance (`unit.Provider.ControlID`), l'arrêt vise ce que systemd tient actif
+  (`Running`), et l'activation d'une instance démarre aussi la cible. Deux corollaires : le motif d'un
+  projet porte le « @ » (`ogs-<id>-*@*.service`) — sans lui, celui d'un projet `ufw` désarmait
+  `ogs-ufw-rollback.timer` —, et relancer une cible tire tous ses `Wants=` : un abandon la démarre sous
+  `--job-mode=ignore-requirements`, sans quoi un worker arrêté par l'exploitant repartait. Seul un vrai
+  systemd le montre (scénario `systemd`).
+- **`project delete` coupe le site avant l'archive** (D114) : vhosts, pools et cron quittent le disque
+  avant le dump, gardés en mémoire pour l'archive et pour l'abandon, qui les rend avant le point de
+  non-retour. Une étape ajoutée entre la coupure et ce point doit passer par `abandon`.
 - Une unité **modifiée** exige un redémarrage : `daemon-reload` relit la définition, il ne relance rien.
   L'intention `systemd:restart-target:<id>` s'en charge, et l'attente de disponibilité la vide avant
   d'attendre.

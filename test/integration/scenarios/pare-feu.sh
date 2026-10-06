@@ -520,6 +520,30 @@ ogs firewall apply --yes >/tmp/apply.log 2>&1 || { cat /tmp/apply.log; echec "fi
 ufw status | grep -q "Status: active" || echec "ufw doit être réactivé"
 [ -f "$temoin" ] && [ -f "$complement" ] && [ -e /run/ogs-ufw-armed ] || echec "le réarmement pose témoin, complément et marque"
 
+# --- Un projet « ufw » ne touche pas au retour automatique (D114) ------------
+# Le motif ogs-<id>-* d'un projet « ufw » retenait ogs-ufw-rollback.timer :
+# « service stop » et « project delete » désarmaient le retour du pare-feu.
+# L'identifiant est refusé à la création ; un projet déclaré avant la règle est
+# reconstitué à la main.
+systemctl is-active --quiet ogs-ufw-rollback.timer || echec "montage : le retour automatique doit être armé"
+sortie=$(ogs project create ufw.test --id ufw 2>&1); code=$?
+[ "$code" = 3 ] && echo "$sortie" | grep -q "réservé" || { echo "$sortie"; echec "l'identifiant ufw doit être refusé à la création, code $code"; }
+ogs project create ufw.test --kind static >/dev/null || echec "project create ufw.test"
+sed 's/ufwtest/ufw/g' /etc/ogs/projects/ufwtest.yaml >/etc/ogs/projects/ufw.yaml
+rm /etc/ogs/projects/ufwtest.yaml
+# Sans courriel de contact, le certificat échoue : code 6, sans rapport ici.
+ogs apply ufw --yes >/tmp/apply-ufw.log 2>&1
+code=$?
+[ "$code" = 0 ] || [ "$code" = 6 ] || { cat /tmp/apply-ufw.log; echec "apply du projet ufw, code $code"; }
+ogs service stop ufw >/dev/null 2>&1
+systemctl is-active --quiet ogs-ufw-rollback.timer || echec "« service stop ufw » a désarmé le retour automatique"
+sortie=$(ogs project delete ufw --no-dump --yes 2>&1)
+code=$?
+[ "$code" = 0 ] || [ "$code" = 6 ] || { echo "$sortie" | tail -8; echec "project delete ufw, code $code"; }
+getent passwd ufw >/dev/null && { echo "$sortie" | tail -8; echec "le compte ufw a survécu à la suppression"; }
+systemctl is-active --quiet ogs-ufw-rollback.timer || { echo "$sortie" | tail -8; echec "« project delete ufw » a désarmé le retour automatique"; }
+echo "un projet « ufw » laisse le retour automatique du pare-feu armé"
+
 cp "$complement" /root/ogs-rollback.conf.copie
 sync
 echo "redémarrage dans le délai…"

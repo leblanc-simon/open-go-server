@@ -424,5 +424,42 @@ fi
 rm -rf "$partage" /tmp/relutest-dir
 echo "la suppression garde, en le nommant, un groupe que d'autres comptes tiennent"
 
+# Le site est coupé avant l'archive (D114) — vhost, pool et tâches retirés,
+# serveurs rechargés — et rétabli si la suppression renonce avant le point de
+# non-retour. Une archive impossible (un fichier à la place du répertoire des
+# archives) est un tel abandon : le site doit de nouveau répondre, servi par un
+# FPM que la coupure a pu arrêter faute de pool (D74).
+ogs site create coupe.test --kind php-plain --php "$version" --tls=false --yes >/dev/null 2>&1
+echo '<?php echo "servi";' > /home/coupe.test/www/index.php
+chown coupetest:coupetest /home/coupe.test/www/index.php
+repond() { [ "$(curl -s -H 'Host: coupe.test' http://127.0.0.1/index.php)" = "servi" ]; }
+sleep 1
+if ! repond; then
+    echo "ÉCHEC : coupe.test ne répond pas avant la suppression, le scénario n'éprouve rien"
+    exit 1
+fi
+mv /var/lib/ogs/archives /var/lib/ogs/archives.vrai
+: > /var/lib/ogs/archives
+sortie=$(ogs project delete coupetest --yes 2>&1); code=$?
+rm -f /var/lib/ogs/archives
+mv /var/lib/ogs/archives.vrai /var/lib/ogs/archives
+if [ "$code" = 0 ] || ! grep -q "coupure du site" <<<"$sortie" || ! grep -q "rétablissement du site" <<<"$sortie"; then
+    echo "$sortie" | tail -12
+    echo "ÉCHEC : une archive impossible doit abandonner la suppression en rétablissant le site (code $code)"
+    exit 1
+fi
+sleep 1
+if ! repond || [ ! -f "/etc/php/$version/fpm/pool.d/coupetest.conf" ] || [ ! -e /etc/apache2/sites-enabled/coupetest.conf ]; then
+    echo "$sortie" | tail -12
+    echo "ÉCHEC : le site n'est pas rétabli après l'abandon"
+    exit 1
+fi
+if ogs plan coupetest 2>&1 | grep -qE "coupetest.conf|ogs-coupetest"; then
+    ogs plan coupetest
+    echo "ÉCHEC : le site rétabli n'est pas conforme à sa déclaration"
+    exit 1
+fi
+echo "la suppression coupe le site avant l'archive, et le rétablit quand elle renonce"
+
 echo "RÉSULTAT : compte, groupe, home, pool et vhost ont tous disparu, et aucun home d'un autre compte n'est repris ni effacé."
 exit 0

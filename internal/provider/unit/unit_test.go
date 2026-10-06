@@ -821,3 +821,152 @@ func TestServiceRetireSousLesCinqEtats(t *testing.T) {
 		t.Errorf("le fichier d'un autre projet ne part jamais, --force compris : %v", err)
 	}
 }
+
+// systemdFactice tient le rôle de systemd : il enregistre chaque commande et
+// répond à list-units par l'état donné.
+type systemdFactice struct {
+	unités string
+	appels [][]string
+}
+
+func (s *systemdFactice) Simulated() bool { return false }
+
+func (s *systemdFactice) Run(_ context.Context, c exec.Command) (exec.Result, error) {
+	s.appels = append(s.appels, append([]string{c.Name}, c.Args...))
+	if c.Name == "systemctl" && len(c.Args) > 0 && c.Args[0] == "list-units" {
+		return exec.Result{Stdout: s.unités}, nil
+	}
+	return exec.Result{}, nil
+}
+
+func (s *systemdFactice) appel(verbe string) []string {
+	for _, a := range s.appels {
+		if len(a) > 1 && a[0] == "systemctl" && a[1] == verbe {
+			return a[2:]
+		}
+	}
+	return nil
+}
+
+// R1-16 : les instances étaient démarrées une à une, jamais la cible ; l'arrêt
+// visait la seule cible, inactive, qui ne propage rien par PartOf. Le worker
+// restait vivant et userdel échouait à la suppression (D114).
+func TestArrêtEtRedémarrageVisentLesInstancesSansSeFierALaCible(t *testing.T) {
+	prov, proj := fixture(t)
+	proj.Spec.Services = []model.Service{{
+		Name: "veille", Template: TemplateWorker, Instances: 2,
+		Params: map[string]string{"command": "/bin/true"},
+	}}
+	apply(t, prov, proj)
+	sd := &systemdFactice{unités: "ogs-shopfr.target loaded inactive dead Projet shopfr\n" +
+		"ogs-shopfr-veille@1.service loaded active running veille\n" +
+		"ogs-shopfr-veille@2.service loaded activating auto-restart veille\n" +
+		"● ogs-shopfr-ancien@1.service not-found active running ancien\n" +
+		"ogs-shopfr-veille@3.service loaded inactive dead veille\n"}
+	prov.Exec = sd
+	ctx := context.Background()
+
+	if err := prov.Control(ctx, proj, "stop"); err != nil {
+		t.Fatal(err)
+	}
+	arrêtées := sd.appel("stop")
+	for _, u := range []string{"ogs-shopfr-veille@1.service", "ogs-shopfr-veille@2.service",
+		"ogs-shopfr-ancien@1.service"} {
+		if !slices.Contains(arrêtées, u) {
+			t.Errorf("%s, actif, doit être arrêté : systemctl stop %v", u, arrêtées)
+		}
+	}
+	if slices.Contains(arrêtées, "ogs-shopfr-veille@3.service") {
+		t.Errorf("une unité inactive n'a pas à être arrêtée : %v", arrêtées)
+	}
+
+	sd.appels = nil
+	if err := prov.Control(ctx, proj, "restart"); err != nil {
+		t.Fatal(err)
+	}
+	relancées := sd.appel("restart")
+	for _, u := range []string{TargetName("shopfr"), "ogs-shopfr-veille@1.service", "ogs-shopfr-veille@2.service"} {
+		if !slices.Contains(relancées, u) {
+			t.Errorf("%s doit être redémarré : systemctl restart %v", u, relancées)
+		}
+	}
+}
+
+func TestLActivationDUneInstanceDémarreAussiLaCible(t *testing.T) {
+	prov, proj := fixture(t)
+	proj.Spec.Services = []model.Service{{
+		Name: "veille", Template: TemplateWorker, Instances: 1,
+		Params: map[string]string{"command": "/bin/true"},
+	}}
+	sd := &systemdFactice{}
+	prov.Exec = sd
+	apply(t, prov, proj)
+	if démarrées := sd.appel("start"); !slices.Contains(démarrées, TargetName("shopfr")) {
+		t.Errorf("la cible doit démarrer avec ses instances : systemctl start %v", démarrées)
+	}
+	// Et le plan suivant n'en change pas.
+	obs, _ := prov.Observe(context.Background(), proj)
+	steps, _ := prov.Plan(context.Background(), proj, obs)
+	plan := &engine.Plan{Project: proj.ID()}
+	for _, s := range steps {
+		plan.Add(s)
+	}
+	if !plan.Empty() {
+		t.Errorf("second plan non vide :\n%s", plan.String())
+	}
+}
+
+// Le motif d'un projet ne désigne que ses instances : « ufw » est un
+// identifiant valide, et ogs-ufw-* retenait ogs-ufw-rollback.timer, le retour
+// automatique du pare-feu (D72, D86) — « project delete ufw » le désarmait, et
+// l'abandon ne pouvait pas relancer une unité transitoire disparue.
+func TestLArrêtDUnProjetNeTouchePasAuxUnitésDeParc(t *testing.T) {
+	prov, _ := fixture(t)
+	sd := &systemdFactice{unités: "ogs-ufw-rollback.timer loaded active waiting retour d'ufw\n" +
+		"ogs-ufw-rollback.service loaded inactive dead retour d'ufw\n" +
+		"ogs-ufw-veille@1.service loaded active running veille\n"}
+	prov.Exec = sd
+	ctx := context.Background()
+	arrêtées, err := prov.Stop(ctx, "ufw")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(arrêtées, []string{"ogs-ufw-veille@1.service"}) || slices.Contains(sd.appel("stop"),
+		"ogs-ufw-rollback.timer") {
+		t.Errorf("seule l'instance du projet doit être arrêtée : %v, systemctl stop %v", arrêtées, sd.appel("stop"))
+	}
+	if motif := sd.appel("list-units"); slices.Contains(motif, "ogs-ufw-*") {
+		t.Errorf("le motif interrogé ne doit viser que les instances : %v", motif)
+	}
+}
+
+// L'abandon d'une suppression relance ce qui tournait, et cela seul : démarrer
+// la cible tirait chacun de ses Wants=, et un worker arrêté par l'exploitant
+// repartait (D114).
+func TestLaRelanceNeTirePasLesInstancesQuiNeTournaientPas(t *testing.T) {
+	prov, _ := fixture(t)
+	sd := &systemdFactice{}
+	prov.Exec = sd
+	if err := prov.Start(context.Background(), "shopfr",
+		[]string{TargetName("shopfr"), "ogs-shopfr-veille@1.service"}); err != nil {
+		t.Fatal(err)
+	}
+	var cible, instance bool
+	for _, a := range sd.appels {
+		if a[0] != "systemctl" || a[1] != "start" {
+			continue
+		}
+		if slices.Contains(a, TargetName("shopfr")) {
+			cible = slices.Contains(a, "--job-mode=ignore-requirements")
+			if !cible {
+				t.Errorf("la cible doit démarrer sans tirer ses Wants= : %v", a)
+			}
+		}
+		if slices.Contains(a, "ogs-shopfr-veille@1.service") {
+			instance = true
+		}
+	}
+	if !cible || !instance {
+		t.Errorf("la cible et l'instance qui tournaient doivent repartir : %v", sd.appels)
+	}
+}

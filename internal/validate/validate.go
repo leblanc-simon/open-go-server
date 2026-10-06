@@ -904,6 +904,15 @@ func uniquenessConflicts(projects []*model.Project, prepDomain string) []conflic
 		{"home", map[string]int{}, func(p *model.Project) []string {
 			return []string{filepath.Clean(p.Spec.Layout.Root)}
 		}},
+		// Les journaux partent avec le projet, par un effacement récursif (D71) : un
+		// logDir recopié d'un voisin faisait effacer ses journaux à la suppression
+		// (R1-26, D114).
+		{"répertoire de journaux", map[string]int{}, func(p *model.Project) []string {
+			if p.Spec.Layout.LogDir == "" {
+				return nil
+			}
+			return []string{filepath.Clean(p.Spec.Layout.LogDir)}
+		}},
 		{"utilisateur système", map[string]int{}, func(p *model.Project) []string {
 			return []string{p.Spec.User.Name}
 		}},
@@ -1019,6 +1028,31 @@ func uniquenessConflicts(projects []*model.Project, prepDomain string) []conflic
 					"le conflit pouvant précéder la commande en cours (une version antérieure d'ogs l'acceptait)",
 					filepath.Clean(outer.Spec.Layout.Root), outer.Metadata.Name,
 					filepath.Clean(inner.Spec.Layout.Root), inner.Metadata.Name),
+			}, outer.Metadata.Name, inner.Metadata.Name})
+		}
+	}
+	// Les journaux imbriqués aussi : effacer ceux de l'un emporterait ceux de
+	// l'autre. L'égalité reste signalée par la clé ci-dessus.
+	for i := range projects {
+		for j := i + 1; j < len(projects); j++ {
+			li, lj := projects[i].Spec.Layout.LogDir, projects[j].Spec.Layout.LogDir
+			if li == "" || lj == "" {
+				continue
+			}
+			li, lj = filepath.Clean(li), filepath.Clean(lj)
+			if li == lj || !Overlap(li, lj) {
+				continue
+			}
+			outer, inner := projects[i], projects[j]
+			if isUnder(li, lj) {
+				outer, inner = inner, outer
+			}
+			errs = append(errs, conflict{Error{
+				Field: "répertoire de journaux",
+				Message: fmt.Sprintf("%q, journaux du projet %q, contient %q, ceux du projet %q : "+
+					"supprimer le premier effacerait les journaux du second — corriger spec.layout.logDir "+
+					"de l'un des deux", filepath.Clean(outer.Spec.Layout.LogDir), outer.Metadata.Name,
+					filepath.Clean(inner.Spec.Layout.LogDir), inner.Metadata.Name),
 			}, outer.Metadata.Name, inner.Metadata.Name})
 		}
 	}

@@ -77,7 +77,12 @@ func newDeleteCommand(app *App) *cobra.Command {
 			"Le compte emporte sa crontab personnelle et ses tâches at, recopiées dans l'archive,\n" +
 			"son linger, et les fichiers de son UID dans /tmp, /var/tmp et /dev/shm ; son groupe\n" +
 			"ne part que si personne d'autre ne le tient.\n\n" +
-			"Une interruption reçue avant le premier retrait abandonne la suppression et relance\n" +
+			"Les services du projet sont arrêtés et son site — vhost, pool, fichier cron d'ogs —\n" +
+			"coupé avant l'archive et le dump. La crontab personnelle, les tâches at et les\n" +
+			"services du linger tournent encore jusqu'au retrait du compte, comme toute unité que\n" +
+			"l'administrateur a posée sous ce compte hors des modèles d'ogs : userdel la refuse\n" +
+			"alors, en nommant le processus (code 6). Une interruption\n" +
+			"reçue avant le premier retrait abandonne la suppression, rétablit le site et relance\n" +
 			"les services arrêtés ; reçue après, elle laisse la suppression aller à son terme.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -202,34 +207,25 @@ func newDeleteCommand(app *App) *cobra.Command {
 				app.warnf("⚠ "+format+"\n", args...)
 			}
 
-			// 1. Arrêt des services et retrait des tâches : rien ne doit plus
-			// s'exécuter pendant que l'on démonte le site. Une cible que systemd n'a
-			// pas chargée n'a rien à arrêter : l'annoncer comme un échec ferait
-			// passer pour un défaut le cas d'un projet sans service.
-			stopped := false
-			if app.unitActive(cmd.Context(), unit.TargetName(p.ID())) {
+			// 1. Arrêt des services : rien ne doit plus s'exécuter pendant que l'on
+			// démonte le site. Toutes les unités actives du projet, nommées, et non
+			// sa seule cible (D114) : une cible jamais démarrée ne propage pas
+			// l'arrêt, et le worker resté vivant faisait échouer userdel. Ce qui
+			// tournait est retenu : c'est cela, et cela seul, qu'un abandon relance.
+			running, err := provs.Unit.Running(cmd.Context(), p.ID())
+			if err != nil {
+				warn("services de %s : état illisible (%v) — arrêt de la cible et des instances", p.ID(), err)
+				running = provs.Unit.Units(p.ID())
+			}
+			var stopped []string
+			if len(running) > 0 {
 				app.printf("arrêt des services de %s…\n", p.ID())
-				// Un arrêt en échec a pu en arrêter une partie : la cible était active,
-				// c'est elle qu'un abandon relance.
-				stopped = true
-				if err := provs.Unit.Control(cmd.Context(), p, "stop"); err != nil {
+				// Un arrêt en échec a pu en arrêter une partie : tout ce qui tournait
+				// est relancé par un abandon.
+				stopped = running
+				if err := provs.Unit.ControlID(cmd.Context(), p.ID(), "stop"); err != nil {
 					warn("arrêt des services : %v", err)
 				}
-			}
-			// Jusqu'au point de non-retour, renoncer doit rendre le système tel
-			// qu'on l'a trouvé : un dump ou une archive en échec laissait les workers
-			// arrêtés — commandes, courriels et files en souffrance, sans un mot —
-			// jusqu'au prochain redémarrage de la machine. Une commande tuée par une
-			// interruption échoue sur « context canceled » : c'est l'annulation
-			// demandée, qui rend le code 9, non une panne.
-			abandon := func(err error) error {
-				if stopped {
-					app.restartServices(cmd.Context(), provs, p)
-				}
-				if cmd.Context().Err() != nil && ExitCode(err) != CodeCancelled {
-					return exitf(CodeCancelled, "interruption reçue : suppression abandonnée avant tout retrait (%v)", err)
-				}
-				return err
 			}
 
 			// Le sort des fichiers générés est tranché avant l'archive : elle ne
@@ -240,6 +236,34 @@ func newDeleteCommand(app *App) *cobra.Command {
 			// doctor avertissait à vie de leur expiration.
 			certs, keptCerts := app.projectCertificates(provs, p)
 			scope.certs = certs
+
+			// Jusqu'au point de non-retour, renoncer doit rendre le système tel
+			// qu'on l'a trouvé : un dump ou une archive en échec laissait les workers
+			// arrêtés — commandes, courriels et files en souffrance, sans un mot —
+			// jusqu'au prochain redémarrage de la machine. Une commande tuée par une
+			// interruption échoue sur « context canceled » : c'est l'annulation
+			// demandée, qui rend le code 9, non une panne.
+			var cut *siteCut
+			abandon := func(err error) error {
+				app.restoreSite(cmd.Context(), provs, p, cut, warn)
+				if len(stopped) > 0 {
+					app.restartServices(cmd.Context(), provs, p, stopped)
+				}
+				if cmd.Context().Err() != nil && ExitCode(err) != CodeCancelled {
+					return exitf(CodeCancelled, "interruption reçue : suppression abandonnée avant tout retrait (%v)", err)
+				}
+				return err
+			}
+
+			// 2. Le site est coupé avant l'archive et le dump (D114) : vhost, pool et
+			// tâches retirés, serveurs rechargés. Servi pendant l'archive, il
+			// écrivait encore en base et dans son arborescence après le dump, et ces
+			// écritures partaient sans copie. Il est indisponible dès ce moment, et
+			// rétabli par tout abandon avant le point de non-retour.
+			if cut, err = app.cutSite(cmd.Context(), provs, p, files, warn); err != nil {
+				return abandon(err)
+			}
+			scope.cut = cut
 
 			var removed []string
 			archived := ""
@@ -300,6 +324,11 @@ func newDeleteCommand(app *App) *cobra.Command {
 				warn("%s conservé : %s", k.path, k.reason)
 			}
 			for _, file := range files {
+				// Un fichier coupé avant l'archive a déjà quitté le disque (D114).
+				if cut.lookup(file) != nil {
+					removed = append(removed, file)
+					continue
+				}
 				if err := os.Remove(file); err == nil {
 					removed = append(removed, file)
 				} else if !os.IsNotExist(err) {
@@ -967,11 +996,11 @@ func (a *App) keptFilesRefusal(provs *providers, p *model.Project) *refusal {
 // avant le point de non-retour. Le contexte est détaché : une interruption
 // (Ctrl+C) est précisément l'un des abandons à réparer, et un contexte annulé ne
 // relancerait rien.
-func (a *App) restartServices(ctx context.Context, provs *providers, p *model.Project) {
+func (a *App) restartServices(ctx context.Context, provs *providers, p *model.Project, units []string) {
 	a.printf("redémarrage des services de %s : rien n'a été supprimé\n", p.ID())
-	if err := provs.Unit.Control(context.WithoutCancel(ctx), p, "start"); err != nil {
+	if err := provs.Unit.Start(context.WithoutCancel(ctx), p.ID(), units); err != nil {
 		a.warnf("⚠ redémarrage des services : %v — les relancer : systemctl start %s\n",
-			err, unit.TargetName(p.ID()))
+			err, strings.Join(units, " "))
 	}
 }
 
@@ -1052,6 +1081,9 @@ type archiveScope struct {
 	dumps              []model.Database
 	strict             bool
 	skipTree, skipLogs bool
+	// cut est le site coupé avant l'archive (D114) : ses fichiers ont quitté le
+	// disque, l'archive en recueille le contenu gardé en mémoire.
+	cut *siteCut
 }
 
 // archiveExclusions décide, sous --keep-data, de ce que l'archive ne recopie pas.
@@ -1401,6 +1433,21 @@ func (a *App) fleetRefusals(p *model.Project, root string) refusals {
 				remedy: "corriger spec.layout.root de l'une des deux déclarations"})
 			// Un voisin se nomme une fois : son docroot est d'ordinaire sous sa racine.
 			break
+		}
+		// Les journaux partent eux aussi par un effacement récursif (D71) : un
+		// logDir recopié d'un voisin emportait les siens (R1-26, D114).
+		// Seul compte un répertoire qui contient celui du voisin, ou lui est égal :
+		// effacer un répertoire logé sous le sien n'emporte rien de l'autre.
+		mine, theirs := filepath.Clean(p.Spec.Layout.LogDir), filepath.Clean(other.Spec.Layout.LogDir)
+		if p.Spec.Layout.LogDir != "" && other.Spec.Layout.LogDir != "" && validate.Overlap(theirs, mine) &&
+			(theirs == mine || strings.HasPrefix(theirs, mine+string(filepath.Separator))) {
+			relation := "est aussi celui"
+			if theirs != mine {
+				relation = "contient " + theirs + ", celui"
+			}
+			rs = append(rs, &refusal{code: CodeConflict, what: fmt.Sprintf("répertoire de journaux %q : il %s "+
+				"du projet %s (%s), et l'effacer emporterait ses journaux", mine, relation, other.ID(), path),
+				remedy: "corriger spec.layout.logDir de l'une des deux déclarations"})
 		}
 	}
 	return rs
@@ -1785,6 +1832,16 @@ func (a *App) archiveProject(cmd *cobra.Command, provs *providers, p *model.Proj
 	// pour elle-même.
 	var removed []string
 	for _, file := range scope.files {
+		// Le site coupé avant l'archive (D114) : son contenu est en mémoire.
+		if f := scope.cut.lookup(file); f != nil {
+			removed = append(removed, file)
+			if f.link == "" {
+				if err := w.AddBytes("config", "config/"+filepath.Base(file), file, f.data, f.mode); err != nil {
+					return "", nil, wrap(CodeError, err)
+				}
+			}
+			continue
+		}
 		info, err := os.Lstat(file)
 		if err != nil {
 			continue
@@ -2053,6 +2110,11 @@ func newRestoreCommand(app *App) *cobra.Command {
 				if p.ID() != id {
 					return exitf(CodeUsage, "%s : le manifeste nomme le projet %s, la déclaration archivée %s",
 						path, id, p.ID())
+				}
+				// Un identifiant réservé aux unités d'ogs n'est refusé qu'à la
+				// création : la reprise vaut pour un projet déjà déposé (D114).
+				if err := naming.CheckCreatable(id); err != nil {
+					return exitf(CodeValidation, "%v", err)
 				}
 				// Une archive qui déclare « webAccess: acl » serait refusée par
 				// l'apply, après le dépôt de la déclaration : le refus vient avant

@@ -85,6 +85,12 @@ if ! systemctl show ogs-shopfr.target -p Wants --no-pager | grep -q veille; then
     systemctl show ogs-shopfr.target -p Wants --no-pager
     exit 1
 fi
+# La cible démarre avec ses instances (D114) : inactive, elle ne propageait ni
+# l'arrêt ni le redémarrage, et la suppression laissait les workers vivants.
+if [ "$(systemctl is-active ogs-shopfr.target)" != "active" ]; then
+    echo "ÉCHEC : l'apply a démarré les instances sans leur cible"
+    exit 1
+fi
 systemctl stop ogs-shopfr.target
 sleep 1
 if [ "$(systemctl is-active 'ogs-shopfr-veille@1.service')" = "active" ]; then
@@ -341,8 +347,73 @@ fi
 echo "  modèle retiré, instance arrêtée, l'autre service toujours actif"
 
 echo
+echo "--- abandon d'une suppression : seul ce qui tournait repart (D114) ---"
+# Deux instances, la seconde arrêtée par l'exploitant. Une archive impossible fait
+# abandonner la suppression : relancer la cible tirait ses Wants=, et la seconde
+# instance repartait.
+ogs service scale shopfr veille 2 --yes >/dev/null 2>&1
+systemctl start ogs-shopfr.target
+sleep 1
+systemctl stop ogs-shopfr-veille@2.service
+mv /var/lib/ogs/archives /var/lib/ogs/archives.vrai
+: > /var/lib/ogs/archives
+sortie=$(ogs project delete shopfr --yes 2>&1); code=$?
+rm -f /var/lib/ogs/archives
+mv /var/lib/ogs/archives.vrai /var/lib/ogs/archives
+sleep 2
+if [ "$code" = 0 ] || ! grep -q "redémarrage des services" <<<"$sortie"; then
+    echo "$sortie" | tail -12
+    echo "ÉCHEC : une archive impossible doit abandonner la suppression et relancer les services (code $code)"
+    exit 1
+fi
+etats="$(systemctl is-active ogs-shopfr.target) $(systemctl is-active ogs-shopfr-veille@1.service) $(systemctl is-active ogs-shopfr-veille@2.service)"
+if [ "$etats" != "active active inactive" ]; then
+    echo "$sortie" | tail -12
+    echo "ÉCHEC : cible, @1 et @2 après l'abandon : $etats (attendu : active active inactive)"
+    exit 1
+fi
+echo "  cible et @1 relancées, @2 — arrêtée par l'exploitant — reste arrêtée"
+ogs service scale shopfr veille 1 --yes >/dev/null 2>&1
+
+echo
+echo "--- cible inactive, instance vivante : redémarrage et arrêt l'atteignent (D114) ---"
+# L'état d'un parc antérieur à D114 : les instances démarrées une à une, la
+# cible jamais. PartOf ne propage rien depuis une cible inactive.
+systemctl stop ogs-shopfr.target
+systemctl start ogs-shopfr-veille@1.service
+sleep 1
+if [ "$(systemctl is-active ogs-shopfr.target)" = "active" ] \
+    || [ "$(systemctl is-active ogs-shopfr-veille@1.service)" != "active" ]; then
+    echo "ÉCHEC : l'état de départ (cible inactive, instance active) n'est pas reproduit"
+    exit 1
+fi
+avant=$(systemctl show -p MainPID --value ogs-shopfr-veille@1.service)
+ogs service restart shopfr >/dev/null 2>&1
+sleep 2
+apres=$(systemctl show -p MainPID --value ogs-shopfr-veille@1.service)
+if [ "$avant" = "$apres" ] || [ "$apres" = 0 ]; then
+    echo "ÉCHEC : « service restart » n'a pas redémarré l'instance (PID $avant → $apres)"
+    exit 1
+fi
+echo "  « service restart » redémarre l'instance d'une cible inactive"
+systemctl stop ogs-shopfr.target
+systemctl start ogs-shopfr-veille@1.service
+sleep 1
+
+echo
 echo "--- suppression : plus rien ne subsiste dans systemd ---"
-ogs project delete shopfr --yes >/dev/null 2>&1
+# La cible est inactive et l'instance vivante : la suppression arrêtait la seule
+# cible, le worker survivait et userdel échouait (code 6).
+sortie=$(ogs project delete shopfr --yes 2>&1); code=$?
+if [ "$code" != 0 ]; then
+    echo "$sortie" | tail -12
+    echo "ÉCHEC : la suppression rend $code"
+    exit 1
+fi
+if getent passwd shopfr >/dev/null; then
+    echo "ÉCHEC : le compte shopfr a survécu à sa suppression"
+    exit 1
+fi
 systemctl daemon-reload
 restants=$(systemctl list-units --no-pager --all 'ogs-shopfr*' | grep -c "ogs-shopfr" || true)
 echo "unités restantes : $restants"

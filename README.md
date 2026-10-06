@@ -335,9 +335,10 @@ tout ce qui la refuse, chaque refus avec son remède : une racine qu'un autre pr
 partage ou englobe, un point de montage sous l'arborescence ou les journaux, un fichier
 de configuration qu'ogs n'a pas écrit pour ce projet, une base qu'elle ne pourrait pas
 sauvegarder (`--no-dump` lève ce refus) et, sans `--force`, le compte ou les bases d'un
-projet adopté. Une interruption reçue avant le premier retrait abandonne la suppression
-et relance les services arrêtés ; reçue après, elle laisse la suppression aller à son
-terme. `--dry-run` y est refusé (code 2) : la commande ne sait pas simuler.
+projet adopté. Le site — vhost, pool, tâches — est coupé avant l'archive et le dump
+(D114). Une interruption reçue avant le premier retrait abandonne la suppression, rétablit
+le site et relance les services arrêtés ; reçue après, elle laisse la suppression aller à
+son terme. `--dry-run` y est refusé (code 2) : la commande ne sait pas simuler.
 
 La restauration applique d'abord la déclaration, puis remet le home tel que
 l'utilisateur l'avait laissé, **sans traverser aucun lien** — ni celui du trousseau
