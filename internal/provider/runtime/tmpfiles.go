@@ -5,10 +5,8 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/user"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
@@ -16,6 +14,7 @@ import (
 	"leblanc.io/open-go-server/internal/engine"
 	"leblanc.io/open-go-server/internal/fs"
 	"leblanc.io/open-go-server/internal/model"
+	"leblanc.io/open-go-server/internal/provider/php"
 )
 
 // ProjectRunMode est le mode du répertoire d'exécution d'un projet : le projet y
@@ -29,25 +28,10 @@ const ProjectRunMode os.FileMode = 0o710
 // n'atteindrait le répertoire d'un projet.
 const RunRootMode os.FileMode = 0o755
 
-// ProjectRunOwner résout le propriétaire du répertoire d'exécution. Une
-// résolution impossible — compte pas encore créé, mode préfixé sans compte
-// système — laisse le propriétaire en place : c'est systemd-tmpfiles qui
-// corrigera au vidage des intentions.
+// ProjectRunOwner résout le propriétaire du répertoire d'exécution
+// (fs.LookupOwner).
 func ProjectRunOwner(proj *model.Project) fs.Owner {
-	u, err := user.Lookup(proj.Spec.User.Name)
-	if err != nil {
-		return fs.KeepOwner
-	}
-	g, err := user.LookupGroup(proj.Spec.User.Group)
-	if err != nil {
-		return fs.KeepOwner
-	}
-	uid, errU := strconv.Atoi(u.Uid)
-	gid, errG := strconv.Atoi(g.Gid)
-	if errU != nil || errG != nil {
-		return fs.KeepOwner
-	}
-	return fs.Owner{UID: uid, GID: gid}
+	return fs.LookupOwner(proj.Spec.User.Name, proj.Spec.User.Group)
 }
 
 // EnsureProjectRunDir pose /run/ogs/<id> avec le mode et le propriétaire que
@@ -67,7 +51,10 @@ func EnsureProjectRunDir(path string, proj *model.Project) error {
 // au redémarrage, et c'est systemd-tmpfiles qui les recrée.
 type Provider struct {
 	Paths config.Paths
-	Now   func() time.Time
+	// Config donne le gc_maxlifetime des pools, d'où l'âge de la purge des
+	// sessions (D115). nil vaut la configuration livrée.
+	Config *config.Config
+	Now    func() time.Time
 }
 
 // Name identifie le provider.
@@ -96,11 +83,43 @@ func (p *Provider) Build(projects []*model.Project) []byte {
 	for _, id := range ids {
 		fmt.Fprintf(&b, "d %s %04o %s -\n", p.Paths.ProjectRunDir(id), ProjectRunMode.Perm(), owners[id])
 	}
+	// Sessions PHP (D115), purgées selon leur âge : Debian n'en confie la purge
+	// qu'à sessionclean, qui ne connaît que le save_path du php.ini. La chaîne
+	// est entièrement root jusqu'au répertoire du projet : systemd-tmpfiles
+	// résout les parents par leur nom, et sous le home, l'utilisateur lui
+	// désignait le répertoire « sessions » de son choix.
+	sessions := p.sessionLines(projects)
+	if len(sessions) > 0 {
+		b.WriteString("# Sessions PHP, purgées au-delà du session.gc_maxlifetime effectif des pools.\n")
+		fmt.Fprintf(&b, "d %s %04o root root -\n", p.Paths.SessionsRoot(), php.SessionsRootMode.Perm())
+		for _, line := range sessions {
+			b.WriteString(line)
+		}
+	}
 	return fs.Render(fs.Header{
 		Project:   fmt.Sprintf("%d projet(s)", len(projects)),
 		Resource:  "runtime/tmpfiles",
 		Generated: p.now(),
 	}, []byte(b.String()), "#")
+}
+
+// sessionLines rend la ligne de sessions de chaque projet PHP, triée.
+func (p *Provider) sessionLines(projects []*model.Project) []string {
+	var out []string
+	for _, proj := range projects {
+		age, isPHP := php.SessionLifetime(p.Config, p.Paths, proj)
+		if !isPHP {
+			continue
+		}
+		purge := "-"
+		if age > 0 {
+			purge = fmt.Sprintf("%ds", age)
+		}
+		out = append(out, fmt.Sprintf("d %s %04o %s %s %s\n", p.Paths.ProjectSessionsDir(proj.ID()),
+			php.SessionsDirMode.Perm(), proj.Spec.User.Name, proj.Spec.User.Group, purge))
+	}
+	sort.Strings(out)
+	return out
 }
 
 // Plan renvoie l'étape de mise à jour du fichier tmpfiles.
@@ -153,6 +172,11 @@ func (p *Provider) ensureNow(projects []*model.Project) error {
 	for _, proj := range projects {
 		if err := EnsureProjectRunDir(p.Paths.ProjectRunDir(proj.ID()), proj); err != nil {
 			return err
+		}
+		if _, isPHP := php.SessionLifetime(p.Config, p.Paths, proj); isPHP {
+			if err := php.EnsureSessionsDir(p.Paths, proj); err != nil {
+				return err
+			}
 		}
 	}
 	return nil

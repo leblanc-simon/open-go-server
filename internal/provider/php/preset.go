@@ -8,6 +8,7 @@ import (
 
 	"leblanc.io/open-go-server/internal/config"
 	"leblanc.io/open-go-server/internal/model"
+	"leblanc.io/open-go-server/internal/template"
 	"leblanc.io/open-go-server/internal/validate"
 )
 
@@ -94,15 +95,20 @@ func KnownPresets(cfg *config.Config) []string {
 
 // baseSettings sont les réglages communs à tous les pools : journalisation,
 // cloisonnement et garde-fous de durée. open_basedir limite l'accès au home du
-// projet, ce qui contient les dégâts d'une inclusion de fichier malveillante.
-func baseSettings(root, logDir string) map[string]string {
+// projet, ce qui contient les dégâts d'une inclusion de fichier malveillante —
+// et au répertoire de ses sessions, que FPM y soumet aussi.
+//
+// Les sessions vivent hors du home (D115) : systemd-tmpfiles les purge selon
+// leur âge, en root, et résout le chemin par son nom — un parent du home lié par
+// l'utilisateur lui faisait purger le répertoire « sessions » de son choix.
+func baseSettings(root, logDir, sessions string) map[string]string {
 	return map[string]string{
 		"pm.max_requests":                    "500",
 		"php_admin_flag[log_errors]":         "on",
 		"php_admin_value[error_log]":         filepath.Join(logDir, "php-error.log"),
-		"php_admin_value[open_basedir]":      root + ":/tmp:/usr/share/php",
+		"php_admin_value[open_basedir]":      root + ":/tmp:/usr/share/php:" + sessions,
 		"php_admin_value[upload_tmp_dir]":    filepath.Join(root, "var", "tmp"),
-		"php_admin_value[session.save_path]": filepath.Join(root, "var", "sessions"),
+		"php_admin_value[session.save_path]": sessions,
 		"php_admin_value[sys_temp_dir]":      filepath.Join(root, "var", "tmp"),
 		"slowlog":                            filepath.Join(logDir, "php-slow.log"),
 		"request_slowlog_timeout":            "10s",
@@ -153,6 +159,10 @@ type Resolved struct {
 	Settings   map[string]string
 	Env        map[string]string
 	Problems   []Problem
+	// Notes nomme ce qui est rendu mais sans effet — un php_value que le
+	// php_admin_value du même nom masque (D115). Elles ne comptent ni au plan ni
+	// dans le code de retour : « doctor » les porte.
+	Notes []Problem
 }
 
 // Blocking rend les problèmes que le plan du projet refuse.
@@ -206,9 +216,10 @@ func poolConfig(cfg *config.Config) config.PHPPool {
 // Resolve n'échoue jamais sur un réglage : il rend ce qu'il a pu calculer et la
 // liste de ce qu'il a écarté. Le vhost de supervision, calculé pour tout le parc,
 // passe par lui — un pool mal déclaré ne doit pas arrêter le plan global.
-func Resolve(cfg *config.Config, proj *model.Project, pool model.Pool, at model.AppType) Resolved {
+func Resolve(cfg *config.Config, paths config.Paths, proj *model.Project, pool model.Pool, at model.AppType) Resolved {
 	pc := poolConfig(cfg)
-	r := Resolved{Settings: baseSettings(proj.Spec.Layout.Root, proj.Spec.Layout.LogDir)}
+	r := Resolved{Settings: baseSettings(proj.Spec.Layout.Root, proj.Spec.Layout.LogDir,
+		paths.ProjectSessionsDir(proj.ID()))}
 	projectField := fmt.Sprintf("spec.php.pools[%s]", pool.Name)
 
 	apply := func(layer model.PoolSettings, field string, fromProject bool) {
@@ -307,6 +318,11 @@ func Resolve(cfg *config.Config, proj *model.Project, pool model.Pool, at model.
 		}
 	}
 
+	r.Notes = shadowedValues(r.Settings, pool.Settings, projectField+".settings")
+	if pb := keepSessionsReachable(r.Settings, paths.ProjectSessionsDir(proj.ID())); pb != nil {
+		r.Problems = append(r.Problems, *pb)
+	}
+
 	r.Env = map[string]string{}
 	if at.EnvVar != "" {
 		// « prod » en préproduction aussi (D96) : le site y est public, et un code
@@ -330,6 +346,73 @@ func Resolve(cfg *config.Config, proj *model.Project, pool model.Pool, at model.
 	return r
 }
 
+// shadowedValues nomme un php_value ou un php_flag que le projet déclare et qu'un
+// php_admin_value ou php_admin_flag du même nom rend sans effet : PHP ne laisse
+// pas une valeur ordinaire relever celle de l'administration. Le cas courant est
+// php_value[session.save_path] face au socle d'ogs (D115) — les sessions
+// restaient dans le répertoire d'ogs sans un mot.
+func shadowedValues(settings map[string]string, declared model.PoolSettings, field string) []Problem {
+	var out []Problem
+	keys := make([]string, 0, len(declared))
+	for k := range declared {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		if declared[k] == nil {
+			continue
+		}
+		ck := validate.CanonicalPoolKey(k)
+		var name string
+		switch {
+		case strings.HasPrefix(ck, "php_value["):
+			name = strings.TrimPrefix(ck, "php_value[")
+		case strings.HasPrefix(ck, "php_flag["):
+			name = strings.TrimPrefix(ck, "php_flag[")
+		default:
+			continue
+		}
+		for _, admin := range []string{"php_admin_value[" + name, "php_admin_flag[" + name} {
+			if _, ok := settings[admin]; ok {
+				out = append(out, Problem{Field: field + "." + k,
+					Message: fmt.Sprintf("sans effet : %s l'emporte — déclarer %s", admin, admin)})
+				break
+			}
+		}
+	}
+	return out
+}
+
+// keepSessionsReachable ajoute le répertoire des sessions à un open_basedir
+// déclaré qui ne le couvre pas, tant que le pool y range ses sessions : le
+// gestionnaire « files » de PHP soumet save_path à open_basedir, et un
+// open_basedir déclaré avant D115 — ou repris d'un pool adopté — ne connaît pas
+// ce répertoire. Une valeur citée par l'exploitant est lue comme FPM la lit, et
+// réécrite littéralement ; seule une citation qui développe « ${…} » reste telle
+// quelle, nommée au plan.
+func keepSessionsReachable(settings map[string]string, dir string) *Problem {
+	const key = "php_admin_value[open_basedir]"
+	basedir, ok := settings[key]
+	if !ok || basedir == "" {
+		return nil
+	}
+	if save, ok := iniSetting(settings, "session.save_path"); !ok || filepath.Clean(save) != dir {
+		return nil
+	}
+	read := template.FPMRead(basedir)
+	for _, entry := range strings.Split(read, ":") {
+		if entry = filepath.Clean(entry); entry == dir || strings.HasPrefix(dir, strings.TrimSuffix(entry, "/")+"/") {
+			return nil
+		}
+	}
+	if template.FPMQuotedForm(basedir) && strings.Contains(basedir, "${") {
+		return &Problem{Field: key, Message: fmt.Sprintf("ne couvre pas %s, où le pool range ses sessions : "+
+			"PHP n'en ouvrira aucune — l'y ajouter", dir)}
+	}
+	settings[key] = read + ":" + dir
+	return nil
+}
+
 func presetExists(pc config.PHPPool, name string) bool {
 	if _, ok := presets[name]; ok {
 		return true
@@ -349,7 +432,7 @@ func ConfigProblems(cfg *config.Config) []Problem {
 	// Les couches sont éprouvées comme le rendu les traite, sur le socle d'un
 	// projet quelconque : c'est le même jugement, au mot près.
 	layer := func(settings model.PoolSettings, field string) {
-		out = append(out, applyLayer(baseSettings("/", "/"), settings, field, false)...)
+		out = append(out, applyLayer(baseSettings("/", "/", "/"), settings, field, false)...)
 	}
 	layer(pc.Defaults, "config.yaml php.pool.defaults")
 	names := make([]string, 0, len(pc.Presets))
@@ -431,7 +514,7 @@ func applyLayer(dst map[string]string, layer model.PoolSettings, field string, f
 			delete(dst, ck)
 			continue
 		}
-		if msg := validate.PoolValueProblem(*v); msg != "" {
+		if msg := validate.PoolValueProblem(ck, *v); msg != "" {
 			out = append(out, Problem{Field: field + "." + k,
 				Message: msg + " — écartée", Blocking: fromProject})
 			continue

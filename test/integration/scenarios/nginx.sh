@@ -104,6 +104,51 @@ if [ "$recu" != "jeton" ]; then
 fi
 
 echo
+echo "--- valeurs de pool citées : FPM lit ce que la déclaration porte (D115) ---"
+# L'analyseur d'ini de FPM lit « ; » comme un commentaire, développe « ${…} »,
+# évalue les opérateurs et les mots-clés, refuse « = » : chaque valeur doit
+# parvenir telle quelle au script, sauf la citation de l'exploitant (D103) et
+# l'expression de constantes, que FPM évalue comme avant.
+python3 - <<'PY'
+import json
+chemin = "/etc/ogs/projects/phptest.yaml"
+s = open(chemin).read()
+env = {"V1": ".:/a;/b", "V2": "a${HOME}x", "V3": "l'a", "V4": "a & b", "V5": "no",
+       "V6": "a=b", "V7": "x$y", "V8": '"x" ${HOME}', "V9": "E_ALL", "V10": "a/b~c (d) !e"}
+settings = {"php_value[highlight.string]": "a=b ; c", "php_value[highlight.comment]": "l'apostrophe ~ (x)",
+            "php_value[highlight.keyword]": '"/usr/sbin/sendmail -t -i"',
+            "php_value[error_reporting]": "E_ALL & ~E_DEPRECATED",
+            "php_value[session.gc_maxlifetime]": "3"}
+bloc = "        settings:\n" + "".join("          %s: %s\n" % (json.dumps(k), json.dumps(v)) for k, v in settings.items())
+# « $PATH » relaie la variable du maître : syntaxe de FPM, jamais refusée.
+bloc += "        env:\n" + "".join("          %s: %s\n" % (k, json.dumps(v)) for k, v in dict(env, RELAIS="$PATH").items())
+if "highlight.string" not in s:
+    s = s.replace("      - name: web\n", "      - name: web\n" + bloc, 1)
+open(chemin, "w").write(s)
+json.dump({"env": env, "highlight.string": settings["php_value[highlight.string]"],
+           "highlight.comment": settings["php_value[highlight.comment]"],
+           "highlight.keyword": "/usr/sbin/sendmail -t -i"}, open("/tmp/attendu.json", "w"))
+PY
+# Sans init, le rechargement par le substitut peut échouer (code 6) : FPM est
+# relancé plus bas par son pidfile. Seul un refus de la déclaration compte.
+code=0
+ogs apply phptest --yes >/tmp/apply-valeurs.out 2>&1 || code=$?
+if [ "$code" != 0 ] && [ "$code" != 6 ]; then
+    echo "ÉCHEC : apply des valeurs citées refusé (code $code)"
+    cat /tmp/apply-valeurs.out
+    exit 1
+fi
+grep -E "^(env\[V|php_value\[(highlight|error))" "/etc/php/$version/fpm/pool.d/phptest.conf"
+php-fpm"$version" -t >/dev/null 2>&1 || { echo "ÉCHEC : php-fpm -t refuse le pool rendu"; php-fpm"$version" -t; exit 1; }
+sockphp=$(sed -n 's/^listen = //p' "/etc/php/$version/fpm/pool.d/phptest.conf")
+kill -USR2 "$(cat "/run/php/php$version-fpm.pid")" 2>/dev/null || true
+sleep 1
+for _ in $(seq 1 10); do
+    [ -S "$sockphp" ] && break
+    sleep 1
+done
+
+echo
 echo "--- PHP exécuté par le socket FastCGI, sous l'identité du projet ---"
 mkdir -p /home/php.test/www/public
 # Le front controller répond 404 sur /absent, pour la page d'erreur éprouvée plus
@@ -111,7 +156,23 @@ mkdir -p /home/php.test/www/public
 # (revalidate_freq=2), et un script réécrit puis interrogé dans les deux
 # secondes répond encore par l'ancien code.
 cat > /home/php.test/www/public/index.php <<'PHP'
-<?php if ($_SERVER["REQUEST_URI"] === "/absent") { http_response_code(404); }
+<?php
+$uri = $_SERVER["REQUEST_URI"];
+if ($uri === "/valeurs") {
+    $env = [];
+    foreach (["V1", "V2", "V3", "V4", "V5", "V6", "V7", "V8", "V9", "V10", "RELAIS"] as $k) { $env[$k] = getenv($k); }
+    echo json_encode(["env" => $env, "highlight.string" => ini_get("highlight.string"),
+        "highlight.comment" => ini_get("highlight.comment"), "highlight.keyword" => ini_get("highlight.keyword"),
+        "error_reporting" => error_reporting(), "attendu" => E_ALL & ~E_DEPRECATED]);
+    exit;
+}
+if ($uri === "/session") { session_start(); $_SESSION["x"] = 1; echo session_save_path(), "/sess_", session_id(); exit; }
+if ($uri === "/opcache") {
+    $s = @opcache_get_status(true);
+    echo $s === false ? "API fermée" : implode("\n", array_keys($s["scripts"] ?? []));
+    exit;
+}
+if ($uri === "/absent") { http_response_code(404); }
 echo "php actif sous ", posix_getpwuid(posix_geteuid())["name"];
 PHP
 chown -R phptest:phptest /home/php.test/www
@@ -122,6 +183,47 @@ if [[ "$reponse" != *"php actif sous phptest"* ]]; then
     tail -5 /home/php.test/logs/nginx-error.log 2>/dev/null
     exit 1
 fi
+
+echo
+echo "--- chaque valeur parvient telle quelle au script (D115) ---"
+curl -sk --resolve php.test:443:127.0.0.1 https://php.test/valeurs >/tmp/valeurs.json
+python3 - <<'PY' || exit 1
+import json, sys
+recu = json.load(open("/tmp/valeurs.json"))
+attendu = json.load(open("/tmp/attendu.json"))
+fautes = [f"env {k} : reçu {recu['env'].get(k)!r}, déclaré {v!r}" for k, v in attendu["env"].items()
+          if recu["env"].get(k) != v]
+fautes += [f"{k} : reçu {recu[k]!r}, déclaré {attendu[k]!r}" for k in ("highlight.string", "highlight.comment",
+           "highlight.keyword") if recu[k] != attendu[k]]
+relais = recu["env"].get("RELAIS") or ""
+if relais in ("", "$PATH") or "/bin" not in relais:
+    fautes.append(f"env RELAIS = $PATH : reçu {relais!r}, la variable PATH du maître attendue")
+if recu["error_reporting"] != recu["attendu"]:
+    fautes.append(f"error_reporting {recu['error_reporting']} : l'expression doit être évaluée ({recu['attendu']})")
+for f in fautes:
+    print("ÉCHEC :", f)
+if fautes:
+    sys.exit(1)
+print("valeurs reçues intactes :", len(attendu["env"]) + 3, "+ error_reporting évalué")
+PY
+
+echo
+echo "--- sessions hors du home, purgées par systemd-tmpfiles selon leur âge (D115) ---"
+session=$(curl -sk --resolve php.test:443:127.0.0.1 https://php.test/session)
+echo "session : $session"
+case "$session" in
+/var/lib/ogs/sessions/phptest/sess_*) ;;
+*) echo "ÉCHEC : la session n'est pas rangée sous /var/lib/ogs/sessions/phptest"; exit 1 ;;
+esac
+[ -f "$session" ] || { echo "ÉCHEC : fichier de session absent"; ls -la /var/lib/ogs/sessions/phptest; exit 1; }
+grep "sessions/phptest" /etc/tmpfiles.d/ogs.conf
+grep -q "sessions/phptest 0700 phptest phptest 3s" /etc/tmpfiles.d/ogs.conf ||
+    { echo "ÉCHEC : la ligne tmpfiles ne suit pas le gc_maxlifetime du pool"; exit 1; }
+sleep 4
+systemd-tmpfiles --clean /etc/tmpfiles.d/ogs.conf
+[ -e "$session" ] && { echo "ÉCHEC : session expirée non purgée"; exit 1; }
+[ -d /var/lib/ogs/sessions/phptest ] || { echo "ÉCHEC : le répertoire des sessions a été retiré"; exit 1; }
+echo "session expirée purgée, répertoire en place"
 
 echo
 echo "--- aucun autre script PHP n'est exécutable ---"
@@ -229,6 +331,17 @@ attendu /themes/classic/assets/css/theme.css 200
 for uri in /api/products /admin7x2k/index.php; do
     echo "  (constat) $uri → HTTP $(curl -s -o /dev/null -w '%{http_code}' -H 'Host: boutique.test' "http://127.0.0.1$uri")"
 done
+echo
+echo "--- OPcache : ce qu'un projet voit des scripts de ses voisins (constat, §20) ---"
+curl -s -o /dev/null -H 'Host: boutique.test' http://127.0.0.1/
+curl -s -o /dev/null -H 'Host: boutique.test' http://127.0.0.1/admin7x2k/index.php
+vus=$(curl -sk --resolve php.test:443:127.0.0.1 https://php.test/opcache)
+if printf '%s\n' "$vus" | grep -q "/home/boutique.test/"; then
+    echo "(constat) opcache_get_status() de phptest énumère les scripts de boutiquetest : R4-34 reste ouvert"
+else
+    echo "(constat) phptest ne voit pas les scripts de boutiquetest : $vus" | head -3
+fi
+
 ogs project delete boutiquetest --yes >/dev/null 2>&1
 echo "les règles de Prestashop sont servies sous nginx comme sous Apache"
 
@@ -784,6 +897,10 @@ code=$(curl -sk -o /dev/null -w '%{http_code}' --resolve php.test:443:127.0.0.1 
 echo "php.test après suppression : HTTP $code"
 if [ "$code" = "200" ]; then
     echo "ÉCHEC : le site supprimé est encore servi"
+    exit 1
+fi
+if [ -e /var/lib/ogs/sessions/phptest ]; then
+    echo "ÉCHEC : les sessions du projet supprimé restent"
     exit 1
 fi
 

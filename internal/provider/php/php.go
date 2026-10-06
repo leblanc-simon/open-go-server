@@ -152,6 +152,25 @@ func (p *Provider) Observe(ctx context.Context, proj *model.Project) (Observed, 
 		wanted[path] = true
 		names[filepath.Base(path)] = true
 	}
+	p.scanPools(proj.ID(), func(path string, owned bool) {
+		switch {
+		case wanted[path]:
+		case owned:
+			obs.Stale = append(obs.Stale, path)
+		case names[filepath.Base(path)]:
+			// Le nom exact d'un pool du projet, ailleurs que dans sa version :
+			// il tourne encore sous le compte du projet. Le taire laissait deux
+			// pools actifs après un « php switch » sans que rien ne le dise.
+			obs.Leftovers = append(obs.Leftovers, path)
+		}
+	})
+	return obs, nil
+}
+
+// scanPools parcourt les fichiers de pool de toutes les versions détectées et
+// dit, pour chacun, si son en-tête le déclare écrit par ogs comme l'un des pools
+// du projet id. Un fichier illisible ne peut pas être attribué : il ne l'est pas.
+func (p *Provider) scanPools(id string, visit func(path string, owned bool)) {
 	for _, v := range p.versions() {
 		entries, err := os.ReadDir(v.PoolDir)
 		if err != nil {
@@ -162,24 +181,33 @@ func (p *Provider) Observe(ctx context.Context, proj *model.Project) (Observed, 
 				continue
 			}
 			path := filepath.Join(v.PoolDir, e.Name())
-			if wanted[path] {
-				continue
-			}
-			// Un fichier illisible ne peut pas être attribué : il n'est pas retiré.
 			owner, resource, err := fs.ManagedResource(path)
-			switch {
-			case err != nil:
-			case owner == proj.ID() && strings.HasPrefix(resource, "php/pool/"):
-				obs.Stale = append(obs.Stale, path)
-			case names[e.Name()]:
-				// Le nom exact d'un pool du projet, ailleurs que dans sa version :
-				// il tourne encore sous le compte du projet. Le taire laissait deux
-				// pools actifs après un « php switch » sans que rien ne le dise.
-				obs.Leftovers = append(obs.Leftovers, path)
-			}
+			visit(path, err == nil && owner == id && strings.HasPrefix(resource, "php/pool/"))
 		}
 	}
-	return obs, nil
+}
+
+// OwnedPools énumère les pools qu'ogs a écrits pour un projet, lus sur l'en-tête
+// et jamais sur le nom (D76), toutes versions confondues. « project delete » y
+// trouve ceux que la déclaration ne nomme plus — type d'application devenu sans
+// PHP, pool retiré sans apply (D115) —, qui survivaient sinon au projet.
+func (p *Provider) OwnedPools(id string) []string {
+	var out []string
+	p.scanPools(id, func(path string, owned bool) {
+		if owned {
+			out = append(out, path)
+		}
+	})
+	sort.Strings(out)
+	return out
+}
+
+// Retired observe un projet dont le type n'emploie plus PHP (D115) : tous les
+// pools qu'ogs a écrits pour lui sont obsolètes, qu'une déclaration restée en
+// place les nomme encore ou non. Ils tournaient sinon sous son compte, jamais
+// réconciliés, et survivaient à sa suppression.
+func (p *Provider) Retired(proj *model.Project) Observed {
+	return Observed{Files: map[string]fs.State{}, Stale: p.OwnedPools(proj.ID())}
 }
 
 // poolName traduit le nom logique d'un pool en nom effectif : le pool principal
@@ -324,7 +352,7 @@ func (p *Provider) Build(proj *model.Project, pool model.Pool) (*PoolPlan, error
 	if err != nil {
 		return nil, err
 	}
-	resolved := Resolve(p.Config, proj, pool, at)
+	resolved := Resolve(p.Config, p.Paths, proj, pool, at)
 	// php.ini l'emporte sur le pool : une fonction qu'il ferme reste fermée,
 	// allowFunctions compris (éprouvé sous un vrai FPM, D103).
 	if len(pool.AllowFunctions) > 0 {
@@ -385,6 +413,7 @@ func (p *Provider) Build(proj *model.Project, pool model.Pool) (*PoolPlan, error
 // Plan calcule les étapes relatives aux pools.
 func (p *Provider) Plan(_ context.Context, proj *model.Project, obs Observed) ([]*engine.Step, error) {
 	var steps []*engine.Step
+	writes := false
 	for _, pool := range proj.Spec.PHP.Pools {
 		bp, err := p.Build(proj, pool)
 		if err != nil {
@@ -416,12 +445,25 @@ func (p *Provider) Plan(_ context.Context, proj *model.Project, obs Observed) ([
 					pool.Version, strings.Join(v.Missing, ", "))
 			}
 		}
-		steps = append(steps, p.poolStep(proj, bp))
+		step := p.poolStep(proj, bp)
+		writes = writes || step.Action != engine.NoOp
+		steps = append(steps, step)
 		// Ce qui a été écarté du rendu est nommé par une étape non critique : le
 		// pool est servi sans, et l'apply rend le code 6 tant que la déclaration —
 		// ou config.yaml — n'est pas corrigée.
 		if warnings := bp.Resolved.Warnings(); len(warnings) > 0 {
 			steps = append(steps, discardedStep(bp, warnings))
+		}
+	}
+	// Le répertoire des sessions (D115) manquant est recréé quand aucun pool ne
+	// s'écrit — l'écriture d'un pool le pose déjà : retiré à la main, PHP
+	// n'ouvrait plus aucune session, et rien ne le reposait avant que le fichier
+	// tmpfiles ne change.
+	if dir := p.Paths.ProjectSessionsDir(proj.ID()); !writes && len(proj.Spec.PHP.Pools) > 0 {
+		if info, err := os.Lstat(dir); err != nil || !info.IsDir() {
+			s := engine.NewStep("php/sessions", engine.Create, "répertoire des sessions PHP "+dir)
+			s.Apply = func(context.Context) error { return EnsureSessionsDir(p.Paths, proj) }
+			steps = append([]*engine.Step{s}, steps...)
 		}
 	}
 	return append(steps, unitSteps(obs)...), nil
@@ -584,6 +626,11 @@ func (p *Provider) poolStep(proj *model.Project, bp *PoolPlan) *engine.Step {
 			if _, err := fs.BackupTo(bp.Path, p.Paths.BackupsDir(), p.now()); err != nil && !os.IsNotExist(err) {
 				return err
 			}
+		}
+		// Le répertoire des sessions que le pool désigne (D115) existe avant
+		// que FPM ne le relise.
+		if err := EnsureSessionsDir(p.Paths, proj); err != nil {
+			return err
 		}
 		if err := p.writePool(ctx, bp); err != nil {
 			return err

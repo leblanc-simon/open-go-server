@@ -12,8 +12,8 @@ Les commits ne mentionnent jamais l'assistance d'un outil d'IA.
 
 ## La référence
 
-[`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md) fait autorité : 113 décisions d'architecture
-arbitrées (D1–D111, D113 et D114, D112 réservée ; tableau §2), spécification par module, plan de tests, découpage en lots. **Consulter le
+[`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md) fait autorité : 114 décisions d'architecture
+arbitrées (D1–D111, D113 à D115, D112 réservée ; tableau §2), spécification par module, plan de tests, découpage en lots. **Consulter le
 tableau des décisions avant de proposer une architecture** — la plupart des questions « pourquoi pas
 plutôt… ? » y sont déjà tranchées, avec leur raison. Toute décision nouvelle s'y ajoute.
 
@@ -553,6 +553,22 @@ Ils ont tous coûté un défaut réel ; les tests unitaires ne les voyaient pas.
   déclaration, et la normalisation n'écrit plus de preset — un pool sans preset écrit suit
   `defaultPreset`, une déclaration antérieure garde le `medium` qu'elle porte. `php.Resolve` est le seul
   calcul des réglages : le vhost de supervision lit `PoolPlan.Resolved.Settings`, jamais la déclaration.
+- **L'analyseur d'ini de FPM ne rend pas une valeur nue telle quelle** (D115) : `;` commente, `${…}` se
+  développe, `& | ~ ( ) !` et les constantes s'évaluent (`a & b` → 0), `no`/`off`/`null` deviennent vides —
+  `env[X] = no` fait refuser le pool —, `=` est une erreur de syntaxe. `template.FPMValue` cite toute valeur
+  qui l'exige, `$""{` pour `${` (`\${` en tête de chaîne garde la barre avant PHP 8.1), et laisse nues la
+  citation de l'exploitant, le booléen d'un flag et l'expression de constantes (`error_reporting` lit une
+  chaîne par `atoi` : citée, elle vaut 0). Un `$` en tête d'`env[]` relaie, après l'analyse, la variable
+  de ce nom dans l'environnement du maître (`env[HOSTNAME] = $HOSTNAME`, www.conf de Debian) : c'est une
+  fonction de FPM, jamais un refus — le refuser rendait le code 3 à des déclarations qui marchaient. Le banc
+  `TestFPMLitLesValeursCiteesTellesQuelles` éprouve chaque FPM installé par `php-fpm -tt`.
+- **systemd-tmpfiles résout les parents par leur nom, en root** : il refuse un lien au dernier composant,
+  jamais aux parents. Une ligne de purge sous un home (`~/var/sessions`) laissait l'utilisateur, qui renomme
+  `~/var`, désigner le répertoire `sessions` de son choix. D'où les sessions sous `/var/lib/ogs/sessions/<id>`
+  (D115) : toute ligne tmpfiles vise une chaîne entièrement root.
+- **`opcache.restrict_api` ne cloisonne pas** : il ne juge que le script appelant. Restreint à la racine de
+  chaque projet, le script d'un projet énumère les scripts des voisins et vide le cache commun de la version
+  (§20, R4-34).
 - **Le shell des comptes de projet est ouvert** — `/bin/bash` (D62), réglable par `user.shell` dans
   `/etc/ogs/config.yaml` et par `spec.user.shell`. Trois points à ne pas défaire : le défaut de la
   configuration est un défaut **de création**, le fichier du projet faisant autorité ensuite — le propager

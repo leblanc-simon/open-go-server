@@ -900,6 +900,14 @@ func (p Paths) EnvFile(id string) string { return filepath.Join(p.EnvFilesDir(),
 // ProjectRunDir renvoie le répertoire d'exécution d'un projet (verrous, sockets).
 func (p Paths) ProjectRunDir(id string) string { return filepath.Join(p.RunDir(), id) }
 
+// SessionsRoot est la racine des sessions PHP des projets (D115) : une chaîne
+// entièrement root, que systemd-tmpfiles purge sans suivre un lien posé par un
+// compte de projet.
+func (p Paths) SessionsRoot() string { return p.join(libDir, "sessions") }
+
+// ProjectSessionsDir est le répertoire des sessions PHP d'un projet (D115).
+func (p Paths) ProjectSessionsDir(id string) string { return filepath.Join(p.SessionsRoot(), id) }
+
 // LogsRoot renvoie la racine des journaux des projets, préfixe appliqué.
 func (p Paths) LogsRoot(cfg *Config) string { return p.join(cfg.LogsRoot()) }
 

@@ -62,7 +62,7 @@ func TestLesCouchesDuPoolSEmpilentDansLOrdre(t *testing.T) {
 		"pm":                              "ondemand",
 		"php_admin_value[memory_limit]":   "512M", // type sur preset
 		"php_admin_value[max_input_vars]": "9000", // projet sur type
-		"php_value[date.timezone]":        "",
+		"php_value[date.timezone]":        `""`,
 		"security.limit_extensions":       ".php",
 	} {
 		if got, ok := ligne(t, c, key); !ok || got != want {
@@ -446,61 +446,89 @@ func TestLesValeursSontCiteesQuandLAnalyseurLesLiraitAutrement(t *testing.T) {
 		"php_value[error_reporting]": model.Value("E_ALL & ~E_DEPRECATED"),
 	}
 	p.Spec.PHP.Pools[0].Env = map[string]string{"DSN": "a;b"}
-	var refus *DeclarationError
 	bp, _ := prov.Build(p, p.Spec.PHP.Pools[0])
 	c := string(bp.Content)
-	for _, want := range []string{"php_value[include_path] = '.:/a;/b'", "php_value[user_agent] = '${HOME}x'",
-		"php_value[error_reporting] = E_ALL & ~E_DEPRECATED", "env[DSN] = 'a;b'"} {
+	for _, want := range []string{`php_value[include_path] = ".:/a;/b"`, `php_value[user_agent] = "$""{HOME}x"`,
+		"php_value[error_reporting] = E_ALL & ~E_DEPRECATED", `env[DSN] = "a;b"`} {
 		if !strings.Contains(c, want) {
 			t.Errorf("%q absent :\n%s", want, c)
 		}
 	}
-	// Les sept cas de la relecture. main rendait toute valeur nue : chacune garde
-	// ce rendu, donc ce que FPM en lit, sauf « ; » — que main tronquait en
-	// commentaire — et le guillemet non apparié, que FPM refusait au démarrage.
-	cases := []struct {
-		value, render string // render vide : refus nommé
-		asMain        bool
-	}{
-		{`"/usr/sbin/sendmail -t -i"`, `"/usr/sbin/sendmail -t -i"`, true},
-		{`""`, `""`, true},
-		{`'x'`, `'x'`, true},
-		{`"a" "b"`, `"a" "b"`, true}, // FPM colle : ab
-		{`"a\"b"`, `"a\"b"`, true},   // FPM lit a"b
-		{`a"`, ``, false},
-		{`.:/a;/b`, `'.:/a;/b'`, false}, // main : « .:/a », le reste en commentaire
+	// Une valeur déjà citée par l'exploitant garde son rendu (D103) ; toute autre
+	// valeur que l'analyseur lirait autrement est citée, et parvient telle
+	// quelle à FPM (D115) — main en refusait, ou la corrompait en silence.
+	cases := []struct{ value, render string }{
+		{`"/usr/sbin/sendmail -t -i"`, `"/usr/sbin/sendmail -t -i"`},
+		{`""`, `""`},
+		{`'x'`, `'x'`},
+		{`"a" "b"`, `"a" "b"`}, // FPM colle : ab
+		{`"a\"b"`, `"a\"b"`},   // FPM lit a"b
+		{`"a;b"`, `"a;b"`},
+		{`a"`, `"a\""`},
+		{`.:/a;/b`, `".:/a;/b"`},
+		{`a";b`, `"a\";b"`},
+		{`"x" ${HOME}`, `"\"x\" $""{HOME}"`},
+		{`l'a;b`, `"l'a;b"`},
+		{`l'a`, `"l'a"`},
+		{`a & b`, `"a & b"`},
+		{`a=b`, `"a=b"`},
+		{`no`, `"no"`},
+		{`$HOME`, `"$HOME"`},
+		{``, `""`},
 	}
 	for _, tc := range cases {
 		p.Spec.PHP.Pools[0].Settings = model.PoolSettings{"php_value[user_agent]": model.Value(tc.value)}
 		p.Spec.PHP.Pools[0].Env = nil
-		if tc.render == "" {
-			_, err := prov.Plan(context.Background(), p, Observed{})
-			if !errors.As(err, &refus) || !strings.Contains(err.Error(), "php_value[user_agent]") {
-				t.Errorf("%s : refus nommé attendu, obtenu %v", tc.value, err)
-			}
-			continue
+		if _, err := prov.Plan(context.Background(), p, Observed{}); err != nil {
+			t.Errorf("%s : refusée à tort : %v", tc.value, err)
 		}
 		bp, _ = prov.Build(p, p.Spec.PHP.Pools[0])
 		got, _ := ligne(t, string(bp.Content), "php_value[user_agent]")
 		if got != tc.render {
 			t.Errorf("%s : rendu %s, attendu %s", tc.value, got, tc.render)
 		}
-		if tc.asMain && got != tc.value {
-			t.Errorf("%s : rendu différent de main (%s)", tc.value, got)
+	}
+	// Un mot-clé reste nu là où il est un booléen.
+	p.Spec.PHP.Pools[0].Settings = model.PoolSettings{"php_flag[display_errors]": model.Value("off"),
+		"catch_workers_output": model.Value("no")}
+	bp, _ = prov.Build(p, p.Spec.PHP.Pools[0])
+	for _, want := range []string{"php_flag[display_errors] = off", "catch_workers_output = no"} {
+		if !strings.Contains(string(bp.Content), want) {
+			t.Errorf("%q absent :\n%s", want, bp.Content)
 		}
 	}
-	// « " » mêlé à « ; » ou « ${ » : refus nommé, qu'il soit cité ou non.
-	for _, v := range []string{`a";b`, `"x" ${HOME}`, `"a;b"`} {
-		p.Spec.PHP.Pools[0].Settings = model.PoolSettings{"php_value[z]": model.Value(v)}
-		if _, err := prov.Plan(context.Background(), p, Observed{}); !errors.As(err, &refus) ||
-			!strings.Contains(err.Error(), "php_value[z]") {
-			t.Errorf("%q doit être refusée en la nommant : %v", v, err)
+	// Une variable est toujours citée : « no » arrivait vide — FPM refusait même
+	// le pool —, « E_ALL » valait 32767.
+	p.Spec.PHP.Pools[0].Settings = nil
+	p.Spec.PHP.Pools[0].Env = map[string]string{"A": "no", "B": "E_ALL", "C": "l'a", "D": "x$y"}
+	bp, _ = prov.Build(p, p.Spec.PHP.Pools[0])
+	for _, want := range []string{"env[APP_ENV] = prod", `env[A] = "no"`, `env[B] = "E_ALL"`, `env[C] = "l'a"`, `env[D] = "x$y"`} {
+		if !strings.Contains(string(bp.Content), want) {
+			t.Errorf("%q absent :\n%s", want, bp.Content)
 		}
 	}
-	// Une apostrophe en plus ne se cite pas : refus au plan.
-	p.Spec.PHP.Pools[0].Settings = model.PoolSettings{"php_value[x]": model.Value("l'a;b")}
-	if _, err := prov.Plan(context.Background(), p, Observed{}); !errors.As(err, &refus) {
-		t.Errorf("une valeur à citer portant une apostrophe doit être refusée : %v", err)
+	// « $… » en tête d'une variable est la syntaxe de FPM pour relayer celle de
+	// l'environnement de son maître (www.conf de Debian : env[HOSTNAME] =
+	// $HOSTNAME) : elle passe le plan et garde ce sens, citée ou non (D115).
+	for _, v := range []string{`$HOSTNAME`, `"$x"`} {
+		p.Spec.PHP.Pools[0].Env = map[string]string{"HN": v}
+		if _, err := prov.Plan(context.Background(), p, Observed{}); err != nil {
+			t.Errorf("env %q refusée : %v", v, err)
+		}
+	}
+	p.Spec.PHP.Pools[0].Env = map[string]string{"HN": "$HOSTNAME"}
+	bp, _ = prov.Build(p, p.Spec.PHP.Pools[0])
+	if !strings.Contains(string(bp.Content), `env[HN] = "$HOSTNAME"`) {
+		t.Errorf("env[HN] = $HOSTNAME doit être rendue pour FPM :\n%s", bp.Content)
+	}
+	p.Spec.PHP.Pools[0].Env = nil
+	p.Spec.PHP.Pools[0].Settings = model.PoolSettings{"env[PASS]": model.Value("$x")}
+	if _, err := prov.Plan(context.Background(), p, Observed{}); err != nil {
+		t.Errorf("env[] des réglages commençant par « $ » refusée : %v", err)
+	}
+	p.Spec.PHP.Pools[0].Settings = model.PoolSettings{"php_value[x]": model.Value("$x")}
+	if _, err := prov.Plan(context.Background(), p, Observed{}); err != nil {
+		t.Errorf("« $ » en tête d'une valeur d'ini se cite : %v", err)
 	}
 }
 
@@ -537,5 +565,112 @@ func TestUneValeurNulleSansCleHeriteeEstNommee(t *testing.T) {
 	w := bp.Resolved.Warnings()
 	if len(w) != 1 || !strings.Contains(w[0].String(), "php_value[x]") {
 		t.Errorf("seule la clé sans héritage doit être nommée : %v", w)
+	}
+}
+
+// D115 : les sessions quittent le home pour une chaîne root, que
+// systemd-tmpfiles purge sans suivre de lien. Un open_basedir déclaré, écrit
+// avant, ne connaît pas ce répertoire : il y est ajouté, sans quoi PHP refusait
+// d'ouvrir la moindre session.
+func TestLesSessionsViventHorsDuHomeEtRestentAtteignables(t *testing.T) {
+	prov, paths, _ := fixture(t, "8.3")
+	p := project(t, "shop.fr", model.KindSymfony, "6.4", "8.3")
+	dir := paths.ProjectSessionsDir("shopfr")
+	bp, err := prov.Build(p, p.Spec.PHP.Pools[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := string(bp.Content)
+	if got, _ := ligne(t, c, "php_admin_value[session.save_path]"); got != dir {
+		t.Errorf("save_path %q, attendu %q", got, dir)
+	}
+	if got, _ := ligne(t, c, "php_admin_value[open_basedir]"); !strings.HasSuffix(got, ":"+dir) {
+		t.Errorf("open_basedir %q ne couvre pas %s", got, dir)
+	}
+	p.Spec.PHP.Pools[0].Settings = model.PoolSettings{
+		"php_admin_value[open_basedir]": model.Value(p.Spec.Layout.Root + ":/usr/share/fonts")}
+	bp, _ = prov.Build(p, p.Spec.PHP.Pools[0])
+	if got, _ := ligne(t, string(bp.Content), "php_admin_value[open_basedir]"); got !=
+		`"`+p.Spec.Layout.Root+":/usr/share/fonts:"+dir+`"` && got != p.Spec.Layout.Root+":/usr/share/fonts:"+dir {
+		t.Errorf("open_basedir déclaré : %q", got)
+	}
+	// Cité par l'exploitant, il est lu comme FPM le lit, puis complété.
+	p.Spec.PHP.Pools[0].Settings = model.PoolSettings{
+		"php_admin_value[open_basedir]": model.Value(`"` + p.Spec.Layout.Root + `:/opt/lib"`)}
+	bp, _ = prov.Build(p, p.Spec.PHP.Pools[0])
+	if got, _ := ligne(t, string(bp.Content), "php_admin_value[open_basedir]"); got != p.Spec.Layout.Root+":/opt/lib:"+dir {
+		t.Errorf("open_basedir cité : %q", got)
+	}
+	// Un save_path déclaré ailleurs n'appelle rien.
+	p.Spec.PHP.Pools[0].Settings["php_admin_value[session.save_path]"] = model.Value("/srv/sessions")
+	bp, _ = prov.Build(p, p.Spec.PHP.Pools[0])
+	if got, _ := ligne(t, string(bp.Content), "php_admin_value[open_basedir]"); strings.Contains(got, dir) {
+		t.Errorf("open_basedir modifié sans objet : %q", got)
+	}
+}
+
+// Un php_value que le php_admin_value du socle rend sans effet est noté (D115),
+// pour doctor : php_value[session.save_path] laissait les sessions dans le
+// répertoire d'ogs sans un mot.
+func TestUnPHPValueMasqueParLAdministrationEstNomme(t *testing.T) {
+	prov, _, _ := fixture(t, "8.3")
+	p := project(t, "shop.fr", model.KindSymfony, "6.4", "8.3")
+	p.Spec.PHP.Pools[0].Settings = model.PoolSettings{"php_value[session.save_path]": model.Value("/srv/s")}
+	bp, err := prov.Build(p, p.Spec.PHP.Pools[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, pb := range bp.Resolved.Notes {
+		found = found || strings.Contains(pb.String(), "php_admin_value[session.save_path] l'emporte")
+	}
+	// Une note, jamais un problème : une déclaration ancienne rendrait sinon le
+	// code 6 à chaque apply.
+	if !found || len(bp.Resolved.Problems) > 0 {
+		t.Errorf("php_value masqué : notes %v, problèmes %v", bp.Resolved.Notes, bp.Resolved.Problems)
+	}
+}
+
+// Un répertoire de sessions retiré à la main est recréé à l'apply, pools
+// conformes ou non (D115).
+func TestLeRepertoireDesSessionsManquantEstRecree(t *testing.T) {
+	prov, paths, _ := fixture(t, "8.3")
+	p := project(t, "shop.fr", model.KindSymfony, "6.4", "8.3")
+	// Pool écrit puis répertoire retiré à la main : le pool est conforme.
+	steps, err := prov.Plan(context.Background(), p, Observed{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range steps {
+		if s.Apply != nil {
+			if err := s.Apply(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := os.RemoveAll(paths.ProjectSessionsDir("shopfr")); err != nil {
+		t.Fatal(err)
+	}
+	steps, err = prov.Plan(context.Background(), p, Observed{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, s := range steps {
+		if s.Resource == "php/sessions" {
+			found = true
+			if err := s.Apply(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if info, err := os.Stat(paths.ProjectSessionsDir("shopfr")); !found || err != nil || info.Mode().Perm() != SessionsDirMode {
+		t.Errorf("répertoire des sessions non recréé (étape %v) : %v %v", found, info, err)
+	}
+	steps, _ = prov.Plan(context.Background(), p, Observed{})
+	for _, s := range steps {
+		if s.Resource == "php/sessions" {
+			t.Error("répertoire présent : aucune étape attendue")
+		}
 	}
 }

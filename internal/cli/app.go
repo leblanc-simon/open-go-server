@@ -456,7 +456,7 @@ func (a *App) buildProviders() (*providers, error) {
 			Owner: func(proj *model.Project) (int, int, error) { return sys.ResolveOwner(proj, "") }},
 		Unit:      &unit.Provider{Paths: a.Paths, Exec: a.Exec, Templates: tmpl, Force: a.Force},
 		Sudoers:   &sudoers.Provider{Paths: a.Paths, Exec: a.Exec, Force: a.Force},
-		Runtime:   &runtime.Provider{Paths: a.Paths},
+		Runtime:   &runtime.Provider{Paths: a.Paths, Config: a.Cfg},
 		Hooks:     a.hookRunner(),
 		PHP:       php,
 		Web:       webProv,

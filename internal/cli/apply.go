@@ -127,6 +127,9 @@ func (a *App) buildPlan(ctx context.Context, provs *providers, p *model.Project)
 		if err != nil {
 			return nil, wrap(CodeError, err)
 		}
+	} else if stale, err = provs.PHP.PlanStale(ctx, p, provs.PHP.Retired(p)); err != nil {
+		// Un type sans PHP retire les pools qu'ogs a écrits pour le projet (D115).
+		return nil, wrap(CodeError, err)
 	}
 
 	// Application non-PHP : runtime, unité et attente de disponibilité. Elle

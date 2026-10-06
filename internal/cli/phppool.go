@@ -25,7 +25,7 @@ func (a *App) checkPoolDeclarations(p *model.Project) error {
 	}
 	var lines []string
 	for _, pool := range p.Spec.PHP.Pools {
-		for _, pb := range php.Resolve(a.Cfg, p, pool, at).Blocking() {
+		for _, pb := range php.Resolve(a.Cfg, a.Paths, p, pool, at).Blocking() {
 			lines = append(lines, pb.String())
 		}
 	}
@@ -42,7 +42,7 @@ func (a *App) poolPreset(p *model.Project, pool model.Pool) string {
 	if err != nil {
 		return pool.PresetLabel()
 	}
-	return php.Resolve(a.Cfg, p, pool, at).DescribePreset()
+	return php.Resolve(a.Cfg, a.Paths, p, pool, at).DescribePreset()
 }
 
 // phpPoolChecks porte les contrôles des pools (D103) : la section « php.pool »
@@ -68,7 +68,7 @@ func (a *App) phpPoolChecks(projects []*model.Project, add func(name, status, de
 			continue
 		}
 		for _, pool := range p.Spec.PHP.Pools {
-			r := php.Resolve(a.Cfg, p, pool, at)
+			r := php.Resolve(a.Cfg, a.Paths, p, pool, at)
 			for _, pb := range r.Problems {
 				// Ceux de config.yaml sont déjà nommés, une fois pour toute la machine.
 				if strings.HasPrefix(pb.Field, "config.yaml") {
@@ -82,6 +82,14 @@ func (a *App) phpPoolChecks(projects []*model.Project, add func(name, status, de
 					add("pools php", "avertissement", "projet "+p.ID()+" : "+pb.String(),
 						"retirer ce réglage de "+p.ID()+".yaml ; le pool est rendu sans lui, code 6 à l'apply")
 				}
+			}
+			// Un réglage rendu mais sans effet (D115) : doctor seul le dit, il ne
+			// compte pas à l'apply — une déclaration ancienne rendrait sinon 6 à
+			// chaque passage.
+			for _, pb := range r.Notes {
+				declared++
+				add("pools php", "avertissement", "projet "+p.ID()+" : "+pb.String(),
+					"remplacer ce réglage dans "+p.ID()+".yaml par la directive d'administration nommée")
 			}
 			loads = append(loads, poolLoad{Project: p.ID(), Pool: pool.Name, Version: pool.Version,
 				Settings: r.Settings})

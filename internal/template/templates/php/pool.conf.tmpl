@@ -12,8 +12,8 @@ listen.mode = 0660
 ; utilisateur local peut donc faire exécuter du code sous cette identité.
 listen.allowed_clients = 127.0.0.1
 {{- end }}
-{{ range $key := sorted .Settings }}{{ $key }} = {{ fpmValue (index $.Settings $key) }}
+{{ range $key := sorted .Settings }}{{ $key }} = {{ fpmValue $key (index $.Settings $key) }}
 {{ end }}
 {{- range $key := sorted .Env }}
-env[{{ $key }}] = {{ fpmValue (index $.Env $key) }}
+env[{{ $key }}] = {{ fpmEnv (index $.Env $key) }}
 {{- end }}

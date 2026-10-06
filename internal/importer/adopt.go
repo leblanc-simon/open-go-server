@@ -3,11 +3,14 @@ package importer
 import (
 	"fmt"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"leblanc.io/open-go-server/internal/model"
 	"leblanc.io/open-go-server/internal/naming"
 	"leblanc.io/open-go-server/internal/provider/db"
+	"leblanc.io/open-go-server/internal/template"
+	"leblanc.io/open-go-server/internal/validate"
 )
 
 // Adopt construit la déclaration d'un projet à partir d'un candidat. L'adoption
@@ -116,6 +119,11 @@ func Adopt(c Candidate, homeRoot, prepDomain string, opts ...model.NormalizeOpti
 						"qu'il n'a pas créés (D111) ; « ogs doctor » signale une base adoptée ouverte à tous les rôles "+
 						"du cluster", r.Name))
 			}
+		case KindPool:
+			if len(p.Spec.PHP.Pools) == 0 || r.Attr("version") != c.PHPVersion {
+				continue
+			}
+			notes = append(notes, adoptPoolSettings(&p.Spec.PHP.Pools[0], r)...)
 		case KindCertificate:
 			if r.Attr("source") == "certbot" {
 				notes = append(notes, fmt.Sprintf(
@@ -152,6 +160,93 @@ func Adopt(c Candidate, homeRoot, prepDomain string, opts ...model.NormalizeOpti
 		p.Spec.User.Group = c.User
 	}
 	return p, notes, nil
+}
+
+// adoptPoolSettings reprend dans la déclaration les réglages du pool existant
+// (D115) : sans eux, le premier apply basculait le site sur le preset par défaut
+// — douze workers à 256M au lieu de ce qui le tenait en charge. Le preset
+// devient « custom », qui n'ajoute rien : les réglages repris s'appliquent sur le
+// seul socle d'ogs, qu'ils surchargent.
+//
+// Rien de ce que le plan refuserait ou écarterait n'entre dans la déclaration :
+// identité et point d'écoute, qu'ogs pose lui-même, sont laissés sans un mot ;
+// les autres clés verrouillées (D103) et une valeur hors grammaire sont nommées.
+// Une variable « $X » garde son sens — FPM relaie celle de son maître —, une
+// valeur « ${X} » non citée devient littérale et le dit, et un
+// php_value[session.save_path], sans effet face au php_admin_value du socle,
+// est repris en php_admin_value pour que les sessions restent où elles sont.
+func adoptPoolSettings(pool *model.Pool, r Resource) []string {
+	keys := make([]string, 0, len(r.Attributes))
+	for k := range r.Attributes {
+		if strings.HasPrefix(k, SettingAttr) {
+			keys = append(keys, strings.TrimPrefix(k, SettingAttr))
+		}
+	}
+	if len(keys) == 0 {
+		return nil
+	}
+	sort.Strings(keys)
+	var skipped, literal []string
+	settings, env := model.PoolSettings{}, map[string]string{}
+	_, adminSave := r.Attributes[SettingAttr+"php_admin_value[session.save_path]"]
+	for _, k := range keys {
+		v := r.Attributes[SettingAttr+k]
+		// Hors d'une citation, FPM développait « ${…} » depuis l'environnement de
+		// son maître ; la déclaration rendue sous D115 l'écrit littéralement.
+		if strings.Contains(v, "${") && !template.FPMQuotedForm(v) {
+			literal = append(literal, k)
+		}
+		// Le socle d'ogs pose php_admin_value[session.save_path] : un php_value
+		// n'y ferait rien, et les sessions du site changeraient de répertoire.
+		if k == "php_value[session.save_path]" && !adminSave {
+			k = "php_admin_value[session.save_path]"
+		}
+		if why, locked := validate.LockedPoolKey(k); locked {
+			if k != "user" && k != "group" && !strings.HasPrefix(k, "listen") {
+				skipped = append(skipped, fmt.Sprintf("%s (%s)", k, why))
+			}
+			continue
+		}
+		if name, ok := strings.CutPrefix(k, "env["); ok && strings.HasSuffix(name, "]") {
+			name = strings.TrimSuffix(name, "]")
+			if msg := validate.PoolEnvProblem(name, v); msg != "" {
+				skipped = append(skipped, fmt.Sprintf("%s (%s)", k, msg))
+				continue
+			}
+			env[name] = v
+			continue
+		}
+		if msg := validate.PoolKeyProblem(k); msg != "" {
+			skipped = append(skipped, fmt.Sprintf("%s (%s)", k, msg))
+			continue
+		}
+		if msg := validate.PoolValueProblem(k, v); msg != "" {
+			skipped = append(skipped, fmt.Sprintf("%s (%s)", k, msg))
+			continue
+		}
+		settings[k] = model.Value(v)
+	}
+	var notes []string
+	if len(settings)+len(env) > 0 {
+		pool.Preset = "custom"
+		if len(settings) > 0 {
+			pool.Settings = settings
+		}
+		if len(env) > 0 {
+			pool.Env = env
+		}
+		notes = append(notes, fmt.Sprintf("réglages du pool %s repris (%d directive(s), %d variable(s), preset custom)",
+			r.Name, len(settings), len(env)))
+	}
+	if len(skipped) > 0 {
+		notes = append(notes, fmt.Sprintf("réglages du pool %s non repris : %s", r.Name, strings.Join(skipped, " ; ")))
+	}
+	if len(literal) > 0 {
+		notes = append(notes, fmt.Sprintf("réglages du pool %s repris littéralement : %s — FPM y développait « ${…} » "+
+			"depuis l'environnement de son maître ; écrire la valeur voulue, ou la citer entre guillemets pour garder ce sens",
+			r.Name, strings.Join(literal, ", ")))
+	}
+	return notes
 }
 
 // splitAccount sépare le nom et l'hôte d'un compte tel que le scan le relève :

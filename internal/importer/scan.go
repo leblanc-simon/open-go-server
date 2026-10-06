@@ -17,6 +17,7 @@ import (
 	"leblanc.io/open-go-server/internal/provider/db"
 	"leblanc.io/open-go-server/internal/provider/php"
 	"leblanc.io/open-go-server/internal/provider/web"
+	"leblanc.io/open-go-server/internal/validate"
 )
 
 // Kind est la nature d'une ressource découverte.
@@ -190,6 +191,57 @@ var rePoolUser = regexp.MustCompile(`(?im)^\s*user\s*=\s*(\S+)`)
 var rePoolListen = regexp.MustCompile(`(?im)^\s*listen\s*=\s*(\S+)`)
 var rePoolName = regexp.MustCompile(`(?m)^\[([^\]]+)\]`)
 
+// SettingAttr préfixe, dans les attributs d'un pool, chacune de ses directives.
+const SettingAttr = "setting:"
+
+// PoolDirectives relève les directives de la première section d'un fichier de
+// pool, telles que FPM les lit : la dernière occurrence l'emporte, la clé sous
+// sa forme canonique (validate.CanonicalPoolKey) ; commentaires ôtés, valeur
+// gardée dans la syntaxe d'ini où elle est écrite — une valeur citée le reste.
+func PoolDirectives(content string) map[string]string {
+	out := map[string]string{}
+	inSection := false
+	for _, line := range strings.Split(content, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || line[0] == ';' || line[0] == '#' {
+			continue
+		}
+		if line[0] == '[' {
+			if inSection {
+				break
+			}
+			inSection = true
+			continue
+		}
+		key, value, ok := strings.Cut(line, "=")
+		if !ok || !inSection {
+			continue
+		}
+		out[validate.CanonicalPoolKey(strings.TrimSpace(key))] = strings.TrimSpace(stripIniComment(value))
+	}
+	return out
+}
+
+// stripIniComment ôte le commentaire d'une valeur d'ini : « ; » hors d'une
+// chaîne citée.
+func stripIniComment(value string) string {
+	var quote byte
+	for i := 0; i < len(value); i++ {
+		c := value[i]
+		switch {
+		case quote == '"' && c == '\\':
+			i++
+		case quote != 0 && c == quote:
+			quote = 0
+		case quote == 0 && (c == '"' || c == '\''):
+			quote = c
+		case quote == 0 && c == ';':
+			return value[:i]
+		}
+	}
+	return value
+}
+
 // scanPools lit les pools PHP-FPM de toutes les versions installées.
 func (s *Scanner) scanPools() []Resource {
 	var out []Resource
@@ -220,6 +272,11 @@ func (s *Scanner) scanPools() []Resource {
 			}
 			if m := rePoolListen.FindStringSubmatch(content); m != nil {
 				attrs["listen"] = m[1]
+			}
+			// Les réglages du pool, pour que l'adoption les reprenne (D115) : le
+			// premier apply basculait sinon le site sur un pool par défaut.
+			for key, value := range PoolDirectives(content) {
+				attrs[SettingAttr+key] = value
 			}
 			out = append(out, Resource{
 				Kind: KindPool, Name: strings.TrimSuffix(e.Name(), ".conf"),

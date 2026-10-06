@@ -47,53 +47,23 @@ func PoolKeyProblem(key string) string {
 	return ""
 }
 
-// PoolValueProblem dit pourquoi une valeur de réglage ne peut pas être rendue :
-// une fin de ligne y injecterait une directive dans le pool, que FPM lit en root.
+// PoolValueProblem dit pourquoi la valeur d'une directive ne peut pas parvenir
+// à FPM telle que la déclaration la porte, vide si elle le peut. Le rendu la
+// cite (template.FPMValue, D115) : « ; », « ${ », apostrophes, guillemets et
+// opérateurs d'ini arrivent tels quels. Reste impossible une fin de ligne ou un
+// NUL, qui injecteraient une directive dans le pool, que FPM lit en root (D103).
 //
-// Une valeur portant « ; » (commentaire) ou « ${ » (variable de l'environnement
-// du maître) est rendue entre apostrophes, que l'analyseur d'ini lit
-// littéralement (PoolValueNeedsQuote) ; elle ne peut donc porter ni apostrophe
-// ni guillemet — avec un guillemet, l'exploitant cite déjà à sa façon, et les
-// apostrophes en changeraient le sens. Un guillemet seul ne déclenche jamais la
-// citation : la valeur est rendue nue, lue par FPM comme avant D103 (« "a" "b" »
-// donne « ab », « "a\"b" » donne « a"b ») ; non apparié, FPM refuserait le pool
-// au démarrage, d'où le refus nommé ici.
-func PoolValueProblem(value string) string {
+// Une variable env[] dont la valeur lue commence par « $ » n'est pas refusée :
+// c'est la syntaxe de FPM pour relayer une variable de l'environnement de son
+// maître (« env[HOSTNAME] = $HOSTNAME », que porte le www.conf de Debian), et
+// elle garde ce sens, citée ou non.
+//
+// key est la directive (forme canonique), ou « env » pour une variable.
+func PoolValueProblem(key, value string) string {
 	if strings.ContainsAny(value, "\n\r\x00") {
 		return "la valeur tient sur une seule ligne"
 	}
-	special := strings.Contains(value, ";") || strings.Contains(value, "${")
-	switch {
-	case special && strings.Contains(value, `"`):
-		return "une valeur portant « ; » ou « ${ » est rendue entre apostrophes, et ne peut donc pas porter de guillemet"
-	case special && strings.Contains(value, "'"):
-		return "une valeur portant « ; » ou « ${ » est rendue entre apostrophes, et ne peut donc pas en porter"
-	case unescapedQuotes(value)%2 != 0:
-		return "guillemet non apparié : FPM refuserait le pool"
-	}
 	return ""
-}
-
-// unescapedQuotes compte les guillemets que l'analyseur d'ini ne lit pas comme
-// échappés (« \" »).
-func unescapedQuotes(value string) int {
-	n := 0
-	for i := 0; i < len(value); i++ {
-		switch value[i] {
-		case '\\':
-			i++
-		case '"':
-			n++
-		}
-	}
-	return n
-}
-
-// PoolValueNeedsQuote dit si une valeur doit être rendue entre apostrophes :
-// « ; » et « ${ » seuls l'exigent. Les autres restent nues : une citation ferait
-// d'« E_ALL & ~E_DEPRECATED » une chaîne, là où l'analyseur évalue l'expression.
-func PoolValueNeedsQuote(value string) bool {
-	return strings.Contains(value, ";") || strings.Contains(value, "${")
 }
 
 // CanonicalPoolKey rend la forme sous laquelle FPM reconnaît une directive :
@@ -111,7 +81,7 @@ func PoolEnvProblem(key, value string) string {
 	if !rePoolEnvKey.MatchString(key) {
 		return "nom de variable hors grammaire (lettres, chiffres, « . », « _ », « - »)"
 	}
-	return PoolValueProblem(value)
+	return PoolValueProblem("env", value)
 }
 
 // LockedPoolKey dit si une clé échappe aux surcharges, de la machine comme d'un

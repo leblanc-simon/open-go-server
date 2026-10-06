@@ -439,6 +439,13 @@ func newDeleteCommand(app *App) *cobra.Command {
 				app.printf("= --keep-data : compte %s conservé, avec sa crontab, ses tâches at, son linger "+
 					"et ses fichiers temporaires\n", p.Spec.User.Name)
 			}
+			// Les sessions PHP (D115) partent dans tous les cas, --keep-data compris :
+			// ce ne sont pas des données à garder, le fichier tmpfiles recalculé ne
+			// les purgerait plus, et un projet recréé sous cet identifiant hériterait
+			// des sessions ouvertes de celui-ci.
+			if err := os.RemoveAll(app.Paths.ProjectSessionsDir(p.ID())); err != nil {
+				warn("sessions PHP %s : %v", app.Paths.ProjectSessionsDir(p.ID()), err)
+			}
 
 			// 6. Le projet quitte l'inventaire actif, et ses numéros de pool et de
 			// port reviennent à la plage — seulement ceux dont le fichier est parti.
@@ -599,6 +606,13 @@ func (a *App) generatedFiles(provs *providers, p *model.Project) []string {
 			name = p.ID() + "_" + pool.Name
 		}
 		files = append(files, a.Paths.PHPPoolFile(pool.Version, name))
+	}
+	// Et tout pool que l'en-tête attribue au projet (D115) : celui d'un type
+	// devenu sans PHP, d'une version quittée, d'un pool retiré sans apply.
+	for _, path := range provs.PHP.OwnedPools(p.ID()) {
+		if !slices.Contains(files, path) {
+			files = append(files, path)
+		}
 	}
 	return files
 }
