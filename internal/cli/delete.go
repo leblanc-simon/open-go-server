@@ -2128,12 +2128,21 @@ func newRestoreCommand(app *App) *cobra.Command {
 			// du code du projet : ses instances, son attente de disponibilité, ses
 			// tâches planifiées et « postCreate » attendent le home et les bases
 			// (heldBack). Un succès partiel — une base indisponible, par exemple —
-			// n'empêche pas la restauration des fichiers ; l'apply final le redira.
+			// n'empêche pas la restauration des fichiers, mais reste un manque :
+			// l'apply final ne redit pas tout — l'annonce d'un compte adopté recréé
+			// (D111) ne vaut que pour l'apply qui le recrée.
 			app.holdServices = true
 			err = app.applyProjects(cmd, []*model.Project{p})
 			app.holdServices = false
-			if err != nil && ExitCode(err) != CodePartial {
-				return err
+			if err != nil {
+				if ExitCode(err) != CodePartial {
+					return err
+				}
+				state.addGaps(restoreGap{fmt.Sprintf("premier apply partiel (%v)", err),
+					"voir les avertissements ci-dessus ; ce qui reste en échec se reprend par ogs apply " + p.ID()})
+				if err := save(); err != nil {
+					return err
+				}
 			}
 			// L'arborescence vient après l'apply, et c'est voulu : le compte existe
 			// alors, et chaque entrée reçoit son propriétaire sur le descripteur de

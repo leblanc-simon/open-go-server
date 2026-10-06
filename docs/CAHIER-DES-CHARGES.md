@@ -3770,7 +3770,9 @@ ce qui exécute son code** — ni activation ni démarrage des instances, ni att
 de tâches planifiées, ni hook `postCreate` (D113) —, puis l'arborescence remise dans le home **après** cet
 apply, les dumps rechargés sauf `--with-data=false`, et enfin un **second apply**, qui active et démarre les
 instances, attend l'application, pose les tâches planifiées et lance `postCreate` : l'application ne démarre
-jamais sur un home vide ou des bases vides. Nécessite la même clé maître. L'extraction ne suit aucun lien et
+jamais sur un home vide ou des bases vides. Un premier apply partiel est un manque de la restauration (code 6) :
+le second ne redit pas tout — l'annonce d'un compte adopté recréé (D111) ne vaut que pour l'apply qui le
+recrée. Nécessite la même clé maître. L'extraction ne suit aucun lien et
 rend chaque entrée à qui la possédait (D81) : ce que l'apply avait posé et que l'utilisateur avait remplacé
 revient tel qu'il l'avait laissé — un `authorized_keys` régulier, un script à la place du lien `php`, un
 répertoire à la place de `~/logs` —, et le second apply le traite selon ses règles (D61, D70, D71), avec le
