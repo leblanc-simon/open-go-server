@@ -282,21 +282,24 @@ func TestLeVhostPrestashopRefuseCeQueSesHtaccessRefusent(t *testing.T) {
 		"/modules/m/views/css/front.css", "/modules/m/logo.png", "/pdf/invoice.css",
 		"/admin634xyz/themes/default/css/admin.css", "/fr/3-vetements",
 	}
+	// servisApache : ce qu'Apache exécute et que nginx refuse, faute d'être un
+	// point d'entrée de la branche (D119) — un .php de js/ ou de themes/ en 1.7.
 	type attendus struct{ refuses, servis, servisApache []string }
 	parBranche := map[string]attendus{
 		"1.7.8.11": {
 			refuses: []string{"/themes/classic/_dev/js/theme.js", "/img/logo.webp"},
 			servis: []string{"/js/vendor/bower.json", "/themes/classic/assets/js/theme.js.map",
-				"/themes/classic/README.md", "/upload/perso.jpg", "/modules/m/config.xml", "/archive.git/HEAD"},
-			servisApache: []string{"/js/porte.php", "/js/retro-compat.js.php", "/modules/m/ajax.php",
-				"/webservice/dispatcher.php", "/themes/classic/porte.php"},
+				"/themes/classic/README.md", "/upload/perso.jpg", "/modules/m/config.xml", "/archive.git/HEAD",
+				"/js/retro-compat.js.php", "/modules/m/ajax.php", "/webservice/dispatcher.php",
+				"/css/retro-compat.css.php"},
+			servisApache: []string{"/js/porte.php", "/themes/classic/porte.php"},
 		},
 		"8.1.7": {
 			refuses: []string{"/modules/m/config.xml", "/modules/m/myconfig.xml", "/modules/m/config_fr.xml",
 				"/upload/perso.jpg", "/upload/", "/js/porte.php", "/js/vendor/bower.json", "/themes/classic/porte.php",
 				"/themes/classic/assets/js/theme.js.map", "/themes/classic/README.md", "/themes/classic/x.avif"},
-			servis: []string{"/img/logo.webp", "/modules/m/readme.txt", "/modules/m/data.json", "/archive.git/HEAD"},
-			servisApache: []string{"/js/retro-compat.js.php", "/js/jquery/jquery.noConflict.php",
+			servis: []string{"/img/logo.webp", "/modules/m/readme.txt", "/modules/m/data.json", "/archive.git/HEAD",
+				"/js/retro-compat.js.php", "/js/jquery/jquery.noConflict.php",
 				"/modules/m/ajax.php", "/webservice/dispatcher.php"},
 		},
 		"9.0.0": {
@@ -304,8 +307,7 @@ func TestLeVhostPrestashopRefuseCeQueSesHtaccessRefusent(t *testing.T) {
 				"/modules/m/data.json", "/modules/m/services.yml", "/modules/m/config.xml",
 				"/js/jquery/jquery.noConflict.php", "/js/retro-compat.js.php", "/upload/perso.jpg",
 				"/archive.git/HEAD", "/themes/classic/porte.php"},
-			servis:       []string{"/img/logo.webp", "/themes/classic/x.avif"},
-			servisApache: []string{"/webservice/dispatcher.php"},
+			servis: []string{"/img/logo.webp", "/themes/classic/x.avif", "/webservice/dispatcher.php"},
 		},
 	}
 	for _, moteur := range []string{"apache", "nginx"} {
@@ -331,8 +333,13 @@ func TestLeVhostPrestashopRefuseCeQueSesHtaccessRefusent(t *testing.T) {
 					}
 					servis := append(append([]string{}, servisPartout...), a.servis...)
 					if moteur == "apache" {
-						// nginx n'exécute que le front controller (§20).
 						servis = append(servis, a.servisApache...)
+					} else {
+						for _, uri := range a.servisApache {
+							if !refuse(uri) {
+								t.Errorf("%s n'est pas un point d'entrée de Prestashop %s : nginx le refuse (D119)", uri, version)
+							}
+						}
 					}
 					for _, uri := range servis {
 						if refuse(uri) {
@@ -655,7 +662,7 @@ func TestApacheReelPrestashopParBranche(t *testing.T) {
 		"modules/m/ajax.php", "modules/m/logs/a.log", "modules/m/views/css/front.css",
 		"js/jquery/jquery.noConflict.php", "js/retro-compat.js.php", "js/vendor/bower.json",
 		"themes/classic/_dev/js/theme.js", "themes/classic/assets/js/theme.js.map",
-		"webservice/dispatcher.php",
+		"webservice/dispatcher.php", "img/porte.php", "themes/porte.php", "js/porte.php",
 	}
 	attendus := map[string]map[string]string{
 		"1.7.8.11": {
@@ -682,6 +689,9 @@ func TestApacheReelPrestashopParBranche(t *testing.T) {
 			"/js/jquery/jquery.noConflict.php":        "200 FPM /js/jquery/jquery.noConflict.php",
 			"/js/absent.js":                           "200 FPM /js/retro-compat.js.php",
 			"/modules/m/ajax.php":                     "200 FPM /modules/m/ajax.php",
+			"/modules/m/ajax.php/suite":               "200 FPM /modules/m/ajax.php",
+			"/img/porte.php/a.jpg":                    "403",
+			"/themes/porte.php/a.css":                 "403",
 			"/modules/m/logs/a.log":                   "200 modules/m/logs/a.log",
 			"/c/3_thumb-category_default/x.jpg":       "200 FPM /index.php",
 			"/admin634xyz/backups/sauvegarde.sql.bz2": "403",
@@ -692,6 +702,10 @@ func TestApacheReelPrestashopParBranche(t *testing.T) {
 			"/c/3_thumb-category_default/x.jpg":       "200 img/c/3_thumb-category_default.jpg",
 			"/upload/perso.jpg":                       "403",
 			"/modules/m/ajax.php":                     "403",
+			"/modules/m/ajax.php/suite":               "403",
+			"/img/porte.php/a.jpg":                    "403",
+			"/themes/porte.php/a.css":                 "403",
+			"/js/porte.php/a.js":                      "403",
 			"/modules/m/logs/a.log":                   "403",
 			"/modules/m/views/css/front.css":          "200 modules/m/views/css/front.css",
 			"/js/jquery/jquery.noConflict.php":        "403",

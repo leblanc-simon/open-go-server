@@ -12,8 +12,8 @@ Les commits ne mentionnent jamais l'assistance d'un outil d'IA.
 
 ## La référence
 
-[`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md) fait autorité : 120 décisions d'architecture
-arbitrées (D1–D115, D117, D118 et D120 à D122, D116 réservée ; tableau §2), spécification par module, plan de tests, découpage en lots. **Consulter le
+[`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md) fait autorité : 121 décisions d'architecture
+arbitrées (D1–D115 et D117–D122, D116 réservée ; tableau §2), spécification par module, plan de tests, découpage en lots. **Consulter le
 tableau des décisions avant de proposer une architecture** — la plupart des questions « pourquoi pas
 plutôt… ? » y sont déjà tranchées, avec leur raison. Toute décision nouvelle s'y ajoute.
 
@@ -695,6 +695,23 @@ Ils ont tous coûté un défaut réel ; les tests unitaires ne les voyaient pas.
   un essai sur un nginx nu ne le montre pas. Les tests émulent l'assertion négative de PCRE (`correspond`) : elle
   doit **finir** le motif, et un `(?i)` de tête vaut pour elle. Reste ouverte la course `SymLinksIfOwnerMatch`
   de D87, qui tient à l'identité `www-data` (D25, §20).
+- **Sous nginx, les points d'entrée PHP s'énumèrent par type** (D119) : le vhost n'exécutait que le front
+  controller, en `internal`, et back-office, webservice, scripts de modules de Prestashop, `/index.php`
+  direct et tout script d'un `php-plain` répondaient 404. Deux pièges de la traduction : un `if` de
+  `location` n'est sûr qu'avec `return` ou `rewrite … last` — un `set` sous condition fait servir la requête
+  par le bloc du `if`, qui n'hérite pas de `try_files` ; et `set` s'exécute avant `try_files`, qui
+  réinitialise `$fastcgi_path_info` (d'où `$ogs_path_info`).
+  Et sous `disable_symlinks`, `if (-d …)` ouvre le répertoire en lecture : un répertoire en 0710, que
+  `www-data` traverse sans l'énumérer, n'est pas « un répertoire » — le refus des sauvegardes du back-office
+  laissait passer celles d'un répertoire d'administration ainsi fermé. Un refus fondé sur le disque éprouve
+  aussi le fichier demandé (`-f`), et le test sur le vrai nginx pose les modes réels.
+- **Une liste blanche par extension juge l'URL, non le fichier** : sous Apache, `/img/x.php/a.jpg` finit par
+  une extension admise et exécute `x.php` avec un `PATH_INFO` (D119).
+  `net/http/fcgi` garde pour lui `QUERY_STRING` et `PATH_INFO` : le test sur le vrai nginx les recopie sous
+  un autre nom pour les voir.
+- **`hsts: false` n'efface pas une politique HSTS** : le navigateur la garde jusqu'à son échéance, un an.
+  Seul un `max-age=0` reçu l'abrège — c'est ce que pose désormais `hsts: false` (D119), `hsts: none` ne
+  retirant l'en-tête qu'une fois l'année écoulée.
 - **`mod_proxy_fcgi` dérive `SCRIPT_NAME` de l'URI demandée**, non du chemin de la cible `fcgi://`. Un
   `ProxyPass /x unix:…|fcgi://localhost/ogs-fpm-status` ne suffit donc pas : FPM ne reconnaît pas son
   `pm.status_path`, cherche un fichier et répond « Primary script unknown ». `ProxyFCGISetEnvIf` réécrit la

@@ -400,6 +400,33 @@ func prestashopVersionChecks(projects []*model.Project, eng web.Engine, add func
 	}
 }
 
+// redirectTargetChecks nomme les cibles de redirection écartées et les options
+// HSTS non reconnues (D119) : une
+// cible qui n'est pas un nom d'hôte, ou une boucle de redirections, laisse le
+// domaine redirigé vers le premier domaine servi. Le plan du projet le dit aussi
+// (code 6) ; le chargement, jamais.
+func redirectTargetChecks(projects []*model.Project, add func(name, status, detail, fix string)) {
+	for _, p := range projects {
+		if len(p.Spec.Web.VHosts) > 0 {
+			// Les vhosts déclarés portent leur propre cible (options.target), et
+			// leurs options HSTS, dont une valeur non reconnue laisse la politique
+			// complète en silence.
+			for _, vh := range p.Spec.Web.VHosts {
+				if problems := web.HSTSOptionProblems(vh.Options); len(problems) > 0 {
+					add("hsts "+p.ID(), "avertissement", "vhost "+p.VHostName(vh)+" : "+strings.Join(problems, " ; "),
+						"options.hsts : true, false (max-age=0) ou none ; options.hstsSubdomains : true ou false")
+				}
+			}
+			continue
+		}
+		if problems := p.RedirectProblems(); len(problems) > 0 {
+			add("redirections "+p.ID(), "avertissement", strings.Join(problems, " ; ")+
+				" : le domaine est redirigé vers le premier domaine servi",
+				"corriger spec.domains[].target : un nom d'hôte, servi ou non par le projet")
+		}
+	}
+}
+
 func valeurOuAbsente(v string) string {
 	if v == "" {
 		return "aucune version lisible"
@@ -762,6 +789,7 @@ func (a *App) runChecks(ctx context.Context) []check {
 	}
 	certificateDeclarationChecks(projects, add)
 	fleetUniquenessChecks(projects, a.Cfg.PrepDomain(), add)
+	redirectTargetChecks(projects, add)
 
 	// .htaccess sous Apache : ogs ne les active plus (AllowOverride None, D99) et
 	// porte lui-même les règles de base. Ce qu'un .htaccess ajoute est ignoré.

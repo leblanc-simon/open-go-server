@@ -22,8 +22,8 @@ server {
 
     ssl_certificate     {{ .CertDir }}/fullchain.pem;
     ssl_certificate_key {{ .CertDir }}/privkey.pem;
-{{- if .HSTS }}
-    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+{{- with .HSTSHeader }}
+    add_header Strict-Transport-Security "{{ . }}" always;
 {{- end }}
 {{- end }}
     root {{ .Docroot }};
@@ -73,12 +73,50 @@ server {
     # sont portées ici, les mêmes que sous Apache (D99), sans quoi le site n'est qu'à
     # moitié fonctionnel (images, pages de catégorie) et sert ce que Prestashop
     # refuse. Le deuxième essai cherche un répertoire : pour « / », c'est le nom
-    # réservé .ogs-accueil/ (fragment d'ogs). Ce vhost n'exécute que le front
-    # controller : back-office, webservice et scripts de modules n'y répondent pas
-    # (§20 du cahier des charges).
+    # réservé .ogs-accueil/ (fragment d'ogs). Les scripts exécutés sont énumérés
+    # plus bas, après les refus (D119).
     location / {
-        try_files $ogs_fichier $ogs_fichier/ /{{ .FrontController }}$is_args$args;
+        try_files $ogs_fichier $ogs_fichier/ @ogs_routage;
         include {{ .IncludeDocroot }}/*.conf;
+    }
+    # Répartiteur d'une URL sans fichier, comme les .htaccess livrés : une route du
+    # répertoire d'administration{{ if eq .Prestashop "9" }} ou d'admin-api/{{ end }} va à son index.php{{ if ne .Prestashop "9" }}, un script absent
+    # de js/ à retro-compat.js.php{{ if eq .Prestashop "1.7" }}, une feuille absente à css/retro-compat.css.php{{ end }}{{ end }}, tout le reste
+    # au front controller. « rewrite » ajoute les arguments d'origine.
+    location @ogs_routage {
+        if ($ogs_admin) {
+            rewrite ^/([^/]+)/ /$1/index.php last;
+        }
+{{- if ne .Prestashop "9" }}
+        # Un script de retro-compat absent laisse la requête au front controller,
+        # comme sous Apache, où l'ErrorDocument reprend le 404 de sa réécriture.
+        if (-f $document_root/js/retro-compat.js.php) {
+            rewrite ^/js/(?:.*/)?([^/]*)\.js$ /js/retro-compat.js.php?file=$1.js last;
+        }
+{{- if eq .Prestashop "1.7" }}
+        if (-f $document_root/css/retro-compat.css.php) {
+            rewrite ^/js/(?:.*/)?([^/]*)\.css$ /css/retro-compat.css.php?file=$1.css last;
+        }
+{{- end }}
+{{- end }}
+        rewrite ^ /{{ .FrontController }} last;
+    }
+    # Répertoire d'administration, renommé à l'installation et reconnu à chaque
+    # requête à son cron_currency_rates.php (de la 1.6 à la 9){{ if eq .Prestashop "9" }}, et admin-api/, à son
+    # index.php{{ end }} : ses scripts s'exécutent, ses routes vont à son index.php (D99,
+    # D119). Même valeur de départ que ci-dessous, pour la même raison.
+    set $ogs_admin_temoin /dev/null/ogs;
+    if ($uri ~ "^/([^/]+)/") {
+        set $ogs_admin_temoin $document_root/$1/cron_currency_rates.php;
+    }
+{{- if eq .Prestashop "9" }}
+    if ($uri ~ "^/admin-api/") {
+        set $ogs_admin_temoin $document_root/admin-api/index.php;
+    }
+{{- end }}
+    set $ogs_admin "";
+    if (-f $ogs_admin_temoin) {
+        set $ogs_admin 1;
     }
     # Sauvegardes, exports et imports du répertoire d'administration, quel que soit
     # son nom et sans témoin : refusés dès que le premier segment est un répertoire
@@ -91,11 +129,22 @@ server {
     # chemin vide, éprouve le répertoire de départ — « -d » d'une variable vide y
     # est vrai, et tout le site répondait 403. Après le if, la variable n'est
     # jamais vide : [^/]+ exige un composant.
+    #
+    # Sous disable_symlinks, « -d » ouvre le répertoire en lecture : un répertoire
+    # d'administration que www-data traverse sans pouvoir l'énumérer (0710, D51)
+    # n'y passait pas pour un répertoire, et ses sauvegardes, lisibles par le
+    # groupe, étaient servies (D119). Le fichier demandé est donc aussi éprouvé,
+    # par « -f », qui l'ouvre comme nginx l'ouvrirait pour le servir.
     set $ogs_rep_prive /dev/null/ogs;
+    set $ogs_fichier_prive /dev/null/ogs;
     if ($uri ~ "^/([^/]+)/(backups|export|import)(/|$)") {
         set $ogs_rep_prive $document_root/$1;
+        set $ogs_fichier_prive $document_root$uri;
     }
     if (-d $ogs_rep_prive) {
+        return 403;
+    }
+    if (-f $ogs_fichier_prive) {
         return 403;
     }
     rewrite ^/api(?:/(.*))?$ /webservice/dispatcher.php?url=$1 last;
@@ -167,7 +216,7 @@ server {
     }
 {{- end }}
 {{- if eq .Prestashop "9" }}
-    location ~ ^/modules/.*(\.php|\.log|\.txt|\.lock|\.json|\.yml|\.yaml)$ {
+    location ~ ^/modules/.*(\.php(/.*)?|\.log|\.txt|\.lock|\.json|\.yml|\.yaml)$ {
         deny all;
     }
 {{- end }}
@@ -198,13 +247,43 @@ server {
     }
 {{- end }}
 {{- end }}
+
+    # Points d'entrée PHP de la branche, les seuls scripts exécutés hors du
+    # répertoire d'administration (D119) : le front controller, appelé aussi
+    # directement (/index.php?controller=…), le webservice{{ if ne .Prestashop "9" }}, les scripts des modules
+    # (leurs appels ajax), ceux de js/ que la liste blanche admet{{ if eq .Prestashop "1.7" }} et
+    # css/retro-compat.css.php{{ end }}{{ end }}. Apache exécute en outre tout .php existant
+    # que rien ne refuse (init.php à la racine{{ if eq .Prestashop "1.7" }}, un .php de js/ ou de themes/{{ end }}) :
+    # ce ne sont pas des points d'entrée, nginx y répond 404. Les refus qui précèdent
+    # l'emportent : nginx retient la première regex qui correspond.
+    location ~ ^/(?:{{ .FrontController }}|webservice/dispatcher\.php{{ if ne .Prestashop "9" }}|modules/.+\.php|js/(?:.+/)?(?:jquery\.noConflict|retro-compat\.js)\.php{{ end }}{{ if eq .Prestashop "1.7" }}|css/retro-compat\.css\.php{{ end }})(?:/|$) {
+{{- template "nginx-fpm" . }}
+    }
+    # Tout autre script ne s'exécute que dans le répertoire d'administration{{ if eq .Prestashop "9" }} ou
+    # admin-api/{{ end }}, dont les modules (autoupgrade, filemanager) déposent les leurs.
+    location ~ \.php(?:/|$) {
+        if ($ogs_admin = "") {
+            return 404;
+        }
+{{- template "nginx-fpm" . }}
+    }
+{{- else if eq .AppKind "php-plain" }}
+    # Site PHP sans front controller imposé : tout .php existant est un point
+    # d'entrée, comme sous Apache (D119) ; une URL sans fichier va à {{ .FrontController }}.
+    location / {
+        try_files $ogs_fichier /{{ .FrontController }}$is_args$args;
+        include {{ .IncludeDocroot }}/*.conf;
+    }
+
+    location ~ \.php(?:/|$) {
+{{- template "nginx-fpm" . }}
+    }
 {{- else }}
     # Front controller unique : tout passe par {{ .FrontController }}.
     location / {
         try_files $ogs_fichier /{{ .FrontController }}$is_args$args;
         include {{ .IncludeDocroot }}/*.conf;
     }
-{{- end }}
 
     location ~ ^/{{ .FrontController }}(/|$) {
         fastcgi_pass {{ .FPMPass }};
@@ -221,6 +300,7 @@ server {
     location ~ \.php$ {
         return 404;
     }
+{{- end }}
 {{- range .Blocks }}
 
     # bloc {{ .Name }}
@@ -232,3 +312,18 @@ server {
     # broncher nginx, là où un chemin littéral introuvable serait fatal.
     include {{ .IncludeVHost }}/*.conf;
 }
+
+{{- define "nginx-fpm" }}
+        # Le script doit exister : nginx ne transmet à FPM qu'un fichier du
+        # docroot, jamais un chemin que FPM réinterpréterait. « set » s'exécute
+        # avant try_files, qui réinitialise $fastcgi_path_info.
+        fastcgi_split_path_info ^(.+?\.php)(/.*)$;
+        set $ogs_path_info $fastcgi_path_info;
+        try_files $fastcgi_script_name =404;
+        fastcgi_pass {{ .FPMPass }};
+        include fastcgi_params;
+        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+        fastcgi_param PATH_INFO $ogs_path_info;
+        fastcgi_param DOCUMENT_ROOT $document_root;
+        fastcgi_param HTTPS {{ if .TLS }}on{{ else }}off{{ end }};
+{{- end }}

@@ -192,6 +192,31 @@ func (p *Provider) Observe(_ context.Context, proj *model.Project) (Observed, er
 	return obs, nil
 }
 
+// OwnedVHostFiles énumère les fichiers de sites-available que leur en-tête
+// attribue au projet comme vhost (fs.ManagedResource), que sa déclaration les
+// nomme encore ou non. La suppression en a besoin (D119) : le nom d'un vhost de
+// redirection dépend de sa cible, que l'exploitant édite, et recalculer les
+// fichiers depuis la seule déclaration laissait actif, après « project
+// delete », un vhost écrit pour une ancienne cible — il désignait des journaux
+// et un certificat effacés, et le rechargement suivant faisait tomber le parc.
+func (p *Provider) OwnedVHostFiles(id string) []string {
+	entries, err := os.ReadDir(p.Engine.AvailableDir())
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		owner, resource, err := fs.ManagedResource(filepath.Join(p.Engine.AvailableDir(), e.Name()))
+		if err == nil && owner == id && strings.HasPrefix(resource, "web/vhost/") {
+			out = append(out, e.Name())
+		}
+	}
+	return out
+}
+
 // loadedConflicts étend la détection aux fichiers que le moteur charge hors de
 // sites-available (Engine.LoadedConfigs) : conf.d, conf-enabled, et les fichiers
 // ordinaires de sites-enabled (R2-44, D118). Un site servi de là n'était pas vu,
@@ -556,7 +581,11 @@ func (p *Provider) Build(proj *model.Project, vh model.VHost) (*VHostPlan, error
 		"ACMEChallengeDir":  p.Paths.ACMEChallengeTokens(),
 		"RobotsNoindexFile": p.Paths.RobotsNoindexFile(),
 		"TLS":               vue.on,
-		"HSTS":              optionBool(vh.Options, "hsts", true),
+		// HSTS reste vrai quand la politique est active : un template surchargé qui
+		// écrit lui-même l'en-tête sous « if .HSTS » garde son sens. HSTSHeader
+		// est la valeur que portent les templates d'ogs, retrait compris (D119).
+		"HSTS":              hstsActive(vh.Options),
+		"HSTSHeader":        hstsHeader(vh.Options),
 		"CertDir":           certDir,
 		"Noindex":           proj.IsPrep(),
 		"ClientMaxBodySize": optionString(vh.Options, "clientMaxBodySize", "32M"),
@@ -814,11 +843,19 @@ func (p *Provider) Plan(_ context.Context, proj *model.Project, obs Observed) ([
 			}
 			steps = append(steps, w)
 		}
+		if problems := HSTSOptionProblems(vh.Options); len(problems) > 0 {
+			// Information seulement : le vhost est servi tel que rendu.
+			steps = append(steps, engine.NewStep("web/vhost/"+bp.Name+"/hsts", engine.NoOp,
+				fmt.Sprintf("vhost %s : %s (D119)", bp.Name, strings.Join(problems, " ; "))))
+		}
 		if i == 0 {
 			if s := p.htaccessStep(proj, bp); s != nil {
 				steps = append(steps, s)
 			}
 		}
+	}
+	if s := redirectStep(proj); s != nil {
+		steps = append(steps, s)
 	}
 	for _, stale := range obs.Stale {
 		s, err := p.removeStep(stale, proj.ID())
@@ -830,6 +867,30 @@ func (p *Provider) Plan(_ context.Context, proj *model.Project, obs Observed) ([
 		}
 	}
 	return steps, nil
+}
+
+// redirectStep annonce les cibles de redirection écartées (D119) : une cible
+// qui n'est pas un nom d'hôte, ou une boucle de redirections, fait viser le
+// premier domaine servi, comme avant que la cible soit honorée. L'étape est non
+// critique — les vhosts sont écrits, l'apply rend le code 6 — et nomme la cible ;
+// le refus n'est jamais au chargement, qui arrêterait tout le parc sur une
+// déclaration jusque-là servie. Nil s'il n'y a rien à dire, ou si les vhosts sont
+// déclarés : ils portent leur propre cible (options.target).
+func redirectStep(proj *model.Project) *engine.Step {
+	if len(proj.Spec.Web.VHosts) > 0 {
+		return nil
+	}
+	problems := proj.RedirectProblems()
+	if len(problems) == 0 {
+		return nil
+	}
+	s := engine.NewStep("web/redirect/"+proj.ID(), engine.Update,
+		"cible de redirection écartée : le premier domaine servi est visé (D119)")
+	s.Critical = false
+	s.Apply = func(context.Context) error {
+		return fmt.Errorf("%s — corriger spec.domains[].target", strings.Join(problems, " ; "))
+	}
+	return s
 }
 
 // htaccessStep annonce, là où le vhost d'un Prestashop va être écrit, ce que le
@@ -2038,6 +2099,90 @@ func firstLines(data []byte) string {
 		data = data[:512]
 	}
 	return string(data)
+}
+
+// HSTSMaxAge est la durée, en secondes, de la politique HSTS que posent les
+// vhosts d'ogs : un an. C'est aussi la durée pendant laquelle un navigateur
+// passé avant un retrait garde la politique — d'où celle de l'en-tête de retrait
+// (D119).
+const HSTSMaxAge = 31536000
+
+// hstsActive dit si un vhost pose une politique HSTS : oui par défaut, non sous
+// « hsts: false » (retrait) et « hsts: none » (aucun en-tête).
+func hstsActive(options map[string]any) bool {
+	v, ok := options["hsts"]
+	if !ok {
+		return true
+	}
+	switch v := v.(type) {
+	case bool:
+		return v
+	case string:
+		return !strings.EqualFold(v, "none")
+	}
+	return true
+}
+
+// hstsHeader rend la valeur de l'en-tête Strict-Transport-Security d'un vhost en
+// TLS, vide s'il n'en porte aucun (D119) :
+//
+//   - par défaut, « max-age=31536000; includeSubDomains » ; « hstsSubdomains:
+//     false » retire includeSubDomains — un sous-domaine servi en HTTP seul,
+//     ici ou ailleurs, cesse d'être injoignable pour qui a visité le domaine ;
+//   - « hsts: false » pose « max-age=0 » : un navigateur qui revient efface la
+//     politique qu'il tenait, sous-domaines compris. Ne rien envoyer ne
+//     l'effacerait pas, et le site resterait imposé en HTTPS jusqu'à un an
+//     après la dernière visite ;
+//   - « hsts: none » n'envoie aucun en-tête : à poser un an (HSTSMaxAge) au
+//     moins après le dernier apply qui servait la politique, quand plus aucun
+//     navigateur ne peut la tenir de ce site.
+func hstsHeader(options map[string]any) string {
+	if v, ok := options["hsts"]; ok {
+		switch v := v.(type) {
+		case bool:
+			if !v {
+				return "max-age=0"
+			}
+		case string:
+			if strings.EqualFold(v, "none") {
+				return ""
+			}
+		}
+	}
+	value := fmt.Sprintf("max-age=%d", HSTSMaxAge)
+	if optionBool(options, "hstsSubdomains", true) {
+		value += "; includeSubDomains"
+	}
+	return value
+}
+
+// HSTSOptionProblems nomme les valeurs de options.hsts et
+// options.hstsSubdomains qu'ogs ne reconnaît pas (D119) : « off », « no », ou
+// « false » entre guillemets laissent la politique complète en place, en
+// silence. Le plan l'annonce en information et doctor le rappelle ; jamais le
+// chargement, qui arrêterait le parc sur une déclaration servie jusque-là.
+func HSTSOptionProblems(options map[string]any) []string {
+	var out []string
+	if v, ok := options["hsts"]; ok {
+		switch v := v.(type) {
+		case bool:
+		case string:
+			if !strings.EqualFold(v, "none") {
+				out = append(out, fmt.Sprintf("options.hsts %q non reconnue (true, false ou none) : "+
+					"la politique complète est servie", v))
+			}
+		default:
+			out = append(out, fmt.Sprintf("options.hsts %v non reconnue (true, false ou none) : "+
+				"la politique complète est servie", v))
+		}
+	}
+	if v, ok := options["hstsSubdomains"]; ok {
+		if _, isBool := v.(bool); !isBool {
+			out = append(out, fmt.Sprintf("options.hstsSubdomains %v non reconnue (true ou false) : "+
+				"includeSubDomains reste posé", v))
+		}
+	}
+	return out
 }
 
 func optionString(options map[string]any, key, fallback string) string {

@@ -33,8 +33,8 @@
     SSLEngine on
     SSLCertificateFile {{ .CertDir }}/fullchain.pem
     SSLCertificateKeyFile {{ .CertDir }}/privkey.pem
-{{- if .HSTS }}
-    Header always set Strict-Transport-Security "max-age=31536000; includeSubDomains"
+{{- with .HSTSHeader }}
+    Header always set Strict-Transport-Security "{{ . }}"
 {{- end }}
 {{ template "apache-body" . }}
     ErrorLog {{ .LogDir }}/apache-error.log
@@ -200,7 +200,8 @@
     RedirectMatch 403 "^/modules/.*(config\.xml|config_[a-z]+\.xml)$"
 {{- end }}
 {{- if eq .Prestashop "9" }}
-    RedirectMatch 403 "^/modules/.*(\.php|\.log|\.txt|\.lock|\.json|\.yml|\.yaml)$"
+    # Un script suivi d'un PATH_INFO (/modules/m/x.php/suite) s'exécuterait sinon.
+    RedirectMatch 403 "^/modules/.*(\.php(/.*)?|\.log|\.txt|\.lock|\.json|\.yml|\.yaml)$"
 {{- end }}
     # Listes blanches par extension : tout autre fichier — un .php compris, qui ne
     # devient pas un point d'entrée — est refusé.
@@ -218,6 +219,9 @@
     RedirectMatch 403 "(?i)^/js/(?!.*(\.(css|js|gif|png|jpg|svg|html|map|eot|ttf|woff)|jquery\.noConflict\.php|retro-compat\.js\.php)$)"
 {{- end }}
 {{- end }}
+    # Une liste blanche juge l'URL, non le fichier : « /img/x.php/a.jpg » finit par
+    # une extension admise, et Apache exécute x.php avec un PATH_INFO (D119).
+    RedirectMatch 403 "(?i)^/{{ if eq .Prestashop "1.7" }}img{{ else }}(img|themes|js){{ end }}/.*\.php/"
 
     # Types des polices et partage d'origine, repris du .htaccess de Prestashop.
     AddType application/vnd.ms-fontobject .eot

@@ -61,7 +61,7 @@ func (a *App) siteFiles(provs *providers, p *model.Project, removing []string) (
 		set[f] = true
 	}
 	web, pools = map[string]string{}, map[string]string{}
-	for _, name := range provs.Web.VHostFiles(p) {
+	for _, name := range vhostFileNames(provs, p) {
 		for _, path := range []string{filepath.Join(provs.Engine.EnabledDir(), name),
 			filepath.Join(provs.Engine.AvailableDir(), name)} {
 			if set[path] {

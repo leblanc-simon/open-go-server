@@ -1321,7 +1321,7 @@ func TestLesVHostsNginxNEmploientQueDesVariablesDefinies(t *testing.T) {
 		"$http_upgrade": true, "$host": true, "$remote_addr": true, "$scheme": true,
 		"$proxy_add_x_forwarded_for": true, "$request_uri": true, "$uri": true,
 		"$is_args": true, "$args": true, "$document_root": true,
-		"$fastcgi_script_name": true, "$query_string": true,
+		"$fastcgi_script_name": true, "$fastcgi_path_info": true, "$query_string": true,
 		"$1": true, "$2": true, "$3": true, "$4": true, "$5": true,
 	}
 	// Le fragment définit une variable par une « map » ; la nommer dans un

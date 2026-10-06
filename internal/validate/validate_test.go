@@ -986,3 +986,24 @@ func TestUnicitéDesRépertoiresDeJournaux(t *testing.T) {
 		t.Errorf("deux répertoires voisins doivent cohabiter : %v", err)
 	}
 }
+
+// Une cible de redirection que le modèle écarte (D119) — pas un nom d'hôte, ou
+// une boucle — n'est jamais refusée au chargement : la cible était ignorée
+// avant D119, et une déclaration servie jusque-là arrêterait sinon tout le parc,
+// « cert renew » compris. Le plan du projet et doctor la signalent.
+func TestUneCibleDeRedirectionEcarteeNArretePasLeChargement(t *testing.T) {
+	p := newProject(t, "shop.fr", naming.EnvProd, model.KindStatic)
+	p.Spec.Domains = append(p.Spec.Domains,
+		model.Domain{Name: "url.fr", Role: "redirect", Target: "https://autre.fr/page"},
+		model.Domain{Name: "a.fr", Role: "redirect", Target: "b.fr"},
+		model.Domain{Name: "b.fr", Role: "redirect", Target: "a.fr"})
+	if len(p.RedirectProblems()) == 0 {
+		t.Fatal("le modèle doit écarter ces cibles")
+	}
+	if err := Project(p, "/home"); err != nil {
+		t.Errorf("le chargement ne doit pas refuser une cible écartée : %v", err)
+	}
+	if err := Uniqueness([]*model.Project{p}, "preprod-pp.net"); err != nil {
+		t.Errorf("ni l'unicité : %v", err)
+	}
+}

@@ -231,6 +231,9 @@ spec:
     - name: ancienne-boutique.fr
       role: redirect
       target: boutique.fr
+    - name: boutique-promo.fr            # une autre cible : son propre vhost de redirection (D119)
+      role: redirect
+      target: promo.boutique.example
 
   php:
     pools:
@@ -291,7 +294,19 @@ spec:
 ```
 
 Ce qui est absent reste déduit : utilisateur, home, docroot `www/public`, vhosts principal et de
-redirection, certificat couvrant `boutique.fr`, `www.boutique.fr` et la redirection `ancienne-boutique.fr`.
+redirection — un par cible : `boutiquefr_redirect.conf` vers `boutique.fr`,
+`boutiquefr_redirect-promo.boutique.example.conf` vers l'autre site —, certificat couvrant `boutique.fr`,
+`www.boutique.fr` et les deux redirections. Une cible qui n'est pas un nom d'hôte (une URL), ou une boucle
+de redirections, est écartée : le domaine part vers le premier domaine servi, et l'apply comme `doctor` le
+signalent (code 6). Au premier apply qui honore une cible autre que le premier domaine, la redirection
+change de destination, en 301 permanent : relire les `target` avant, les navigateurs gardant l'ancienne en
+cache.
+
+Tout site servi en HTTPS envoie `Strict-Transport-Security: max-age=31536000; includeSubDomains`. Un
+sous-domaine servi en HTTP seul — ici ou ailleurs — devient injoignable pour qui a visité le domaine :
+déclarer le vhost avec `options: { hstsSubdomains: false }`. Pour retirer HSTS, `hsts: false` envoie
+`max-age=0`, qui efface la politique chez tout navigateur qui revient ; ne passer à `hsts: none` (plus
+d'en-tête) qu'un an après, la durée que les navigateurs gardent la politique.
 
 Le pool reçoit, sous la déclaration du projet, le socle d'ogs, les défauts de la machine
 (`php.pool` de `/etc/ogs/config.yaml`), le preset et les réglages du type (D103). Quelques clés ne se

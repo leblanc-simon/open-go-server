@@ -279,6 +279,10 @@ poser tools/foundation/foundation.js 'outil'
 poser img/c/3_thumb-category_default.jpg 'vignette-3'
 poser modules/m/logs/m.log 'secret'
 poser modules/m/views/css/front.css 'body{}'
+poser modules/m/ajax.php '<?php echo "module\n";'
+poser admin7x2k/ajax.php '<?php echo "ancien point du back-office\n";'
+poser init.php '<?php echo "init exécuté\n";'
+poser sansmarque/outil.php '<?php echo "outil exécuté\n";'
 # Une 9 : l'apply réécrit le vhost, écrit à la création sur un docroot vide, avec
 # les règles de cette branche.
 poser src/Core/Version.php "<?php
@@ -325,12 +329,20 @@ attendu /docs/csv_import/produits.csv 200 exemple
 attendu /translations/cldr/fr.json 200
 attendu /tools/foundation/foundation.js 200 outil
 attendu /themes/classic/assets/css/theme.css 200
-# Limite préexistante, relevée sans être tranchée ici : le vhost PHP de nginx
-# n'exécute que le front controller racine, si bien que le webservice et le
-# back-office — d'autres index.php — y répondent 404. On le constate.
-for uri in /api/products /admin7x2k/index.php; do
-    echo "  (constat) $uri → HTTP $(curl -s -o /dev/null -w '%{http_code}' -H 'Host: boutique.test' "http://127.0.0.1$uri")"
-done
+# Points d'entrée PHP de la branche (D119) : le front controller, appelé aussi
+# directement, le webservice, et le répertoire d'administration, reconnu à son
+# cron_currency_rates.php sous le docroot en 0710 et disable_symlinks — ses
+# scripts s'exécutent, ses routes vont à son index.php. Aucun autre script.
+attendu /index.php 200 "front boutique"
+attendu /api/products 200 "api ok"
+attendu /admin7x2k/ 200 back-office
+attendu /admin7x2k/index.php 200 back-office
+attendu /admin7x2k/sell/catalog/products 200 back-office
+attendu /admin7x2k/ajax.php 200 "ancien point du back-office"
+attendu /init.php 404
+attendu /sansmarque/outil.php 404
+# En 9, les scripts des modules sont refusés comme par leur .htaccess livré.
+attendu /modules/m/ajax.php 403
 echo
 echo "--- OPcache : ce qu'un projet voit des scripts de ses voisins (constat, §20) ---"
 curl -s -o /dev/null -H 'Host: boutique.test' http://127.0.0.1/
@@ -344,6 +356,37 @@ fi
 
 ogs project delete boutiquetest --yes >/dev/null 2>&1
 echo "les règles de Prestashop sont servies sous nginx comme sous Apache"
+
+echo
+echo "--- php-plain : tout script existant est un point d'entrée (D119) ---"
+ogs site create plain.test --kind php-plain --php "$version" --tls=false --yes -q >/dev/null 2>&1
+sock=$(sed -n 's/^listen = //p' "/etc/php/$version/fpm/pool.d/plaintest.conf")
+kill -USR2 "$(cat "/run/php/php$version-fpm.pid")" 2>/dev/null || true
+for _ in $(seq 1 10); do
+    [ -S "$sock" ] && break
+    sleep 1
+done
+mkdir -p /home/plain.test/www/outils
+echo '<?php echo "accueil plain\n";' > /home/plain.test/www/index.php
+echo '<?php echo "outil plain ", $_SERVER["PATH_INFO"] ?? "", "\n";' > /home/plain.test/www/outils/outil.php
+chown -R plaintest:plaintest /home/plain.test/www
+systemctl reload nginx
+sleep 1
+plain() {
+    local uri=$1 code=$2 contenu=${3:-} obtenu
+    obtenu=$(curl -s -o /tmp/plain.out -w '%{http_code}' -H 'Host: plain.test' "http://127.0.0.1$uri")
+    printf '  %-42s %s %s\n' "$uri" "$obtenu" "$(head -c 40 /tmp/plain.out | tr '\n' ' ')"
+    if [ "$obtenu" != "$code" ] || { [ -n "$contenu" ] && ! grep -q "$contenu" /tmp/plain.out; }; then
+        echo "ÉCHEC : $uri devait répondre $code${contenu:+ avec « $contenu »}"
+        tail -3 /var/log/ogs-projects/plaintest/nginx-error.log 2>/dev/null
+        exit 1
+    fi
+}
+plain / 200 "accueil plain"
+plain /outils/outil.php 200 "outil plain"
+plain /outils/outil.php/suite 200 "outil plain /suite"
+plain /absent.php 404
+ogs project delete plaintest --yes >/dev/null 2>&1
 
 echo
 echo "--- l'accueil reste servi sous disable_symlinks ---"
@@ -577,6 +620,35 @@ cible=$(curl -s -o /dev/null -w '%{redirect_url}' -H 'Host: vieux.test' http://1
 echo "vieux.test/page → $cible"
 if [[ "$cible" != *"ancien.test/page"* ]]; then
     echo "ÉCHEC : la redirection ne pointe pas vers le domaine principal"
+    exit 1
+fi
+# Une cible déclarée autre que le domaine principal est honorée (D119), par un
+# vhost de redirection qui lui est propre.
+python3 - <<'PY'
+chemin = "/etc/ogs/projects/ancientest.yaml"
+s = open(chemin).read()
+s = s.replace("      target: ancien.test\n",
+              "      target: ancien.test\n    - name: promo.test\n      role: redirect\n      target: ailleurs.example\n", 1)
+open(chemin, "w").write(s)
+PY
+ogs apply ancientest --yes >/dev/null 2>&1
+systemctl reload nginx
+sleep 1
+cible=$(curl -s -o /dev/null -w '%{redirect_url}' -H 'Host: promo.test' http://127.0.0.1/page)
+echo "promo.test/page → $cible"
+if [ "$cible" != "http://ailleurs.example/page" ]; then
+    echo "ÉCHEC : la cible déclarée de promo.test n'est pas honorée"
+    ls /etc/nginx/sites-enabled/
+    exit 1
+fi
+cible=$(curl -s -o /dev/null -w '%{redirect_url}' -H 'Host: vieux.test' http://127.0.0.1/page)
+if [[ "$cible" != *"ancien.test/page"* ]]; then
+    echo "ÉCHEC : vieux.test ne redirige plus vers ancien.test : $cible"
+    exit 1
+fi
+if [ ! -e /etc/nginx/sites-enabled/ancientest_redirect-ailleurs.example.conf ]; then
+    echo "ÉCHEC : vhost de redirection propre à la cible absent"
+    ls /etc/nginx/sites-enabled/
     exit 1
 fi
 

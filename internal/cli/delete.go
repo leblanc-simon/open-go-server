@@ -633,7 +633,7 @@ func (a *App) generatedFiles(provs *providers, p *model.Project) []string {
 	// Les noms réels des fichiers : celui d'un vhost adopté ne porte pas toujours
 	// l'extension du moteur (« shop.fr » sur nginx), et le composer depuis le nom
 	// du vhost laissait le fichier et son lien derrière le projet.
-	for _, name := range provs.Web.VHostFiles(p) {
+	for _, name := range vhostFileNames(provs, p) {
 		files = append(files,
 			filepath.Join(provs.Engine.EnabledDir(), name),
 			filepath.Join(provs.Engine.AvailableDir(), name))
@@ -653,6 +653,22 @@ func (a *App) generatedFiles(provs *providers, p *model.Project) []string {
 		}
 	}
 	return files
+}
+
+// vhostFileNames énumère les fichiers de vhost d'un projet : ceux que nomme sa
+// déclaration, puis tout vhost que l'en-tête lui attribue (D119) — celui d'une
+// cible de redirection changée, ou d'une redirection retirée, sans apply. Le
+// nom d'un vhost de redirection suit sa cible : la déclaration seule ne désigne
+// plus le fichier écrit, qui survivait au projet en désignant ses journaux et
+// son certificat effacés.
+func vhostFileNames(provs *providers, p *model.Project) []string {
+	names := provs.Web.VHostFiles(p)
+	for _, name := range provs.Web.OwnedVHostFiles(p.ID()) {
+		if !slices.Contains(names, name) {
+			names = append(names, name)
+		}
+	}
+	return names
 }
 
 // keptFile est un fichier que la suppression laisse en place, et pourquoi.

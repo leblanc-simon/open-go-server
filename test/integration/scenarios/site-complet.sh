@@ -935,6 +935,30 @@ if [ "$code" != "200" ]; then
 fi
 
 echo
+echo "--- redirection vers sa cible déclarée, sous Apache (D119) ---"
+ogs site create cible.test --kind static --redirect vers-principal.test --tls=false --yes -q >/dev/null 2>&1
+python3 - <<'PY'
+chemin = "/etc/ogs/projects/cibletest.yaml"
+s = open(chemin).read()
+s = s.replace("  domains:\n", "  domains:\n    - name: ailleurs.test\n      role: redirect\n      target: ailleurs.example\n", 1)
+open(chemin, "w").write(s)
+PY
+ogs apply cibletest --yes >/dev/null 2>&1
+apache2ctl graceful
+sleep 2
+for cas in "ailleurs.test http://ailleurs.example/page" "vers-principal.test http://cible.test/page"; do
+    set -- $cas
+    cible=$(curl -s -o /dev/null -w '%{redirect_url}' -H "Host: $1" http://127.0.0.1/page)
+    echo "$1/page → $cible"
+    if [ "$cible" != "$2" ]; then
+        echo "ÉCHEC : $1 devait rediriger vers $2"
+        ls /etc/apache2/sites-enabled/
+        exit 1
+    fi
+done
+ogs project delete cibletest --yes >/dev/null 2>&1
+
+echo
 echo "--- paire dépareillée laissée en place, apply d'un projet sans rapport (D110, B2) ---"
 # Une clé recopiée à la main sur shop.test, puis la création d'un autre site. Le
 # rechargement de fin d'apply chargeait la paire : sous Apache, « apachectl -t »
@@ -947,6 +971,14 @@ chown shoptest:shoptest /home/shop.test/www/index.html
 gpasswd -a www-data shoptest >/dev/null
 apache2ctl graceful
 sleep 2
+# HSTS par défaut (D119) : includeSubDomains reste posé, un an.
+hsts=$(curl -skI --resolve shop.test:443:127.0.0.1 https://shop.test/index.html | tr -d '\r' |
+    sed -n 's/^[Ss]trict-[Tt]ransport-[Ss]ecurity: //p')
+echo "HSTS de shop.test : $hsts"
+if [ "$hsts" != "max-age=31536000; includeSubDomains" ]; then
+    echo "ÉCHEC : en-tête HSTS par défaut inattendu"
+    exit 1
+fi
 paire=/var/lib/ogs/acme/certificates/shoptest
 openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$paire/privkey.pem" 2>/dev/null
 if ! apache2ctl -t >/dev/null 2>&1; then

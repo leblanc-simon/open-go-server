@@ -648,7 +648,13 @@ func TestLAccueilNginxResteSousLesSurchargesDuDocroot(t *testing.T) {
 		if at.FrontController == "" {
 			controleur = "/index.php"
 		}
-		if dernier := evaluerNginx(t, fragment, essais[len(essais)-1], "/"); dernier != controleur {
+		// Un dernier argument nommé (@ogs_routage, Prestashop) est un répartiteur :
+		// pour « / », c'est sa réécriture finale qui compte (D119).
+		repli := essais[len(essais)-1]
+		if strings.HasPrefix(repli, "@") {
+			repli = repliDuRepartiteur(t, locs, repli)
+		}
+		if dernier := evaluerNginx(t, fragment, repli, "/"); dernier != controleur {
 			t.Errorf("« / » retombe sur %q, attendu le front controller %q", dernier, controleur)
 		}
 		if l := choisirLocation(t, locs, controleur); !strings.Contains(l.corps, "fastcgi_pass ") {
@@ -673,6 +679,25 @@ func TestLAccueilNginxResteSousLesSurchargesDuDocroot(t *testing.T) {
 			t.Errorf("try_files éprouve %q pour /assets/app.css", v)
 		}
 	})
+}
+
+// repliDuRepartiteur rend la cible de la réécriture inconditionnelle qui clôt une
+// location nommée — celle que prend une URL qui n'est ni du répertoire
+// d'administration ni de js/.
+func repliDuRepartiteur(t *testing.T, locs []locationNginx, nom string) string {
+	t.Helper()
+	for _, l := range locs {
+		if l.motif != nom {
+			continue
+		}
+		m := regexp.MustCompile(`(?m)^rewrite \^ (\S+) last;$`).FindAllStringSubmatch(l.corps, -1)
+		if len(m) == 0 {
+			t.Fatalf("la location %s ne finit par aucune réécriture inconditionnelle :\n%s", nom, l.corps)
+		}
+		return m[len(m)-1][1]
+	}
+	t.Fatalf("location %s introuvable", nom)
+	return ""
 }
 
 var reIncludeDocrootNginx = regexp.MustCompile(`(?m)^include \S+/` + IncludeDocroot + `/\*\.conf;$`)
@@ -733,10 +758,17 @@ func TestLeDocrootNeSertNiFichiersCachesNiMetadonnees(t *testing.T) {
 		if moteur == "nginx" {
 			serveur := serveurDuDocroot(t, c, docroot)
 			locs := locationsNginx(serveur)
-			for _, re := range regexp.MustCompile(`(?m)^\s*rewrite\s+(\S+)\s`).FindAllStringSubmatch(serveur, -1) {
+			// Seules les réécritures de portée server précèdent le choix de la
+			// location ; celles d'une location nommée (@ogs_routage) ne jouent
+			// qu'après un try_files sans fichier, donc après les refus.
+			for _, d := range directivesNginx(serveur) {
+				champs := strings.Fields(d)
+				if len(champs) < 2 || champs[0] != "rewrite" {
+					continue
+				}
 				for _, uri := range urlsSensibles {
-					if compiler(re[1]).MatchString(uri) {
-						t.Fatalf("la réécriture %s détourne %s avant le choix de la location", re[1], uri)
+					if compiler(champs[1]).MatchString(uri) {
+						t.Fatalf("la réécriture %s détourne %s avant le choix de la location", champs[1], uri)
 					}
 				}
 			}

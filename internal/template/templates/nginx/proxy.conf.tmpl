@@ -27,8 +27,8 @@ server {
 
     ssl_certificate     {{ .CertDir }}/fullchain.pem;
     ssl_certificate_key {{ .CertDir }}/privkey.pem;
-{{- if .HSTS }}
-    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+{{- with .HSTSHeader }}
+    add_header Strict-Transport-Security "{{ . }}" always;
 {{- end }}
 {{- end }}
     access_log {{ .LogDir }}/nginx-access.log;

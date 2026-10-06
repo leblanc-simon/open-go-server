@@ -449,8 +449,8 @@ const VHostExt = ".conf"
 
 // VHosts renvoie les vhosts déclarés, ou ceux que le projet déduit. Un projet
 // n'a pas à déclarer son vhost : le type d'application et les domaines
-// suffisent, un domaine « redirect » faisant naître en plus un vhost de
-// redirection.
+// suffisent, les domaines « redirect » faisant naître en plus un vhost de
+// redirection par cible distincte (D119).
 //
 // La règle vit ici, avec celle des noms de fichiers, parce que deux lecteurs en
 // dépendent : le provider web, qui écrit les fichiers, et le contrôle d'unicité
@@ -466,13 +466,10 @@ func (p *Project) VHosts() []VHost {
 		return nil
 	}
 	var domains []string
-	var redirects []string
 	for _, d := range p.Spec.Domains {
 		switch d.Role {
 		case "", "primary", "alias":
 			domains = append(domains, d.Name)
-		case "redirect":
-			redirects = append(redirects, d.Name)
 		}
 	}
 	if len(domains) == 0 {
@@ -488,13 +485,24 @@ func (p *Project) VHosts() []VHost {
 		main.Pool = p.Spec.PHP.Pools[0].Name
 	}
 	out := []VHost{main}
-	if len(redirects) > 0 {
-		out = append(out, VHost{
-			Name:     "redirect",
-			Template: "redirect",
-			Domains:  redirects,
-			Options:  map[string]any{"target": domains[0]},
-		})
+	// Un vhost de redirection par cible distincte (D119), dans l'ordre où chaque
+	// cible apparaît : celui du premier domaine servi garde le nom « redirect »,
+	// donc le fichier qu'il avait avant que la cible déclarée soit honorée.
+	targets, first := p.RedirectTargets()
+	index := map[string]int{}
+	for _, rt := range targets {
+		key := canonicalTarget(rt.Target)
+		i, ok := index[key]
+		if !ok {
+			i = len(out)
+			index[key] = i
+			out = append(out, VHost{
+				Name:     redirectVHostName(rt.Target, first),
+				Template: "redirect",
+				Options:  map[string]any{"target": rt.Target},
+			})
+		}
+		out[i].Domains = append(out[i].Domains, rt.Domain)
 	}
 	return out
 }
