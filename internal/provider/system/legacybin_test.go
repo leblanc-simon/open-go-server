@@ -88,6 +88,101 @@ func TestRienNePartNiNEstReecritSansLeLienDeRemplacement(t *testing.T) {
 	}
 }
 
+// Une réécriture seulement reportée — le lien de remplacement n'est pas encore
+// posé — n'est pas une forme qu'ogs ne réécrit pas : le message disait
+// « sous une forme qu'ogs ne réécrit pas » et invitait à réécrire à la main ce
+// que l'apply suivant réécrit de lui-même (D116). Les deux cas se distinguent,
+// et se nomment chacun quand ils coexistent.
+func TestUneReecritureReporteeNEstPasUneFormeNonReecrite(t *testing.T) {
+	p, prov, _, _ := fixture(t)
+	legacy := ancienBinOgs(t, p, prov)
+	root := p.Spec.Layout.Root
+	if err := os.Symlink(filepath.Join(root, "www", ".venv", "bin", "python"), filepath.Join(legacy, "python")); err != nil {
+		t.Fatal(err)
+	}
+	p.Spec.Crons = []model.CronJob{{Name: "nuit", Schedule: "0 3 * * *", Command: root + "/.bin/python manage.py x"}}
+	deposer(t, p, prov)
+	q, _ := prov.PlanLegacyCommands(p)
+	err := prov.PlanLegacyBin(q).Apply(context.Background())
+	if err == nil {
+		t.Fatal("le retrait doit être refusé")
+	}
+	msg := err.Error()
+	if strings.Contains(msg, "ne réécrit pas") {
+		t.Errorf("une réécriture reportée n'est pas une forme non réécrivable : %v", err)
+	}
+	for _, attendu := range []string{"spec.crons[nuit].command", "apply suivant", filepath.Join(root, ".local", "bin", "python")} {
+		if !strings.Contains(msg, attendu) {
+			t.Errorf("le message doit nommer %q : %v", attendu, err)
+		}
+	}
+	// Une forme relative à côté : chacune sous son motif.
+	p.Spec.Crons = append(p.Spec.Crons, model.CronJob{Name: "rel", Schedule: "0 4 * * *", Command: "../.bin/php x.php"})
+	q, _ = prov.PlanLegacyCommands(p)
+	msg = prov.PlanLegacyBin(q).Apply(context.Background()).Error()
+	if !strings.Contains(msg, "spec.crons[rel].command") || !strings.Contains(msg, "ne réécrit pas") ||
+		!strings.Contains(msg, "apply suivant") {
+		t.Errorf("les deux motifs doivent être nommés : %s", msg)
+	}
+	for _, partie := range strings.Split(msg, " ; ") {
+		if strings.Contains(partie, "ne réécrit pas") && strings.Contains(partie, "spec.crons[nuit]") {
+			t.Errorf("la tâche reportée ne doit pas figurer parmi les formes non réécrivables : %s", msg)
+		}
+	}
+}
+
+// D116 × D123 : ~/.local/bin/python posé vers un venv sans les dépendances de
+// l'application — celui d'une version neuve, créé vide —, la tâche réécrite y
+// perdait l'ancien venv qui les avait. La réécriture attend que le lien soit
+// prêt (LinkNotReady), au plan comme à l'application ; d'ici là .bin reste, et
+// l'étape nomme ce qu'elle attend.
+func TestLaReecritureAttendUnLienPret(t *testing.T) {
+	p, prov, _, _ := fixture(t)
+	legacy := ancienBinOgs(t, p, prov)
+	root := p.Spec.Layout.Root
+	if err := os.Symlink(filepath.Join(root, "www", ".venv", "bin", "python"), filepath.Join(legacy, "python")); err != nil {
+		t.Fatal(err)
+	}
+	liensGeres(t, p, "python")
+	pret := false
+	prov.LinkNotReady = func(_ *model.Project, name string) string {
+		if name == "python" && !pret {
+			return "les dépendances installées dans ~/.venv-3.12.7 : runuser … pip install"
+		}
+		return ""
+	}
+	p.Spec.Crons = []model.CronJob{{Name: "nuit", Schedule: "0 3 * * *", Command: root + "/.bin/python manage.py x"}}
+	deposer(t, p, prov)
+	q, s := prov.PlanLegacyCommands(p)
+	if s != nil || q.Spec.Crons[0].Command != p.Spec.Crons[0].Command {
+		t.Fatalf("aucune réécriture attendue vers un venv vide, obtenu %v / %q", s, q.Spec.Crons[0].Command)
+	}
+	err := prov.PlanLegacyBin(q).Apply(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "pip install") || !strings.Contains(err.Error(), "spec.crons[nuit].command") {
+		t.Fatalf("le retrait doit être refusé en nommant ce qu'attend la réécriture : %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(legacy, "python")); err != nil {
+		t.Error("l'ancien lien python doit rester")
+	}
+	// Prêt au plan, plus à l'application : la déclaration n'est pas réécrite.
+	pret = true
+	q, s = prov.PlanLegacyCommands(p)
+	if s == nil {
+		t.Fatal("réécriture attendue une fois le lien prêt")
+	}
+	pret = false
+	if err := s.Apply(context.Background()); err == nil || !strings.Contains(err.Error(), "pip install") {
+		t.Errorf("l'application doit rejuger le lien : %v", err)
+	}
+	pret = true
+	if err := s.Apply(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if q.Spec.Crons[0].Command != root+"/.local/bin/python manage.py x" {
+		t.Errorf("tâche : %q", q.Spec.Crons[0].Command)
+	}
+}
+
 // deposer écrit la déclaration du projet là où la migration la relit.
 func deposer(t *testing.T, p *model.Project, prov *Provider) {
 	t.Helper()

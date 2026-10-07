@@ -544,10 +544,9 @@ if [ -z "$distribution" ]; then
     sed -i 's/^disable_functions *=.*/disable_functions = phpinfo,getmypid/' "$phpini"
     distribution=phpinfo,getmypid
 fi
-pkill -f "php-fpm: master" || true
-sleep 1
-"/usr/sbin/php-fpm$version" --daemonize
-sleep 1
+# Le maître est relancé, et la réponse attendue de lui seul : un maître ré-exécuté
+# par le USR2 qui précède échappait à l'arrêt, avec le php.ini d'avant (relancer_fpm).
+relancer_fpm "$version" php.test /home/php.test/www || exit 1
 # Un script écrit une fois pour toutes (opcache, revalidate_freq=2) : il dit
 # l'état de chaque fonction et l'effet d'un appel.
 cat > /home/php.test/www/fonctions.php <<'PHP'
@@ -610,10 +609,7 @@ grep -E '^php_admin_value\[disable_functions\] ' "$pool" | sed 's/^/  /'
 # Sans init, le substitut recharge FPM par un signal que le titre réécrit du
 # maître peut faire manquer : le maître est relancé, pour que la réponse dise
 # ce que le pool écrit produit, et non ce qu'un rechargement manqué a laissé.
-pkill -f "php-fpm: master" || true
-sleep 1
-"/usr/sbin/php-fpm$version" --daemonize
-sleep 1
+relancer_fpm "$version" php.test /home/php.test/www || exit 1
 reponse=$(curl -s -H 'Host: php.test' "http://127.0.0.1/fonctions.php?f=exec,system")
 echo "$reponse" | sed 's/^/  /'
 if ! grep -qx "exec=ouverte" <<<"$reponse" || ! grep -qx "system=fermée" <<<"$reponse" ||

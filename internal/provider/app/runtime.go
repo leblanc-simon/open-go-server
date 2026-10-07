@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"leblanc.io/open-go-server/internal/exec"
@@ -180,7 +181,7 @@ func venvUsable(root, rel string) bool {
 // invoqué, sans résoudre un lien vers l'interpréteur — ~/.local/bin/python lance
 // l'interpréteur de base, venv inactif, ses modules introuvables —, mais en
 // traversant un lien de répertoire.
-const VenvLinkName = ".venv"
+const VenvLinkName = model.VenvLinkName
 
 // VenvPython rend l'interpréteur qu'invoque l'unité d'une application Python.
 func VenvPython(root string) string { return filepath.Join(root, VenvLinkName, "bin", "python") }
@@ -195,6 +196,84 @@ const AppModule = "gunicorn"
 func VenvServes(venv string) bool {
 	_, err := os.Stat(filepath.Join(venv, "bin", AppModule))
 	return err == nil
+}
+
+// ServingVenvs nomme les venvs du projet, autres que venv, qui peuvent servir
+// l'application : un répertoire réel, atteint sans suivre de lien, qui porte son
+// interpréteur et le module que lance l'unité — www/.venv quelle que soit sa
+// version, et chaque ~/.venv-<v>. Un premier lien n'est posé vers un venv vide
+// que si cette liste est vide : sinon le projet passerait d'un venv qui a ses
+// dépendances — celui que désignait l'ancien .bin/python, ou le www/.venv d'une
+// autre version — à un venv neuf qui n'a rien (D123 × D116).
+func ServingVenvs(root, venv string) []string {
+	var out []string
+	consider := func(rel string) {
+		path := filepath.Join(root, rel)
+		if filepath.Clean(path) == filepath.Clean(venv) || !venvUsable(root, rel) {
+			return
+		}
+		if _, err := fs.LstatAt(root, filepath.Join(rel, "bin", AppModule)); err != nil {
+			return
+		}
+		// L'interpréteur doit se lancer : bin/python est un lien vers celui de
+		// base, et un lien pendant — version retirée de pyenv, home d'un autre
+		// projet disparu — ne sert plus rien. Seule son existence est lue.
+		if _, err := os.Stat(filepath.Join(path, "bin", "python")); err != nil {
+			return
+		}
+		out = append(out, path)
+	}
+	consider(filepath.Join("www", ".venv"))
+	if dir, err := fs.OpenDir(root); err == nil {
+		names, _ := dir.Names()
+		_ = dir.Close()
+		sort.Strings(names)
+		for _, name := range names {
+			if strings.HasPrefix(name, venvPrefix) {
+				consider(name)
+			}
+		}
+	}
+	return out
+}
+
+// LinkNotReady dit ce qu'attend la réécriture d'une commande de l'ancien
+// .bin/name vers son remplaçant (D116), "" si elle peut avoir lieu. Seul python
+// d'un projet Python est concerné : son remplaçant est ~/.venv/bin/python
+// (model.LegacyReplacement), et une tâche réécrite vers un venv qui n'a pas les
+// dépendances de l'application — celui d'une version neuve, créé vide —
+// perdrait l'ancien qui les avait. La réécriture attend donc que ~/.venv
+// désigne un venv qui porte le module de l'unité, ou le venv même que
+// désignait l'ancien .bin/python. Un ~/.venv absent n'est pas jugé ici : la
+// migration attend déjà qu'il soit posé. Sous préfixe, rien n'est installé :
+// l'assemblage ne câble pas ce contrôle, comme les contrôles des liens.
+func LinkNotReady(proj *model.Project, name string) string {
+	if proj.LegacyReplacement(name) != model.VenvPython {
+		return ""
+	}
+	root := proj.Spec.Layout.Root
+	kind, target, err := fs.LinkStateAt(root, ".", VenvLinkName)
+	if err != nil || kind != fs.EntrySymlink {
+		return ""
+	}
+	venv := filepath.Clean(target)
+	if k, old, err := fs.LinkStateAt(root, model.LegacyLinkDir, name); err == nil && k == fs.EntrySymlink &&
+		filepath.Dir(filepath.Dir(filepath.Clean(old))) == venv {
+		return ""
+	}
+	if VenvServes(venv) {
+		return ""
+	}
+	return fmt.Sprintf("les dépendances de l'application installées dans %s, que désigne %s : %s",
+		venv, filepath.Join(root, VenvLinkName), PipInstall(proj, venv))
+}
+
+// ForeignLegacyVenv dit si www/.venv est un venv dont l'interpréteur vit hors
+// de ce home : celui qu'un clone d'avant D123 a recopié de la production
+// (R4-25). Il sert encore — son interpréteur se lance —, mais ce n'est pas celui
+// du projet.
+func ForeignLegacyVenv(root string) bool {
+	return venvUsable(root, filepath.Join("www", ".venv")) && legacyVenvVersion(root) == ""
 }
 
 // PipInstall rend la commande qui installe les dépendances d'une application

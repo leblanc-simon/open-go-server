@@ -36,6 +36,7 @@ func (m *Model) viewList() string {
 		}
 	}
 	b.WriteString("\n\n")
+	b.WriteString(m.refusedBanner())
 
 	list := m.visible()
 	if len(list) == 0 {
@@ -234,6 +235,33 @@ func (m *Model) viewWizard() string {
 func (m *Model) helpLine() string {
 	return m.styles.help("↑↓ naviguer  d écarts  a appliquer  s redémarrer  c certificat  " +
 		"n nouveau  r rafraîchir  / filtrer  q quitter")
+}
+
+// refusedBanner nomme les déclarations refusées au chargement, une ligne
+// chacune : elles manquent à la liste, et l'exploitant doit le savoir. C'est
+// l'écran qui les porte, jamais la sortie d'erreur, que Bubble Tea recouvre
+// (D120).
+func (m *Model) refusedBanner() string {
+	if len(m.refused) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString(m.styles.warning(fmt.Sprintf(
+		"⚠ %d déclaration(s) refusée(s), absente(s) de la liste — « ogs doctor » les détaille :",
+		len(m.refused))) + "\n")
+	width := m.width - 4
+	if width < 20 {
+		width = 20
+	}
+	for _, r := range m.refused {
+		line := strings.Join(strings.Fields(r), " ")
+		if runes := []rune(line); len(runes) > width {
+			line = string(runes[:width-1]) + "…"
+		}
+		b.WriteString("  " + m.styles.warning(line) + "\n")
+	}
+	b.WriteString("\n")
+	return b.String()
 }
 
 func truncate(s string, n int) string {

@@ -27,8 +27,9 @@ type LegacyBinRef struct {
 	// "" quand la référence n'est pas réécrite (forme relative, que seul
 	// l'exploitant sait résoudre).
 	Value, Rewritten string
-	// Links nomme les liens que la réécriture fait désigner dans ~/.local/bin :
-	// elle n'a de sens que s'ils y sont (D116).
+	// Links nomme les liens de l'ancien .bin que la valeur désignait ; la
+	// réécriture fait désigner leur remplaçant (LegacyReplacement), et n'a de
+	// sens que s'il est en place (D116).
 	Links []string
 }
 
@@ -52,9 +53,38 @@ func legacyPrefixes(p *Project) []string {
 	return out
 }
 
+// VenvPython est, relatif à la racine, l'interpréteur d'un projet Python qui
+// active son venv : ~/.venv est un lien de répertoire vers le venv de la
+// version (D123), que Python traverse ; ~/.local/bin/python désigne
+// <venv>/bin/python, et Python, qui cherche pyvenv.cfg à côté du chemin
+// invoqué sans résoudre ce lien, lance par lui l'interpréteur de base.
+const VenvPython = VenvLinkName + "/bin/python"
+
+// VenvLinkName est le lien de répertoire, à la racine du home d'un projet
+// Python, qui désigne le venv de la version déclarée (D123).
+const VenvLinkName = ".venv"
+
+// isPython dit si le projet est une application Python.
+func (p *Project) isPython() bool {
+	at, err := p.AppType()
+	return err == nil && at.Runtime == "python"
+}
+
+// LegacyReplacement rend, relatif à la racine, ce qui remplace le lien name de
+// l'ancien .bin : ~/.local/bin/<name>, sauf python dans un projet Python, que
+// remplace ~/.venv/bin/python — une tâche réécrite vers ~/.local/bin/python
+// tournerait hors du venv, sans ses dépendances (D116, D123).
+func (p *Project) LegacyReplacement(name string) string {
+	if name == "python" && p.isPython() {
+		return VenvPython
+	}
+	return LinkDir + "/" + name
+}
+
 // rewriteLegacy réécrit, dans une valeur, chaque <préfixe>.bin/<lien> en
-// <préfixe>.local/bin/<lien>, pour les seuls liens qu'ogs posait et seulement
-// en fin de mot : « .bin/php8.1 » ou « .bin/phpunit » ne sont pas à lui.
+// <préfixe><remplaçant> (LegacyReplacement), pour les seuls liens qu'ogs posait
+// et seulement en fin de mot : « .bin/php8.1 » ou « .bin/phpunit » ne sont pas à
+// lui.
 func rewriteLegacy(p *Project, v string) (string, []string, bool) {
 	changed := false
 	var links []string
@@ -72,7 +102,8 @@ func rewriteLegacy(p *Project, v string) (string, []string, bool) {
 			if name := v[loc[4]:loc[5]]; !slices.Contains(links, name) {
 				links = append(links, name)
 			}
-			v = v[:loc[3]] + base + LinkDir + "/" + v[loc[4]:]
+			name := v[loc[4]:loc[5]]
+			v = v[:loc[3]] + base + p.LegacyReplacement(name) + v[loc[5]:]
 			changed = true
 		}
 	}
@@ -97,19 +128,48 @@ func (p *Project) LegacyBinRefs() []LegacyBinRef {
 			out = append(out, LegacyBinRef{Field: field, Path: path, Value: v})
 		}
 	}
+	p.eachCommandValue(add)
+	return out
+}
+
+// eachCommandValue appelle f pour chaque valeur déclarée qui porte une commande
+// ou un chemin : commandes des tâches, paramètres des services, commande et
+// variables de l'application.
+func (p *Project) eachCommandValue(f func(field string, path []any, v string)) {
 	for i, c := range p.Spec.Crons {
-		add(fmt.Sprintf("spec.crons[%s].command", c.Name), []any{"spec", "crons", i, "command"}, c.Command)
+		f(fmt.Sprintf("spec.crons[%s].command", c.Name), []any{"spec", "crons", i, "command"}, c.Command)
 	}
 	for i, s := range p.Spec.Services {
 		for _, k := range sortedKeys(s.Params) {
-			add(fmt.Sprintf("spec.services[%s].params.%s", s.Name, k),
+			f(fmt.Sprintf("spec.services[%s].params.%s", s.Name, k),
 				[]any{"spec", "services", i, "params", k}, s.Params[k])
 		}
 	}
-	add("spec.app.command", []any{"spec", "app", "command"}, p.Spec.App.Command)
+	f("spec.app.command", []any{"spec", "app", "command"}, p.Spec.App.Command)
 	for _, k := range sortedKeys(p.Spec.App.Env) {
-		add("spec.app.env."+k, []any{"spec", "app", "env", k}, p.Spec.App.Env[k])
+		f("spec.app.env."+k, []any{"spec", "app", "env", k}, p.Spec.App.Env[k])
 	}
+}
+
+// localPython reconnaît un appel à .local/bin/python, sous quelque préfixe que
+// ce soit, en fin de mot : « python3 » ou « python3.12 » ne sont pas le lien
+// d'ogs.
+var localPython = regexp.MustCompile(`(?:^|[^A-Za-z0-9_.-])\.local/bin/python(?:$|[^A-Za-z0-9_.+-])`)
+
+// LocalPythonRefs nomme les valeurs déclarées d'un projet Python qui appellent
+// ~/.local/bin/python : l'interpréteur de base y tourne, venv inactif (D123),
+// et ~/.venv/bin/python est ce qu'elles doivent invoquer. doctor les signale ;
+// ni le chargement ni le plan ne les refusent — ce lien reste celui du shell.
+func (p *Project) LocalPythonRefs() []string {
+	if !p.isPython() {
+		return nil
+	}
+	var out []string
+	p.eachCommandValue(func(field string, _ []any, v string) {
+		if localPython.MatchString(v) {
+			out = append(out, field)
+		}
+	})
 	return out
 }
 

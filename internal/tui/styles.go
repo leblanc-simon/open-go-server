@@ -107,3 +107,10 @@ func (s Styles) item(text string) string {
 	}
 	return s.Item.Render("  " + text)
 }
+
+func (s Styles) warning(text string) string {
+	if s.Plain {
+		return text
+	}
+	return s.Warning.Render(text)
+}

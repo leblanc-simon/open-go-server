@@ -280,6 +280,9 @@ func (a *App) buildPlan(ctx context.Context, provs *providers, p *model.Project)
 		// Une déclaration étrangère morte d'un domaine du projet : information,
 		// jamais un écart (D118).
 		plan.Notes = append(plan.Notes, provs.Web.ConflictNotes(p, webObs)...)
+		// Une option HSTS non reconnue : information, le vhost est servi avec la
+		// politique complète (D119).
+		plan.Notes = append(plan.Notes, provs.Web.HSTSNotes(p)...)
 
 		// Les certificats viennent après le vhost HTTP : le challenge HTTP-01
 		// exige que /.well-known/acme-challenge réponde déjà. Puis le vhost est

@@ -105,17 +105,16 @@ func TestUneOptionHSTSNonReconnueEstAnnonceeParLePlan(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var vu bool
+	// Une note du plan, jamais une étape : une étape NoOp n'était montrée nulle
+	// part (D118).
 	for _, s := range steps {
-		if s.Resource == "web/vhost/shopfr/hsts" {
-			vu = true
-			if s.Mutates() || !strings.Contains(s.Summary, `"off"`) || !strings.Contains(s.Summary, "hstsSubdomains") {
-				t.Errorf("information attendue, nommant les deux options : %+v", s)
-			}
+		if strings.HasSuffix(s.Resource, "/hsts") {
+			t.Errorf("l'option HSTS n'est pas une étape : %+v", s)
 		}
 	}
-	if !vu {
-		t.Error("aucune étape n'annonce l'option non reconnue")
+	notes := prov.HSTSNotes(p)
+	if len(notes) != 1 || !strings.Contains(notes[0], `"off"`) || !strings.Contains(notes[0], "hstsSubdomains") {
+		t.Errorf("une note attendue, nommant les deux options : %v", notes)
 	}
 	for _, o := range []map[string]any{nil, {"hsts": false}, {"hsts": "None"}, {"hstsSubdomains": false}} {
 		if pb := HSTSOptionProblems(o); len(pb) > 0 {

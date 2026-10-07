@@ -210,6 +210,109 @@ fi
 echo "l'ancien venv sert sa version, sans rien recréer"
 
 echo
+echo "--- un premier lien ne désigne pas un venv vide, la tâche suit ~/.venv (D123, D116) ---"
+# Un projet d'avant D70 : pas de ~/.local/bin/python, l'ancien .bin/python vers
+# www/.venv, qui a ses dépendances, et une tâche qui l'invoque. La déclaration
+# demande une autre version, dont le venv naît vide : le premier lien y était
+# posé sans garde. La seconde version est l'interpréteur déjà compilé sous un
+# autre nom — pyenv install -s la tient pour installée —, ce qui épargne une
+# seconde compilation. La tâche, elle, est réécrite vers ~/.venv/bin/python :
+# par ~/.local/bin/python, lien vers l'interpréteur du venv, Python lançait
+# l'interpréteur de base, venv inactif.
+autre="$VERSION_PYTHON-bis"
+ln -s "$VERSION_PYTHON" "$racine/.pyenv/versions/$autre"
+rm -f "$racine/.local/bin/python"
+install -d -o root -g root -m 0710 "$racine/.bin"
+ln -s "$racine/www/.venv/bin/python" "$racine/.bin/python"
+tache="-c 'import gunicorn, sys; print(sys.prefix)'"
+ogs cron add pythontest nuit --schedule "0 3 * * *" --command "$racine/.bin/python $tache" >/dev/null 2>&1
+AUTRE="$autre" VERSION="$VERSION_PYTHON" python3 - <<'PYV'
+import os, re
+chemin = "/etc/ogs/projects/pythontest.yaml"
+s = open(chemin).read()
+n = re.sub(r'(\n\s+runtime: )"?' + re.escape(os.environ["VERSION"]) + r'"?\n', r'\g<1>' + os.environ["AUTRE"] + "\n", s, count=1)
+assert n != s, "version non trouvée dans la déclaration"
+open(chemin, "w").write(n)
+PYV
+# executer_tache lance la commande de la tâche telle que le fichier de tâches
+# la porte, sous le compte du projet.
+executer_tache() {
+    local commande
+    commande=$(grep -o "$racine/[^ ]*/python -c 'import gunicorn, sys; print(sys.prefix)'" /etc/cron.d/ogs-pythontest | head -1)
+    [ -n "$commande" ] || { echo "(tâche introuvable)"; return 1; }
+    runuser -u pythontest -- bash -c "$commande" 2>&1 | tail -1
+}
+for passage in 1 2; do
+    sortie=$(ogs apply pythontest --yes 2>&1); code=$?
+    echo "  apply $passage : code $code"
+    echo "$sortie" | grep -E "pip install|\.bin|déclaration" | head -4 | sed 's/^/    /'
+    if [ "$code" != 6 ] || [[ "$sortie" != *"-m pip install"* ]]; then
+        echo "ÉCHEC : l'apply doit rendre 6 en nommant la commande pip"
+        echo "$sortie" | tail -15
+        exit 1
+    fi
+    if [ -e "$racine/.local/bin/python" ] || [ -L "$racine/.local/bin/python" ]; then
+        echo "ÉCHEC : ~/.local/bin/python posé vers le venv vide : $(readlink "$racine/.local/bin/python")"
+        exit 1
+    fi
+    if [ "$(readlink "$racine/.venv")" != "$racine/www/.venv" ]; then
+        echo "ÉCHEC : ~/.venv a quitté le venv qui sert : $(readlink "$racine/.venv")"
+        exit 1
+    fi
+done
+# ~/.venv désigne le venv même de l'ancien .bin/python : la tâche le suit dès
+# le premier apply, et .bin part.
+if ! grep -q "$racine/.venv/bin/python -c" /etc/cron.d/ogs-pythontest ||
+    ! grep -q "$racine/.venv/bin/python -c" /etc/ogs/projects/pythontest.yaml; then
+    echo "ÉCHEC : la tâche doit désigner ~/.venv/bin/python"
+    grep python /etc/cron.d/ogs-pythontest
+    exit 1
+fi
+if [ -e "$racine/.bin" ]; then
+    echo "ÉCHEC : l'ancien .bin doit partir, son remplaçant ~/.venv étant en place"
+    exit 1
+fi
+sortie_tache=$(executer_tache)
+echo "  tâche : $sortie_tache"
+if [ "$sortie_tache" != "$racine/.venv" ]; then
+    echo "ÉCHEC : la tâche ne tourne pas dans le venv, gunicorn importé"
+    exit 1
+fi
+if [ ! -x "$racine/.venv-$autre/bin/python" ] || [ -e "$racine/.venv-$autre/bin/gunicorn" ]; then
+    echo "ÉCHEC : le venv de $autre devait être créé, vide"
+    exit 1
+fi
+if [[ "$(repond)" != "prefix $racine/.venv gunicorn "* ]]; then
+    echo "ÉCHEC : l'application ne sert plus : $(repond)"
+    exit 1
+fi
+echo "  l'ancien venv reste en service, la tâche y tourne par ~/.venv"
+# Une commande qui appelle ~/.local/bin/python est nommée par doctor.
+ogs cron add pythontest shell --schedule "0 4 * * *" --command "$racine/.local/bin/python -V" >/dev/null 2>&1
+diag=$(ogs doctor 2>&1 | grep -A1 "python hors venv pythontest")
+echo "  doctor : $(echo "$diag" | head -1)"
+if [[ "$diag" != *"spec.crons[shell].command"* ]] || [[ "$diag" != *"$racine/.venv/bin/python"* ]]; then
+    echo "ÉCHEC : doctor doit nommer l'appel à ~/.local/bin/python et le remède"
+    exit 1
+fi
+ogs cron remove pythontest shell --yes >/dev/null 2>&1 || ogs cron remove pythontest shell >/dev/null 2>&1
+runuser -u pythontest -- "$racine/.venv-$autre/bin/python" -m pip install -q gunicorn 2>&1 | tail -2
+ogs apply pythontest --yes >/dev/null 2>&1
+if [ "$(readlink "$racine/.local/bin/python")" != "$racine/.venv-$autre/bin/python" ] ||
+    [ "$(readlink "$racine/.venv")" != "$racine/.venv-$autre" ]; then
+    echo "ÉCHEC : les liens doivent suivre une fois le venv pourvu"
+    exit 1
+fi
+sortie_tache=$(executer_tache)
+echo "  tâche après bascule : $sortie_tache"
+if [ "$sortie_tache" != "$racine/.venv" ] ||
+    [ "$(runuser -u pythontest -- "$racine/.venv/bin/python" -c 'import sys; print(sys.version.split()[0], sys.base_prefix)')" = "" ]; then
+    echo "ÉCHEC : la tâche doit tourner dans le venv de la nouvelle version"
+    exit 1
+fi
+echo "venv pourvu : liens posés, la tâche suit ~/.venv sans réécriture"
+
+echo
 echo "--- une seconde installation ne recompile pas ---"
 debut=$(date +%s)
 ogs runtime install rubytest "$VERSION_RUBY" 2>&1 | tail -2

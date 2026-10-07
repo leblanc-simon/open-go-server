@@ -860,6 +860,12 @@ func (a *App) systemProvider() *system.Provider {
 	// Par la variable du paquet, que les essais substituent.
 	prov.AccountOfUID = func(uid int) (string, error) { return accountOfUID(uid) }
 	prov.KnownHome = a.knownHome
+	// La réécriture d'une commande vers ~/.venv/bin/python attend un venv
+	// pourvu de ses dépendances (D116, D123). Sous préfixe, rien n'est installé :
+	// ce contrôle se tait, comme ceux des liens du provider applicatif.
+	if a.Prefix == "" {
+		prov.LinkNotReady = appprov.LinkNotReady
+	}
 	if a.Prefix != "" {
 		prov.AccountsOfGID = system.AccountsOfGIDIn(ident.PasswdPath)
 	}

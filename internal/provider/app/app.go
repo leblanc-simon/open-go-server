@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -542,6 +543,8 @@ func (p *Provider) runtimeSteps(proj *model.Project, at model.AppType, obs Obser
 		// verrait sinon une version que l'application n'emploie pas.
 		if venv != "" && obs.LinkTarget != "" {
 			checks = append(checks, p.servesCheck(proj, venv))
+		} else if venv != "" {
+			checks = append(checks, p.firstLinkCheck(proj, venv))
 		}
 		steps = append(steps, p.linkStep(proj, obs, "app/link/"+at.Runtime, model.LinkDir+"/"+name,
 			obs.LinkTarget, target, func(t string) error { return p.setLink(proj, name, t) }, checks...))
@@ -600,6 +603,40 @@ func (p *Provider) servesCheck(proj *model.Project, venv string) linkCheck {
 		return nil
 	}}
 	if !p.simulated() && !VenvServes(venv) {
+		c.plan = fmt.Sprintf("attend %s dans %s : %s", AppModule, venv, PipInstall(proj, venv))
+	}
+	return c
+}
+
+// firstLinkCheck garde un premier lien vers venv — ~/.local/bin/python ou
+// ~/.venv, quand aucun n'existe encore. Il n'a rien à garder sur un projet
+// neuf, mais un projet d'avant D70 tournait par l'ancien .bin/python, et un
+// www/.venv d'une autre version que la déclarée n'est pas repris : y poser le
+// lien vers le venv neuf, vide, faisait passer l'application et les tâches que
+// D116 réécrit vers ~/.local/bin/python d'un venv pourvu à un venv sans
+// dépendances. Le lien n'est posé vers un venv sans le module de l'unité que si
+// aucun autre venv du projet ne peut servir (ServingVenvs) ; sinon rien n'est
+// posé, l'existant reste en service, et l'étape échoue sans dérouler (code 6)
+// en nommant la commande pip.
+func (p *Provider) firstLinkCheck(proj *model.Project, venv string) linkCheck {
+	root := proj.Spec.Layout.Root
+	c := linkCheck{apply: func() error {
+		if VenvServes(venv) {
+			return nil
+		}
+		if serving := ServingVenvs(root, venv); len(serving) > 0 {
+			note := ""
+			if legacy := legacyVenv(root); slices.Contains(serving, legacy) && ForeignLegacyVenv(root) {
+				note = fmt.Sprintf(" (%s a son interpréteur hors de ce home : venv recopié par un clone "+
+					"d'avant D123 ; le retirer s'il ne sert plus)", legacy)
+			}
+			return fmt.Errorf("%s ne porte pas %s, alors que %s, qui le porte, sert encore le projet%s — "+
+				"installer les dépendances : %s, puis « ogs apply %s »", venv, AppModule,
+				strings.Join(serving, ", "), note, PipInstall(proj, venv), proj.ID())
+		}
+		return nil
+	}}
+	if !p.simulated() && !VenvServes(venv) && len(ServingVenvs(root, venv)) > 0 {
 		c.plan = fmt.Sprintf("attend %s dans %s : %s", AppModule, venv, PipInstall(proj, venv))
 	}
 	return c
@@ -680,6 +717,8 @@ func (p *Provider) venvLinkStep(proj *model.Project, obs Observed, venv string) 
 	checks := []linkCheck{p.binaryCheck(proj, filepath.Join(venv, "bin", "python"))}
 	if obs.VenvLinkTarget != "" || (obs.UnitPresent && obs.LinkTarget != "") {
 		checks = append(checks, p.servesCheck(proj, venv))
+	} else {
+		checks = append(checks, p.firstLinkCheck(proj, venv))
 	}
 	return p.linkStep(proj, obs, resource, path, obs.VenvLinkTarget, venv,
 		func(t string) error { return p.setVenvLink(proj, t) }, checks...)

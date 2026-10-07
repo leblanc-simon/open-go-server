@@ -170,3 +170,76 @@ func TestLesReferencesALAncienBin(t *testing.T) {
 		t.Errorf("e : %q", r.Rewritten)
 	}
 }
+
+// Arbitrage du lot Z (D116 × D123) : dans un projet Python, ~/.local/bin/python
+// désigne <venv>/bin/python, et Python n'active pas un venv atteint par un lien
+// vers son interpréteur. Une commande .bin/python est réécrite vers
+// ~/.venv/bin/python, lien de répertoire qui l'active ; les autres liens, et
+// python hors d'un projet Python, gardent ~/.local/bin.
+func TestLAncienPythonEstReecritVersLeVenv(t *testing.T) {
+	p := New("py.fr", naming.EnvProd, KindPython)
+	p.Spec.App.Runtime = "3.12.7"
+	if err := p.Normalize("/home", "preprod-pp.net"); err != nil {
+		t.Fatal(err)
+	}
+	root := p.Spec.Layout.Root
+	p.Spec.Crons = []CronJob{
+		{Name: "a", Command: root + "/.bin/python manage.py x && ~/.bin/node y.js"},
+		{Name: "b", Command: "$HOME/.bin/python -V"},
+	}
+	got := map[string]LegacyBinRef{}
+	for _, r := range p.LegacyBinRefs() {
+		got[r.Field] = r
+	}
+	if r := got["spec.crons[a].command"]; r.Rewritten != root+"/.venv/bin/python manage.py x && ~/.local/bin/node y.js" {
+		t.Errorf("a : %q", r.Rewritten)
+	}
+	if r := got["spec.crons[b].command"]; r.Rewritten != "$HOME/.venv/bin/python -V" {
+		t.Errorf("b : %q", r.Rewritten)
+	}
+	if rel := p.LegacyReplacement("python"); rel != ".venv/bin/python" {
+		t.Errorf("remplaçant de python : %q", rel)
+	}
+	if rel := p.LegacyReplacement("node"); rel != ".local/bin/node" {
+		t.Errorf("remplaçant de node : %q", rel)
+	}
+
+	s := New("shop.fr", naming.EnvProd, KindStatic)
+	if err := s.Normalize("/home", "preprod-pp.net"); err != nil {
+		t.Fatal(err)
+	}
+	s.Spec.Crons = []CronJob{{Name: "a", Command: "~/.bin/python x.py"}}
+	if r := s.LegacyBinRefs(); len(r) != 1 || r[0].Rewritten != "~/.local/bin/python x.py" {
+		t.Errorf("hors d'un projet Python, python garde ~/.local/bin : %+v", r)
+	}
+}
+
+// doctor nomme les commandes déclarées qui appellent ~/.local/bin/python : le
+// venv n'y est pas actif (D123). Le relevé ne vaut que pour un projet Python.
+func TestLesAppelsALInterpreteurSansVenv(t *testing.T) {
+	p := New("py.fr", naming.EnvProd, KindPython)
+	p.Spec.App.Runtime = "3.12.7"
+	if err := p.Normalize("/home", "preprod-pp.net"); err != nil {
+		t.Fatal(err)
+	}
+	root := p.Spec.Layout.Root
+	p.Spec.Crons = []CronJob{
+		{Name: "a", Command: root + "/.local/bin/python manage.py x"},
+		{Name: "b", Command: "cd www && ../.local/bin/python -V"},
+		{Name: "c", Command: root + "/.venv/bin/python ok.py"},
+		{Name: "d", Command: "~/.local/bin/python3 x.py"},
+	}
+	p.Spec.App.Env = map[string]string{"PY": "$HOME/.local/bin/python"}
+	want := []string{"spec.crons[a].command", "spec.crons[b].command", "spec.app.env.PY"}
+	if got := p.LocalPythonRefs(); strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("relevé : %v, attendu %v", got, want)
+	}
+	s := New("shop.fr", naming.EnvProd, KindStatic)
+	if err := s.Normalize("/home", "preprod-pp.net"); err != nil {
+		t.Fatal(err)
+	}
+	s.Spec.Crons = []CronJob{{Name: "a", Command: "~/.local/bin/python x.py"}}
+	if got := s.LocalPythonRefs(); len(got) != 0 {
+		t.Errorf("hors d'un projet Python : %v", got)
+	}
+}

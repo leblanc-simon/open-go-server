@@ -90,6 +90,15 @@ Pièges du harnais :
   `pkill -USR2 -f /usr/sbin/php-fpm<v>`, que le titre réécrit du maître peut faire manquer. Écrire un script
   une fois pour toutes, avec toutes les branches dont le scénario a besoin : `nginx` échouait de façon
   reproductible.
+- **Relancer FPM sans init passe par `relancer_fpm`** (`scenarios/lib.sh`), jamais par
+  `pkill -f "php-fpm: master"; sleep 1; php-fpm<v> --daemonize`. Un maître que USR2 ré-exécute porte, le
+  temps de réécrire son titre, la ligne de commande `/usr/sbin/php-fpm<v> --daemonize` : le motif le
+  manquait, il survivait, le maître relancé échouait faute de socket (code 70, ignoré), et la réponse venait
+  d'un maître qui avait lu `php.ini` avant ou après sa modification à quelques millisecondes près —
+  `site-complet` échouait par intermittence sur « phpinfo, fermée par php.ini, a été rouverte par le pool ».
+  La fonction arrête tout maître de la version — titre ou ligne de commande — jusqu'au dernier, sans
+  toucher aux autres versions, vérifie le démarrage, et attend une
+  réponse dont le parent (`posix_getppid`) est le maître relancé.
 - **Ce qui énumère un répertoire sous `www-data` échoue sur le docroot**, qu'il traverse sans pouvoir le
   lire (0710, D51) : MultiViews (403, AH00686), `Indexes`, et sous nginx `disable_symlinks`, qui ouvre les
   répertoires. Un scénario qui éprouve ces mécanismes le fait dans un sous-répertoire, et pose un
@@ -516,7 +525,12 @@ Ils ont tous coûté un défaut réel ; les tests unitaires ne les voyaient pas.
   `~/.local/bin/python` en est un depuis D70 : l'unité d'une application Python n'a jamais trouvé gunicorn
   dans le venv, et aucun scénario ne lançait d'application Python. L'unité passe par le lien de
   **répertoire** `~/.venv` (D123), que Python traverse ; et une application en service ne bascule sur un
-  venv que s'il porte le module que lance son unité — un venv neuf est vide.
+  venv que s'il porte le module que lance son unité — un venv neuf est vide. Il en va de même des tâches :
+  la migration de D116 réécrit `.bin/python` d'un projet Python vers `~/.venv/bin/python`, jamais vers
+  `~/.local/bin/python` (`model.LegacyReplacement`), et `doctor` nomme les commandes déclarées qui appellent
+  encore celui-ci. Un **premier** lien est gardé comme une bascule : il n'est posé vers un venv vide que si
+  aucun autre venv du projet ne peut servir (`app.ServingVenvs`) — un projet d'avant D70 dont le
+  `www/.venv` est d'une autre version passait sinon, au premier apply, d'un venv pourvu à un venv vide.
 - `ogs harden` restreint les droits de `/etc` (D56, D85). Trois invariants : il **ne desserre jamais** — un
   répertoire déjà plus strict est laissé tel quel, et le mode posé est l'intersection du constaté et de la
   cible, setgid et sticky conservés — ; il **préserve le bit d'exécution** des fichiers, sans quoi il rendrait

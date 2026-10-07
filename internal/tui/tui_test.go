@@ -17,6 +17,7 @@ import (
 // système, sans terminal et sans provider.
 type fakeBackend struct {
 	projects  []*model.Project
+	refused   []string
 	snapshots map[string]Snapshot
 	applied   []string
 	restarted []string
@@ -31,7 +32,9 @@ type fakeBackend struct {
 
 func (f *fakeBackend) PrepDomain() string { return "preprod-pp.net" }
 
-func (f *fakeBackend) Projects() ([]*model.Project, error) { return f.projects, nil }
+func (f *fakeBackend) Projects() ([]*model.Project, []string, error) {
+	return f.projects, f.refused, nil
+}
 
 func (f *fakeBackend) Snapshot(_ context.Context, p *model.Project) (Snapshot, error) {
 	if s, ok := f.snapshots[p.ID()]; ok {
@@ -446,5 +449,35 @@ func TestApplyMontreLePlanAvantDeConfirmer(t *testing.T) {
 	}
 	if !strings.Contains(m.Status(), "aucun changement") {
 		t.Errorf("l'absence de changement doit être dite : %q", m.Status())
+	}
+}
+
+// Une déclaration refusée au chargement est nommée à l'écran, dans un bandeau
+// au-dessus de la liste — le backend ne l'écrit plus sur la sortie, que Bubble
+// Tea recouvre (D120) —, et le bandeau disparaît quand elle est corrigée.
+func TestLesDeclarationsRefuseesSontNommeesALEcran(t *testing.T) {
+	backend := &fakeBackend{
+		projects: []*model.Project{project(t, "shop.fr", naming.EnvProd)},
+		refused:  []string{"projet blogfr :\nspec.user.webAccess : attendu group, acl ou none"},
+	}
+	m := New(backend)
+	m.styles = Styles{Plain: true}
+	m.Update(m.Init()())
+	vue := m.View()
+	for _, attendu := range []string{"1 déclaration(s) refusée(s)", "projet blogfr : spec.user.webAccess", "shopfr"} {
+		if !strings.Contains(vue, attendu) {
+			t.Errorf("l'écran doit montrer %q :\n%s", attendu, vue)
+		}
+	}
+	backend.refused = nil
+	m.Update(m.loadProjects())
+	if strings.Contains(m.View(), "refusée") {
+		t.Errorf("le bandeau doit disparaître une fois la déclaration corrigée :\n%s", m.View())
+	}
+	// Parc vide hormis la déclaration refusée : le bandeau reste visible.
+	backend.projects, backend.refused = nil, []string{"déclaration illisible : casse.yaml"}
+	m.Update(m.loadProjects())
+	if !strings.Contains(m.View(), "casse.yaml") {
+		t.Errorf("le bandeau doit figurer même sans projet lisible :\n%s", m.View())
 	}
 }

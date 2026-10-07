@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -533,22 +534,16 @@ func (p *Provider) PlanLegacyCommands(proj *model.Project) (*model.Project, *eng
 	// dans ~/.local/bin : un runtime dont l'installation échoue ne pose pas son
 	// lien, et la tâche, réécrite, perdrait l'ancien qui fonctionnait. Celle-ci
 	// garde .bin (la déclaration le désigne encore) et attend l'apply suivant.
+	// Python d'un projet Python est réécrit vers ~/.venv/bin/python, qui active
+	// le venv (D123) ; il attend que ~/.venv désigne un venv pourvu des
+	// dépendances de l'application (LinkNotReady) : la tâche y perdrait sinon
+	// celles de l'ancien.
 	// Le lien php est l'exception : binStep le pose dans ce même plan, étape
 	// critique qui précède tâches et unités — un projet d'avant D70 n'a pas
 	// encore de ~/.local/bin à son premier apply.
 	var edits []model.LegacyBinRef
 	for _, r := range proj.LegacyBinRefs() {
-		if r.Rewritten == "" {
-			continue
-		}
-		missing := 0
-		for _, n := range r.Links {
-			if n == "php" && len(proj.Spec.PHP.Pools) > 0 {
-				continue
-			}
-			missing += len(missingManagedLinks(proj.Spec.Layout.Root, []string{n}))
-		}
-		if missing == 0 {
+		if r.Rewritten != "" && p.rewriteWaits(proj, r) == "" {
 			edits = append(edits, r)
 		}
 	}
@@ -561,12 +556,19 @@ func (p *Provider) PlanLegacyCommands(proj *model.Project) (*model.Project, *eng
 	}
 	path := p.Paths.ProjectFile(proj.ID())
 	fields := make([]string, 0, len(edits))
+	var links []string
 	for _, r := range edits {
 		fields = append(fields, r.Field)
+		for _, n := range r.Links {
+			if !slices.Contains(links, n) {
+				links = append(links, n)
+			}
+		}
 	}
+	sort.Strings(links)
 	s := engine.NewStep("system/declaration/legacy-bin", engine.Update,
-		fmt.Sprintf("déclaration %s : %s → %s dans %s", path, model.LegacyLinkDir+"/",
-			model.LinkDir+"/", strings.Join(fields, ", ")))
+		fmt.Sprintf("déclaration %s : %s dans %s", path, replacementPairs(proj, links),
+			strings.Join(fields, ", ")))
 	// Non critique : crons et unités sont déjà calculés sur les nouveaux chemins ;
 	// tant que la déclaration reste en l'état, l'ancien .bin est retenu
 	// (PlanLegacyBin), et le prochain apply la reprend.
@@ -575,9 +577,13 @@ func (p *Provider) PlanLegacyCommands(proj *model.Project) (*model.Project, *eng
 	var written []byte
 	s.Apply = func(context.Context) error {
 		for _, r := range edits {
-			if missing := missingManagedLinks(proj.Spec.Layout.Root, r.Links); len(missing) > 0 {
+			if missing := missingReplacements(proj, r.Links); len(missing) > 0 {
 				return fmt.Errorf("%s non réécrite : %s absent — l'ancien %s est gardé", r.Field,
 					strings.Join(missing, ", "), model.LegacyLinkDir)
+			}
+			if why := p.linksNotReady(proj, r.Links); why != "" {
+				return fmt.Errorf("%s non réécrite : elle attend %s — l'ancien %s est gardé", r.Field,
+					why, model.LegacyLinkDir)
 			}
 		}
 		data, err := os.ReadFile(path)
@@ -596,9 +602,8 @@ func (p *Provider) PlanLegacyCommands(proj *model.Project) (*model.Project, *eng
 		}
 		out, err := spec.RewriteValues(data, spEdits)
 		if err != nil {
-			return fmt.Errorf("%s : %w — remplacer %s par %s dans %s ; l'ancien %s est gardé d'ici là", path, err,
-				"<racine>/"+model.LegacyLinkDir+"/", "<racine>/"+model.LinkDir+"/", strings.Join(fields, ", "),
-				model.LegacyLinkDir)
+			return fmt.Errorf("%s : %w — remplacer %s dans %s ; l'ancien %s est gardé d'ici là", path, err,
+				replacementPairs(proj, links), strings.Join(fields, ", "), model.LegacyLinkDir)
 		}
 		if err := spec.WriteFileAtomic(path, out); err != nil {
 			return err
@@ -620,16 +625,95 @@ func (p *Provider) PlanLegacyCommands(proj *model.Project) (*model.Project, *eng
 	return proj.WithLegacyBinRefs(edits), s
 }
 
-// missingManagedLinks nomme, parmi names, les liens absents de ~/.local/bin,
-// lus par descripteur sans suivre de lien (D83).
-func missingManagedLinks(root string, names []string) []string {
+// rewriteWaits dit ce qu'attend la réécriture de r, "" si elle peut avoir lieu
+// (D116) : le remplaçant de chaque lien qu'elle désignait — ~/.local/bin/<lien>,
+// ou ~/.venv pour python d'un projet Python —, sauf php, posé par ce même
+// plan, et prêt à la recevoir (LinkNotReady : un ~/.venv vers un venv sans
+// dépendances ne l'est pas, D123). Une forme qu'ogs ne réécrit pas
+// n'attend rien : elle ne sera jamais réécrite.
+func (p *Provider) rewriteWaits(proj *model.Project, r model.LegacyBinRef) string {
+	if r.Rewritten == "" {
+		return ""
+	}
+	var missing []string
+	for _, n := range r.Links {
+		if n == "php" && len(proj.Spec.PHP.Pools) > 0 {
+			continue
+		}
+		missing = append(missing, missingReplacements(proj, []string{n})...)
+	}
+	if len(missing) > 0 {
+		posé := "posé"
+		if len(missing) > 1 {
+			posé = "posés"
+		}
+		return strings.Join(missing, ", ") + " " + posé
+	}
+	return p.linksNotReady(proj, r.Links)
+}
+
+// linksNotReady rend ce qu'attend le premier des liens names qui n'est pas prêt
+// à recevoir une commande réécrite, "" s'ils le sont tous.
+func (p *Provider) linksNotReady(proj *model.Project, names []string) string {
+	if p.LinkNotReady == nil {
+		return ""
+	}
+	for _, n := range names {
+		if why := p.LinkNotReady(proj, n); why != "" {
+			return why
+		}
+	}
+	return ""
+}
+
+// missingReplacements nomme, parmi les liens names de l'ancien .bin, ceux dont
+// le remplaçant manque, lu par descripteur sans suivre de lien (D83) : le lien
+// de ~/.local/bin, ou ~/.venv pour python d'un projet Python
+// (model.LegacyReplacement).
+func missingReplacements(proj *model.Project, names []string) []string {
+	root := proj.Spec.Layout.Root
 	var out []string
 	for _, n := range names {
+		if proj.LegacyReplacement(n) == model.VenvPython {
+			if kind, _, err := fs.LinkStateAt(root, ".", model.VenvLinkName); err != nil || kind != fs.EntrySymlink {
+				out = append(out, filepath.Join(root, model.VenvLinkName))
+			}
+			continue
+		}
 		if kind, _, err := fs.LinkStateAt(root, model.LinkDir, n); err != nil || kind == fs.EntryAbsent {
 			out = append(out, filepath.Join(model.BinDir(root), n))
 		}
 	}
 	return out
+}
+
+// replacementPairs décrit la réécriture des liens names : « .bin/php →
+// .local/bin/php », « .bin/python → .venv/bin/python ».
+func replacementPairs(proj *model.Project, names []string) string {
+	pairs := make([]string, 0, len(names))
+	for _, n := range names {
+		pairs = append(pairs, model.LegacyLinkDir+"/"+n+" → "+proj.LegacyReplacement(n))
+	}
+	return strings.Join(pairs, ", ")
+}
+
+// replacementDirs dit où vivent les remplaçants des liens de l'ancien .bin.
+func replacementDirs(proj *model.Project) string {
+	root := proj.Spec.Layout.Root
+	if proj.LegacyReplacement("python") == model.VenvPython {
+		return model.BinDir(root) + ", " + filepath.Join(root, model.VenvLinkName) + " pour python"
+	}
+	return model.BinDir(root)
+}
+
+// replacementHint dit ce que l'exploitant écrit à la place de .bin/<lien>.
+func replacementHint(proj *model.Project) string {
+	root := proj.Spec.Layout.Root
+	hint := filepath.Join(model.BinDir(root), "<lien>")
+	if proj.LegacyReplacement("python") == model.VenvPython {
+		hint += " (" + filepath.Join(root, model.VenvPython) + " pour python)"
+	}
+	return hint
 }
 
 // declaredLegacyRefs relit la déclaration déposée et nomme les valeurs qui
@@ -665,8 +749,10 @@ func (p *Provider) declaredLegacyRefs(proj *model.Project) ([]string, error) {
 // lien (D83) ; seuls les liens reconnus partent, et le répertoire seulement vide.
 //
 // Tant qu'une déclaration désigne encore .bin — sous une forme qu'ogs ne réécrit
-// pas, un chemin relatif, ou parce que la réécriture du fichier a été refusée —,
-// rien n'est retiré : l'étape échoue en la nommant. Le fichier déposé est relu
+// pas, un chemin relatif, parce que la réécriture attend un lien de
+// ~/.local/bin pas encore posé, ou parce que la réécriture du fichier a été
+// refusée —, rien n'est retiré : l'étape échoue en la nommant, chaque motif
+// sous son propre message. Le fichier déposé est relu
 // à l'application, après l'étape qui le réécrit.
 func (p *Provider) PlanLegacyBin(proj *model.Project) *engine.Step {
 	root := proj.Spec.Layout.Root
@@ -676,21 +762,49 @@ func (p *Provider) PlanLegacyBin(proj *model.Project) *engine.Step {
 		return nil
 	}
 	s := engine.NewStep("system/legacy-bin", engine.Delete,
-		fmt.Sprintf("retrait de l'ancien %s (liens désormais dans %s)", legacy, model.BinDir(root)))
+		fmt.Sprintf("retrait de l'ancien %s (liens désormais dans %s)", legacy, replacementDirs(proj)))
 	s.Critical = false
 	s.FlushReloads = true
-	var held []string
+	// Deux motifs de retenue, à ne pas confondre : une forme qu'ogs ne réécrit
+	// pas (chemin relatif), que seul l'exploitant peut reprendre, et une
+	// réécriture seulement reportée parce que le lien qu'elle désignera n'est pas
+	// encore dans ~/.local/bin, ou pas prêt — le venv qu'il désigne n'a pas les
+	// dépendances de l'application (PlanLegacyCommands, rewriteWaits) —, que
+	// l'apply suivant fait de lui-même une fois ce qu'elle attend en place.
+	var unwritable []string
+	deferred := false
 	for _, r := range proj.LegacyBinRefs() {
-		held = append(held, r.Field)
+		if r.Rewritten == "" {
+			unwritable = append(unwritable, r.Field)
+		} else {
+			deferred = true
+		}
 	}
-	if len(held) > 0 {
+	if len(unwritable) > 0 || deferred {
 		s.Action = engine.Update
 		s.Summary = fmt.Sprintf("ancien %s conservé : la déclaration le désigne encore", legacy)
 		s.FlushReloads = false
 		s.Apply = func(context.Context) error {
-			return fmt.Errorf("%s conservé : %s le désigne encore sous une forme qu'ogs ne réécrit pas — "+
-				"y écrire %s, puis relancer « ogs apply %s »", legacy, strings.Join(held, ", "),
-				filepath.Join(model.BinDir(root), "<lien>"), proj.ID())
+			var parts []string
+			if len(unwritable) > 0 {
+				parts = append(parts, fmt.Sprintf("%s le désigne encore sous une forme qu'ogs ne réécrit pas — "+
+					"y écrire %s, puis relancer « ogs apply %s »", strings.Join(unwritable, ", "),
+					replacementHint(proj), proj.ID()))
+			}
+			// Rejugé ici : ce qu'attendait la réécriture au plan a pu arriver dans
+			// cet apply — un runtime installé pose son lien.
+			for _, r := range proj.LegacyBinRefs() {
+				if r.Rewritten == "" {
+					continue
+				}
+				if waits := p.rewriteWaits(proj, r); waits != "" {
+					parts = append(parts, fmt.Sprintf("%s le désigne encore : réécrite à l'apply suivant une fois %s",
+						r.Field, waits))
+				} else {
+					parts = append(parts, fmt.Sprintf("%s le désigne encore : réécrite à l'apply suivant", r.Field))
+				}
+			}
+			return fmt.Errorf("%s conservé : %s", legacy, strings.Join(parts, " ; "))
 		}
 		return s
 	}
@@ -715,7 +829,7 @@ func (p *Provider) PlanLegacyBin(proj *model.Project) *engine.Step {
 		if len(fields) > 0 {
 			return fmt.Errorf("%s conservé : %s désigne encore %s dans %s — y écrire %s, puis relancer "+
 				"« ogs apply %s »", legacy, p.Paths.ProjectFile(proj.ID()), model.LegacyLinkDir+"/",
-				strings.Join(fields, ", "), model.LinkDir+"/", proj.ID())
+				strings.Join(fields, ", "), replacementHint(proj), proj.ID())
 		}
 		now := p.inspectLegacyBin(dir, root)
 		if !now.ours {
@@ -729,7 +843,7 @@ func (p *Provider) PlanLegacyBin(proj *model.Project) *engine.Step {
 			names = append(names, name)
 		}
 		sort.Strings(names)
-		if missing := missingManagedLinks(root, names); len(missing) > 0 {
+		if missing := missingReplacements(proj, names); len(missing) > 0 {
 			return fmt.Errorf("%s conservé : %s absent — l'apply suivant le retire une fois le lien posé",
 				legacy, strings.Join(missing, ", "))
 		}

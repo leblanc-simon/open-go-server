@@ -47,6 +47,12 @@ type Provider struct {
 	WebReload string
 	// WebEngine est le moteur retenu, qui nomme les journaux web pré-créés (D71).
 	WebEngine string
+	// LinkNotReady dit ce qu'attend la réécriture d'une commande vers le lien
+	// géré name de ~/.local/bin, "" s'il peut la recevoir (D116) : le lien
+	// python d'un venv qui n'a pas les dépendances de l'application ne doit pas
+	// recevoir une tâche qui les avait (D123). L'assemblage le câble sur
+	// app.LinkNotReady ; nil : seul l'existence du lien est jugée.
+	LinkNotReady func(proj *model.Project, name string) string
 	// AccountOfUID nomme le compte d'un UID, "" s'il n'en a aucun ; nil lit la
 	// base des comptes de la machine. Substituable en test.
 	AccountOfUID func(uid int) (string, error)

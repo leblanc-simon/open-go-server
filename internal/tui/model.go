@@ -15,8 +15,10 @@ import (
 // Backend est ce que la TUI attend de l'application : elle n'appelle jamais un
 // provider directement, ce qui la rend éprouvable sans système ni terminal.
 type Backend interface {
-	// Projects charge l'inventaire.
-	Projects() ([]*model.Project, error)
+	// Projects charge l'inventaire : le parc lisible, et les déclarations
+	// refusées, que l'interface nomme à l'écran — le backend n'écrit rien
+	// lui-même pendant que Bubble Tea pilote le terminal (D120).
+	Projects() ([]*model.Project, []string, error)
 	// Snapshot rassemble l'état observé d'un projet.
 	Snapshot(ctx context.Context, p *model.Project) (Snapshot, error)
 	// Apply réconcilie un projet et renvoie un compte rendu.
@@ -65,6 +67,9 @@ type Model struct {
 	backend  Backend
 	styles   Styles
 	projects []*model.Project
+	// refused nomme les déclarations refusées au chargement : elles ne sont pas
+	// dans l'inventaire, et le bandeau le dit (D120).
+	refused []string
 	// snapshots est renseigné à la demande : observer tout le parc au démarrage
 	// rendrait l'ouverture lente sur un serveur chargé.
 	snapshots map[string]Snapshot
@@ -238,8 +243,11 @@ func (m *Model) Output() []string { return m.output }
 
 // Messages internes.
 type (
-	projectsLoadedMsg struct{ projects []*model.Project }
-	snapshotMsg       struct {
+	projectsLoadedMsg struct {
+		projects []*model.Project
+		refused  []string
+	}
+	snapshotMsg struct {
 		id       string
 		snapshot Snapshot
 	}
@@ -260,11 +268,11 @@ type (
 func (m *Model) Init() tea.Cmd { return m.read(m.loadProjects) }
 
 func (m *Model) loadProjects() tea.Msg {
-	projects, err := m.backend.Projects()
+	projects, refused, err := m.backend.Projects()
 	if err != nil {
 		return errMsg{err}
 	}
-	return projectsLoadedMsg{projects}
+	return projectsLoadedMsg{projects: projects, refused: refused}
 }
 
 // visible renvoie les projets correspondant au filtre.
@@ -308,6 +316,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case projectsLoadedMsg:
 		m.done()
 		m.projects = msg.projects
+		m.refused = msg.refused
 		sort.Slice(m.projects, func(i, j int) bool { return m.projects[i].ID() < m.projects[j].ID() })
 		m.err = nil
 		return m, m.observeCurrent()
@@ -563,6 +572,9 @@ func (m *Model) observeCurrent() tea.Cmd {
 
 // Quitting indique que le modèle a demandé la sortie.
 func (m *Model) Quitting() bool { return m.quitting }
+
+// Refused rend les déclarations refusées au dernier chargement.
+func (m *Model) Refused() []string { return m.refused }
 
 // Status expose le message d'état, pour les tests.
 func (m *Model) Status() string { return m.status }

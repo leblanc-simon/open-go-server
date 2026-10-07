@@ -217,7 +217,7 @@ func TestLePlanCalculeDeuxFoisGardeLaReecriture(t *testing.T) {
 func TestLInterfaceAffichepuisAppliqueReecritLaDeclaration(t *testing.T) {
 	h, home, decl := tacheSurAncienBin(t)
 	b := &tuiBackend{app: h.ouvrirApp(t, true)}
-	ps, err := b.Projects()
+	ps, _, err := b.Projects()
 	if err != nil {
 		t.Fatal(err)
 	}

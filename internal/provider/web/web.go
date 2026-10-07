@@ -437,6 +437,23 @@ func (p *Provider) ConflictNotes(proj *model.Project, obs Observed) []string {
 	return notes
 }
 
+// HSTSNotes rend les informations du plan sur les options HSTS non reconnues
+// des vhosts du projet, à porter dans engine.Plan.Notes (D118, D119). Ce ne sont
+// ni des étapes ni des écarts : le vhost est servi tel que rendu, la politique
+// complète, et le code de retour n'en dépend pas. Portées par une étape NoOp,
+// elles n'étaient montrées nulle part — ni le plan ni le JSON ne retiennent une
+// étape qui ne change rien.
+func (p *Provider) HSTSNotes(proj *model.Project) []string {
+	var notes []string
+	for _, vh := range p.vhosts(proj) {
+		if problems := HSTSOptionProblems(vh.Options); len(problems) > 0 {
+			notes = append(notes, fmt.Sprintf("vhost %s : %s (D119)",
+				p.vhostName(proj, vh), strings.Join(problems, " ; ")))
+		}
+	}
+	return notes
+}
+
 // loadKey situe un fichier dans l'ordre de chargement du moteur : conf.d ou
 // conf-enabled d'abord (« 0 »), puis sites-enabled par nom (« 1<nom> ») — un
 // fichier de sites-available l'est par le premier lien chargé qui le désigne.
@@ -842,11 +859,6 @@ func (p *Provider) Plan(_ context.Context, proj *model.Project, obs Observed) ([
 				return fmt.Errorf("le moteur retient la première déclaration d'un nom : %s", strings.Join(motifs, " ; "))
 			}
 			steps = append(steps, w)
-		}
-		if problems := HSTSOptionProblems(vh.Options); len(problems) > 0 {
-			// Information seulement : le vhost est servi tel que rendu.
-			steps = append(steps, engine.NewStep("web/vhost/"+bp.Name+"/hsts", engine.NoOp,
-				fmt.Sprintf("vhost %s : %s (D119)", bp.Name, strings.Join(problems, " ; "))))
 		}
 		if i == 0 {
 			if s := p.htaccessStep(proj, bp); s != nil {

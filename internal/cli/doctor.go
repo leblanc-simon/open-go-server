@@ -441,6 +441,24 @@ func redirectTargetChecks(projects []*model.Project, add func(name, status, deta
 	}
 }
 
+// localPythonChecks nomme les commandes déclarées d'un projet Python qui
+// appellent ~/.local/bin/python : ce lien désigne <venv>/bin/python, et Python
+// n'active pas un venv atteint par un lien vers son interpréteur — la commande
+// tourne sur l'interpréteur de base, sans les dépendances du venv (D123). Le
+// remède est ~/.venv/bin/python. Ni le chargement ni le plan ne le disent : le
+// lien reste celui du shell, et une commande qui n'importe rien du venv
+// fonctionne (D116).
+func localPythonChecks(projects []*model.Project, add func(name, status, detail, fix string)) {
+	for _, p := range projects {
+		if fields := p.LocalPythonRefs(); len(fields) > 0 {
+			add("python hors venv "+p.ID(), "avertissement", strings.Join(fields, ", ")+
+				" appelle "+filepath.Join(p.Spec.Layout.Root, model.LinkDir, "python")+
+				", qui lance l'interpréteur de base : le venv n'y est pas actif",
+				"y écrire "+filepath.Join(p.Spec.Layout.Root, model.VenvPython)+", qui active le venv de la version")
+		}
+	}
+}
+
 func valeurOuAbsente(v string) string {
 	if v == "" {
 		return "aucune version lisible"
@@ -804,6 +822,7 @@ func (a *App) runChecks(ctx context.Context) []check {
 	certificateDeclarationChecks(projects, add)
 	fleetUniquenessChecks(projects, a.Cfg.PrepDomain(), add)
 	redirectTargetChecks(projects, add)
+	localPythonChecks(projects, add)
 
 	// .htaccess sous Apache : ogs ne les active plus (AllowOverride None, D99) et
 	// porte lui-même les règles de base. Ce qu'un .htaccess ajoute est ignoré.

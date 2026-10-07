@@ -62,13 +62,22 @@ type tuiBackend struct {
 // PrepDomain renvoie le domaine de préproduction configuré.
 func (b *tuiBackend) PrepDomain() string { return b.app.Cfg.PrepDomain() }
 
-func (b *tuiBackend) Projects() ([]*model.Project, error) {
+func (b *tuiBackend) Projects() ([]*model.Project, []string, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	// L'inspecteur montre le parc lisible ; une déclaration refusée est nommée,
-	// et toute action repasse par checkFleetUniqueness, qui refuse (D120).
-	list, _, err := b.app.loadFleetNamed()
-	return list, err
+	// L'inspecteur montre le parc lisible ; une déclaration refusée est rendue à
+	// l'interface, qui la nomme à l'écran, et toute action repasse par
+	// checkFleetUniqueness, qui refuse (D120). Rien n'est écrit sur la sortie :
+	// Bubble Tea pilote l'écran, et une ligne écrite à côté le brouillait.
+	list, refused, err := b.app.loadFleet()
+	if err != nil {
+		return nil, nil, err
+	}
+	lines := make([]string, len(refused))
+	for i, err := range refused {
+		lines[i] = err.Error()
+	}
+	return list, lines, nil
 }
 
 func (b *tuiBackend) Snapshot(ctx context.Context, p *model.Project) (tui.Snapshot, error) {
