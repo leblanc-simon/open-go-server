@@ -934,3 +934,59 @@ func TestLectureEnÉchecNeVautPasAbsence(t *testing.T) {
 		})
 	}
 }
+
+func TestLeCompteDAdministrationRecoitSesPermissionsSurLeVhost(t *testing.T) {
+	// Un vhost créé sous un autre compte d'administration se lisait, mais toute
+	// déclaration y était refusée en 401 : le tag « administrator » n'ouvre aucun
+	// vhost, et le premier binding déroulait l'apply (D124).
+	p, client, proj := fixture(t)
+	p.Admin = "ogs-admin"
+	apply(t, p, proj)
+	want := Permission{Vhost: "shopfr", User: "ogs-admin", Configure: ".*", Write: ".*", Read: ".*"}
+	if got := client.permissions["shopfr/ogs-admin"]; got != want {
+		t.Fatalf("permissions du compte d'administration %+v, attendu %+v", got, want)
+	}
+	if plan := replan(t, p, proj); !plan.Empty() {
+		t.Fatalf("le second plan doit être vide :\n%s", plan.String())
+	}
+
+	// Le vhost passe au compte d'un autre administrateur : le compte d'ogs
+	// change (« credentials set ») et n'y a aucune permission.
+	p.Admin = "nouvel-admin"
+	plan := replan(t, p, proj)
+	if plan.Empty() || !strings.Contains(plan.String(), "compte d'administration nouvel-admin") {
+		t.Fatalf("le plan doit ouvrir le vhost au compte d'administration :\n%s", plan.String())
+	}
+	apply(t, p, proj)
+	if _, ok := client.permissions["shopfr/nouvel-admin"]; !ok {
+		t.Error("permissions du nouveau compte d'administration non posées")
+	}
+
+	// Des permissions restreintes sont élargies : ogs y déclare files et
+	// exchanges de tout nom.
+	client.permissions["shopfr/nouvel-admin"] = Permission{Vhost: "shopfr", User: "nouvel-admin",
+		Configure: "^$", Write: ".*", Read: ".*"}
+	if plan := replan(t, p, proj); plan.Empty() {
+		t.Error("des permissions restreintes doivent être rétablies")
+	}
+}
+
+func TestAucunePermissionDAdministrationSurUnVhostEtranger(t *testing.T) {
+	p, client, proj := fixture(t)
+	p.Admin = "ogs-admin"
+	client.vhosts["shopfr"] = true
+	apply(t, p, proj)
+	if len(client.permissions) != 0 {
+		t.Errorf("rien ne doit être posé sur un vhost qu'ogs n'a pas créé : %+v", client.permissions)
+	}
+}
+
+func TestSansCompteDAdministrationConnuAucuneEtape(t *testing.T) {
+	p, client, proj := fixture(t)
+	apply(t, p, proj)
+	for key := range client.permissions {
+		if key != "shopfr/shopfr" {
+			t.Errorf("permission inattendue %s", key)
+		}
+	}
+}

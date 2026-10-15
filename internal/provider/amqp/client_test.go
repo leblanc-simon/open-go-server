@@ -513,3 +513,49 @@ func TestRetraitDUnBindingParSaCleDeProprietes(t *testing.T) {
 		t.Errorf("retrait du binding : %s %s", got.Method, got.Path)
 	}
 }
+
+func TestRefusSurUnVhostDistingueDesIdentifiants(t *testing.T) {
+	// Le broker rend 401 au compte reconnu à qui le vhost n'est pas ouvert : le
+	// message « identifiants refusés » envoyait vérifier un mot de passe que
+	// les lectures venaient d'accepter (D124).
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/whoami" {
+			_, _ = w.Write([]byte(`{"name":"ogs-admin","tags":["administrator"]}`))
+			return
+		}
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":"not_authorised","reason":"Access refused."}`))
+	}))
+	defer srv.Close()
+	client, _ := NewHTTPClient(Credentials{URL: srv.URL, User: "ogs-admin", Password: "bon",
+		BrokerAccount: compteDuTest(t)})
+	err := client.EnsureBinding(context.Background(),
+		Binding{Vhost: "shopfr", Source: "messages", Destination: "email", RoutingKey: "email"})
+	if !errors.Is(err, ErrVhostAccess) {
+		t.Fatalf("un refus sur le vhost doit être distingué : %v", err)
+	}
+	for _, attendu := range []string{"ogs-admin", "vhost shopfr", "Access refused.",
+		"rabbitmqctl set_permissions -p shopfr ogs-admin", "ogs apply"} {
+		if !strings.Contains(err.Error(), attendu) {
+			t.Errorf("le message doit porter %q : %v", attendu, err)
+		}
+	}
+	if strings.Contains(err.Error(), "identifiants d'administration RabbitMQ refusés") {
+		t.Errorf("les identifiants ne sont pas en cause : %v", err)
+	}
+}
+
+func TestIdentifiantsRefusesSurUnVhostRestentNommes(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":"not_authorised","reason":"Login failed"}`))
+	}))
+	defer srv.Close()
+	client, _ := NewHTTPClient(Credentials{URL: srv.URL, User: "ogs-admin", Password: "mauvais",
+		BrokerAccount: compteDuTest(t)})
+	err := client.EnsureQueue(context.Background(), Queue{Vhost: "shopfr", Name: "email"})
+	if err == nil || errors.Is(err, ErrVhostAccess) ||
+		!strings.Contains(err.Error(), "refusés") || !strings.Contains(err.Error(), "Login failed") {
+		t.Errorf("des identifiants refusés doivent être nommés comme tels : %v", err)
+	}
+}

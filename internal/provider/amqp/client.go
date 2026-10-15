@@ -14,6 +14,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"leblanc.io/open-go-server/internal/exec"
 )
 
 // DefaultManagementURL est l'adresse du plugin management sur une installation
@@ -197,25 +199,9 @@ func brokerAccount(creds Credentials) string {
 
 // do exécute une requête et décode la réponse éventuelle.
 func (c *httpClient) do(ctx context.Context, method, path string, body, out any) error {
-	var reader io.Reader
-	if body != nil {
-		data, err := json.Marshal(body)
-		if err != nil {
-			return err
-		}
-		reader = bytes.NewReader(data)
-	}
-	req, err := http.NewRequestWithContext(ctx, method, c.base+path, reader)
+	res, err := c.send(ctx, method, path, body)
 	if err != nil {
 		return err
-	}
-	req.SetBasicAuth(c.creds.User, c.creds.Password)
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	res, err := c.http.Do(req)
-	if err != nil {
-		return fmt.Errorf("%w : %w", ErrUnavailable, err)
 	}
 	defer res.Body.Close()
 	switch {
@@ -223,7 +209,7 @@ func (c *httpClient) do(ctx context.Context, method, path string, body, out any)
 		// Une ressource absente n'est pas une erreur pour une lecture.
 		return nil
 	case res.StatusCode == http.StatusUnauthorized:
-		return fmt.Errorf("identifiants d'administration RabbitMQ refusés (%s)", res.Status)
+		return c.refused(ctx, method, path, res)
 	case res.StatusCode == http.StatusNotFound:
 		return fmt.Errorf("%w : %s %s introuvable — vérifier « rabbitmq-plugins enable rabbitmq_management »",
 			ErrPluginMissing, method, path)
@@ -235,6 +221,86 @@ func (c *httpClient) do(ctx context.Context, method, path string, body, out any)
 		return nil
 	}
 	return json.NewDecoder(res.Body).Decode(out)
+}
+
+// send émet une requête authentifiée, sans en interpréter la réponse.
+func (c *httpClient) send(ctx context.Context, method, path string, body any) (*http.Response, error) {
+	var reader io.Reader
+	if body != nil {
+		data, err := json.Marshal(body)
+		if err != nil {
+			return nil, err
+		}
+		reader = bytes.NewReader(data)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, c.base+path, reader)
+	if err != nil {
+		return nil, err
+	}
+	req.SetBasicAuth(c.creds.User, c.creds.Password)
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	res, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("%w : %w", ErrUnavailable, err)
+	}
+	return res, nil
+}
+
+// refused explique un 401. Le broker le rend pour deux causes que son code ne
+// distingue pas : des identifiants refusés, et un compte reconnu à qui le vhost
+// visé n'est pas ouvert — le tag « administrator » fait tout lire, il ne donne
+// aucune permission sur un vhost (D124). « Identifiants refusés » envoyait
+// vérifier un mot de passe que les lectures venaient d'accepter : /api/whoami,
+// qui n'exige que l'authentification, départage.
+func (c *httpClient) refused(ctx context.Context, method, path string, res *http.Response) error {
+	var reply struct {
+		Reason string `json:"reason"`
+	}
+	data, _ := io.ReadAll(io.LimitReader(res.Body, 2048))
+	_ = json.Unmarshal(data, &reply)
+	detail := res.Status
+	if reply.Reason != "" {
+		detail += " : " + reply.Reason
+	}
+	vhost, inVhost := vhostOf(path)
+	if inVhost && path != "/api/whoami" {
+		if check, err := c.send(ctx, http.MethodGet, "/api/whoami", nil); err == nil {
+			check.Body.Close()
+			if check.StatusCode < 300 {
+				return fmt.Errorf("%w : le compte d'administration %s n'a pas de permissions sur le vhost %s "+
+					"(%s %s, %s) — un « ogs apply » du projet les pose, ou « %s »", ErrVhostAccess, c.creds.User,
+					vhost, method, path, detail,
+					exec.ShellLine("rabbitmqctl", "set_permissions", "-p", vhost, c.creds.User, ".*", ".*", ".*"))
+			}
+		}
+	}
+	return fmt.Errorf("identifiants d'administration RabbitMQ refusés (%s) — les vérifier, puis « ogs amqp "+
+		"credentials set --user %s »", detail, c.creds.User)
+}
+
+// ErrVhostAccess indique un compte d'administration reconnu, mais sans
+// permissions sur le vhost visé (D124).
+var ErrVhostAccess = errors.New("accès au vhost refusé")
+
+// vhostOf rend le vhost que désigne un chemin de l'API, pour les ressources qui
+// vivent dans un vhost : /api/<sorte>/<vhost>/…
+func vhostOf(path string) (string, bool) {
+	parts := strings.Split(strings.TrimPrefix(path, "/api/"), "/")
+	if len(parts) < 2 {
+		return "", false
+	}
+	switch parts[0] {
+	case "exchanges", "queues", "bindings", "policies", "permissions", "topic-permissions":
+	default:
+		return "", false
+	}
+	vhost, err := url.PathUnescape(parts[1])
+	if err != nil || vhost == "" {
+		return "", false
+	}
+	return vhost, true
 }
 
 // escape encode un segment de chemin. Le vhost est déclaré sans barre oblique

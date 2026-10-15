@@ -35,6 +35,11 @@ type Provider struct {
 	// voisin antérieur à D93 n'en porte aucune (D100). Nil, ou en échec, tout
 	// retrait d'obsolète est contesté : c'est le sens qui ne supprime rien.
 	Fleet func() ([]*model.Project, error)
+	// Admin est le compte d'administration par lequel ogs parle au broker. Le
+	// tag « administrator » lui fait tout lire, mais ne lui ouvre aucun vhost :
+	// déclarer une file ou un binding exige des permissions sur le vhost, que
+	// le plan lui pose sur chaque vhost du projet (D124). Vide, aucune étape.
+	Admin string
 }
 
 // Name identifie le provider.
@@ -47,10 +52,13 @@ type Observed struct {
 	VhostExists bool
 	UserExists  bool
 	Permission  *Permission
-	Exchanges   map[string]Exchange
-	Queues      map[string]Queue
-	Bindings    []Binding
-	Policies    map[string]Policy
+	// AdminPermission est la permission du compte d'administration sur le vhost
+	// déclaré, nil s'il n'en a aucune (D124).
+	AdminPermission *Permission
+	Exchanges       map[string]Exchange
+	Queues          map[string]Queue
+	Bindings        []Binding
+	Policies        map[string]Policy
 	// Incomplete nomme les lectures du vhost en échec — exchanges, files,
 	// bindings, policies. Une lecture en échec n'est pas une absence (Q-20) :
 	// aucune création ni aucun retrait ne se fonde sur elle, et la trace de
@@ -196,6 +204,9 @@ func (p *Provider) Observe(ctx context.Context, proj *model.Project) (Observed, 
 		if perms[i].Vhost == vhost && perms[i].User == spec.User {
 			obs.Permission = &perms[i]
 		}
+		if perms[i].Vhost == vhost && p.Admin != "" && perms[i].User == p.Admin {
+			obs.AdminPermission = &perms[i]
+		}
 	}
 	if !obs.VhostExists {
 		return obs, nil
@@ -275,6 +286,9 @@ func (p *Provider) Plan(ctx context.Context, proj *model.Project, obs Observed) 
 	}
 	steps = append(steps, userStep)
 	steps = append(steps, p.permissionStep(spec, obs))
+	if s := p.adminPermissionStep(spec, obs); s != nil {
+		steps = append(steps, s)
+	}
 	// Une lecture du vhost en échec n'est pas une absence (Q-20) : créer ce
 	// qu'on n'a pas pu lire, ou retirer de la trace ce qu'on n'a pas vu, se
 	// fonderait sur du vide. Vhost, compte et permissions, lus sans faute, sont
@@ -430,6 +444,35 @@ func (p *Provider) permissionStep(spec *model.AMQP, obs Observed) *engine.Step {
 	}
 	action := engine.Create
 	if obs.Permission != nil {
+		action = engine.Update
+	}
+	s := engine.NewStep(resource, action, summary)
+	s.Apply = func(ctx context.Context) error { return p.Client.EnsurePermission(ctx, want) }
+	return s
+}
+
+// adminPermissionStep ouvre le vhost du projet au compte d'administration
+// d'ogs (D124). Le tag « administrator » ne donne accès à aucun vhost : un vhost
+// créé sous un autre compte — l'administrateur du broker, un ancien compte
+// d'ogs remplacé par « credentials set » — se lisait, mais toute déclaration y
+// était refusée en 401, et le premier binding déroulait l'apply. Le compte du
+// projet n'y gagne rien, et rien n'est posé sur un vhost étranger : foreignStep
+// arrête le plan avant. Le mode dégradé passe par rabbitmqctl, qui n'en a pas
+// besoin.
+func (p *Provider) adminPermissionStep(spec *model.AMQP, obs Observed) *engine.Step {
+	if p.Admin == "" || obs.Degraded || p.Admin == spec.User {
+		return nil
+	}
+	want := Permission{Vhost: spec.Vhost, User: p.Admin, Configure: ".*", Write: ".*", Read: ".*"}
+	resource := "amqp/permission/" + spec.Vhost + "/" + p.Admin
+	summary := fmt.Sprintf("permissions du compte d'administration %s sur %s (configure %s, write %s, read %s)",
+		p.Admin, spec.Vhost, want.Configure, want.Write, want.Read)
+	if have := obs.AdminPermission; have != nil &&
+		have.Configure == want.Configure && have.Write == want.Write && have.Read == want.Read {
+		return engine.NewStep(resource, engine.NoOp, summary)
+	}
+	action := engine.Create
+	if obs.AdminPermission != nil {
 		action = engine.Update
 	}
 	s := engine.NewStep(resource, action, summary)

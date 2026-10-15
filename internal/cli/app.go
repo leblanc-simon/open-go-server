@@ -781,6 +781,7 @@ func (a *App) amqpProvider() *amqp.Provider {
 	}
 	if client, err := amqp.NewHTTPClient(creds); err == nil {
 		prov.Client = client
+		prov.Admin = creds.User
 		prov.Host = "127.0.0.1"
 		prov.Port = creds.AMQPPort
 		prov.ManagementURL = creds.URL

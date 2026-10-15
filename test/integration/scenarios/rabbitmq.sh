@@ -73,6 +73,31 @@ if echo "$sortie" | grep -qiE "\+ queue|\+ exchange|\+ vhost amqp|~ queue"; then
 fi
 
 echo
+echo "--- vhost fermé au compte d'administration (D124) ---"
+# Le tag « administrator » fait tout lire, mais n'ouvre aucun vhost : un vhost
+# créé sous un autre compte d'administration rendait 401 à la première
+# déclaration, et l'apply se déroulait sur « identifiants refusés ». Le binding
+# retiré oblige l'apply à écrire dans le vhost.
+# Le binding part d'abord : sans permissions, l'administrateur lui-même ne
+# peut plus le retirer.
+curl -sf -u "$auth" -X DELETE "$api/bindings/shopfr/e/messages/q/async/async" ||
+    { echo "ÉCHEC : binding non retiré"; exit 1; }
+curl -sf -u "$auth" -X DELETE "$api/permissions/shopfr/admin" ||
+    { echo "ÉCHEC : permissions du compte d'administration non retirées"; exit 1; }
+sortie=$(ogs apply shopfr --yes 2>&1); code=$?
+echo "$sortie" | grep -Ei "administration|binding" | head -3
+if [ "$code" != 0 ]; then
+    echo "ÉCHEC : l'apply rend $code sur un vhost fermé au compte d'administration :"
+    echo "$sortie" | tail -6
+    exit 1
+fi
+curl -sf -u "$auth" "$api/permissions/shopfr/admin" | grep -q '"configure":".\*"' ||
+    { echo "ÉCHEC : le vhost n'a pas été rouvert au compte d'administration"; exit 1; }
+curl -sf -u "$auth" "$api/bindings/shopfr/e/messages/q/async" | grep -q '"routing_key":"async"' ||
+    { echo "ÉCHEC : le binding n'a pas été rétabli"; exit 1; }
+echo "vhost rouvert au compte d'administration, binding rétabli"
+
+echo
 echo "--- arguments de file immuables ---"
 # RabbitMQ refuse de modifier les arguments d'une file existante
 # (PRECONDITION_FAILED). ogs doit le détecter et l'expliquer, et ne recréer la

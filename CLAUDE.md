@@ -12,8 +12,8 @@ Les commits ne mentionnent jamais l'assistance d'un outil d'IA.
 
 ## La référence
 
-[`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md) fait autorité : 123 décisions d'architecture
-arbitrées (D1–D123, tableau §2), spécification par module, plan de tests, découpage en lots. **Consulter le
+[`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md) fait autorité : 124 décisions d'architecture
+arbitrées (D1–D124, tableau §2), spécification par module, plan de tests, découpage en lots. **Consulter le
 tableau des décisions avant de proposer une architecture** — la plupart des questions « pourquoi pas
 plutôt… ? » y sont déjà tranchées, avec leur raison. Toute décision nouvelle s'y ajoute.
 
@@ -1167,6 +1167,11 @@ Ils ont tous coûté un défaut réel ; les tests unitaires ne les voyaient pas.
   aussi les objets partagés, bases comprises : un rôle qui possède encore une base n'est pas retiré. Sous
   MySQL, `DROP DATABASE` laisse les droits de `mysql.db` : une base « où le compte a ses droits » se juge
   sur son existence, pas sur `SCHEMA_PRIVILEGES` seul.
+- **Le tag `administrator` de RabbitMQ ne donne accès à aucun vhost** (D124) : il fait tout lire par l'API,
+  mais déclarer une file ou un binding exige des permissions sur le vhost, et le broker rend alors **401**, le
+  même code qu'un mot de passe refusé. Un vhost créé sous un autre compte d'administration se lisait au plan
+  et faisait dérouler l'apply au premier binding, sur « identifiants refusés ». Le plan pose les permissions
+  du compte d'`amqp.yaml` sur chaque vhost d'ogs, et un 401 sur un vhost est départagé par `/api/whoami`.
 - **Une file quorum refuse `if-empty` et `if-unused`** : `DELETE /api/queues/<v>/<f>?if-empty=true&if-unused=true`
   rend 400, et le préréglage Messenger déclare ses transports en quorum. Le retrait d'une file relit ses
   compteurs juste avant de la retirer sans condition ; seule une file classique est jugée par le broker
