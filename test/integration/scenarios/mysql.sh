@@ -98,6 +98,14 @@ if [ "$(mariadb -N -e "SELECT max_user_connections FROM mysql.user WHERE user='s
     exit 1
 fi
 echo "limite calculée posée, surcharge appliquée par le serveur, calcul rétabli"
+# doctor confronte la somme des limites à max_connections, lu sur le serveur.
+capacite=$(mariadb -N -e 'SELECT @@max_connections')
+ligne=$(ogs doctor 2>&1 | grep "connexions mysql")
+echo "  $ligne"
+if [[ "$ligne" != *"capacité de $capacite"* ]]; then
+    echo "ÉCHEC : doctor doit confronter la somme des limites à max_connections ($capacite)"
+    exit 1
+fi
 
 echo
 echo "--- clone : la préproduction ne reçoit pas le mot de passe de la production ---"

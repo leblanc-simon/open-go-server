@@ -184,3 +184,33 @@ func TestLimiteSousPostgreSQL(t *testing.T) {
 		t.Error("un nom hors de la liste blanche doit être refusé")
 	}
 }
+
+func TestLaCapaciteSommeLesLimitesDuParcParServeur(t *testing.T) {
+	// doctor confronte la somme des limites voulues à max_connections (D127) :
+	// un compte sans limite est nommé, jamais compté.
+	prov, shop := projetMySQL(t, "8.3")
+	prov.PHPWorkers = func(*model.Project) int { return 12 }
+	shop.Spec.Databases[0].ExtraUsers = []model.DBUser{{User: "lecteur", Privileges: "readonly"}}
+	blog := model.New("blog.fr", "prod", model.KindPHPPlain)
+	if err := blog.Normalize(t.TempDir(), "preprod-pp.net"); err != nil {
+		t.Fatal(err)
+	}
+	blog.Spec.Databases = []model.Database{{Engine: "mariadb", Name: "blogfr", User: "blogfr",
+		MaxConnections: NoConnectionLimit}}
+	client, m := fauxMySQL(t, nil, nil, nil)
+	m.réponses = append([]fauxRéponse{{"@@max_connections", []string{"n"}, [][]driver.Value{{int64(30)}}}},
+		m.réponses...)
+	// Les deux moteurs atteignent le même socket : un client chacun, un serveur.
+	prov.clients = map[string]Client{"mysql": client, "mariadb": client}
+	caps := prov.ConnectionCapacity(context.Background(), []*model.Project{shop, blog})
+	if len(caps) != 1 {
+		t.Fatalf("mysql et mariadb visent le même serveur : %+v", caps)
+	}
+	c := caps[0]
+	if c.Server != "mysql" || c.MaxConnections != 30 || c.Total != 22+ExtraUserConnections || c.Accounts != 2 {
+		t.Errorf("capacité 30, somme %d sur deux comptes attendues : %+v", 22+ExtraUserConnections, c)
+	}
+	if len(c.Unlimited) != 1 || !strings.Contains(c.Unlimited[0], "'blogfr'@'localhost' (blogfr)") {
+		t.Errorf("le compte sans limite doit être nommé : %v", c.Unlimited)
+	}
+}

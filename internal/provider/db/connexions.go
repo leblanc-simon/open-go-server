@@ -65,19 +65,36 @@ func accountKey(decl model.Database, user string) string {
 	return "mysql|" + user + "@" + host
 }
 
+// accountLimit est la limite voulue d'un compte, avec la déclaration qui le
+// désigne — son moteur, son cluster, son hôte.
+type accountLimit struct {
+	decl  model.Database
+	user  string
+	limit int
+}
+
 // accountLimits rend la limite voulue de chaque compte du projet. Un compte
 // nommé par plusieurs déclarations — principal d'une base, additionnel d'une
 // autre — reçoit la plus large, l'absence de limite l'emportant : deux limites
 // différentes feraient osciller le plan d'un apply à l'autre.
 func accountLimits(proj *model.Project, phpWorkers int) map[string]int {
 	out := map[string]int{}
-	merge := func(key string, limit int) {
+	for key, a := range projectAccounts(proj, phpWorkers) {
+		out[key] = a.limit
+	}
+	return out
+}
+
+func projectAccounts(proj *model.Project, phpWorkers int) map[string]*accountLimit {
+	out := map[string]*accountLimit{}
+	merge := func(decl model.Database, user string, limit int) {
+		key := accountKey(decl, user)
 		cur, ok := out[key]
 		switch {
-		case !ok, limit == NoConnectionLimit:
-			out[key] = limit
-		case cur != NoConnectionLimit && limit > cur:
-			out[key] = limit
+		case !ok:
+			out[key] = &accountLimit{decl: decl, user: user, limit: limit}
+		case limit == NoConnectionLimit, cur.limit != NoConnectionLimit && limit > cur.limit:
+			cur.limit = limit
 		}
 	}
 	budget := ConnectionBudget(proj, phpWorkers)
@@ -86,13 +103,13 @@ func accountLimits(proj *model.Project, phpWorkers int) map[string]int {
 		if decl.MaxConnections != 0 {
 			main = decl.MaxConnections
 		}
-		merge(accountKey(decl, decl.User), main)
+		merge(decl, decl.User, main)
 		for _, u := range decl.ExtraUsers {
 			extra := ExtraUserConnections
 			if u.MaxConnections != 0 {
 				extra = u.MaxConnections
 			}
-			merge(accountKey(decl, u.User), extra)
+			merge(decl, u.User, extra)
 		}
 	}
 	return out
@@ -250,4 +267,119 @@ func describeLimit(engine string, n int) string {
 		return "sans limite"
 	}
 	return fmt.Sprint(n)
+}
+
+// Capacity confronte, pour un serveur de bases, la somme des limites voulues
+// des comptes du parc à son max_connections (D127). Les limites bornent ce
+// qu'un projet peut prendre ; leur somme au-delà de la capacité laisse des
+// projets pris ensemble l'épuiser encore.
+type Capacity struct {
+	// Server nomme le serveur : « mysql », ou « postgres <cluster> ».
+	Server string
+	// MaxConnections est la capacité relue du serveur, connexions réservées aux
+	// superutilisateurs déduites sous PostgreSQL.
+	MaxConnections int
+	// Total est la somme des limites des comptes limités, Accounts leur nombre.
+	Total    int
+	Accounts int
+	// Unlimited nomme les comptes déclarés sans limite (maxConnections: -1).
+	Unlimited []string
+	// Err porte le motif d'une capacité illisible ; le reste vaut tout de même.
+	Err error
+}
+
+// serverCapacity relit la capacité d'un serveur.
+type serverCapacity interface {
+	MaxConnections(ctx context.Context) (int, error)
+}
+
+func (c *mysqlClient) MaxConnections(ctx context.Context) (int, error) {
+	var n int64
+	err := c.db.QueryRowContext(ctx, "SELECT @@max_connections").Scan(&n)
+	return int(n), err
+}
+
+func (c *pgClient) MaxConnections(ctx context.Context) (int, error) {
+	var n int64
+	err := c.db.QueryRowContext(ctx, "SELECT current_setting('max_connections')::int - "+
+		"current_setting('superuser_reserved_connections')::int").Scan(&n)
+	return int(n), err
+}
+
+// ConnectionCapacity rend, par serveur, la somme des limites voulues des comptes
+// de tous les projets et la capacité du serveur. Un serveur injoignable est
+// tu : Notices le dit déjà, base par base.
+func (p *Provider) ConnectionCapacity(ctx context.Context, projects []*model.Project) []Capacity {
+	byServer := map[string]*Capacity{}
+	clients := map[string]Client{}
+	var order []string
+	for _, proj := range projects {
+		workers := 0
+		if p.PHPWorkers != nil {
+			workers = p.PHPWorkers(proj)
+		}
+		accounts := projectAccounts(proj, workers)
+		keys := make([]string, 0, len(accounts))
+		for key := range accounts {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			a := accounts[key]
+			client, err := p.clientFor(a.decl)
+			if err != nil {
+				continue
+			}
+			server := "mysql"
+			if a.decl.Engine == "postgres" {
+				server = "postgres " + p.clusterID(a.decl)
+			}
+			c, ok := byServer[server]
+			if !ok {
+				c = &Capacity{Server: server}
+				byServer[server], clients[server] = c, client
+				order = append(order, server)
+			}
+			if a.limit == NoConnectionLimit {
+				c.Unlimited = append(c.Unlimited, fmt.Sprintf("%s (%s)", accountLabel(a.decl, a.user), proj.ID()))
+				continue
+			}
+			c.Total += a.limit
+			c.Accounts++
+		}
+	}
+	sort.Strings(order)
+	out := make([]Capacity, 0, len(order))
+	for _, server := range order {
+		c := byServer[server]
+		if reader, ok := clients[server].(serverCapacity); ok {
+			c.MaxConnections, c.Err = reader.MaxConnections(ctx)
+		}
+		out = append(out, *c)
+	}
+	return out
+}
+
+// clusterID nomme le cluster d'une déclaration PostgreSQL : celui qu'elle
+// désigne, ou le premier détecté, que clientFor retient à défaut.
+func (p *Provider) clusterID(decl model.Database) string {
+	if decl.Cluster != "" {
+		return decl.Cluster
+	}
+	if clusters := DetectClusters(p.Paths.Prefix()); len(clusters) > 0 {
+		return clusters[0].ID()
+	}
+	return "défaut"
+}
+
+// accountLabel nomme un compte comme le moteur le désigne.
+func accountLabel(decl model.Database, user string) string {
+	if decl.Engine == "postgres" {
+		return "rôle " + user
+	}
+	host := decl.Host
+	if host == "" {
+		host = "localhost"
+	}
+	return fmt.Sprintf("'%s'@'%s'", user, host)
 }

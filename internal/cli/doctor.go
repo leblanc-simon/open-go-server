@@ -182,6 +182,36 @@ func databaseChecks(ctx context.Context, provs *providers, projects []*model.Pro
 			}
 		}
 	}
+	connectionCapacityChecks(ctx, provs, projects, add)
+}
+
+// connectionCapacityChecks confronte, serveur par serveur, la somme des limites
+// de connexions des comptes du parc à max_connections (D127). Chaque limite
+// borne ce qu'un projet peut prendre ; leur somme au-delà de la capacité laisse
+// des projets pris ensemble l'épuiser, et un compte sans limite le peut seul.
+// Ce sont les limites voulues : celles que le prochain apply pose.
+func connectionCapacityChecks(ctx context.Context, provs *providers, projects []*model.Project,
+	add func(name, status, detail, fix string)) {
+	for _, c := range provs.DB.ConnectionCapacity(ctx, projects) {
+		name := "connexions " + c.Server
+		if len(c.Unlimited) > 0 {
+			add(name, "avertissement", fmt.Sprintf("%d compte(s) sans limite de connexions : %s — chacun peut "+
+				"épuiser seul le serveur (D127)", len(c.Unlimited), strings.Join(c.Unlimited, ", ")),
+				"retirer « maxConnections: -1 » de la déclaration, ou lui donner une valeur")
+		}
+		switch {
+		case c.Err != nil:
+			add(name, "avertissement", fmt.Sprintf("max_connections illisible : %v", c.Err), "")
+		case c.MaxConnections > 0 && c.Total > c.MaxConnections:
+			add(name, "avertissement", fmt.Sprintf("la somme des limites de %d compte(s), %d, dépasse la capacité "+
+				"du serveur, %d : plusieurs projets en pic ensemble peuvent encore l'épuiser (D127)",
+				c.Accounts, c.Total, c.MaxConnections),
+				"relever max_connections du serveur, ou abaisser spec.databases[].maxConnections des plus gros projets")
+		case c.Accounts > 0:
+			add(name, "ok", fmt.Sprintf("%d compte(s), somme des limites %d pour une capacité de %d",
+				c.Accounts, c.Total, c.MaxConnections), "")
+		}
+	}
 }
 
 // cronLegacyChecks nomme les tâches dont un nom nu n'est résolu dans le

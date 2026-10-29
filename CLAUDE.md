@@ -666,7 +666,8 @@ Ils ont tous coûté un défaut réel ; les tests unitaires ne les voyaient pas.
   instances non PHP, la moitié en sus), 10 pour un additionnel, surchargée par `maxConnections` (-1 : aucune,
   écrite 0 sous MySQL — où 0 veut dire « sans limite » et sous PostgreSQL « aucune connexion »). Elle se
   pose aux comptes adoptés : `ALTER USER … WITH` n'exige aucun mot de passe. Un compte nommé par deux
-  déclarations prend la plus large, sans quoi le plan oscillerait.
+  déclarations prend la plus large, sans quoi le plan oscillerait. `doctor` confronte la somme des limites
+  voulues de chaque serveur à `max_connections` (`db.ConnectionCapacity`) : un avertissement, jamais un refus.
 - **Les versions PHP déclarables viennent de `php.versions`** (D125, 7.1 à 8.5 par défaut, forme bornée à
   9.9 par la norme des numéros de pool) : jamais jugées au chargement d'une déclaration, qui ne contrôle que
   la forme, mais au plan du projet visé — une version retirée de config.yaml arrêtait sinon tout le parc. Le
