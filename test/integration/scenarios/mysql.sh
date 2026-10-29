@@ -62,6 +62,44 @@ if ! mariadb -h 127.0.0.1 -u shopfr -p"$motdepasse" shopfr \
 fi
 
 echo
+echo "--- le compte a-t-il sa limite de connexions (D127) ? ---"
+limite=$(mariadb -N -e "SELECT max_user_connections FROM mysql.user WHERE user='shopfr' AND host='localhost'")
+echo "  limite calculée : $limite"
+if [ -z "$limite" ] || [ "$limite" -lt 10 ]; then
+    echo "ÉCHEC : le compte doit recevoir une limite calculée depuis la déclaration (au moins 10)"
+    exit 1
+fi
+# La surcharge de la déclaration l'emporte, et le serveur l'applique vraiment.
+sed -i "/- engine: mysql/,/user:/ s/^\( *\)user: shopfr$/&\n\1maxConnections: 2/" /etc/ogs/projects/shopfr.yaml
+ogs apply shopfr --yes 2>&1 | grep -i "connexions" | sed 's/^/  /'
+if [ "$(mariadb -N -e "SELECT max_user_connections FROM mysql.user WHERE user='shopfr' AND host='localhost'")" != 2 ]; then
+    echo "ÉCHEC : maxConnections: 2 n'a pas été posé"
+    exit 1
+fi
+# Seuls ces deux clients sont attendus : un « wait » nu attendrait aussi
+# mariadbd-safe, lancé en tâche de fond plus haut, et ne rendrait jamais la main.
+clients=()
+for _ in 1 2; do
+    mariadb -h 127.0.0.1 -u shopfr -p"$motdepasse" shopfr -e 'SELECT SLEEP(4)' >/dev/null 2>&1 &
+    clients+=($!)
+done
+sleep 1
+if refus=$(mariadb -h 127.0.0.1 -u shopfr -p"$motdepasse" shopfr -e 'SELECT 1' 2>&1); then
+    echo "ÉCHEC : une troisième connexion simultanée a été acceptée"
+    wait "${clients[@]}"
+    exit 1
+fi
+wait "${clients[@]}"
+echo "  troisième connexion refusée : $refus"
+sed -i '/^ *maxConnections: 2$/d' /etc/ogs/projects/shopfr.yaml
+ogs apply shopfr --yes >/dev/null 2>&1
+if [ "$(mariadb -N -e "SELECT max_user_connections FROM mysql.user WHERE user='shopfr' AND host='localhost'")" != "$limite" ]; then
+    echo "ÉCHEC : sans surcharge, la limite calculée doit revenir"
+    exit 1
+fi
+echo "limite calculée posée, surcharge appliquée par le serveur, calcul rétabli"
+
+echo
 echo "--- clone : la préproduction ne reçoit pas le mot de passe de la production ---"
 # La configuration de l'application, écrite depuis « ogs secrets env » comme le
 # guide l'indique, était recopiée telle quelle : la préproduction écrivait dans

@@ -138,12 +138,19 @@ type Database struct {
 	AuthPlugin string   `yaml:"authPlugin,omitempty"`
 	Extensions []string `yaml:"extensions,omitempty"`
 	ExtraUsers []DBUser `yaml:"extraUsers,omitempty"`
+	// MaxConnections borne les connexions simultanées du compte principal
+	// (D127) : absent, la limite est calculée depuis la déclaration du projet
+	// (workers PHP, services, tâches, marge) ; -1 retire toute limite.
+	MaxConnections int `yaml:"maxConnections,omitempty"`
 }
 
 // DBUser est un utilisateur de base additionnel.
 type DBUser struct {
 	User       string `yaml:"user"`
 	Privileges string `yaml:"privileges"`
+	// MaxConnections borne ses connexions simultanées (D127) : absent, 10 ; -1
+	// retire toute limite.
+	MaxConnections int `yaml:"maxConnections,omitempty"`
 }
 
 // AMQP décrit le vhost RabbitMQ du projet.

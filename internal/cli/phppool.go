@@ -41,6 +41,25 @@ func (a *App) checkPoolDeclarations(p *model.Project) error {
 	return nil
 }
 
+// phpWorkers rend la somme des pm.max_children résolus des pools d'un projet :
+// chaque worker peut tenir une connexion à la base, première part du budget de
+// connexions de ses comptes (D127). Le calcul est celui du rendu (php.Resolve),
+// préproduction et couches de config.yaml comprises.
+func (a *App) phpWorkers(p *model.Project) int {
+	at, err := p.AppType()
+	if err != nil || !at.NeedsPHP {
+		return 0
+	}
+	total := 0
+	for _, pool := range p.Spec.PHP.Pools {
+		n, err := strconv.Atoi(php.Resolve(a.Cfg, a.Paths, p, pool, at).Settings["pm.max_children"])
+		if err == nil && n > 0 {
+			total += n
+		}
+	}
+	return total
+}
+
 // poolPreset nomme le preset que le pool reçoit : déclaré, ou celui de la
 // machine, descendu d'un cran en préproduction.
 func (a *App) poolPreset(p *model.Project, pool model.Pool) string {

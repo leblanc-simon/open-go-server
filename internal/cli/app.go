@@ -679,7 +679,7 @@ func (a *App) buildProviders() (*providers, error) {
 	amqpProv := a.amqpProvider()
 	amqpPort := amqpProv.Port
 	dbProv := &db.Provider{Paths: a.Paths, Exec: a.Exec, Store: a.Store, Keys: a.Keys, AMQPPort: amqpPort, Force: a.Force,
-		Reserved: a.reservedDBAccounts()}
+		Reserved: a.reservedDBAccounts(), PHPWorkers: a.phpWorkers}
 	certStore := tlsprov.Store{Paths: a.Paths}
 	certs := &tlsprov.Provider{
 		Paths: a.Paths, Cfg: a.Cfg, Store: certStore, DB: a.Store,

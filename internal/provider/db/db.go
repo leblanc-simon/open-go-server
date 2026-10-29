@@ -40,6 +40,10 @@ type Provider struct {
 	// n'en tient pas compte — son --force reprend un fichier retouché.
 	Force bool
 
+	// PHPWorkers rend la somme des pm.max_children résolus des pools d'un
+	// projet, première part de son budget de connexions (D127) ; nul, zéro.
+	PHPWorkers func(*model.Project) int
+
 	// Clients est le cache des connexions ouvertes, par moteur ou cluster.
 	clients map[string]Client
 }
@@ -158,6 +162,13 @@ type DBState struct {
 	alterPlugin bool
 	// pluginAuto dit que le plugin voulu vient de « auto », non de la déclaration.
 	pluginAuto bool
+	// Limits porte la limite de connexions relue de chaque compte existant de la
+	// déclaration, dans la valeur du moteur ; un compte dont la lecture a échoué
+	// n'y figure pas (D127).
+	Limits map[string]int
+	// SetLimits porte les limites que l'étape pose : comptes à créer, et comptes
+	// existants dont la limite relue diffère de la voulue.
+	SetLimits map[string]int
 
 	// projectID est la portée du keystore où vivent les mots de passe du projet.
 	projectID string
@@ -263,7 +274,7 @@ func (p *Provider) Observe(ctx context.Context, proj *model.Project) (Observed, 
 			ExtraGrants: map[string]string{}, OtherHosts: map[string][]string{},
 			ExtraOwned: map[string]bool{}, Adopted: proj.Metadata.Labels["adopted"] == "true",
 			Jokers: map[string]string{}, JokerPrivs: map[string]string{}, JokersKept: map[string][]string{},
-			projectID: proj.ID()}
+			Limits: map[string]int{}, projectID: proj.ID()}
 		state.UserOwned = p.sealed(proj.ID(), decl.Engine, decl.User)
 		state.Moved = map[string][]string{}
 		state.Retired = map[string][]string{}
@@ -361,6 +372,7 @@ func (p *Provider) Observe(ctx context.Context, proj *model.Project) (Observed, 
 		}
 
 		state.observePlugin(ctx, client, proj, host)
+		state.observeLimits(ctx, client, host)
 		if state.UserExists {
 			if grants, err := client.Grants(ctx, decl.User, host); err == nil {
 				state.Grants = grants
@@ -398,6 +410,11 @@ func (p *Provider) Observe(ctx context.Context, proj *model.Project) (Observed, 
 // l'échec est explicite plutôt que fatal.
 func (p *Provider) Plan(ctx context.Context, proj *model.Project, obs Observed) ([]*engine.Step, error) {
 	var steps []*engine.Step
+	phpWorkers := 0
+	if p.PHPWorkers != nil {
+		phpWorkers = p.PHPWorkers(proj)
+	}
+	limits := accountLimits(proj, phpWorkers)
 	for _, state := range obs.States {
 		decl := state.Declaration
 		resource := fmt.Sprintf("db/%s/%s", decl.Engine, decl.Name)
@@ -483,6 +500,8 @@ func (p *Provider) Plan(ctx context.Context, proj *model.Project, obs Observed) 
 			state.Declaration = decl
 		}
 		state.alterPlugin = pluginDrift(state, plugin) && state.UserOwned
+		// La limite de connexions de chaque compte (D127), adoptés compris.
+		state.planLimits(limits)
 		observedGrants := state.Grants[decl.Name]
 		hasGrant := grantsConform(decl.Engine, observedGrants, priv)
 		// Une base adoptée n'appartient pas toujours au rôle que l'import a
@@ -498,7 +517,8 @@ func (p *Provider) Plan(ctx context.Context, proj *model.Project, obs Observed) 
 		// jamais un refus (R1-45).
 		reopened := decl.Engine == "postgres" && state.CreatedByOGS() && state.PublicConnect
 		conforming := state.DBExists && state.UserExists && hasGrant && !reopened && len(state.Jokers) == 0 &&
-			extensionsSatisfied(decl, state) && extraUsersSatisfied(decl, state) && !state.alterPlugin
+			extensionsSatisfied(decl, state) && extraUsersSatisfied(decl, state) && !state.alterPlugin &&
+			!state.limitDrift()
 
 		// Ce qu'une déclaration changée laisse derrière elle (D100) : l'ancien
 		// compte sous l'hôte d'avant, les droits d'un compte retiré de la base.
@@ -538,7 +558,8 @@ func (p *Provider) Plan(ctx context.Context, proj *model.Project, obs Observed) 
 			continue
 		}
 		summary := fmt.Sprintf("base %s %s (utilisateur %s, privilèges %s)",
-			decl.Engine, decl.Name, decl.User, priv) + stateNotes(state, reopened) + pluginNote(state, plugin)
+			decl.Engine, decl.Name, decl.User, priv) + stateNotes(state, reopened) + pluginNote(state, plugin) +
+			limitNote(state)
 		s := engine.NewStep(resource, action, summary)
 		declCopy, stateCopy := decl, state
 		s.Diff = func() (string, error) { return p.describe(declCopy, stateCopy, priv, host) }
@@ -852,7 +873,12 @@ func (p *Provider) statements(decl model.Database, state DBState, priv Privilege
 		if err != nil {
 			return nil, err
 		}
-		return append(out, jokers...), nil
+		out = append(out, jokers...)
+		limits, err := limitStatements(decl, state, host)
+		if err != nil {
+			return nil, err
+		}
+		return append(out, limits...), nil
 	case "postgres":
 		stmts, err := CreatePostgres(PostgresSpec{
 			Database: decl.Name, Role: decl.User, Password: password(decl.User, state.UserExists),
@@ -862,7 +888,12 @@ func (p *Provider) statements(decl model.Database, state DBState, priv Privilege
 			return nil, err
 		}
 		stmts.Cluster = append(stmts.Cluster, pgOwnership(decl, state)...)
-		return append(stmts.Cluster, stmts.InDatabase...), nil
+		out := append(stmts.Cluster, stmts.InDatabase...)
+		limits, err := limitStatements(decl, state, host)
+		if err != nil {
+			return nil, err
+		}
+		return append(out, limits...), nil
 	}
 	return nil, fmt.Errorf("moteur %q inconnu", decl.Engine)
 }
@@ -999,6 +1030,16 @@ func (p *Provider) apply(ctx context.Context, proj *model.Project, decl model.Da
 					return err
 				}
 			}
+		}
+	}
+	// Les limites de connexions en dernier : chaque compte existe (D127).
+	limits, err := limitStatements(decl, state, host)
+	if err != nil {
+		return err
+	}
+	for _, stmt := range limits {
+		if err := client.Exec(ctx, stmt); err != nil {
+			return err
 		}
 	}
 	return nil

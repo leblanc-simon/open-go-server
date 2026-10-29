@@ -1026,3 +1026,19 @@ func TestUneCibleDeRedirectionEcarteeNArretePasLeChargement(t *testing.T) {
 		t.Errorf("ni l'unicité : %v", err)
 	}
 }
+
+func TestLimiteDeConnexionsDeclaree(t *testing.T) {
+	for n, ok := range map[int]bool{0: true, -1: true, 1: true, 100000: true, -2: false, 100001: false} {
+		p := newProject(t, "shop.fr", naming.EnvProd, model.KindSymfony)
+		p.Spec.Databases = []model.Database{{Engine: "mysql", Name: "shopfr", User: "shopfr", MaxConnections: n,
+			ExtraUsers: []model.DBUser{{User: "lecteur", Privileges: "readonly", MaxConnections: n}}}}
+		err := Project(p, "/home")
+		if ok && err != nil {
+			t.Errorf("%d doit être accepté : %v", n, err)
+		}
+		if !ok && (err == nil || !strings.Contains(err.Error(), "spec.databases[0].maxConnections") ||
+			!strings.Contains(err.Error(), "extraUsers[0].maxConnections")) {
+			t.Errorf("%d doit être refusé sur les deux comptes, obtenu : %v", n, err)
+		}
+	}
+}

@@ -7,7 +7,7 @@ PostgreSQL, vhost et files RabbitMQ, pool PHP-FPM, vhost Apache ou Nginx, certif
 et services systemd. Un projet est décrit par un fichier YAML ; un moteur de réconciliation idempotent amène
 le serveur dans l'état décrit.
 
-Le cahier des charges technique complet — 126 décisions d'architecture arbitrées (D1–D126), spécification
+Le cahier des charges technique complet — 127 décisions d'architecture arbitrées (D1–D127), spécification
 par module, plan de tests, découpage en lots — est dans [`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md).
 C'est la référence : toute contribution s'y adosse.
 
@@ -502,7 +502,7 @@ d'une suppression, ou pendant la copie d'un clone.
 
 ## Documentation
 
-- [`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md) — la référence : 126 décisions d'architecture (D1–D126)
+- [`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md) — la référence : 127 décisions d'architecture (D1–D127)
   arbitrées, spécification par module, plan de tests, découpage en lots.
 - [`docs/UTILISATION.md`](docs/UTILISATION.md) — déclarer un site, l'appliquer, le faire vivre ; fichiers
   retouchés et `--force`, suppression et restauration, migration d'un ancien serveur.

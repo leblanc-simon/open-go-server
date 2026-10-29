@@ -12,8 +12,8 @@ Les commits ne mentionnent jamais l'assistance d'un outil d'IA.
 
 ## La référence
 
-[`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md) fait autorité : 126 décisions d'architecture
-arbitrées (D1–D126, tableau §2), spécification par module, plan de tests, découpage en lots. **Consulter le
+[`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md) fait autorité : 127 décisions d'architecture
+arbitrées (D1–D127, tableau §2), spécification par module, plan de tests, découpage en lots. **Consulter le
 tableau des décisions avant de proposer une architecture** — la plupart des questions « pourquoi pas
 plutôt… ? » y sont déjà tranchées, avec leur raison. Toute décision nouvelle s'y ajoute.
 
@@ -659,6 +659,14 @@ Ils ont tous coûté un défaut réel ; les tests unitaires ne les voyaient pas.
   passe scellé (`CREATE USER IF NOT EXISTS` ne le touche pas), seulement vers un plugin à mot de passe
   (S2R-08). MySQL 8.4 livre ce plugin désactivé, MySQL 9 l'a retiré : le compte garde alors le défaut du
   serveur, et une étape non critique nomme le remède.
+- **Un compte de base sans limite de connexions met le parc à la merci d'un projet** (D127) : un pic, une
+  boucle de workers ou une fuite épuisait `max_connections`, et toutes les bases refusaient leurs clients.
+  Chaque compte reçoit `MAX_USER_CONNECTIONS` / `CONNECTION LIMIT`, calculée pour le compte principal depuis
+  la déclaration (`db.ConnectionBudget` : `pm.max_children` résolus par `App.phpWorkers`, services, tâches,
+  instances non PHP, la moitié en sus), 10 pour un additionnel, surchargée par `maxConnections` (-1 : aucune,
+  écrite 0 sous MySQL — où 0 veut dire « sans limite » et sous PostgreSQL « aucune connexion »). Elle se
+  pose aux comptes adoptés : `ALTER USER … WITH` n'exige aucun mot de passe. Un compte nommé par deux
+  déclarations prend la plus large, sans quoi le plan oscillerait.
 - **Les versions PHP déclarables viennent de `php.versions`** (D125, 7.1 à 8.5 par défaut, forme bornée à
   9.9 par la norme des numéros de pool) : jamais jugées au chargement d'une déclaration, qui ne contrôle que
   la forme, mais au plan du projet visé — une version retirée de config.yaml arrêtait sinon tout le parc. Le

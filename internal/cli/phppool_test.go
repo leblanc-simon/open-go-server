@@ -7,7 +7,9 @@ import (
 	"strings"
 	"testing"
 
+	"leblanc.io/open-go-server/internal/config"
 	"leblanc.io/open-go-server/internal/model"
+	"leblanc.io/open-go-server/internal/naming"
 	"leblanc.io/open-go-server/internal/spec"
 )
 
@@ -293,5 +295,31 @@ func TestUneVersionRetireeDePHPVersionsNArretePasLeParc(t *testing.T) {
 	h.mustRunPartial("apply", "shopfr", "--yes")
 	if pool := h.read(t, filepath.Join("etc", "php", "8.6", "fpm", "pool.d", "shopfr.conf")); !strings.Contains(pool, "php8.6-fpm-18601-shopfr.sock") {
 		t.Errorf("une version ajoutée à php.versions doit être gérée :\n%s", pool)
+	}
+}
+
+func TestLesWorkersPHPSuiventLeRenduDesPools(t *testing.T) {
+	// Le budget de connexions des comptes de base part des pm.max_children que
+	// le pool rendra (D127) : preset, réglages déclarés et couches de config.yaml.
+	app := newApp()
+	app.Cfg, app.Paths = config.Default(), config.NewPaths(t.TempDir())
+	p := model.New("shop.fr", naming.EnvProd, model.KindPHPPlain)
+	if err := p.Normalize("/home", "preprod-pp.net"); err != nil {
+		t.Fatal(err)
+	}
+	base := app.phpWorkers(p)
+	if base <= 0 {
+		t.Fatalf("le pool par défaut doit compter ses workers, obtenu %d", base)
+	}
+	second := p.Spec.PHP.Pools[0]
+	second.Name = "api"
+	second.Settings = model.PoolSettings{"pm.max_children": model.Value("7")}
+	p.Spec.PHP.Pools = append(p.Spec.PHP.Pools, second)
+	if got := app.phpWorkers(p); got != base+7 {
+		t.Errorf("%d attendu, obtenu %d", base+7, got)
+	}
+	static := model.New("vitrine.fr", naming.EnvProd, model.KindStatic)
+	if got := app.phpWorkers(static); got != 0 {
+		t.Errorf("un site statique n'a aucun worker PHP, obtenu %d", got)
 	}
 }

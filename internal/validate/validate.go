@@ -466,12 +466,33 @@ func validateDatabases(p *model.Project, add func(string, string, ...any)) {
 		default:
 			add(f+".privileges", "jeu de privilèges %q inconnu (all, crud ou readonly)", db.Privileges)
 		}
+		if msg := maxConnectionsProblem(db.MaxConnections); msg != "" {
+			add(f+".maxConnections", "%s", msg)
+		}
 		for j, u := range db.ExtraUsers {
 			if !reDBObject.MatchString(u.User) {
 				add(fmt.Sprintf("%s.extraUsers[%d].user", f, j), "nom %q invalide", u.User)
 			}
+			if msg := maxConnectionsProblem(u.MaxConnections); msg != "" {
+				add(fmt.Sprintf("%s.extraUsers[%d].maxConnections", f, j), "%s", msg)
+			}
 		}
 	}
+}
+
+// maxConnectionsLimit borne une limite de connexions déclarée : au-delà, elle
+// dépasse tout max_connections raisonnable, et ne protège plus rien.
+const maxConnectionsLimit = 100000
+
+// maxConnectionsProblem juge une limite de connexions déclarée (D127) : absente
+// (calculée), -1 (aucune), ou de 1 à maxConnectionsLimit. Le champ est né avec
+// D127 : le juger au chargement n'invalide aucune déclaration antérieure.
+func maxConnectionsProblem(n int) string {
+	if n == 0 || n == -1 || n >= 1 && n <= maxConnectionsLimit {
+		return ""
+	}
+	return fmt.Sprintf("limite %d invalide : de 1 à %d, ou -1 pour aucune limite (absente : calculée)",
+		n, maxConnectionsLimit)
 }
 
 // reservedDBAccounts énumère, par moteur, les comptes qu'aucun projet ne doit
