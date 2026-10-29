@@ -8,7 +8,7 @@ set -uo pipefail
 . /scenarios/lib.sh
 
 echo "=== scénario : nginx ==="
-version=$(ls /etc/php | head -1)
+version=$(version_php)
 
 # Les deux moteurs sont installés : Apache doit céder le port 80.
 apache2ctl stop >/dev/null 2>&1 || true

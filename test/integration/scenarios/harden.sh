@@ -11,7 +11,7 @@ set -uo pipefail
 . /scenarios/lib.sh
 
 echo "=== scénario : durcissement des droits de /etc et de /home ==="
-version=$(ls /etc/php | head -1)
+version=$(version_php)
 
 # Les serveurs sont démarrés avant : on veut constater qu'ils survivent.
 mkdir -p /run/mysqld && chown mysql:mysql /run/mysqld

@@ -43,7 +43,65 @@ type Config struct {
 
 // PHP paramètre ce que la machine impose ou propose aux pools PHP-FPM (D103).
 type PHP struct {
-	Pool PHPPool `yaml:"pool,omitempty"`
+	// Versions énumère les versions PHP qu'un projet peut déclarer (D125). Absente,
+	// DefaultPHPVersions. Comme le reste de la section, elle n'est jamais
+	// contrôlée au chargement : une entrée hors de la norme est écartée et nommée
+	// par « doctor », et un projet dont la version a quitté la liste est refusé à
+	// son plan, jamais au chargement du parc.
+	Versions []string `yaml:"versions,omitempty"`
+	Pool     PHPPool  `yaml:"pool,omitempty"`
+}
+
+// DefaultPHPVersions est la liste livrée de « php.versions » (D39, D125).
+var DefaultPHPVersions = []string{"7.1", "7.2", "7.3", "7.4", "8.0", "8.1", "8.2", "8.3", "8.4", "8.5"}
+
+// rePHPVersion est la forme d'une version gérable : la norme des numéros de pool
+// (1<version><incrément>, §7.5) tient sous 65535 jusqu'à 9.9, et rien d'antérieur
+// à 7.1 n'est géré.
+var rePHPVersion = regexp.MustCompile(`^(7\.[1-9]|[89]\.[0-9])$`)
+
+// PHPVersionShape indique si une version a la forme d'une version gérable.
+func PHPVersionShape(version string) bool { return rePHPVersion.MatchString(version) }
+
+// PHPVersions rend les versions déclarables, défaut livré appliqué, sans les
+// entrées hors de la norme (VersionProblems les nomme) ni les doublons.
+func (p PHP) PHPVersions() []string {
+	if p.Versions == nil {
+		return DefaultPHPVersions
+	}
+	var out []string
+	seen := map[string]bool{}
+	for _, v := range p.Versions {
+		if PHPVersionShape(v) && !seen[v] {
+			seen[v] = true
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+// ManagesPHP indique si une version figure parmi les versions déclarables.
+func (p PHP) ManagesPHP(version string) bool {
+	for _, v := range p.PHPVersions() {
+		if v == version {
+			return true
+		}
+	}
+	return false
+}
+
+// VersionProblems nomme les entrées de « php.versions » écartées.
+func (p PHP) VersionProblems() []string {
+	var out []string
+	for _, v := range p.Versions {
+		if !PHPVersionShape(v) {
+			out = append(out, fmt.Sprintf("version %q écartée : attendu 7.1 à 9.9 (exemple : 8.3)", v))
+		}
+	}
+	if p.Versions != nil && len(p.PHPVersions()) == 0 {
+		out = append(out, "aucune version déclarable : tout pool PHP est refusé au plan")
+	}
+	return out
 }
 
 // PHPPool porte les couches de la machine dans le calcul d'un pool. L'ordre

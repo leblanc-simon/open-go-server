@@ -143,6 +143,21 @@ type DBState struct {
 	OtherHosts map[string][]string
 	// Unavailable porte le motif si le moteur n'est pas joignable.
 	Unavailable error
+	// UserPlugin est le plugin d'authentification du compte principal, relu sur
+	// un vrai MySQL quand la déclaration en appelle un (D126) ; vide sinon.
+	UserPlugin string
+	// NativeActive dit si mysql_native_password est actif sur le serveur ;
+	// nativeRead, qu'on a pu le lire.
+	NativeActive bool
+	nativeRead   bool
+	// legacyPHP porte les versions de PHP du projet qui exigent
+	// mysql_native_password.
+	legacyPHP []string
+	// alterPlugin demande de reposer le plugin du compte principal, existant et
+	// tenu par ogs, avec son mot de passe scellé.
+	alterPlugin bool
+	// pluginAuto dit que le plugin voulu vient de « auto », non de la déclaration.
+	pluginAuto bool
 
 	// projectID est la portée du keystore où vivent les mots de passe du projet.
 	projectID string
@@ -345,6 +360,7 @@ func (p *Provider) Observe(ctx context.Context, proj *model.Project) (Observed, 
 			}
 		}
 
+		state.observePlugin(ctx, client, proj, host)
 		if state.UserExists {
 			if grants, err := client.Grants(ctx, decl.User, host); err == nil {
 				state.Grants = grants
@@ -457,6 +473,16 @@ func (p *Provider) Plan(ctx context.Context, proj *model.Project, obs Observed) 
 			decl.ExtraUsers = kept
 			state.Declaration = decl
 		}
+		// Le plugin d'authentification (D126) : « auto » vaut mysql_native_password
+		// sur un vrai MySQL dès qu'une version de PHP du projet l'exige.
+		plugin, missing := wantedPlugin(state)
+		authNotice := pluginNotice(resource, decl, state, plugin, missing, host)
+		if decl.Engine != "postgres" {
+			state.pluginAuto = !declaredPlugin(decl) && plugin != ""
+			decl.AuthPlugin = plugin
+			state.Declaration = decl
+		}
+		state.alterPlugin = pluginDrift(state, plugin) && state.UserOwned
 		observedGrants := state.Grants[decl.Name]
 		hasGrant := grantsConform(decl.Engine, observedGrants, priv)
 		// Une base adoptée n'appartient pas toujours au rôle que l'import a
@@ -472,7 +498,7 @@ func (p *Provider) Plan(ctx context.Context, proj *model.Project, obs Observed) 
 		// jamais un refus (R1-45).
 		reopened := decl.Engine == "postgres" && state.CreatedByOGS() && state.PublicConnect
 		conforming := state.DBExists && state.UserExists && hasGrant && !reopened && len(state.Jokers) == 0 &&
-			extensionsSatisfied(decl, state) && extraUsersSatisfied(decl, state)
+			extensionsSatisfied(decl, state) && extraUsersSatisfied(decl, state) && !state.alterPlugin
 
 		// Ce qu'une déclaration changée laisse derrière elle (D100) : l'ancien
 		// compte sous l'hôte d'avant, les droits d'un compte retiré de la base.
@@ -480,6 +506,9 @@ func (p *Provider) Plan(ctx context.Context, proj *model.Project, obs Observed) 
 		if conforming {
 			steps = append(steps, engine.NewStep(resource, engine.NoOp,
 				fmt.Sprintf("base %s %s (utilisateur %s)", decl.Engine, decl.Name, decl.User)))
+			if authNotice != nil {
+				steps = append(steps, authNotice)
+			}
 			steps = append(steps, follow...)
 			continue
 		}
@@ -509,7 +538,7 @@ func (p *Provider) Plan(ctx context.Context, proj *model.Project, obs Observed) 
 			continue
 		}
 		summary := fmt.Sprintf("base %s %s (utilisateur %s, privilèges %s)",
-			decl.Engine, decl.Name, decl.User, priv) + stateNotes(state, reopened)
+			decl.Engine, decl.Name, decl.User, priv) + stateNotes(state, reopened) + pluginNote(state, plugin)
 		s := engine.NewStep(resource, action, summary)
 		declCopy, stateCopy := decl, state
 		s.Diff = func() (string, error) { return p.describe(declCopy, stateCopy, priv, host) }
@@ -586,6 +615,9 @@ func (p *Provider) Plan(ctx context.Context, proj *model.Project, obs Observed) 
 			return nil
 		}
 		steps = append(steps, s)
+		if authNotice != nil {
+			steps = append(steps, authNotice)
+		}
 		if notice := p.recreatedNotice(resource, proj, decl, state, &sealedHere); notice != nil {
 			steps = append(steps, notice)
 		}
@@ -794,6 +826,11 @@ func (p *Provider) statements(decl model.Database, state DBState, priv Privilege
 			return nil, err
 		}
 		out := stmts.All()
+		if alter, err := alterPluginStatement(decl, state, host, spec.Password); err != nil {
+			return nil, err
+		} else if alter != "" {
+			out = append(out, alter)
+		}
 		for _, u := range decl.ExtraUsers {
 			extraPriv, err := ParsePrivilege(u.Privileges)
 			if err != nil {
@@ -802,7 +839,8 @@ func (p *Provider) statements(decl model.Database, state DBState, priv Privilege
 			extra, err := createMySQL(MySQLSpec{
 				Database: decl.Name, Charset: decl.Charset, Collation: decl.Collation,
 				User: u.User, Host: host, Password: password(u.User, state.ExtraUsers[u.User]), Privileges: extraPriv,
-				Revoke: MySQLGrantsOverflow(state.ExtraGrants[u.User], extraPriv),
+				AuthPlugin: decl.AuthPlugin,
+				Revoke:     MySQLGrantsOverflow(state.ExtraGrants[u.User], extraPriv),
 			})
 			if err != nil {
 				return nil, err
@@ -867,7 +905,15 @@ func (p *Provider) apply(ctx context.Context, proj *model.Project, decl model.Da
 		if err != nil {
 			return err
 		}
-		for _, stmt := range stmts.All() {
+		all := stmts.All()
+		alter, err := alterPluginStatement(decl, state, host, mainPassword)
+		if err != nil {
+			return err
+		}
+		if alter != "" {
+			all = append(all, alter)
+		}
+		for _, stmt := range all {
 			if err := client.Exec(ctx, stmt); err != nil {
 				return err
 			}
@@ -883,7 +929,7 @@ func (p *Provider) apply(ctx context.Context, proj *model.Project, decl model.Da
 			}
 			extra, err := createMySQL(MySQLSpec{
 				Database: decl.Name, User: u.User, Host: host,
-				Password: extraPassword, Privileges: extraPriv,
+				Password: extraPassword, Privileges: extraPriv, AuthPlugin: decl.AuthPlugin,
 				Revoke: MySQLGrantsOverflow(state.ExtraGrants[u.User], extraPriv),
 			})
 			if err != nil {

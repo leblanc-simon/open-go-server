@@ -272,12 +272,48 @@ func TestBuildIsDeterministic(t *testing.T) {
 	}
 }
 
-func TestBuildRejectsUnsupportedVersion(t *testing.T) {
+// Les versions déclarables viennent de config.yaml (D125) : une version absente
+// de la liste est refusée au calcul du pool, une version ajoutée y est admise.
+func TestBuildSuitLesVersionsDeLaConfiguration(t *testing.T) {
 	prov, _, _ := fixture(t, "8.5")
 	p := project(t, "shop.fr", model.KindSymfony, "6.4", "8.5")
-	p.Spec.PHP.Pools[0].Version = "7.2"
+	p.Spec.PHP.Pools[0].Version = "7.1"
+	if _, err := prov.Build(p, p.Spec.PHP.Pools[0]); err != nil {
+		t.Errorf("PHP 7.1 fait partie de la liste livrée : %v", err)
+	}
+	p.Spec.PHP.Pools[0].Version = "8.6"
+	if _, err := prov.Build(p, p.Spec.PHP.Pools[0]); err == nil || !strings.Contains(err.Error(), "php.versions") {
+		t.Errorf("PHP 8.6 n'est pas dans la liste livrée, obtenu : %v", err)
+	}
+	cfg := config.Default()
+	cfg.PHP.Versions = []string{"8.5", "8.6"}
+	prov.Config = cfg
+	bp, err := prov.Build(p, p.Spec.PHP.Pools[0])
+	if err != nil {
+		t.Fatalf("PHP 8.6 est déclaré dans php.versions : %v", err)
+	}
+	if bp.Number != 18601 {
+		t.Errorf("premier pool en 8.6 : 18601 attendu, obtenu %d", bp.Number)
+	}
+	p.Spec.PHP.Pools[0].Version = "7.4"
 	if _, err := prov.Build(p, p.Spec.PHP.Pools[0]); err == nil {
-		t.Error("PHP 7.2 est hors périmètre")
+		t.Error("PHP 7.4 a quitté php.versions : le pool doit être refusé")
+	}
+}
+
+// FPM refuse une directive qu'il ne connaît pas, et le maître meurt sur le pool
+// entier : decorate_workers_output n'existe qu'à partir de 7.3 (D125).
+func TestSocleSelonLaVersion(t *testing.T) {
+	prov, _, _ := fixture(t, "7.2", "7.3")
+	for version, want := range map[string]bool{"7.1": false, "7.2": false, "7.3": true, "8.5": true} {
+		p := project(t, "shop.fr", model.KindSymfony, "6.4", version)
+		bp, err := prov.Build(p, p.Spec.PHP.Pools[0])
+		if err != nil {
+			t.Fatalf("%s : %v", version, err)
+		}
+		if got := strings.Contains(string(bp.Content), "decorate_workers_output"); got != want {
+			t.Errorf("PHP %s : decorate_workers_output présent = %v, attendu %v", version, got, want)
+		}
 	}
 }
 

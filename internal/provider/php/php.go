@@ -291,8 +291,11 @@ var reListenLine = regexp.MustCompile(`(?m)^listen\s*=\s*(?:127\.0\.0\.1:([0-9]+
 // pool : en écoute TCP, le vhost d'un voisin relaie déjà vers le port de son
 // pool. Le projet et le pool sont lus sur l'en-tête, jamais sur le nom du
 // fichier (D76).
+//
+// Toute version présente sous /etc/php est parcourue, déclarable ou non : une
+// version retirée de « php.versions » garde ses pools, donc leurs numéros.
 func (p *Provider) recoverNumbers() error {
-	for _, version := range Supported {
+	for _, version := range p.knownVersions() {
 		min, err := naming.PoolNumber(version, 1)
 		if err != nil {
 			return err
@@ -335,10 +338,36 @@ func (p *Provider) recoverNumbers() error {
 	return nil
 }
 
+// knownVersions rend les versions déclarables et celles que porte /etc/php, à
+// la forme d'une version gérable.
+func (p *Provider) knownVersions() []string {
+	seen := map[string]bool{}
+	var out []string
+	add := func(v string) {
+		if config.PHPVersionShape(v) && !seen[v] {
+			seen[v] = true
+			out = append(out, v)
+		}
+	}
+	for _, v := range Managed(p.Config) {
+		add(v)
+	}
+	if entries, err := os.ReadDir(p.Paths.PHPRoot()); err == nil {
+		for _, e := range entries {
+			if e.IsDir() {
+				add(e.Name())
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
 // Build calcule le rendu attendu d'un pool.
 func (p *Provider) Build(proj *model.Project, pool model.Pool) (*PoolPlan, error) {
-	if !IsSupported(pool.Version) {
-		return nil, fmt.Errorf("version PHP %q hors périmètre (gérées : %v)", pool.Version, Supported)
+	if !IsManaged(p.Config, pool.Version) {
+		return nil, fmt.Errorf("version PHP %q non gérée (gérées : %s — php.versions de config.yaml)",
+			pool.Version, strings.Join(Managed(p.Config), ", "))
 	}
 	name, err := p.poolName(proj, pool)
 	if err != nil {

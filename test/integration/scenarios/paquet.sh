@@ -164,7 +164,7 @@ bash -lc 'source /usr/share/bash-completion/completions/ogs && complete -p ogs' 
 }
 
 echo "--- l'outil fonctionne après installation ---"
-php=$(ls /etc/php | head -1)
+php=$(version_php)
 ogs init --quiet
 choisir_moteur apache
 ogs site create paquet.test --kind php-plain --php "$php" --tls=false --yes 2>&1 | tail -3

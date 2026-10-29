@@ -22,7 +22,7 @@ echec() { echo "ÉCHEC : $*"; exit 1; }
 docteur() { ogs doctor 2>&1 || true; }
 
 echo "=== scénario : journaux hors du home (D71) ==="
-version=$(ls /etc/php | head -1)
+version=$(version_php)
 ogs init --quiet
 choisir_moteur apache
 systemctl start "php$version-fpm" >/dev/null 2>&1

@@ -6,12 +6,12 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/goccy/go-yaml"
 	"github.com/spf13/cobra"
 
 	"leblanc.io/open-go-server/internal/config"
 	"leblanc.io/open-go-server/internal/model"
 	"leblanc.io/open-go-server/internal/naming"
-	"leblanc.io/open-go-server/internal/provider/php"
 	"leblanc.io/open-go-server/internal/spec"
 )
 
@@ -35,7 +35,10 @@ func installCompletions(root *cobra.Command, app *App) {
 	// Les valeurs de ces options sont closes : les proposer évite une faute de frappe.
 	for _, cmd := range walk(root) {
 		if f := cmd.Flags().Lookup("php"); f != nil {
-			_ = cmd.RegisterFlagCompletionFunc("php", staticComplete(php.Supported))
+			_ = cmd.RegisterFlagCompletionFunc("php",
+				func(_ *cobra.Command, _ []string, prefix string) ([]string, cobra.ShellCompDirective) {
+					return filterPrefix(phpVersions(app), prefix), cobra.ShellCompDirectiveNoFileComp
+				})
 		}
 		if f := cmd.Flags().Lookup("kind"); f != nil {
 			_ = cmd.RegisterFlagCompletionFunc("kind", staticComplete(kinds()))
@@ -63,7 +66,7 @@ func completeToken(app *App, cmd *cobra.Command, tokens []string, args []string,
 		return filterPrefix(serviceNames(app, first(args)), prefix), cobra.ShellCompDirectiveNoFileComp
 	case tok == "version":
 		if cmd.Parent() != nil && cmd.Parent().Name() == "php" {
-			return filterPrefix(php.Supported, prefix), cobra.ShellCompDirectiveNoFileComp
+			return filterPrefix(phpVersions(app), prefix), cobra.ShellCompDirectiveNoFileComp
 		}
 		return nil, cobra.ShellCompDirectiveNoFileComp
 	case tok == "base":
@@ -191,6 +194,19 @@ func sharedCerts(app *App) []string {
 // paths reconstruit les chemins depuis le préfixe : la complétion s'exécute
 // avant que setup n'ait eu lieu.
 func paths(app *App) config.Paths { return config.NewPaths(app.Prefix) }
+
+// phpVersions rend les versions déclarables (« php.versions », D125). La
+// complétion ne passe pas par le chargement de la configuration : elle la relit
+// elle-même, et retombe sur la liste livrée si elle ne peut pas.
+func phpVersions(app *App) []string {
+	cfg := config.Default()
+	if data, err := os.ReadFile(paths(app).ConfigFile()); err == nil {
+		if yaml.Unmarshal(data, cfg) != nil {
+			cfg = config.Default()
+		}
+	}
+	return cfg.PHP.PHPVersions()
+}
 
 func kinds() []string {
 	return []string{

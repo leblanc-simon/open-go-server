@@ -101,8 +101,12 @@ func KnownPresets(cfg *config.Config) []string {
 // Les sessions vivent hors du home (D115) : systemd-tmpfiles les purge selon
 // leur âge, en root, et résout le chemin par son nom — un parent du home lié par
 // l'utilisateur lui faisait purger le répertoire « sessions » de son choix.
-func baseSettings(root, logDir, sessions string) map[string]string {
-	return map[string]string{
+//
+// Le socle suit la version du pool (D125) : FPM refuse une directive qu'il ne
+// connaît pas, et le maître meurt sur le pool entier. Une version vide vaut la
+// plus récente.
+func baseSettings(version, root, logDir, sessions string) map[string]string {
+	s := map[string]string{
 		"pm.max_requests":                    "500",
 		"php_admin_flag[log_errors]":         "on",
 		"php_admin_value[error_log]":         filepath.Join(logDir, "php-error.log"),
@@ -128,6 +132,11 @@ func baseSettings(root, logDir, sessions string) map[string]string {
 		"pm.status_path": config.PoolStatusPath,
 		"ping.path":      config.PoolPingPath,
 	}
+	// decorate_workers_output est né avec FPM 7.3.
+	if version == "7.1" || version == "7.2" {
+		delete(s, "decorate_workers_output")
+	}
+	return s
 }
 
 // DisableFunctionsKey est la directive où se rend la liste de disable_functions.
@@ -218,7 +227,7 @@ func poolConfig(cfg *config.Config) config.PHPPool {
 // passe par lui — un pool mal déclaré ne doit pas arrêter le plan global.
 func Resolve(cfg *config.Config, paths config.Paths, proj *model.Project, pool model.Pool, at model.AppType) Resolved {
 	pc := poolConfig(cfg)
-	r := Resolved{Settings: baseSettings(proj.Spec.Layout.Root, proj.Spec.Layout.LogDir,
+	r := Resolved{Settings: baseSettings(pool.Version, proj.Spec.Layout.Root, proj.Spec.Layout.LogDir,
 		paths.ProjectSessionsDir(proj.ID()))}
 	projectField := fmt.Sprintf("spec.php.pools[%s]", pool.Name)
 
@@ -432,7 +441,7 @@ func ConfigProblems(cfg *config.Config) []Problem {
 	// Les couches sont éprouvées comme le rendu les traite, sur le socle d'un
 	// projet quelconque : c'est le même jugement, au mot près.
 	layer := func(settings model.PoolSettings, field string) {
-		out = append(out, applyLayer(baseSettings("/", "/", "/"), settings, field, false)...)
+		out = append(out, applyLayer(baseSettings("", "/", "/", "/"), settings, field, false)...)
 	}
 	layer(pc.Defaults, "config.yaml php.pool.defaults")
 	names := make([]string, 0, len(pc.Presets))

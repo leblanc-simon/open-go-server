@@ -40,7 +40,7 @@ done
 # ogs administre PostgreSQL sous un rôle au nom de l'utilisateur système (D44).
 su -s /bin/sh postgres -c "createuser --superuser root" >/dev/null 2>&1
 
-version=$(ls /etc/php | head -1)
+version=$(version_php)
 ogs init --quiet
 choisir_moteur apache
 

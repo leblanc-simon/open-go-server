@@ -11,10 +11,6 @@ import (
 	"leblanc.io/open-go-server/internal/validate"
 )
 
-// Supported énumère les versions gérées (D39). Les versions en fin de support en
-// font partie : un Prestashop ancien peut exiger 7.4.
-var Supported = []string{"7.4", "8.0", "8.1", "8.2", "8.3", "8.4", "8.5"}
-
 // Version décrit une version PHP observée sur la machine.
 type Version struct {
 	Version string `json:"version" yaml:"version"`
@@ -87,9 +83,18 @@ func Find(versions []Version, want string) (Version, bool) {
 	return Version{}, false
 }
 
-// IsSupported indique si une version fait partie du périmètre.
-func IsSupported(version string) bool {
-	for _, v := range Supported {
+// Managed rend les versions qu'un projet peut déclarer (« php.versions » de
+// config.yaml, D125). cfg nil vaut la configuration livrée.
+func Managed(cfg *config.Config) []string {
+	if cfg == nil {
+		return config.DefaultPHPVersions
+	}
+	return cfg.PHP.PHPVersions()
+}
+
+// IsManaged indique si une version fait partie des versions déclarables.
+func IsManaged(cfg *config.Config, version string) bool {
+	for _, v := range Managed(cfg) {
 		if v == version {
 			return true
 		}

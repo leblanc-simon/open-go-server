@@ -25,7 +25,7 @@ archive_de() { ls -t /var/lib/ogs/archives/"$1"-*.tar.zst 2>/dev/null | head -1;
 proprio() { stat -c '%U:%G' "$1" 2>/dev/null; }
 
 echo "=== scénario : restauration d'un projet supprimé ==="
-version=$(ls /etc/php | head -1)
+version=$(version_php)
 ogs init --quiet
 choisir_moteur apache
 systemctl start "php$version-fpm" >/dev/null 2>&1

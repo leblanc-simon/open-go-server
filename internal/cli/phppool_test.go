@@ -262,3 +262,36 @@ func TestLesReglagesEcartesDUnPoolSAnnoncentUneFois(t *testing.T) {
 		}
 	}
 }
+
+func TestUneVersionRetireeDePHPVersionsNArretePasLeParc(t *testing.T) {
+	// Les versions déclarables viennent de config.yaml (D125) : une version qui
+	// en sort refuse le plan du projet qui l'emploie, jamais le chargement du
+	// parc, et doctor le nomme.
+	h := deuxSitesPHP(t)
+	h.modifierDéclaration(t, "shopfr", func(p *model.Project) { p.Spec.PHP.Pools[0].Version = "7.1" })
+	cfg := h.path("etc", "ogs", "config.yaml")
+	data, err := os.ReadFile(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	extra := "\nphp:\n  versions: [\"8.3\", \"8.6\", \"10.0\"]\n"
+	if err := os.WriteFile(cfg, append(data, extra...), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if out, code := h.run("plan", "blogfr"); code != CodeOK {
+		t.Errorf("le voisin doit rester planifiable (code %d) :\n%s", code, out)
+	}
+	out, code := h.run("plan", "shopfr")
+	if code != CodeValidation || !strings.Contains(out, "spec.php.pools[0].version") || !strings.Contains(out, "php.versions") {
+		t.Errorf("code %d, attendu %d et la version nommée :\n%s", code, CodeValidation, out)
+	}
+	out, _ = h.run("doctor")
+	if !strings.Contains(out, "php 7.1 (shopfr)") || !strings.Contains(out, `"10.0" écartée`) {
+		t.Errorf("doctor doit nommer la version retirée et l'entrée écartée :\n%s", out)
+	}
+	h.modifierDéclaration(t, "shopfr", func(p *model.Project) { p.Spec.PHP.Pools[0].Version = "8.6" })
+	h.mustRunPartial("apply", "shopfr", "--yes")
+	if pool := h.read(t, filepath.Join("etc", "php", "8.6", "fpm", "pool.d", "shopfr.conf")); !strings.Contains(pool, "php8.6-fpm-18601-shopfr.sock") {
+		t.Errorf("une version ajoutée à php.versions doit être gérée :\n%s", pool)
+	}
+}

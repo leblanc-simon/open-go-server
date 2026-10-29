@@ -10,6 +10,7 @@ import (
 	"leblanc.io/open-go-server/internal/model"
 	"leblanc.io/open-go-server/internal/provider/php"
 	"leblanc.io/open-go-server/internal/spec"
+	"leblanc.io/open-go-server/internal/validate"
 )
 
 func newPHPCommand(app *App) *cobra.Command {
@@ -89,8 +90,8 @@ func newPHPSwitchCommand(app *App) *cobra.Command {
 		Args: cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			id, version := args[0], args[1]
-			if !php.IsSupported(version) {
-				return exitf(CodeUsage, "version PHP %q hors périmètre (gérées : %v)", version, php.Supported)
+			if err := validate.PHPVersion(version, app.Cfg.PHP.PHPVersions()); err != nil {
+				return exitf(CodeUsage, "%v", err)
 			}
 			p, err := app.loadProject(id)
 			if err != nil {

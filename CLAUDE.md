@@ -12,8 +12,8 @@ Les commits ne mentionnent jamais l'assistance d'un outil d'IA.
 
 ## La référence
 
-[`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md) fait autorité : 124 décisions d'architecture
-arbitrées (D1–D124, tableau §2), spécification par module, plan de tests, découpage en lots. **Consulter le
+[`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md) fait autorité : 126 décisions d'architecture
+arbitrées (D1–D126, tableau §2), spécification par module, plan de tests, découpage en lots. **Consulter le
 tableau des décisions avant de proposer une architecture** — la plupart des questions « pourquoi pas
 plutôt… ? » y sont déjà tranchées, avec leur raison. Toute décision nouvelle s'y ajoute.
 
@@ -50,12 +50,12 @@ make dev-demo                                   # crée ./dev, deux projets, pla
 
 ### Essais sur système réel
 
-Vingt scénarios conteneurisés éprouvent ce que les tests unitaires ne peuvent pas voir. Ils ont mis au jour
+Vingt et un scénarios conteneurisés éprouvent ce que les tests unitaires ne peuvent pas voir. Ils ont mis au jour
 plus de trente défauts invisibles autrement (§18 du cahier des charges) : **y recourir avant de déclarer un
 provider fonctionnel**.
 
 ```sh
-make integration-all       # les vingt, à la suite
+make integration-all       # les vingt et un, à la suite
 make integration-nginx     # un seul (voir SCENARIOS dans le Makefile)
 
 # Hors série : rbenv et pyenv compilent depuis les sources (un quart d'heure).
@@ -86,10 +86,17 @@ Pièges du harnais :
   appelaient le vrai, et la mise à jour du paquet n'éprouvait rien. Le scénario `paquet` passe
   `-o DPkg::Path="$PATH"` à chaque `apt-get` (`apt_paquet`).
 - **PHP-FPM tourne avec l'opcache** (`revalidate_freq=2`) : un script réécrit puis interrogé dans les deux
-  secondes répond encore par l'ancien code, et sans init le substitut recharge FPM par
-  `pkill -USR2 -f /usr/sbin/php-fpm<v>`, que le titre réécrit du maître peut faire manquer. Écrire un script
+  secondes répond encore par l'ancien code. Écrire un script
   une fois pour toutes, avec toutes les branches dont le scénario a besoin : `nginx` échouait de façon
   reproductible.
+- **Sans init, le substitut signale le maître FPM par son titre** (`php-fpm: master process
+  (/etc/php/<v>/…)`) ou sa ligne de commande : il visait `/usr/sbin/php-fpm<v>`, que le titre réécrit ne porte
+  jamais — tout `reload` de FPM rendait 1, ogs en faisait un avertissement, et FPM ne relisait ses pools que
+  par `relancer_fpm`. Seul `php-anciennes`, qui bascule un site d'une version à l'autre par apply, l'a vu.
+- **L'image porte aussi PHP 7.1 et 7.2** (Sury, épinglé sous Debian sauf ces versions et `php-common`) : un
+  scénario prend la version de la distribution par `version_php` (`scenarios/lib.sh`), jamais par
+  `ls /etc/php | head -1`. Le `php-fpm.conf` de Sury pour 7.1 et 7.2 ne déclare **aucun fichier pid** :
+  `relancer_fpm` le passe par `--pid`.
 - **Relancer FPM sans init passe par `relancer_fpm`** (`scenarios/lib.sh`), jamais par
   `pkill -f "php-fpm: master"; sleep 1; php-fpm<v> --daemonize`. Un maître que USR2 ré-exécute porte, le
   temps de réécrire son titre, la ligne de commande `/usr/sbin/php-fpm<v> --daemonize` : le motif le
@@ -645,6 +652,18 @@ Ils ont tous coûté un défaut réel ; les tests unitaires ne les voyaient pas.
   déclaration, et la normalisation n'écrit plus de preset — un pool sans preset écrit suit
   `defaultPreset`, une déclaration antérieure garde le `medium` qu'elle porte. `php.Resolve` est le seul
   calcul des réglages : le vhost de supervision lit `PoolPlan.Resolved.Settings`, jamais la déclaration.
+- **mysqlnd de PHP 7.1 et 7.2 n'emploie pas de façon fiable `caching_sha2_password`**, le défaut de MySQL 8
+  (D126) : `authPlugin: auto` vaut `mysql_native_password` sur un vrai MySQL dès qu'un pool ou une tâche du
+  projet est dans l'une de ces versions — jamais sous MariaDB, qui l'emploie déjà et dont la grammaire
+  diffère. Un compte en place est repassé au plugin par `ALTER USER … IDENTIFIED WITH … BY` avec son mot de
+  passe scellé (`CREATE USER IF NOT EXISTS` ne le touche pas), seulement vers un plugin à mot de passe
+  (S2R-08). MySQL 8.4 livre ce plugin désactivé, MySQL 9 l'a retiré : le compte garde alors le défaut du
+  serveur, et une étape non critique nomme le remède.
+- **Les versions PHP déclarables viennent de `php.versions`** (D125, 7.1 à 8.5 par défaut, forme bornée à
+  9.9 par la norme des numéros de pool) : jamais jugées au chargement d'une déclaration, qui ne contrôle que
+  la forme, mais au plan du projet visé — une version retirée de config.yaml arrêtait sinon tout le parc. Le
+  socle d'un pool suit sa version : FPM refuse une directive inconnue et meurt sur le pool entier
+  (`decorate_workers_output` n'existe qu'à partir de 7.3).
 - **L'analyseur d'ini de FPM ne rend pas une valeur nue telle quelle** (D115) : `;` commente, `${…}` se
   développe, `& | ~ ( ) !` et les constantes s'évaluent (`a & b` → 0), `no`/`off`/`null` deviennent vides —
   `env[X] = no` fait refuser le pool —, `=` est une erreur de syntaxe. `template.FPMValue` cite toute valeur

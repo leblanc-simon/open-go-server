@@ -9,7 +9,7 @@ set -uo pipefail
 . /scenarios/lib.sh
 
 echo "=== scénario : suppression d'un site dont le pool tourne ==="
-version=$(ls /etc/php | head -1)
+version=$(version_php)
 echo "version PHP détectée : $version"
 
 # L'image porte les deux moteurs web, et sous systemd nginx démarre au boot :

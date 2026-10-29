@@ -11,6 +11,7 @@ import (
 
 	"leblanc.io/open-go-server/internal/model"
 	"leblanc.io/open-go-server/internal/provider/php"
+	"leblanc.io/open-go-server/internal/validate"
 )
 
 // checkPoolDeclarations refuse, au plan et à l'apply du projet visé comme aux
@@ -24,7 +25,12 @@ func (a *App) checkPoolDeclarations(p *model.Project) error {
 		return nil
 	}
 	var lines []string
-	for _, pool := range p.Spec.PHP.Pools {
+	for i, pool := range p.Spec.PHP.Pools {
+		// Les versions déclarables suivent config.yaml (D125) : jugées ici, au
+		// plan du projet visé, jamais au chargement du parc.
+		if err := validate.PHPVersion(pool.Version, a.Cfg.PHP.PHPVersions()); err != nil {
+			lines = append(lines, fmt.Sprintf("spec.php.pools[%d].version : %v", i, err))
+		}
 		for _, pb := range php.Resolve(a.Cfg, a.Paths, p, pool, at).Blocking() {
 			lines = append(lines, pb.String())
 		}

@@ -8,7 +8,7 @@ set -uo pipefail
 . /scenarios/lib.sh
 
 echo "=== scénario : site PHP servi de bout en bout ==="
-version=$(ls /etc/php | head -1)
+version=$(version_php)
 echo "version PHP détectée : $version"
 
 apache2ctl start

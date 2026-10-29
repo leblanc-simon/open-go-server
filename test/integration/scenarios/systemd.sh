@@ -8,7 +8,7 @@ set -uo pipefail
 
 echo "=== scénario : services systemd et tâches planifiées ==="
 systemctl is-system-running || true
-version=$(ls /etc/php | head -1)
+version=$(version_php)
 
 ogs init --quiet
 choisir_moteur apache

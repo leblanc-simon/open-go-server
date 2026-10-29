@@ -106,6 +106,7 @@ entre le socle d'ogs et le preset ; le type d'application et la déclaration du 
 
 ```yaml
 php:
+  versions: ["7.1", "7.2", "7.3", "7.4", "8.0", "8.1", "8.2", "8.3", "8.4", "8.5"]  # déclarables (D125)
   pool:
     defaultPreset: ondemand          # preset d'un pool qui n'en déclare pas (défaut : ondemand)
     defaults:
@@ -117,6 +118,11 @@ php:
     disableFunctions: [exec, passthru, shell_exec, system, proc_open, popen, pcntl_exec]  # php-plain
     capacityWarnPercent: 200         # seuil d'avertissement de doctor (0 : jamais)
 ```
+
+`php.versions` énumère les versions qu'un projet peut déclarer (D125) ; absente, la liste ci-dessus. Y
+ajouter `8.6` ou `9.0` suffit à les gérer, une fois installées (dépôt Sury). Une entrée hors de 7.1 à 9.9
+est écartée et nommée par `doctor` ; un projet dont la version quitte la liste n'est refusé qu'à son plan
+(code 3), jamais au chargement du parc, et ses pools gardent leurs numéros.
 
 Ces valeurs sont **vivantes**, à la différence de `user.shell` : les changer réécrit, au prochain
 `ogs apply`, tous les pools qu'elles touchent, et FPM est rechargé une fois par version. Un pool dont la

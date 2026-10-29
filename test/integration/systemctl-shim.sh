@@ -53,12 +53,20 @@ agir() {
     php*-fpm)
         binaire=$(fpm_binaire "$unite")
         [ -x "$binaire" ] || { echo "systemctl (substitut) : $binaire absent" >&2; return 1; }
+        # Le maître de cette version : son titre réécrit nomme sa configuration,
+        # sa ligne de commande le binaire tant qu'il ne l'a pas réécrit. Le seul
+        # binaire manquait tout maître démarré, sous toute version : « reload »
+        # rendait 1, ogs en faisait un avertissement (code 6), et FPM ne relisait
+        # ses pools que par relancer_fpm. Les workers (« pool … ») ne sont pas
+        # visés.
+        v=$(echo "$unite" | sed 's/^php\(.*\)-fpm$/\1/; s/\./\\./g')
+        maitre="^(php-fpm: master process \\(/etc/php/$v/|/usr/sbin/php-fpm$v( |\$))"
         case "$action" in
         start) "$binaire" --daemonize ;;
         # USR2 est bien ce que systemd envoie pour un reload de FPM.
-        reload) pkill -USR2 -f "$binaire" ;;
-        stop) pkill -QUIT -f "$binaire" ;;
-        restart) pkill -QUIT -f "$binaire" 2>/dev/null; sleep 1; "$binaire" --daemonize ;;
+        reload) pkill -USR2 -f "$maitre" ;;
+        stop) pkill -QUIT -f "$maitre" ;;
+        restart) pkill -QUIT -f "$maitre" 2>/dev/null; sleep 1; "$binaire" --daemonize ;;
         esac
         ;;
     ogs-*)

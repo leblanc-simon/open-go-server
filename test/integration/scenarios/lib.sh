@@ -1,5 +1,12 @@
 # Fonctions communes aux scénarios.
 
+# version_php rend la version de PHP de la distribution, celle de /usr/bin/php.
+# L'image porte aussi 7.1 et 7.2 (scénario php-anciennes) : « ls /etc/php | head
+# -1 » les aurait fait éprouver par tous les scénarios.
+version_php() {
+    readlink -f /usr/bin/php | sed 's#^/usr/bin/php##'
+}
+
 # choisir_moteur fixe le moteur web dans la configuration. L'image porte Apache
 # et nginx : ogs refuse — à raison — de choisir seul, et chaque scénario doit
 # donc déclarer celui qu'il éprouve.
@@ -75,7 +82,9 @@ relancer_fpm() {
         return 1
     fi
     rm -f "$pidfile"
-    if ! "$binaire" --daemonize; then
+    # Le fichier pid est imposé : le php-fpm.conf de Sury pour 7.1 et 7.2 n'en
+    # déclare aucun, et le maître n'en écrivait pas.
+    if ! "$binaire" --daemonize --pid "$pidfile"; then
         echo "ÉCHEC : le maître FPM $version ne démarre pas"
         return 1
     fi

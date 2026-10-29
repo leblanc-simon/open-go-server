@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 
+	"leblanc.io/open-go-server/internal/config"
 	"leblanc.io/open-go-server/internal/model"
 	"leblanc.io/open-go-server/internal/naming"
 	"leblanc.io/open-go-server/internal/provider/tls"
@@ -46,7 +47,6 @@ func (errs Errors) OrNil() error {
 var (
 	reDBObject    = regexp.MustCompile(`^[a-zA-Z0-9_]+$`)
 	reMode        = regexp.MustCompile(`^0[0-7]{3}$`)
-	rePHPVer      = regexp.MustCompile(`^[78]\.[0-9]$`)
 	reQueueName   = regexp.MustCompile(`^[a-zA-Z0-9._-]+$`)
 	reServiceName = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_.-]*$`)
 )
@@ -58,27 +58,29 @@ var (
 // invaliderait des projets déjà en service.
 const maxServiceName = 200
 
-// supportedPHP énumère les versions gérées (D39).
 // dnsProviderOVH est le seul provider DNS géré (D27).
 const dnsProviderOVH = "ovh"
 
-var supportedPHP = []string{"7.4", "8.0", "8.1", "8.2", "8.3", "8.4", "8.5"}
-
 // phpEOL indique les versions dont le support est terminé. Elles restent
-// utilisables : un Prestashop ancien peut exiger 7.4.
+// utilisables : un Prestashop ancien peut exiger 7.1.
 var phpEOL = map[string]string{
+	"7.1": "2019-12-01",
+	"7.2": "2020-11-30",
+	"7.3": "2021-12-06",
 	"7.4": "2022-11-28",
 	"8.0": "2023-11-26",
 	"8.1": "2025-12-31",
 }
 
-// PHPVersion contrôle une version PHP : sa forme, puis qu'elle soit gérée.
-func PHPVersion(version string) error {
-	if !rePHPVer.MatchString(version) {
+// PHPVersion contrôle une version PHP : sa forme, puis qu'elle figure parmi les
+// versions déclarables (« php.versions » de config.yaml, D125).
+func PHPVersion(version string, managed []string) error {
+	if !config.PHPVersionShape(version) {
 		return fmt.Errorf("version %q invalide (exemple : 8.3)", version)
 	}
-	if !contains(supportedPHP, version) {
-		return fmt.Errorf("version %q non gérée (gérées : %s)", version, strings.Join(supportedPHP, ", "))
+	if !contains(managed, version) {
+		return fmt.Errorf("version %q non gérée (gérées : %s — php.versions de config.yaml)",
+			version, strings.Join(managed, ", "))
 	}
 	return nil
 }
@@ -630,12 +632,13 @@ func validatePHP(p *model.Project, add func(string, string, ...any)) {
 			add(f+".name", "pool %q déclaré deux fois", pool.Name)
 		}
 		seen[pool.Name] = true
-		if !rePHPVer.MatchString(pool.Version) {
-			add(f+".version", "version %q invalide (exemple : 8.3)", pool.Version)
+		// Seule la forme se juge au chargement : les versions déclarables
+		// dépendent de config.yaml (D125), et une version retirée de la liste ne
+		// doit pas arrêter tout le parc. Qu'elle y figure est éprouvé au plan du
+		// projet visé et par « doctor ».
+		if !config.PHPVersionShape(pool.Version) {
+			add(f+".version", "version %q invalide (attendu 7.1 à 9.9, exemple : 8.3)", pool.Version)
 			continue
-		}
-		if !contains(supportedPHP, pool.Version) {
-			add(f+".version", "version %q non gérée (gérées : %s)", pool.Version, strings.Join(supportedPHP, ", "))
 		}
 		switch pool.Listen {
 		case "", "unix", "tcp":

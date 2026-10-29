@@ -918,8 +918,18 @@ func (a *App) runChecks(ctx context.Context) []check {
 		}
 		add("identifiants dns", "ok", fmt.Sprintf("%d jeu(x), %d zone(s) déclarée(s)", len(dnsSets), zones), "")
 	}
+	// Versions déclarables (D125) : une entrée écartée, ou un projet dont la
+	// version a quitté la liste, ne se voient sinon qu'au plan.
+	for _, msg := range a.Cfg.PHP.VersionProblems() {
+		add("config.yaml php.versions", "avertissement", msg, "corriger "+a.Paths.ConfigFile())
+	}
 	for _, p := range projects {
 		for _, pool := range p.Spec.PHP.Pools {
+			if !a.Cfg.PHP.ManagesPHP(pool.Version) {
+				add(fmt.Sprintf("php %s (%s)", pool.Version, p.ID()), "échec",
+					"version absente de php.versions : le plan du projet est refusé",
+					"ajouter "+pool.Version+" à php.versions de "+a.Paths.ConfigFile()+", ou « ogs php switch »")
+			}
 			if date, eol := validate.EOLDate(pool.Version); eol {
 				add(fmt.Sprintf("php %s (%s)", pool.Version, p.ID()), "avertissement",
 					"support terminé depuis le "+date, "envisager « ogs php switch »")

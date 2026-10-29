@@ -20,7 +20,7 @@ if ! mariadb -e 'SELECT VERSION()' 2>/dev/null; then
     exit 1
 fi
 
-version=$(ls /etc/php | head -1)
+version=$(version_php)
 ogs init --quiet
 choisir_moteur apache
 

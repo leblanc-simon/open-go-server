@@ -33,6 +33,9 @@ type Provider struct {
 	// Simulated suspend le contrôle d'installation d'une version PHP fixée par
 	// une tâche : le mode préfixé ne pose aucun binaire.
 	Simulated bool
+	// PHPVersions sont les versions qu'une tâche peut fixer (« php.versions »,
+	// D125) ; nulles, la liste livrée.
+	PHPVersions []string
 }
 
 // refusStep produit l'étape qui refuse d'écraser un fichier qu'ogs n'a pas
@@ -389,7 +392,11 @@ func (p *Provider) interpreter(proj *model.Project, decl model.CronJob) (string,
 	if decl.PHP == "" {
 		return filepath.Join(model.BinDir(proj.Spec.Layout.Root), "php"), nil
 	}
-	if err := validate.PHPVersion(decl.PHP); err != nil {
+	managed := p.PHPVersions
+	if managed == nil {
+		managed = config.DefaultPHPVersions
+	}
+	if err := validate.PHPVersion(decl.PHP, managed); err != nil {
 		return "", fmt.Errorf("tâche %s : php : %w", decl.Name, err)
 	}
 	bin := p.Paths.PHPBin(decl.PHP)

@@ -9,7 +9,7 @@ set -uo pipefail
 . /scenarios/lib.sh
 
 echo "=== scénario : moteur web durci (ProtectHome=read-only) ==="
-version=$(ls /etc/php | head -1)
+version=$(version_php)
 echo "version PHP détectée : $version"
 
 # L'image porte les deux moteurs et nginx occupe le port 80 sous systemd.

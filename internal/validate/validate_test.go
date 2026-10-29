@@ -85,12 +85,29 @@ func TestProjectRequiresPoolForPHPKinds(t *testing.T) {
 	}
 }
 
-func TestProjectRejectsUnsupportedPHP(t *testing.T) {
-	p := newProject(t, "shop.fr", naming.EnvProd, model.KindPrestashop)
-	p.Spec.PHP.Pools = []model.Pool{{Name: "web", Version: "7.2"}}
-	err := Project(p, "/home")
-	if err == nil || !strings.Contains(err.Error(), "non gérée") {
-		t.Fatalf("PHP 7.2 devrait être refusé, obtenu : %v", err)
+// Au chargement, seule la forme d'une version compte : la liste des versions
+// déclarables vient de config.yaml et se juge au plan (D125).
+func TestProjectNeJugeQueLaFormeDeLaVersionPHP(t *testing.T) {
+	for version, ok := range map[string]bool{"7.1": true, "8.6": true, "9.0": true,
+		"7.0": false, "5.6": false, "10.0": false, "8": false} {
+		p := newProject(t, "shop.fr", naming.EnvProd, model.KindPrestashop)
+		p.Spec.PHP.Pools = []model.Pool{{Name: "web", Version: version}}
+		err := Project(p, "/home")
+		if ok && err != nil {
+			t.Errorf("PHP %s doit être accepté au chargement : %v", version, err)
+		}
+		if !ok && (err == nil || !strings.Contains(err.Error(), "invalide")) {
+			t.Errorf("PHP %s devrait être refusé, obtenu : %v", version, err)
+		}
+	}
+}
+
+func TestPHPVersionSuitLaListe(t *testing.T) {
+	if err := PHPVersion("7.1", []string{"7.1", "8.5"}); err != nil {
+		t.Error(err)
+	}
+	if err := PHPVersion("8.4", []string{"7.1", "8.5"}); err == nil || !strings.Contains(err.Error(), "non gérée") {
+		t.Errorf("8.4 hors de la liste, obtenu : %v", err)
 	}
 }
 
@@ -102,8 +119,10 @@ func TestProjectAcceptsEOLPHP(t *testing.T) {
 	if err := Project(p, "/home"); err != nil {
 		t.Fatalf("PHP 7.4 doit être accepté : %v", err)
 	}
-	if _, eol := EOLDate("7.4"); !eol {
-		t.Error("PHP 7.4 devrait être signalé en fin de support")
+	for _, v := range []string{"7.1", "7.2", "7.3", "7.4"} {
+		if _, eol := EOLDate(v); !eol {
+			t.Errorf("PHP %s devrait être signalé en fin de support", v)
+		}
 	}
 	if _, eol := EOLDate("8.4"); eol {
 		t.Error("PHP 8.4 ne devrait pas être signalé en fin de support")

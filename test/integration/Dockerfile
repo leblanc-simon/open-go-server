@@ -54,6 +54,24 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && a2enmod proxy proxy_fcgi proxy_http rewrite headers setenvif ssl status \
     && rm -rf /var/lib/apt/lists/*
 
+# PHP 7.1 et 7.2 (D125, D126), du dépôt packages.sury.org : leur FPM ne connaît
+# pas toutes les directives du socle, et leur mysqlnd pas caching_sha2_password.
+# Le dépôt est épinglé sous la distribution : il n'apporte que ces deux versions
+# et php-common — celui de Debian casse php7.1-common —, et le PHP de Debian,
+# celui que les autres scénarios éprouvent, reste le sien.
+RUN curl -fsSLo /tmp/sury.deb https://packages.sury.org/debsuryorg-archive-keyring.deb \
+    && dpkg -i /tmp/sury.deb && rm -f /tmp/sury.deb \
+    && printf '%s\n' 'Types: deb' 'URIs: https://packages.sury.org/php/' 'Suites: trixie' \
+        'Components: main' 'Signed-By: /usr/share/keyrings/debsuryorg-archive-keyring.gpg' \
+        > /etc/apt/sources.list.d/sury-php.sources \
+    && printf '%s\n' 'Package: *' 'Pin: origin packages.sury.org' 'Pin-Priority: 100' '' \
+        'Package: php7.1* php7.2* php-common' 'Pin: origin packages.sury.org' 'Pin-Priority: 500' \
+        > /etc/apt/preferences.d/sury-php \
+    && apt-get update && apt-get install -y --no-install-recommends \
+        php7.1-fpm php7.1-cli php7.1-mysql \
+        php7.2-fpm php7.2-cli php7.2-mysql \
+    && rm -rf /var/lib/apt/lists/*
+
 # Sans init dans le conteneur, systemctl est inopérant : un substitut dispatche
 # les actions sur les services réellement installés. Il s'efface de lui-même
 # lorsque le scénario démarre un vrai systemd en PID 1.

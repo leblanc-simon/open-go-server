@@ -69,7 +69,7 @@ func newCronAddCommand(app *App) *cobra.Command {
 				return exitf(CodeValidation, "expression %q : %v", schedule, err)
 			}
 			if php != "" {
-				if err := validate.PHPVersion(php); err != nil {
+				if err := validate.PHPVersion(php, app.Cfg.PHP.PHPVersions()); err != nil {
 					return exitf(CodeValidation, "--php : %v", err)
 				}
 			}

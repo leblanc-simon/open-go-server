@@ -438,3 +438,36 @@ php:
 		t.Errorf("clés inconnues : %v\nattendu      : %v", unknown, want)
 	}
 }
+
+// php.versions (D125) : absente, la liste livrée ; une entrée hors de la norme
+// est écartée et nommée, jamais refusée au chargement.
+func TestPHPVersions(t *testing.T) {
+	var p PHP
+	if got := p.PHPVersions(); len(got) != len(DefaultPHPVersions) || got[0] != "7.1" {
+		t.Errorf("liste livrée attendue, obtenu %v", got)
+	}
+	if len(p.VersionProblems()) != 0 {
+		t.Error("aucun problème attendu sans php.versions")
+	}
+	p.Versions = []string{"8.6", "7.0", "8.6", "10.0", "9.0"}
+	if got := strings.Join(p.PHPVersions(), ","); got != "8.6,9.0" {
+		t.Errorf("8.6,9.0 attendu, obtenu %s", got)
+	}
+	if !p.ManagesPHP("9.0") || p.ManagesPHP("8.5") {
+		t.Error("ManagesPHP doit suivre la liste déclarée")
+	}
+	if probs := p.VersionProblems(); len(probs) != 2 {
+		t.Errorf("7.0 et 10.0 doivent être nommés, obtenu %v", probs)
+	}
+	p.Versions = []string{"6.0"}
+	if probs := p.VersionProblems(); len(probs) != 2 || !strings.Contains(probs[1], "aucune version") {
+		t.Errorf("une liste vide après écart doit être nommée, obtenu %v", probs)
+	}
+	cfg := Default()
+	if err := yaml.Unmarshal([]byte("php:\n  versions: [\"7.1\", \"8.6\"]\n"), cfg); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(cfg.PHP.PHPVersions(), ","); got != "7.1,8.6" {
+		t.Errorf("lecture de config.yaml : %s", got)
+	}
+}

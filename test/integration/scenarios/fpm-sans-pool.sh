@@ -15,7 +15,7 @@ set -uo pipefail
 . /scenarios/lib.sh
 
 echo "=== scénario : FPM sans pool de distribution ==="
-version=$(ls /etc/php | head -1)
+version=$(version_php)
 unite="php$version-fpm"
 echo "version PHP détectée : $version"
 

@@ -77,7 +77,7 @@ func newWizard(prepDomain string) wizard {
 		{label: "Version applicative", help: "« auto » lit le composer.json",
 			get: func(a WizardAnswers) string { return a.AppVersion },
 			set: func(a *WizardAnswers, v string) { a.AppVersion = v }, optional: true},
-		{label: "Version PHP", help: "7.4 à 8.5",
+		{label: "Version PHP", help: "php.versions de config.yaml (7.1 à 8.5 par défaut)",
 			get: func(a WizardAnswers) string { return a.PHPVersion },
 			set: func(a *WizardAnswers, v string) { a.PHPVersion = v }, optional: true},
 		{label: "Base de données", help: "vide pour aucune",

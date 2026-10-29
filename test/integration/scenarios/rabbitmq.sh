@@ -11,7 +11,7 @@ auth="admin:motdepasse-essai"
 echo "=== scénario : RabbitMQ ==="
 curl -sf -u "$auth" "$api/overview" | grep -o '"management_version":"[^"]*"'
 
-version=$(ls /etc/php | head -1)
+version=$(version_php)
 ogs init --quiet
 choisir_moteur apache
 # Le mot de passe passe par l'entrée standard, jamais par la ligne de commande :
