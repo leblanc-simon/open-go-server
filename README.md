@@ -19,8 +19,8 @@ Pour l'usage — déclarer un site, l'appliquer, lancer ses services —, voir l
 | Lot | Contenu | État |
 |---|---|---|
 | **L0** | Socle : nommage, modèle, validation, YAML, écriture atomique, base d'état, keystore, audit, moteur (plan/apply/diff/saga/verrou), provider système, CLI | **livré** |
-| **L1** | Web + PHP : templates surchargeables, pools multi-version 7.4→8.5 avec numérotation, vhosts Apache et Nginx, types Prestashop et Symfony 3.4→8, clé de déploiement, lien `~/.local/bin/php`, `php switch` avec garde-fou de compatibilité, rotation des logs | **livré** |
-| **L2** | Bases MySQL/MariaDB et PostgreSQL : privilèges nommés, échappement des motifs de `GRANT`, keystore, multi-cluster PostgreSQL, dump/restore, `secrets env` | **livré** |
+| **L1** | Web + PHP : templates surchargeables, pools multi-version 7.1→8.5, liste réglable par `php.versions` (D125), avec numérotation, vhosts Apache et Nginx, types Prestashop et Symfony 3.4→8, clé de déploiement, lien `~/.local/bin/php`, `php switch` avec garde-fou de compatibilité, rotation des logs | **livré** |
+| **L2** | Bases MySQL/MariaDB et PostgreSQL : privilèges nommés, échappement des motifs de `GRANT`, limite de connexions par compte (D127), keystore, multi-cluster PostgreSQL, dump/restore, `secrets env` | **livré** |
 | **L3** | TLS : ACME embarqué (lego), HTTP-01 et DNS-01 OVH, wildcard partagé pour les préproductions, timer de renouvellement, suspension après échecs répétés | **livré** |
 | **L4** | RabbitMQ : vhosts, utilisateurs, exchanges, files, bindings, policies, préréglage Messenger, arguments immuables détectés | **livré** |
 | **L5** | Tâches planifiées, services systemd templatisés avec instances multiples, délégation sudoers, répertoires d'exécution | **livré** |
@@ -57,7 +57,7 @@ make integration           # un reload suffit-il pour l'appartenance de www-data
 make integration-php       # site PHP servi de bout en bout, sous l'identité du projet
 make integration-nginx     # nginx réel : quatre types de vhost, FastCGI, TLS, isolation
 make integration-hooks     # portées, refus d'un « pre », rejet d'un script détournable
-make integration-mysql     # MariaDB réel : privilèges, échappement des motifs, rotation
+make integration-mysql     # MariaDB réel : privilèges, échappement des motifs, rotation, limites de connexions
 make integration-postgres  # cluster réel : schéma public durci, extensions, multi-cluster
 make integration-rabbitmq  # broker réel : isolation par vhost, bindings, arguments immuables
 make integration-acme      # autorité ACME réelle (pebble) : émission, HTTPS, renouvellement
@@ -447,6 +447,9 @@ est transmis par `SOCKET_PATH`, et si le code l'ignore, l'attente de disponibili
   données réelles.
 - **Privilèges MySQL** : le nom de base côté `ON` est un motif où `_` fait joker — il est donc
   systématiquement échappé. Le nom d'utilisateur, lui, est un littéral exact et ne l'est pas.
+- **Connexions simultanées** : chaque compte de base est limité (`MAX_USER_CONNECTIONS`, `CONNECTION
+  LIMIT`), d'après la déclaration du projet — workers PHP, services, tâches, avec une marge — ou d'après
+  `maxConnections`. Comptes adoptés compris : la limite se pose au premier apply, annoncée par le plan.
 - **Archives** : conservées 14 jours, puis purgées par une étape du plan — annoncée, auditée, jamais
   silencieuse. `archives.retentionDays: 0` conserve indéfiniment, et doit être un choix explicite.
 - **Fournisseur DNS** : OVH seul est géré, refusé dès la déclaration pour tout autre.

@@ -102,6 +102,15 @@ S'ajoutent un pool PHP-FPM dédié qui tourne sous l'identité du projet, le lie
 l'interpréteur choisi, une base `blogfr` et son utilisateur. Le mot de passe est généré une fois, scellé
 dans le keystore, et n'est plus jamais changé sans `ogs db user rotate`.
 
+Les versions de PHP proposées sont celles de `php.versions` dans `/etc/ogs/config.yaml` : 7.1 à 8.5 par
+défaut, et y ajouter une version suffit à la gérer (D125). Sous MySQL, un projet en 7.1 ou 7.2 reçoit un
+compte en `mysql_native_password`, que leur `mysqlnd` exige (D126).
+
+Le compte de la base est limité en connexions simultanées (D127) : le pool PHP par défaut (12 workers)
+donne 22 — chaque worker, service et tâche compte pour une connexion, et la moitié en sus, au moins 10, couvre les
+pics et l'exploitation. Le plan l'annonce ; `maxConnections` dans la déclaration la remplace (exemple
+au §6), et `ogs doctor` dit quand la somme des limites dépasse la capacité du serveur.
+
 Changer de version de PHP plus tard :
 
 ```sh
@@ -250,6 +259,9 @@ spec:
     - engine: mysql
       name: boutiquefr
       user: boutiquefr
+      maxConnections: 60                 # connexions simultanées ; absent : calculé (D127), -1 : aucune
+      extraUsers:
+        - { user: boutiquefr_ro, privileges: readonly }   # limité à 10 par défaut
     - engine: postgres
       name: boutiquefr_stats
       user: boutiquefr_stats

@@ -23,7 +23,7 @@ plutôt… ? » y sont déjà tranchées, avec leur raison. Toute décision nouv
 make build            # ./ogs, statique (CGO_ENABLED=0), aucune dépendance C
 make test             # tests unitaires
 make check            # fmt + vet + test
-make cover            # couverture (66,5 % actuellement)
+make cover            # couverture (78,2 % actuellement)
 make doc              # pages de manuel, complétions, référence Markdown → dist/doc
 make package          # paquet Debian → dist/*.deb (nfpm, réseau requis)
 

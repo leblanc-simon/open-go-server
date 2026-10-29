@@ -2714,9 +2714,12 @@ redémarrage, de limite mémoire et de durée de vie.
 
 #### 7.10.3 Compatibilité PHP × application
 
-Les versions PHP gérées vont de **7.4 à 8.5** (dépôt Sury), soit `7.4`, `8.0`, `8.1`, `8.2`, `8.3`, `8.4`,
-`8.5`. La numérotation des pools s'y applique sans changement : PHP 7.4 premier pool → `17401`, PHP 8.5
-premier pool → `18501`.
+Les versions PHP gérées sont celles de **`php.versions`** dans `config.yaml` (D125) — par défaut **7.1 à 8.5**
+(dépôt Sury), soit `7.1`, `7.2`, `7.3`, `7.4`, `8.0`, `8.1`, `8.2`, `8.3`, `8.4`, `8.5`. Ajouter `8.6` ou `9.0`
+à la liste suffit à les gérer ; la forme admise va de `7.1` à `9.9`. La numérotation des pools s'y applique
+sans changement : PHP 7.1 premier pool → `17101`, PHP 8.5 premier pool → `18501`, PHP 9.9 → `19901`. Le socle
+du pool suit la version : `decorate_workers_output`, né avec FPM 7.3, n'est pas rendu en 7.1 et 7.2. Un projet
+MySQL en 7.1 ou 7.2 reçoit `mysql_native_password` (D126, §7.2).
 
 **La source d'autorité est le `composer.json` de l'application**, pas une table figée dans `ogs` : la
 contrainte `require.php` est lue et confrontée à la version du pool. Un écart est signalé au `plan` — de
@@ -2748,8 +2751,8 @@ Table indicative, utilisée seulement en l'absence de `composer.json` exploitabl
 exige `--force` accompagné du motif, journalisé. C'est le garde-fou le plus utile de tout le module PHP : une
 bascule de 7.4 vers 8.x sur un Symfony 3.4 rend le site inaccessible instantanément.
 
-**Fin de support** : `doctor` marque les versions dont le support est terminé (7.4, 8.0 et 8.1 le sont à ce
-jour) à partir d'une table datée embarquée, sans jamais bloquer — un Prestashop ancien peut exiger 7.4, et
+**Fin de support** : `doctor` marque les versions dont le support est terminé (7.1 à 7.4, 8.0 et 8.1 le sont à
+ce jour) à partir d'une table datée embarquée, sans jamais bloquer — un Prestashop ancien peut exiger 7.1, et
 c'est une réalité d'exploitation, pas une erreur de configuration. L'information est remontée dans `status` et
 dans la TUI, avec la date de fin de support.
 
