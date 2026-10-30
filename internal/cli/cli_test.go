@@ -2074,8 +2074,8 @@ func TestAMQPMessengerPresetAndApply(t *testing.T) {
 	h.mustRun("init")
 	state := newBrokerState()
 	h.fakeBroker(t, state)
-	h.mustRun("project", "create", "shop.fr", "--kind", "php-symfony", "--app-version", "6.4", "--php", "8.5")
-	out := h.mustRun("amqp", "messenger", "shopfr", "--transport", "async")
+	h.mustRun("project", "create", "shop.fr", "--kind", "php-symfony", "--app-version", "3.4", "--php", "7.4")
+	out := h.mustRun("amqp", "messenger", "shopfr", "--transport", "async", "--failed")
 	if !strings.Contains(out, "async_failed") {
 		t.Errorf("la file d'échec doit être déclarée :\n%s", out)
 	}
@@ -2087,14 +2087,14 @@ func TestAMQPMessengerPresetAndApply(t *testing.T) {
 	if !state.users["shopfr"] {
 		t.Error("utilisateur non créé")
 	}
-	// Le type quorum se déclare par argument : c'est la seule forme acceptée par
-	// toutes les versions du broker.
+	// Les files du préréglage sont classiques, comme celles que déclare
+	// oldsound/rabbitmq-bundle : aucun x-queue-type n'est envoyé.
 	async, ok := state.queues["async"]
 	if !ok {
 		t.Fatalf("file async non déclarée : %v", state.writes)
 	}
 	args, _ := async["arguments"].(map[string]any)
-	if args["x-queue-type"] != "quorum" {
+	if _, ok := args["x-queue-type"]; ok {
 		t.Errorf("type de file : %+v", args)
 	}
 	if args["x-dead-letter-exchange"] != "dlx" {
@@ -2235,18 +2235,46 @@ func TestSuppressionRetireLeVhostAMQPDOgs(t *testing.T) {
 	}
 }
 
-func TestAMQPRefusesMessengerOnSymfony34(t *testing.T) {
-	// Le composant Messenger n'existe qu'à partir de Symfony 4.1 : le proposer
-	// sur un projet en 3.4 produirait une configuration inutilisable.
+func TestAMQPMessengerNImposeAucuneTopologie(t *testing.T) {
+	// Messenger déclare lui-même exchanges, files et liaisons (auto_setup) : une
+	// topologie imposée le faisait refuser par le broker (406) dès qu'elle
+	// différait de la sienne. Seuls le vhost, le compte et ses permissions sont
+	// déclarés, --failed compris.
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("project", "create", "shop.fr", "--kind", "php-symfony", "--app-version", "6.4", "--php", "8.5")
+	h.mustRun("amqp", "messenger", "shopfr", "--transport", "async", "--failed")
+	p, err := spec.Load(h.path("etc", "ogs", "projects", "shopfr.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := p.Spec.AMQP
+	if a == nil || a.Vhost != "shopfr" || a.User != "shopfr" || a.Permissions["configure"] != ".*" {
+		t.Fatalf("vhost, compte et permissions attendus : %+v", a)
+	}
+	if len(a.Exchanges)+len(a.Queues)+len(a.Bindings) != 0 {
+		t.Errorf("aucune topologie ne doit être imposée à Messenger : %+v", a)
+	}
+}
+
+func TestAMQPMessengerSymfony34SansFileDEchecParDefaut(t *testing.T) {
+	// Sans Messenger, les workers rabbitmq:consumer reçoivent le préréglage
+	// complet ; l'exchange de rejet et les files d'échec ne viennent que sous
+	// --failed.
 	h := newHarness(t)
 	h.mustRun("init")
 	h.mustRun("project", "create", "ancien.fr", "--kind", "php-symfony", "--app-version", "3.4", "--php", "7.4")
-	out, code := h.run("amqp", "messenger", "ancienfr")
-	if code != CodeUsage {
-		t.Fatalf("code %d attendu %d :\n%s", code, CodeUsage, out)
+	h.mustRun("amqp", "messenger", "ancienfr", "--transport", "async")
+	p, err := spec.Load(h.path("etc", "ogs", "projects", "ancienfr.yaml"))
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(out, "rabbitmq-consumer") {
-		t.Errorf("le message doit indiquer la solution de remplacement :\n%s", out)
+	a := p.Spec.AMQP
+	if len(a.Queues) != 1 || a.Queues[0].Name != "async" || len(a.Exchanges) != 1 {
+		t.Fatalf("une file async et un exchange attendus : %+v", a)
+	}
+	if _, ok := a.Queues[0].Arguments["x-dead-letter-exchange"]; ok {
+		t.Errorf("aucun exchange de rejet sans --failed : %+v", a.Queues[0])
 	}
 }
 
@@ -2255,8 +2283,8 @@ func TestAMQPImmutableArgumentsRequireExplicitRecreation(t *testing.T) {
 	h.mustRun("init")
 	state := newBrokerState()
 	h.fakeBroker(t, state)
-	h.mustRun("project", "create", "shop.fr", "--kind", "php-symfony", "--app-version", "6.4", "--php", "8.5")
-	h.mustRun("amqp", "messenger", "shopfr")
+	h.mustRun("project", "create", "shop.fr", "--kind", "php-symfony", "--app-version", "3.4", "--php", "7.4")
+	h.mustRun("amqp", "messenger", "shopfr", "--failed")
 	h.mustRun("apply", "shopfr", "--yes")
 
 	// Le broker rapporte désormais une file existante, avec des messages en

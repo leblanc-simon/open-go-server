@@ -422,7 +422,7 @@ func TestRecreateQueuesWhenAuthorized(t *testing.T) {
 	client.queues["shopfr/async"] = q
 	for i := range proj.Spec.AMQP.Queues {
 		if proj.Spec.AMQP.Queues[i].Name == "async" {
-			proj.Spec.AMQP.Queues[i].Type = "classic"
+			proj.Spec.AMQP.Queues[i].Type = "quorum"
 		}
 	}
 	p.RecreateQueues = true
@@ -437,7 +437,7 @@ func TestRecreateQueuesWhenAuthorized(t *testing.T) {
 	if len(client.deleted) != 1 || client.deleted[0] != "queue:async" {
 		t.Errorf("la queue devait être supprimée puis recréée : %v", client.deleted)
 	}
-	if client.queues["shopfr/async"].EffectiveType() != "classic" {
+	if client.queues["shopfr/async"].EffectiveType() != "quorum" {
 		t.Errorf("type après recréation : %q", client.queues["shopfr/async"].EffectiveType())
 	}
 }
@@ -625,8 +625,10 @@ func TestPresetMatchesMessengerExpectations(t *testing.T) {
 	if async.Arguments["x-dead-letter-routing-key"] != "async_failed" {
 		t.Errorf("clé de rejet : %+v", async.Arguments)
 	}
-	if async.Type != "quorum" {
-		t.Errorf("le transport principal doit être en quorum : %q", async.Type)
+	// Classique : c'est ce que déclare oldsound/rabbitmq-bundle, et le broker
+	// refuse (406) une redéclaration d'un autre type.
+	if async.Type != "classic" {
+		t.Errorf("le transport principal doit être classique : %q", async.Type)
 	}
 	// Un binding par queue.
 	if len(spec.Bindings) != 4 {

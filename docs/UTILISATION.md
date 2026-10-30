@@ -134,8 +134,12 @@ sudo ogs site create shop.fr \
   demande : l'émission se replie alors sans lui, le site reste en HTTPS, et l'apply rend le code 6 en le
   nommant. Une redirection depuis une adresse IP n'entre jamais dans le certificat : son vhost reste en
   HTTP ;
-- `--messenger async` crée dans RabbitMQ un vhost, un utilisateur, l'exchange, la file `async` et sa file
-  d'échec ; `ogs secrets env shopfr` donne alors aussi `MESSENGER_TRANSPORT_DSN` ;
+- `--messenger async` crée dans RabbitMQ un vhost et un utilisateur, avec tous les droits sur ce vhost ;
+  Messenger y déclare lui-même exchanges et files (`auto_setup`) et gère ses échecs par sa
+  `retry_strategy` et son `failure_transport`. `ogs secrets env shopfr` donne alors aussi
+  `MESSENGER_TRANSPORT_DSN`. Sous Symfony avant 4.1, sans Messenger, les services passent par
+  `rabbitmq-consumer`, et ogs déclare un exchange direct, une file par transport et leurs bindings —
+  files d'échec et exchange de rejet seulement par `ogs amqp messenger <id> --failed` ;
 - `--service` démarre trois consommateurs de la file (voir [Les services](#les-services)) ;
 - `--cron` pose une tâche chaque minute, sous l'utilisateur du projet, enveloppée dans `flock` pour ne
   jamais se chevaucher, journalisée dans `~/logs/`.
@@ -267,7 +271,7 @@ spec:
       user: boutiquefr_stats
       extensions: [pg_trgm]
 
-  # Le bloc amqp (exchanges, files, bindings) est complété par « ogs amqp messenger ».
+  # « ogs amqp messenger » pose vhost, compte et permissions ; Messenger déclare lui-même ses files.
   amqp:
     vhost: boutiquefr
     user: boutiquefr

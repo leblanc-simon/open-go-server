@@ -1,6 +1,6 @@
 #!/bin/bash
 # Éprouve le provider RabbitMQ sur un vrai broker : vhost, utilisateur,
-# permissions, exchanges, files, bindings, préréglage Messenger, et le point le
+# permissions, exchanges, files, bindings, préréglage rabbitmq:consumer, et le point le
 # plus délicat — les arguments de file, immuables une fois la file créée.
 set -uo pipefail
 . /scenarios/lib.sh
@@ -23,9 +23,17 @@ grep -q "password: motdepasse-essai" /etc/ogs/credentials/amqp.yaml ||
     { echo "ÉCHEC : le mot de passe lu sur l'entrée standard n'est pas celui enregistré"; exit 1; }
 
 echo
-echo "--- création d'un site avec deux transports Messenger ---"
-ogs site create shop.fr --kind php-symfony --app-version 6.4 --php "$version" \
-    --tls=false --messenger async --messenger emails --yes 2>&1 |
+echo "--- création d'un site avec deux transports et leurs files d'échec ---"
+# Messenger déclare lui-même sa topologie : ogs ne lui pose que vhost, compte et
+# permissions. Le préréglage complet, files d'échec comprises sous --failed, ne
+# vaut que pour les workers rabbitmq:consumer de Symfony avant 4.1 : c'est lui
+# qu'éprouve ce scénario.
+ogs site create shop.fr --kind php-symfony --app-version 3.4 --php "$version" \
+    --tls=false --apply=false >/dev/null ||
+    { echo "ÉCHEC : déclaration du site refusée"; exit 1; }
+ogs amqp messenger shopfr --transport async --transport emails --failed >/dev/null ||
+    { echo "ÉCHEC : préréglage AMQP refusé"; exit 1; }
+ogs apply shopfr --yes 2>&1 |
     grep -Ei "queue|exchange|vhost amqp|utilisateur amqp|⚠" | head -12
 
 echo
@@ -173,7 +181,7 @@ done
 # remplaçait toute la déclaration, et c'est par lui que ce scénario retirait
 # emails. Le retrait se fait désormais à la main, comme le ferait l'exploitant
 # (l'image n'a pas python3-yaml).
-ogs amqp messenger shopfr --transport async >/dev/null
+ogs amqp messenger shopfr --transport async --failed >/dev/null
 grep -q 'name: emails$' /etc/ogs/projects/shopfr.yaml ||
     { echo "ÉCHEC : « amqp messenger » a retiré le transport emails de la déclaration"; exit 1; }
 awk '
@@ -302,7 +310,7 @@ curl -sf -u "$auth" -X PUT "$api/queues/atelierfr/commandes" -H 'content-type: a
 empreinte() { curl -sf -u "$auth" "$api/users/atelierfr" | grep -o '"password_hash":"[^"]*"'; }
 avant=$(empreinte)
 [ -n "$avant" ] || { echo "ÉCHEC : empreinte du compte de l'administrateur illisible"; exit 1; }
-sortie=$(ogs site create atelier.fr --kind php-symfony --app-version 6.4 --php "$version" \
+sortie=$(ogs site create atelier.fr --kind php-symfony --app-version 3.4 --php "$version" \
     --tls=false --messenger async --yes 2>&1)
 code=$?
 echo "$sortie" | grep -i "vhost amqp" | head -2

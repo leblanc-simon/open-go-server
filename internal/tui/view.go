@@ -207,7 +207,7 @@ func (m *Model) viewWizard() string {
 	b.WriteString("\n\n")
 	// Les réponses déjà données restent visibles : l'assistant doit se relire.
 	for i := 0; i < w.index; i++ {
-		b.WriteString(fmt.Sprintf("  %-24s %s\n",
+		b.WriteString(fmt.Sprintf("  %-30s %s\n",
 			m.styles.label(w.steps[i].label), m.styles.value(w.steps[i].get(w.answers))))
 	}
 	s := w.current()

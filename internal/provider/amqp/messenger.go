@@ -8,7 +8,7 @@ import (
 	"leblanc.io/open-go-server/internal/model"
 )
 
-// DefaultExchange est l'exchange dans lequel Symfony Messenger publie.
+// DefaultExchange est l'exchange du préréglage complet (Preset).
 const DefaultExchange = "messages"
 
 // DeadLetterExchange reçoit les messages rejetés.
@@ -17,18 +17,30 @@ const DeadLetterExchange = "dlx"
 // FailedSuffix nomme la file d'échec associée à un transport.
 const FailedSuffix = "_failed"
 
-// Preset construit la déclaration AMQP d'un projet pour Symfony Messenger : un
-// exchange direct, une queue par transport, un binding par clé de routage, et
-// une file d'échec par transport si elle est demandée.
+// Declaration rend la déclaration AMQP d'un projet qui demande des transports.
 //
-// C'est la configuration qu'attend le transport AMQP de Messenger ; la produire
-// ici évite à l'exploitant de déduire les noms à la main, où une erreur ne se
-// manifeste qu'au premier message perdu.
-func Preset(proj *model.Project, transports []string, withFailed bool) *model.AMQP {
-	if len(transports) == 0 {
-		transports = []string{"async"}
+// Symfony Messenger déclare lui-même ses exchanges, ses files et ses liaisons
+// (auto_setup), et gère seul ses échecs : nouvelle tentative par republication
+// différée, puis failure_transport. Lui imposer une topologie le faisait refuser
+// par le broker (406 PRECONDITION_FAILED) dès que la sienne différait — type de
+// l'exchange, x-dead-letter-exchange, type de file —, et le DLX recevait une copie
+// de chaque tentative ratée, Messenger rejetant l'original à chaque échec. Un
+// projet Messenger ne reçoit donc que son vhost, son compte et ses permissions.
+//
+// Symfony avant 4.1 n'a pas Messenger : le préréglage complet reste celui des
+// workers rabbitmq:consumer, files d'échec seulement si elles sont demandées.
+func Declaration(proj *model.Project, transports []string, withFailed bool) *model.AMQP {
+	kind := proj.Spec.App.Kind
+	if kind == model.KindSymfony && !model.SupportsMessenger(kind, proj.Spec.App.Version) {
+		return Preset(proj, transports, withFailed)
 	}
-	spec := &model.AMQP{
+	return Access(proj)
+}
+
+// Access rend le vhost du projet, son compte et des permissions entières sur ce
+// vhost : de quoi laisser l'application déclarer elle-même ce qu'il lui faut.
+func Access(proj *model.Project) *model.AMQP {
+	return &model.AMQP{
 		Vhost: proj.ID(),
 		User:  proj.ID(),
 		Permissions: map[string]string{
@@ -36,9 +48,20 @@ func Preset(proj *model.Project, transports []string, withFailed bool) *model.AM
 			"write":     ".*",
 			"read":      ".*",
 		},
-		Exchanges: []model.Exchange{
-			{Name: DefaultExchange, Type: "direct", Durable: true},
-		},
+	}
+}
+
+// Preset construit une topologie complète : un exchange direct, une queue par
+// transport, un binding par clé de routage, et une file d'échec par transport si
+// elle est demandée. Seuls les workers rabbitmq:consumer la reçoivent
+// (Declaration).
+func Preset(proj *model.Project, transports []string, withFailed bool) *model.AMQP {
+	if len(transports) == 0 {
+		transports = []string{"async"}
+	}
+	spec := Access(proj)
+	spec.Exchanges = []model.Exchange{
+		{Name: DefaultExchange, Type: "direct", Durable: true},
 	}
 	if withFailed {
 		spec.Exchanges = append(spec.Exchanges,
@@ -46,7 +69,7 @@ func Preset(proj *model.Project, transports []string, withFailed bool) *model.AM
 	}
 	for _, transport := range transports {
 		queue := model.Queue{
-			Name: transport, Type: "quorum", Durable: true,
+			Name: transport, Type: "classic", Durable: true,
 			Arguments: map[string]any{},
 		}
 		if withFailed {

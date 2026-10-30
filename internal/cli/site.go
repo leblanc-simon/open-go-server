@@ -207,12 +207,12 @@ func (a *App) buildSite(host string, opts siteOptions) (*model.Project, error) {
 			return nil, exitf(CodeUsage, "moteur %q inconnu (mysql, mariadb ou postgres)", opts.database)
 		}
 	}
+	// Symfony avant 4.1 n'a pas le composant Messenger : refuser la création
+	// n'aidait personne. Les workers basculent sur rabbitmq:consumer
+	// (oldsound/rabbitmq-bundle), et amqp.Declaration choisit la déclaration.
+	consumer := kind == model.KindSymfony && !model.SupportsMessenger(kind, p.Spec.App.Version)
 	if len(opts.messenger) > 0 {
-		if kind == model.KindSymfony && !model.SupportsMessenger(kind, p.Spec.App.Version) {
-			return nil, exitf(CodeUsage, "Symfony %s n'a pas le composant Messenger "+
-				"(introduit en 4.1) : employer un service rabbitmq-consumer", p.Spec.App.Version)
-		}
-		p.Spec.AMQP = amqp.Preset(p, opts.messenger, true)
+		p.Spec.AMQP = amqp.Declaration(p, opts.messenger, false)
 	}
 	if !opts.tls {
 		// Le certificat doit disparaître avec le TLS : le laisser déclaré ferait
@@ -232,6 +232,9 @@ func (a *App) buildSite(host string, opts siteOptions) (*model.Project, error) {
 		}}
 	}
 	for _, raw := range opts.services {
+		if consumer && (raw == unit.TemplateMessenger || strings.HasPrefix(raw, unit.TemplateMessenger+":")) {
+			raw = unit.TemplateConsumer + strings.TrimPrefix(raw, unit.TemplateMessenger)
+		}
 		svc, err := parseServiceOption(raw)
 		if err != nil {
 			return nil, exitf(CodeUsage, "%s", err)
@@ -663,12 +666,15 @@ func (a *App) cloneProject(source *model.Project, env naming.Env) (*model.Projec
 	}
 	if source.Spec.AMQP != nil {
 		transports := make([]string, 0, len(source.Spec.AMQP.Queues))
+		failed := false
 		for _, q := range source.Spec.AMQP.Queues {
-			if !strings.HasSuffix(q.Name, amqp.FailedSuffix) {
+			if strings.HasSuffix(q.Name, amqp.FailedSuffix) {
+				failed = true
+			} else {
 				transports = append(transports, q.Name)
 			}
 		}
-		clone.Spec.AMQP = amqp.Preset(&clone, transports, true)
+		clone.Spec.AMQP = amqp.Declaration(&clone, transports, failed)
 	}
 	if err := a.prepare(&clone); err != nil {
 		return nil, err

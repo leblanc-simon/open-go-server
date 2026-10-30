@@ -137,15 +137,15 @@ func TestLaDélégationDeConfigYamlEstUnDéfautDeCréation(t *testing.T) {
 func TestAMQPMessengerComplèteSansRetirer(t *testing.T) {
 	h := newHarness(t)
 	h.mustRun("init")
-	h.mustRun("project", "create", "shop.fr", "--kind", "php-symfony", "--app-version", "6.4")
-	h.mustRun("amqp", "messenger", "shopfr", "--transport", "async")
+	h.mustRun("project", "create", "shop.fr", "--kind", "php-symfony", "--app-version", "3.4", "--php", "7.4")
+	h.mustRun("amqp", "messenger", "shopfr", "--transport", "async", "--failed")
 	h.modifierDéclaration(t, "shopfr", func(p *model.Project) {
 		p.Spec.AMQP.Queues = append(p.Spec.AMQP.Queues, model.Queue{Name: "rapports", Type: "classic", Durable: true})
 		p.Spec.AMQP.Policies = []model.Policy{{Name: "borne", Pattern: "^rapports$",
 			Definition: map[string]any{"max-length": 1000}}}
 		p.Spec.AMQP.Permissions["configure"] = "^(async|rapports).*"
 	})
-	h.mustRun("amqp", "messenger", "shopfr", "--transport", "mails")
+	h.mustRun("amqp", "messenger", "shopfr", "--transport", "mails", "--failed")
 	p, err := spec.Load(h.path("etc", "ogs", "projects", "shopfr.yaml"))
 	if err != nil {
 		t.Fatal(err)
@@ -172,16 +172,16 @@ func TestAMQPMessengerComplèteSansRetirer(t *testing.T) {
 func TestAMQPMessengerGardeUneFileDéclaréeAutrement(t *testing.T) {
 	h := newHarness(t)
 	h.mustRun("init")
-	h.mustRun("project", "create", "shop.fr", "--kind", "php-symfony", "--app-version", "6.4")
-	h.mustRun("amqp", "messenger", "shopfr", "--transport", "async")
+	h.mustRun("project", "create", "shop.fr", "--kind", "php-symfony", "--app-version", "3.4", "--php", "7.4")
+	h.mustRun("amqp", "messenger", "shopfr", "--transport", "async", "--failed")
 	h.modifierDéclaration(t, "shopfr", func(p *model.Project) {
 		for i := range p.Spec.AMQP.Queues {
 			if p.Spec.AMQP.Queues[i].Name == "async" {
-				p.Spec.AMQP.Queues[i].Type = "classic"
+				p.Spec.AMQP.Queues[i].Type = "quorum"
 			}
 		}
 	})
-	out, code := h.run("amqp", "messenger", "shopfr", "--transport", "async")
+	out, code := h.run("amqp", "messenger", "shopfr", "--transport", "async", "--failed")
 	if code != CodePartial || !strings.Contains(out, "file async") {
 		t.Errorf("code 6 et la file nommée attendus, obtenu %d :\n%s", code, out)
 	}
@@ -190,8 +190,8 @@ func TestAMQPMessengerGardeUneFileDéclaréeAutrement(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, q := range p.Spec.AMQP.Queues {
-		if q.Name == "async" && q.Type != "classic" {
-			t.Errorf("la file déclarée doit rester classique : %+v", q)
+		if q.Name == "async" && q.Type != "quorum" {
+			t.Errorf("la file déclarée doit rester en quorum : %+v", q)
 		}
 	}
 }

@@ -84,10 +84,10 @@ func newWizard(prepDomain string) wizard {
 			get:     func(a WizardAnswers) string { return a.Database },
 			set:     func(a *WizardAnswers, v string) { a.Database = v },
 			choices: []string{"", "mysql", "mariadb", "postgres"}, optional: true},
-		{label: "Transports Messenger", help: "séparés par une virgule, vide pour aucun",
+		{label: "Noms des transports Messenger", help: "ex: async,emails,high - séparés par une virgule, vide pour aucun",
 			get: func(a WizardAnswers) string { return a.Messenger },
 			set: func(a *WizardAnswers, v string) { a.Messenger = v }, optional: true},
-		{label: "Instances de worker", help: "vide si aucun transport",
+		{label: "Nombre d'instances de worker", help: "vide si aucun transport",
 			get: func(a WizardAnswers) string { return a.Instances },
 			set: func(a *WizardAnswers, v string) { a.Instances = v }, optional: true},
 	}

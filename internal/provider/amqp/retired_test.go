@@ -57,7 +57,7 @@ func TestCeQuiQuitteLaDeclarationQuitteLeBroker(t *testing.T) {
 	// La file async garde ses arguments sur le broker : ses écarts ne relèvent pas
 	// de ce test.
 	q := client.queues["shopfr/async"]
-	q.Arguments = map[string]any{"x-queue-type": "quorum"}
+	q.Arguments = map[string]any{}
 	client.queues["shopfr/async"] = q
 
 	applyReport(t, p, proj)

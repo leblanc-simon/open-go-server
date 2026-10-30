@@ -16,6 +16,7 @@ import (
 	"leblanc.io/open-go-server/internal/hook"
 	"leblanc.io/open-go-server/internal/model"
 	"leblanc.io/open-go-server/internal/provider/tls"
+	"leblanc.io/open-go-server/internal/provider/unit"
 	"leblanc.io/open-go-server/internal/spec"
 	"leblanc.io/open-go-server/internal/tui"
 )
@@ -328,15 +329,22 @@ func (b *tuiBackend) Create(ctx context.Context, answers tui.WizardAnswers) (str
 		kind: answers.Kind, appVersion: answers.AppVersion, phpVersion: answers.PHPVersion,
 		env: answers.Env, database: answers.Database, tls: true, apply: false,
 	}
-	if answers.Messenger != "" {
-		opts.messenger = strings.Split(answers.Messenger, ",")
-		instances := answers.Instances
+	// Les noms sont nettoyés une fois pour toutes : « async, high » nommait sinon
+	// la file « high » précédée d'une espace, que le worker « high » ne consommait pas.
+	for _, transport := range strings.Split(answers.Messenger, ",") {
+		if transport = strings.TrimSpace(transport); transport != "" {
+			opts.messenger = append(opts.messenger, transport)
+		}
+	}
+	if len(opts.messenger) > 0 {
+		instances := strings.TrimSpace(answers.Instances)
 		if instances == "" {
 			instances = "1"
 		}
+		// buildSite bascule ce service sur rabbitmq-consumer sous Symfony < 4.1.
 		for _, transport := range opts.messenger {
 			opts.services = append(opts.services,
-				fmt.Sprintf("symfony-messenger:%s:%s", strings.TrimSpace(transport), instances))
+				fmt.Sprintf("%s:%s:%s", unit.TemplateMessenger, transport, instances))
 		}
 	}
 	p, err := b.app.buildSite(answers.Host, opts)

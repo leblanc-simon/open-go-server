@@ -13,8 +13,8 @@ func (h *harness) projetMessenger(t *testing.T, state *brokerState) {
 	t.Helper()
 	h.mustRun("init")
 	h.fakeBroker(t, state)
-	h.mustRun("project", "create", "shop.fr", "--kind", "php-symfony", "--app-version", "6.4", "--php", "8.5")
-	h.mustRun("amqp", "messenger", "shopfr", "--transport", "async")
+	h.mustRun("project", "create", "shop.fr", "--kind", "php-symfony", "--app-version", "3.4", "--php", "7.4")
+	h.mustRun("amqp", "messenger", "shopfr", "--transport", "async", "--failed")
 	h.mustRun("apply", "shopfr", "--yes")
 }
 
@@ -24,11 +24,11 @@ func TestAMQPFileRetireeDeLaDeclarationQuitteLeBroker(t *testing.T) {
 	h.projetMessenger(t, state)
 	state.queueList = []map[string]any{{
 		"name": "async", "vhost": "shopfr", "durable": true,
-		"arguments": map[string]any{"x-queue-type": "quorum", "x-dead-letter-exchange": "dlx",
+		"arguments": map[string]any{"x-dead-letter-exchange": "dlx",
 			"x-dead-letter-routing-key": "async_failed"},
 	}, {
 		"name": "async_failed", "vhost": "shopfr", "durable": true,
-		"arguments": map[string]any{"x-queue-type": "quorum"},
+		"arguments": map[string]any{},
 	}}
 	h.modifierDéclaration(t, "shopfr", func(p *model.Project) {
 		p.Spec.AMQP.Queues = slices.DeleteFunc(p.Spec.AMQP.Queues,

@@ -7,7 +7,7 @@ PostgreSQL, vhost et files RabbitMQ, pool PHP-FPM, vhost Apache ou Nginx, certif
 et services systemd. Un projet est décrit par un fichier YAML ; un moteur de réconciliation idempotent amène
 le serveur dans l'état décrit.
 
-Le cahier des charges technique complet — 127 décisions d'architecture arbitrées (D1–D127), spécification
+Le cahier des charges technique complet — 128 décisions d'architecture arbitrées (D1–D128), spécification
 par module, plan de tests, découpage en lots — est dans [`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md).
 C'est la référence : toute contribution s'y adosse.
 
@@ -249,9 +249,11 @@ sudo ogs apply shopfr
 sudo ogs secrets env shopfr        # MESSENGER_TRANSPORT_DSN incluse
 ```
 
-Le préréglage produit ce qu'attend le transport AMQP de Symfony Messenger : un
-exchange direct, une file par transport, un binding par clé de routage et une file
-d'échec pour rejouer les messages rejetés.
+Symfony Messenger déclare lui-même ses exchanges et ses files (`auto_setup`) et
+gère seul ses échecs (`retry_strategy`, `failure_transport`) : ogs ne lui pose que
+le vhost, le compte et ses permissions. Sous Symfony avant 4.1, les workers
+`rabbitmq-consumer` reçoivent un exchange direct, une file par transport et un
+binding par clé de routage — files d'échec seulement sous `--failed`.
 
 **Les arguments d'une file sont immuables.** Modifier un TTL, un exchange de rejet
 ou le type d'une file existante exige de la recréer, ce qui détruit les messages en
@@ -505,7 +507,7 @@ d'une suppression, ou pendant la copie d'un clone.
 
 ## Documentation
 
-- [`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md) — la référence : 127 décisions d'architecture (D1–D127)
+- [`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md) — la référence : 128 décisions d'architecture (D1–D128)
   arbitrées, spécification par module, plan de tests, découpage en lots.
 - [`docs/UTILISATION.md`](docs/UTILISATION.md) — déclarer un site, l'appliquer, le faire vivre ; fichiers
   retouchés et `--force`, suppression et restauration, migration d'un ancien serveur.

@@ -12,8 +12,8 @@ Les commits ne mentionnent jamais l'assistance d'un outil d'IA.
 
 ## La référence
 
-[`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md) fait autorité : 127 décisions d'architecture
-arbitrées (D1–D127, tableau §2), spécification par module, plan de tests, découpage en lots. **Consulter le
+[`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md) fait autorité : 128 décisions d'architecture
+arbitrées (D1–D128, tableau §2), spécification par module, plan de tests, découpage en lots. **Consulter le
 tableau des décisions avant de proposer une architecture** — la plupart des questions « pourquoi pas
 plutôt… ? » y sont déjà tranchées, avec leur raison. Toute décision nouvelle s'y ajoute.
 
@@ -1201,7 +1201,8 @@ Ils ont tous coûté un défaut réel ; les tests unitaires ne les voyaient pas.
   et faisait dérouler l'apply au premier binding, sur « identifiants refusés ». Le plan pose les permissions
   du compte d'`amqp.yaml` sur chaque vhost d'ogs, et un 401 sur un vhost est départagé par `/api/whoami`.
 - **Une file quorum refuse `if-empty` et `if-unused`** : `DELETE /api/queues/<v>/<f>?if-empty=true&if-unused=true`
-  rend 400, et le préréglage Messenger déclare ses transports en quorum. Le retrait d'une file relit ses
+  rend 400 — les files du préréglage (Symfony avant 4.1, D128) sont classiques, mais une file déclarée à la main
+  peut être en quorum. Le retrait d'une file relit ses
   compteurs juste avant de la retirer sans condition ; seule une file classique est jugée par le broker
   lui-même. Et ce que l'application crée elle-même dans son vhost (Messenger, `auto_setup`) n'est jamais
   retiré : seul ce que la trace `amqp-declared/<vhost>` dit qu'ogs a déclaré l'est (D100).

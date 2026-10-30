@@ -193,37 +193,29 @@ func sortedQueueNames(queues map[string]amqp.Queue) []string {
 func newAMQPMessengerCommand(app *App) *cobra.Command {
 	var (
 		transports []string
+		failed     bool
 		noFailed   bool
 	)
 	cmd := &cobra.Command{
 		Use:   "messenger <id>",
 		Short: "Déclarer le transport Symfony Messenger d'un projet",
-		Long: "Produit la configuration attendue par le transport AMQP de Messenger : un\n" +
-			"exchange direct, une file par transport, un binding par clé de routage et une\n" +
-			"file d'échec pour rejouer les messages rejetés. Une déclaration AMQP existante\n" +
-			"est complétée, jamais remplacée : ce qu'elle porte déjà reste tel quel.",
+		Long: "Déclare le vhost du projet, son compte et ses permissions. Messenger déclare\n" +
+			"lui-même exchanges, files et liaisons (auto_setup) et gère seul ses échecs\n" +
+			"(nouvelles tentatives, failure_transport) : ogs ne lui impose aucune topologie.\n" +
+			"Sous Symfony avant 4.1, sans Messenger, les workers rabbitmq:consumer reçoivent\n" +
+			"un exchange direct, une file par transport et un binding par clé de routage,\n" +
+			"plus une file d'échec par transport sous --failed. Une déclaration AMQP\n" +
+			"existante est complétée, jamais remplacée : ce qu'elle porte déjà reste tel quel.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			p, err := app.loadProject(args[0])
 			if err != nil {
 				return err
 			}
-			at, err := p.AppType()
-			if err != nil {
-				return exitf(CodeValidation, "%s", err)
-			}
-			// Messenger n'existe qu'à partir de Symfony 4.1 : le proposer sur un
-			// projet en 3.4 produirait une configuration inutilisable.
-			if p.Spec.App.Kind == model.KindSymfony &&
-				!model.SupportsMessenger(p.Spec.App.Kind, p.Spec.App.Version) {
-				return exitf(CodeUsage, "Symfony %s n'a pas le composant Messenger "+
-					"(introduit en 4.1) : employer le template rabbitmq-consumer", p.Spec.App.Version)
-			}
-			_ = at
 			// La déclaration existante est complétée, jamais remplacée (D121) : ce
 			// qui la quitte quitte aussi le broker au prochain apply (D100).
 			var notes []string
-			p.Spec.AMQP, notes = amqp.Complete(p.Spec.AMQP, amqp.Preset(p, transports, !noFailed))
+			p.Spec.AMQP, notes = amqp.Complete(p.Spec.AMQP, amqp.Declaration(p, transports, failed))
 			if err := app.prepare(p); err != nil {
 				return err
 			}
@@ -244,7 +236,11 @@ func newAMQPMessengerCommand(app *App) *cobra.Command {
 			}
 			app.printf("✓ transport AMQP déclaré pour %s\n", p.ID())
 			app.printf("  vhost      %s\n", p.Spec.AMQP.Vhost)
-			app.printf("  files      %s\n", strings.Join(queueNames(p.Spec.AMQP), ", "))
+			if names := queueNames(p.Spec.AMQP); len(names) > 0 {
+				app.printf("  files      %s\n", strings.Join(names, ", "))
+			} else {
+				app.printf("  files      déclarées par l'application (auto_setup de Messenger)\n")
+			}
 			app.printf("\nAppliquer :\n  ogs apply %s\n", p.ID())
 			if len(notes) > 0 {
 				for _, n := range notes {
@@ -258,7 +254,10 @@ func newAMQPMessengerCommand(app *App) *cobra.Command {
 	}
 	f := cmd.Flags()
 	f.StringSliceVar(&transports, "transport", []string{"async"}, "transports à déclarer (répétable)")
-	f.BoolVar(&noFailed, "no-failed", false, "ne pas créer les files d'échec")
+	f.BoolVar(&failed, "failed", false, "files d'échec et exchange de rejet (Symfony avant 4.1 seulement)")
+	// --no-failed est devenu le défaut : l'option reste acceptée, sans effet.
+	f.BoolVar(&noFailed, "no-failed", false, "sans effet : les files d'échec ne sont plus créées par défaut")
+	_ = f.MarkDeprecated("no-failed", "les files d'échec ne sont plus créées par défaut")
 	return cmd
 }
 
