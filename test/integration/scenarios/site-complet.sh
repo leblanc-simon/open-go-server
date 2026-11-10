@@ -60,6 +60,17 @@ echo "shell réconcilié après modification à la main"
 echo 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOpErateur opérateur@parc' > /opt/default_authorized_keys
 chown root:root /opt/default_authorized_keys
 chmod 0644 /opt/default_authorized_keys
+# Script de déploiement commun (D132) : un substitut qui, comme le vrai, déduit
+# sa configuration de l'emplacement du lien, sans le résoudre.
+cat > /opt/deploy.sh <<'DEPLOY'
+#!/usr/bin/env bash
+set -eu
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "${SCRIPT_DIR}/deploy.conf"
+echo "déploiement $(basename "${SCRIPT_DIR}") ${FRAMEWORK} ${BRANCH} ${ENVIRONNEMENT} $(id -un)"
+DEPLOY
+chown root:root /opt/deploy.sh
+chmod 0755 /opt/deploy.sh
 ogs site create keys.test --kind static --tls=false --yes 2>&1 | tail -3
 
 lien=/home/keys.test/.ssh/authorized_keys
@@ -89,6 +100,34 @@ fi
 # Rejouer ne doit rien changer : le lien conforme sort du plan.
 if ogs apply keystest --yes 2>&1 | grep -qi "authorized"; then
     echo "ÉCHEC : le lien déjà conforme reparaît dans le plan"
+    exit 1
+fi
+# Le lien du script commun et sa configuration, au compte du projet (D132).
+if [ "$(readlink /home/keys.test/deploy.sh)" != /opt/deploy.sh ]; then
+    echo "ÉCHEC : ~/deploy.sh ne désigne pas /opt/deploy.sh"
+    ls -l /home/keys.test/ 2>&1 | sed 's/^/  /'
+    exit 1
+fi
+conf_stat=$(stat -c '%U:%G %a' /home/keys.test/deploy.conf)
+lien_stat=$(stat -c '%U:%G' /home/keys.test/deploy.sh)
+echo "déploiement : lien $lien_stat, deploy.conf $conf_stat"
+if [ "$conf_stat" != "keystest:keystest 600" ] || [ "$lien_stat" != "keystest:keystest" ]; then
+    echo "ÉCHEC : deploy.sh et deploy.conf doivent être au projet (deploy.conf en 0600)"
+    exit 1
+fi
+sortie=$(cd / && runuser -u keystest -- /home/keys.test/deploy.sh)
+if [ "$sortie" != "déploiement keys.test none main prod keystest" ]; then
+    echo "ÉCHEC : le script lancé par le lien a lu « $sortie »"
+    exit 1
+fi
+# deploy.conf est au projet : retouché, il n'est jamais réécrit, ni signalé.
+echo 'BRANCH="release"' >> /home/keys.test/deploy.conf
+if ogs apply keystest --yes 2>&1 | grep -q "deploy"; then
+    echo "ÉCHEC : deploy.conf retouché reparaît dans le plan"
+    exit 1
+fi
+if ! grep -q 'BRANCH="release"' /home/keys.test/deploy.conf; then
+    echo "ÉCHEC : deploy.conf retouché a été réécrit"
     exit 1
 fi
 # Un authorized_keys posé à la main porte l'accès de quelqu'un : il est préservé.

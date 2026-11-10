@@ -350,6 +350,49 @@ func (a *App) checkDefaultAuthorizedKeys() (status, detail, fix string) {
 	return "ok", fmt.Sprintf("%s (mode %04o), lié dans le .ssh de chaque projet", keys, perm), ""
 }
 
+// checkDeployScript contrôle le script de déploiement commun du parc (D132). Un
+// statut vide signifie « pas de script » : la fonction est facultative.
+//
+// Chaque compte de projet l'exécute par le lien deploy.sh de son home : un script
+// qu'un autre que root peut réécrire fait exécuter son code sous l'identité de
+// tous les projets du parc. Il doit aussi être lisible et exécutable par eux.
+func (a *App) checkDeployScript() (status, detail, fix string) {
+	script := a.Paths.DeployScript()
+	info, err := os.Lstat(script)
+	if err != nil {
+		return "", "", ""
+	}
+	if !info.Mode().IsRegular() {
+		return "échec", fmt.Sprintf("%s n'est pas un fichier régulier", script), ""
+	}
+	var problems []string
+	perm := info.Mode().Perm()
+	if perm&0o005 != 0o005 {
+		problems = append(problems,
+			fmt.Sprintf("mode %04o : ni lisible ni exécutable par les utilisateurs des projets", perm))
+	}
+	// Sous préfixe, l'arborescence appartient à qui fait tourner l'essai.
+	if a.Prefix == "" {
+		if uid, _, ok := system.OwnerOf(info); ok && uid != 0 {
+			problems = append(problems, fmt.Sprintf("propriétaire uid %d, attendu root", uid))
+		}
+		if perm&0o022 != 0 {
+			problems = append(problems,
+				fmt.Sprintf("mode %04o : inscriptible au-delà de root, donc par d'autres que lui", perm))
+		}
+		parent := filepath.Dir(script)
+		if pinfo, perr := os.Stat(parent); perr == nil && pinfo.Mode().Perm()&0o022 != 0 {
+			problems = append(problems, fmt.Sprintf("%s (mode %04o) est inscriptible au-delà de root",
+				parent, pinfo.Mode().Perm()))
+		}
+	}
+	if len(problems) > 0 {
+		return "échec", strings.Join(problems, " ; "),
+			"chown root:root " + script + " && chmod 0755 " + script
+	}
+	return "ok", fmt.Sprintf("%s (mode %04o), lié dans le home de chaque projet", script, perm), ""
+}
+
 // htaccessChecks signale, pour chaque projet servi par Apache, ce que ses
 // .htaccess portent et que le vhost ne reprend pas. Depuis D99, ogs n'active plus
 // les .htaccess sous Apache (AllowOverride None) — un .htaccess servi par
@@ -657,6 +700,10 @@ func (a *App) runChecks(ctx context.Context) []check {
 	// à lire une ligne de plus.
 	if status, detail, fix := a.checkDefaultAuthorizedKeys(); status != "" {
 		add("trousseau de clés commun", status, detail, fix)
+	}
+	// Script de déploiement commun (D132) : exécuté par tous les comptes de projet.
+	if status, detail, fix := a.checkDeployScript(); status != "" {
+		add("script de déploiement commun", status, detail, fix)
 	}
 
 	// Shell des comptes de projet : useradd accepte un chemin qui n'existe pas, et

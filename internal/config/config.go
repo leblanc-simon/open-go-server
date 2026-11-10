@@ -811,6 +811,12 @@ const (
 	// fichier géré par ogs — c'est l'administrateur qui le pose et le tient à
 	// jour ; ogs ne fait que le lier, et « doctor » en contrôle les droits.
 	defaultAuthorizedKeysFile = "/opt/default_authorized_keys"
+
+	// deployScriptFile est le script de déploiement commun du parc : s'il existe,
+	// le home de chaque projet en porte un lien deploy.sh et sa configuration
+	// deploy.conf (D132). Comme le trousseau, il est à l'administrateur — posé par
+	// le script d'installation du serveur — ; ogs ne fait que le lier.
+	deployScriptFile = "/opt/deploy.sh"
 )
 
 // NewPaths construit les chemins pour un préfixe donné.
@@ -844,6 +850,10 @@ func (p Paths) ACMEChallenge() string { return p.join(libDir, "acme-challenge") 
 // DefaultAuthorizedKeys renvoie le trousseau de clés commun du parc, lié dans le
 // .ssh de chaque projet lorsqu'il est présent.
 func (p Paths) DefaultAuthorizedKeys() string { return p.join(defaultAuthorizedKeysFile) }
+
+// DeployScript renvoie le script de déploiement commun du parc, lié dans le home
+// de chaque projet lorsqu'il est présent (D132).
+func (p Paths) DeployScript() string { return p.join(deployScriptFile) }
 
 // ACMEChallengeTokens est le répertoire où les jetons sont réellement déposés :
 // le client ACME ajoute « .well-known/acme-challenge » au webroot qu'on lui

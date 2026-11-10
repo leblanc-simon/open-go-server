@@ -332,6 +332,13 @@ func (p *Provider) Plan(_ context.Context, proj *model.Project, obs Observed) ([
 	if s := p.binStep(proj); s != nil {
 		steps = append(steps, s)
 	}
+	// Script de déploiement commun et sa configuration (D132).
+	if s := p.deployLinkStep(proj); s != nil {
+		steps = append(steps, s)
+	}
+	if s := p.deployConfStep(proj); s != nil {
+		steps = append(steps, s)
+	}
 	// 7. Journaux, hors du home (D71) : la chaîne root, les fichiers pré-créés,
 	// et le lien de commodité du home.
 	steps = append(steps, p.logSteps(proj, obs)...)

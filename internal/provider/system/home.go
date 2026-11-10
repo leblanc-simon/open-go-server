@@ -115,7 +115,8 @@ func (p *Provider) PreexistingHome(proj *model.Project, obs Observed) error {
 // au premier niveau, les répertoires de spec.layout.dirs, ceux des gestionnaires
 // de runtime (.nvm, .rbenv, .pyenv, et les venvs .venv-<version> de D123 avec
 // leur lien ~/.venv, qu'une saga déroulée laisse), les anciens
-// .bin et logs et le lien ~/logs (D70, D71) ; dans .ssh, la clé de déploiement,
+// .bin et logs et le lien ~/logs (D70, D71), le lien deploy.sh vers le script
+// commun et le deploy.conf qu'ogs pose (D132) ; dans .ssh, la clé de déploiement,
 // known_hosts et le lien vers le trousseau commun (D61) ; dans .local, bin, qui
 // ne porte que des liens (D70). Ni le contenu des répertoires du projet — www/,
 // c'est le site —, ni celui des gestionnaires de runtime ne sont jugés : pour ces
@@ -150,6 +151,19 @@ func (p *Provider) notSkeleton(proj *model.Project) ([]string, error) {
 		name := e.Name()
 		switch {
 		case name == model.LogLink && e.Type()&os.ModeSymlink != 0:
+			continue
+		case name == DeployLink && e.Type()&os.ModeSymlink != 0:
+			// Le lien vers le script de déploiement commun (D132) — vers lui seul.
+			if target, err := readlinkAt(rootFD, DeployLink); err == nil && target == p.Paths.DeployScript() {
+				continue
+			}
+			if !add(strconv.Quote(name)) {
+				return out, nil
+			}
+			continue
+		case name == DeployConf && deployConfIsOurs(rootFD, proj):
+			// Le deploy.conf tel qu'ogs le pose pour ce projet (D132) ; retouché,
+			// il peut porter les hooks d'un ancien titulaire.
 			continue
 		case name == ".venv" && e.Type()&os.ModeSymlink != 0:
 			// Le lien vers le venv de la version déclarée (D123).

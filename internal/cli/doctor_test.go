@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"leblanc.io/open-go-server/internal/config"
 	"leblanc.io/open-go-server/internal/provider/monitoring"
 	"leblanc.io/open-go-server/internal/secret"
 	"leblanc.io/open-go-server/internal/store"
@@ -400,5 +401,29 @@ func TestDoctorNeSignaleRienQuandLaSupervisionEstActive(t *testing.T) {
 	out, _ := h.run("doctor")
 	if strings.Contains(out, "supervision désactivée") {
 		t.Errorf("la supervision n'est pas désactivée en configuration :\n%s", out)
+	}
+}
+
+func TestLeScriptDeDeploiementCommunSeJugeSiPresent(t *testing.T) {
+	a := &App{Prefix: t.TempDir()}
+	a.Paths = config.NewPaths(a.Prefix)
+	if status, _, _ := a.checkDeployScript(); status != "" {
+		t.Errorf("sans script, rien à dire : %q", status)
+	}
+	script := a.Paths.DeployScript()
+	if err := os.MkdirAll(filepath.Dir(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(script, []byte("#!/bin/sh\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if status, detail, _ := a.checkDeployScript(); status != "échec" {
+		t.Errorf("un script que les projets ne peuvent exécuter doit être signalé : %s / %s", status, detail)
+	}
+	if err := os.Chmod(script, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if status, detail, _ := a.checkDeployScript(); status != "ok" {
+		t.Errorf("script conforme : %s / %s", status, detail)
 	}
 }
