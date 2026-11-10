@@ -93,9 +93,10 @@ migration:
   ttl_final: 3600
 
   # Où sont gérées les zones DNS. ogs ne sait émettre un certificat AVANT la
-  # bascule (challenge dns-01) que pour une zone chez OVH ; ailleurs, le
-  # certificat est émis juste après la bascule (http-01), et le site n'est
-  # servi qu'en HTTP le temps de l'émission (une à deux minutes).
+  # bascule (challenge dns-01) que pour une zone chez OVH ; ailleurs, il reprend
+  # celui de la source (projets[].source.certificat), ou l'émet juste après la
+  # bascule (http-01) — le site n'est alors servi qu'en HTTP le temps de
+  # l'émission (une à deux minutes).
   dns:
     - zone: ~                     # ex. shop.fr
       hebergeur: ~                # ovh | gandi | cloudflare | client…
@@ -173,6 +174,16 @@ projets:
         - public/maintenance.flag # posé DANS le code : sans cela, la dernière copie
                                   # l'emporterait, et la cible s'ouvrirait en maintenance
       volume_estime: ~            # `du -sh` — règle la durée de la pré-synchronisation
+      # Certificat en service sur l'ancien serveur : le répertoire live/ de certbot,
+      # qui porte fullchain.pem et privkey.pem (`ogs import scan` les liste). Repris
+      # sur la cible avant le premier apply (`ogs cert import`, D130) : le site y est
+      # servi en HTTPS dès la vérification, avant la bascule, et ogs le renouvelle
+      # ensuite par son propre compte ACME. Il doit couvrir au moins un domaine du
+      # projet et rester valable plus de 30 jours, sans quoi ogs tente de le
+      # renouveler — en vain tant que le DNS désigne la source. `~` : aucun, le
+      # certificat est alors émis après la bascule. Désactiver certbot sur la source
+      # une fois le site basculé.
+      certificat: /etc/letsencrypt/live/shop.fr
       # Fichiers de configuration applicative qui portent des identifiants de
       # base, d'AMQP ou des chemins absolus. Ils sont réécrits après copie.
       configuration:
@@ -385,8 +396,13 @@ projets:
 #     donnent le même, shop.preprod-pp.net — et son home s'en déduit ;
 #   - le déposer dans /etc/ogs/projects/<id>.yaml ;
 #   - `ogs amqp messenger <id> --transport …` si `amqp.present` ;
-#   - `ogs apply <id> --yes` : compte, home, pool, bases vides, vhost.
-#     Le certificat http-01 échoue tant que le DNS pointe la source : code 6, attendu ;
+#   - si `source.certificat` : fullchain.pem et privkey.pem lus par ssh vers le
+#     répertoire privé de l'exécution, puis `ogs cert import <id>` — un certificat
+#     déjà présent sur la cible est laissé tel quel, un refus arrête la déclaration
+#     avant l'apply ; rien n'est repris une fois la bascule faite ;
+#   - `ogs apply <id> --yes` : compte, home, pool, bases vides, vhost — en HTTPS
+#     sur le certificat repris. Sans lui, le certificat http-01 échoue tant que le
+#     DNS pointe la source : code 6, attendu ;
 #   - `ogs mail dkim records <id>` → enregistrement à publier (hors script).
 #
 # PHASE 2 — Pré-synchroniser (par projet, répétable, sans interruption)

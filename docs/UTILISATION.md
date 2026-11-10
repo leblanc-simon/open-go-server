@@ -539,9 +539,11 @@ cible. `prealables` passe les projets dont la bascule est engagée — leur DNS 
 n'avertit que d'un domaine qui n'a encore aucune adresse.
 
 - **Déclarer** dépose la déclaration **crons et services désactivés** : une tâche ne doit jamais tourner sur
-  les deux serveurs à la fois. Le certificat échoue tant que le DNS désigne l'ancien serveur — code 6,
-  attendu. Une zone chez OVH l'obtient d'avance dès que ses identifiants la déclarent
-  (`ogs cert dns-provider set <jeu> --zone <zone>`, voir plus bas).
+  les deux serveurs à la fois. Avec `source.certificat` — le `live/` de certbot sur l'ancien serveur —, le
+  certificat en place y est repris avant le premier apply (`ogs cert import`, voir plus bas) : le site est
+  servi en HTTPS dès la vérification, et ogs le renouvelle ensuite lui-même. Sans lui, le certificat échoue
+  tant que le DNS désigne l'ancien serveur — code 6, attendu ; une zone chez OVH l'obtient d'avance dès que
+  ses identifiants la déclarent (`ogs cert dns-provider set <jeu> --zone <zone>`, voir plus bas).
 - **Synchroniser** ne coupe rien : l'ancien serveur continue de servir. La rejouer la veille de la bascule
   réduit la dernière copie à presque rien. Une fois la bascule engagée, elle est **refusée** : la cible fait
   foi, et une nouvelle copie écraserait ce que les visiteurs y ont écrit.

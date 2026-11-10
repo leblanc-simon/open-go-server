@@ -19,7 +19,8 @@
 #   prealables     outils, ogs doctor, accès ssh à la source, TTL des zones,
 #                  domaines résolus exactement vers la source (projets dont la
 #                  bascule n'est pas engagée)
-#   declarer       dépose la déclaration ogs (crons et services désactivés), apply
+#   declarer       dépose la déclaration ogs (crons et services désactivés),
+#                  importe le certificat de la source (source.certificat), apply
 #   synchroniser   copie fichiers et bases, réécrit la configuration — répétable,
 #                  sans interruption de service, jusqu'à la bascule : refusée
 #                  ensuite, la cible faisant foi
@@ -484,6 +485,10 @@ def c_controle(m, prefixe, *ids):
                 e(pid, f"source.{cle} est requis")
         if src.get("racine") and not str(src["racine"]).startswith("/"):
             e(pid, "source.racine doit être absolu")
+        cert = src.get("certificat")
+        if cert is not None and (not isinstance(cert, str) or not cert.startswith("/")
+                                 or ".." in cert.split("/")):
+            e(pid, "source.certificat : chemin absolu du répertoire live/ de certbot attendu, ou ~")
         for dh in src.get("donnees_hors_code") or []:
             if not dh.get("de") or not dh.get("vers"):
                 e(pid, "donnees_hors_code : « de » et « vers » requis")
@@ -1078,6 +1083,15 @@ phase_prealables() {
         else
             erreur "$id : $racine/$code introuvable sur la source"; manque=1
         fi
+        local cert
+        cert="$(m "$id" source.certificat)"
+        if [[ -n "$cert" ]]; then
+            if src_lire "test -r $(printf '%q' "$cert/fullchain.pem") && test -r $(printf '%q' "$cert/privkey.pem")"; then
+                ok "$id : certificat $cert"
+            else
+                erreur "$id : $cert/fullchain.pem ou privkey.pem illisible sur la source"; manque=1
+            fi
+        fi
         while IFS=$'\x1f' read -r moteur base; do
             [[ -n "$moteur" ]] || continue
             case "$moteur" in
@@ -1131,6 +1145,43 @@ phase_prealables() {
 # =============================================================================
 # PHASE declarer
 # =============================================================================
+# importer_certificat <id> : pose sur la cible le certificat que certbot tient sur
+# la source (source.certificat), avant le premier apply (D130). Sans lui, cet
+# apply tenterait une émission HTTP-01, vouée à l'échec tant que le DNS désigne
+# la source — et comptée dans la limite de validations ratées de l'autorité —,
+# et le site ne serait servi qu'en HTTP jusqu'à l'émission qui suit la bascule.
+# ogs le renouvelle ensuite par son propre compte ACME.
+#
+# La clé privée transite par la sortie de ssh vers le répertoire privé de
+# l'exécution (0700, supprimé à la sortie), jamais par une ligne de commande. Un
+# certificat déjà présent sur la cible — déclaration rejouée, émission par dns-01
+# — est laissé tel quel (code 4 d'ogs).
+importer_certificat() {
+    local id="$1" cert paire rc=0
+    cert="$(m "$id" source.certificat)"
+    [[ -n "$cert" ]] || return 0
+    etape "Certificat de la source ($cert)"
+    if bascule_active "$id"; then
+        info "bascule faite : la cible fait foi, certificat de la source non repris"
+        return 0
+    fi
+    paire="$(temporaire -d)"
+    if ((EXECUTER)); then
+        (umask 077
+         src_lire "cat $(printf '%q' "$cert/fullchain.pem")" >"$paire/fullchain.pem" \
+             && src_lire "cat $(printf '%q' "$cert/privkey.pem")" >"$paire/privkey.pem") \
+            || fatal "$id : $cert illisible sur la source"
+    fi
+    faire "${OGS[@]}" cert import "$id" --cert "$paire/fullchain.pem" --key "$paire/privkey.pem" || rc=$?
+    rm -f -- "$paire/privkey.pem"
+    case $rc in
+        0) if ((EXECUTER)); then ok "certificat importé : le premier apply sert le site en HTTPS, sans émission"; fi ;;
+        6) avert "ogs cert import : certificat importé avec avertissements (code 6) — voir ci-dessus" ;;
+        4) info "un certificat est déjà présent sur la cible : laissé tel quel (ogs cert import --force pour le remplacer)" ;;
+        *) fatal "$id : certificat de la source refusé (code $rc) — le corriger, ou retirer source.certificat : le site sera alors servi en HTTP jusqu'à l'émission qui suit la bascule" ;;
+    esac
+}
+
 declarer_projet() {
     local id="$1" fichier brouillon desactiver=1
     titre "Déclaration de $id"
@@ -1165,6 +1216,8 @@ declarer_projet() {
         fi
     fi
     ((desactiver)) && info "crons et services désactivés jusqu'à la bascule"
+
+    importer_certificat "$id"
 
     etape "Application"
     ogs_faire apply "$id" --yes
