@@ -3,6 +3,7 @@ package fs
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -154,4 +155,36 @@ func substitute(dir, target string, rest []string) string {
 		target = filepath.Join(dir, target)
 	}
 	return filepath.Clean(filepath.Join(append([]string{target}, rest...)...))
+}
+
+// ReadDesignated lit en entier, borné à limit octets, le fichier ordinaire que
+// l'exploitant désigne — la paire d'un certificat importé (D130). Le chemin est
+// parcouru comme pour OpenParentDir : un lien n'est suivi que si seul root a pu
+// le poser, ce qui admet le « live/ » de certbot, dont les liens pointent vers
+// « archive/ » sous /etc/letsencrypt, et refuse celui qu'un utilisateur de
+// projet poserait dans son home vers une clé privée du parc. Un tube nommé ou
+// un périphérique sont refusés sur le descripteur ouvert.
+func ReadDesignated(path string, limit int64) ([]byte, error) {
+	dir, name, err := OpenParentDir(path, false, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer dir.Close()
+	f, err := dir.OpenFile(name)
+	if errors.Is(err, ErrNotRegular) {
+		return nil, fmt.Errorf("%s n'est pas un fichier ordinaire, ou c'est un lien posé dans un répertoire "+
+			"qu'un autre compte que root peut modifier : ogs ne le lit pas — désigner le fichier réel", path)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, limit+1))
+	if err != nil {
+		return nil, fmt.Errorf("%s : %w", path, err)
+	}
+	if int64(len(data)) > limit {
+		return nil, fmt.Errorf("%s : fichier de plus de %d octets, refusé", path, limit)
+	}
+	return data, nil
 }

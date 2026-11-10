@@ -12,8 +12,8 @@ Les commits ne mentionnent jamais l'assistance d'un outil d'IA.
 
 ## La référence
 
-[`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md) fait autorité : 128 décisions d'architecture
-arbitrées (D1–D128, tableau §2), spécification par module, plan de tests, découpage en lots. **Consulter le
+[`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md) fait autorité : 130 décisions d'architecture
+arbitrées (D1–D130, tableau §2), spécification par module, plan de tests, découpage en lots. **Consulter le
 tableau des décisions avant de proposer une architecture** — la plupart des questions « pourquoi pas
 plutôt… ? » y sont déjà tranchées, avec leur raison. Toute décision nouvelle s'y ajoute.
 
@@ -50,12 +50,12 @@ make dev-demo                                   # crée ./dev, deux projets, pla
 
 ### Essais sur système réel
 
-Vingt et un scénarios conteneurisés éprouvent ce que les tests unitaires ne peuvent pas voir. Ils ont mis au jour
+Vingt-deux scénarios conteneurisés éprouvent ce que les tests unitaires ne peuvent pas voir. Ils ont mis au jour
 plus de trente défauts invisibles autrement (§18 du cahier des charges) : **y recourir avant de déclarer un
 provider fonctionnel**.
 
 ```sh
-make integration-all       # les vingt et un, à la suite
+make integration-all       # les vingt-deux, à la suite
 make integration-nginx     # un seul (voir SCENARIOS dans le Makefile)
 
 # Hors série : rbenv et pyenv compilent depuis les sources (un quart d'heure).

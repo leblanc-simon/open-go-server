@@ -54,6 +54,7 @@ var dryRunConducts = map[string]dryRunConduct{
 	// hook « pre » et avant sa première écriture.
 	"ogs apply":             dryRunSimulated, // plan de chaque projet affiché, rien d'exécuté
 	"ogs amqp messenger":    dryRunSimulated, // déclaration affichée, non écrite
+	"ogs cert import":       dryRunSimulated, // paire contrôlée et décrite, rien d'écrit
 	"ogs cert issue":        dryRunSimulated, // demande affichée, aucune émission
 	"ogs cron add":          dryRunSimulated,
 	"ogs db add":            dryRunSimulated,

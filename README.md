@@ -7,7 +7,7 @@ PostgreSQL, vhost et files RabbitMQ, pool PHP-FPM, vhost Apache ou Nginx, certif
 et services systemd. Un projet est décrit par un fichier YAML ; un moteur de réconciliation idempotent amène
 le serveur dans l'état décrit.
 
-Le cahier des charges technique complet — 128 décisions d'architecture arbitrées (D1–D128), spécification
+Le cahier des charges technique complet — 130 décisions d'architecture arbitrées (D1–D130), spécification
 par module, plan de tests, découpage en lots — est dans [`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md).
 C'est la référence : toute contribution s'y adosse.
 
@@ -117,7 +117,7 @@ ogs template list | show | extract <nom>
 ogs db list | add | remove | dump | restore
 ogs db user add | rotate <id> <utilisateur>
 ogs secrets list | show | env <id>
-ogs cert list | issue | renew | revoke | delete
+ogs cert list | issue | import | renew | revoke | delete
 ogs cert dns-provider set ovh --application-key … | --client-id …   (secrets demandés)
 ogs amqp status | messenger | queue add | queue purge
 ogs amqp credentials set --user …           (mot de passe demandé)
@@ -507,7 +507,7 @@ d'une suppression, ou pendant la copie d'un clone.
 
 ## Documentation
 
-- [`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md) — la référence : 128 décisions d'architecture (D1–D128)
+- [`docs/CAHIER-DES-CHARGES.md`](docs/CAHIER-DES-CHARGES.md) — la référence : 130 décisions d'architecture (D1–D130)
   arbitrées, spécification par module, plan de tests, découpage en lots.
 - [`docs/UTILISATION.md`](docs/UTILISATION.md) — déclarer un site, l'appliquer, le faire vivre ; fichiers
   retouchés et `--force`, suppression et restauration, migration d'un ancien serveur.

@@ -579,6 +579,29 @@ sudo ogs                                    # interface en mode texte
 
 Toutes les commandes acceptent `-o json` ou `-o yaml`, et `man ogs-<commande>` détaille chacune.
 
+### Certificat repris d'un autre serveur
+
+Pour migrer un site sans passer par une période en HTTP seul, la cible reprend le certificat que certbot
+tient sur l'ancien serveur (`/etc/letsencrypt/live/<domaine>/`). Le site est servi en HTTPS avant la
+bascule du DNS, sans aucune émission — une émission HTTP-01 échouerait, le DNS désignant encore l'ancien
+serveur :
+
+```sh
+scp ancien:/etc/letsencrypt/live/shop.fr/{fullchain,privkey}.pem /root/shop.fr/
+sudo ogs site create shop.fr --kind php-symfony --alias www.shop.fr \
+    --cert /root/shop.fr/fullchain.pem --key /root/shop.fr/privkey.pem
+# … reprise des données, vérification (curl --resolve shop.fr:443:<ip de la cible> …), bascule du DNS
+```
+
+Pour un site déjà créé : `sudo ogs cert import shopfr --cert … --key …`, puis `sudo ogs apply shopfr`.
+Un certificat déjà présent n'est remplacé que sous `--force`, après sauvegarde dans `/var/lib/ogs/backups`.
+
+ogs traite ensuite ce certificat comme les siens : il le renouvelle par son propre compte ACME trente jours
+avant l'échéance, ce qui suppose que le DNS ait basculé d'ici là. Une clé chiffrée ou dépareillée, un
+certificat échu, de test ou auto-signé sont refusés (code 3) ; une échéance proche, un nom non couvert ou
+une chaîne non vérifiable sont signalés (code 6), le certificat posé quand même. Après la bascule,
+désactiver certbot sur l'ancien serveur : ses renouvellements y échoueraient.
+
 ### Certificats par le DNS
 
 Un certificat passe par le challenge DNS-01, sans rien changer à la déclaration du projet, dès que **tous**

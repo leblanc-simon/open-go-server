@@ -28,6 +28,7 @@ func newCertCommand(app *App) *cobra.Command {
 	cmd.AddCommand(
 		newCertListCommand(app),
 		newCertIssueCommand(app),
+		newCertImportCommand(app),
 		newCertRenewCommand(app),
 		newCertRevokeCommand(app),
 		newCertDeleteCommand(app),

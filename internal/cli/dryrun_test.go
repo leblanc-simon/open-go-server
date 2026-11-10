@@ -267,12 +267,14 @@ type casDryRun struct {
 // casDryRunParCommande couvre chaque commande inscrite dans dryRunConducts. Les
 // commandes qui refusent l'option n'y figurent pas : leurs arguments importent
 // peu, le refus précède tout.
-func casDryRunParCommande(secret string) map[string]casDryRun {
+func casDryRunParCommande(secret, certImport, keyImport string) map[string]casDryRun {
 	return map[string]casDryRun{
 		// Simulations.
 		"ogs apply":          {[]string{"apply", "--yes"}, "--dry-run : rien n'a été appliqué"},
 		"ogs amqp messenger": {[]string{"amqp", "messenger", "shopfr"}, "vhost: shopfr"},
 		"ogs cert issue":     {[]string{"cert", "issue", "certfr"}, "--dry-run : certificat certfr"},
+		"ogs cert import": {[]string{"cert", "import", "certfr", "--cert", certImport, "--key", keyImport, "--force"},
+			"--dry-run : le certificat serait écrit"},
 		"ogs cron add": {[]string{"cron", "add", "shopfr", "nettoyage", "--schedule", "0 4 * * *",
 			"--command", "bin/console app:nettoyage"}, "--dry-run : tâche nettoyage"},
 		"ogs db add":            {[]string{"db", "add", "certfr", "--engine", "postgres"}, "--dry-run : la base postgres"},
@@ -401,7 +403,10 @@ func TestDryRunChaqueCommandeSimuleOuRefuse(t *testing.T) {
 			t.Errorf("dryRunConducts inscrit « %s », qui n'est pas une commande", path)
 		}
 	}
-	cas := casDryRunParCommande(secret)
+	ca := nouvelleAutorité(t)
+	ca.faireConfiance(t)
+	certImport, keyImport := ca.paire(t, t.TempDir(), quatreVingtJours, "cert.fr")
+	cas := casDryRunParCommande(secret, certImport, keyImport)
 	// Un groupe n'affiche que son aide, --dry-run compris (D101).
 	for path, c := range commandes {
 		if c.Annotations[groupAnnotation] == "true" {

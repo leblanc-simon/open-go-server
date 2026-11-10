@@ -57,6 +57,10 @@ type siteOptions struct {
 	crons      []string
 	preset     string
 	apply      bool
+	// certFile et keyFile désignent un certificat à importer avant le premier
+	// apply (D130).
+	certFile string
+	keyFile  string
 }
 
 func newSiteCreateCommand(app *App) *cobra.Command {
@@ -96,6 +100,34 @@ func newSiteCreateCommand(app *App) *cobra.Command {
 			if err := app.preexistingHome(cmd.Context(), p); err != nil {
 				return err
 			}
+			// Le certificat importé est contrôlé avant que rien ne soit écrit : une
+			// clé dépareillée ne laisse pas une déclaration derrière elle (D130).
+			var (
+				imported *certImport
+				provs    *providers
+			)
+			if opts.certFile != "" || opts.keyFile != "" {
+				if !opts.tls || opts.selfSigned {
+					return exitf(CodeUsage, "--cert et --key demandent un vhost en TLS, sans --tls=false ni --self-signed")
+				}
+				if provs, err = app.certProviders(); err != nil {
+					return err
+				}
+				defer provs.close()
+				c, err := app.prepareCertImport(provs, p, "", opts.certFile, opts.keyFile, "")
+				if err != nil {
+					return err
+				}
+				if _, present, _, err := provs.TLS.Store.ReadPair(c.req.Name); err != nil {
+					return wrap(CodeError, err)
+				} else if present {
+					return exitf(CodeConflict, "un certificat %s existe déjà (%s) : le retirer par « ogs cert delete "+
+						"%s », ou créer le site sans --cert puis « ogs cert import %s --force »",
+						c.req.Name, provs.TLS.Store.Dir(c.req.Name), c.req.Name, p.ID())
+				}
+				app.describeCertImport(c)
+				imported = &c
+			}
 			if app.DryRun {
 				data, err := spec.Encode(p)
 				if err != nil {
@@ -110,7 +142,29 @@ func newSiteCreateCommand(app *App) *cobra.Command {
 			if _, err := app.runHook(cmd.Context(), app.hookRunner(), p, hook.PreCreate, hook.Context{}); err != nil {
 				return err
 			}
+			// Le certificat précède la déclaration : le premier apply, ici ou plus
+			// tard, le trouve en place et rend le vhost en HTTPS sans rien émettre.
+			if imported != nil {
+				if err := app.writeCertImport(cmd.Context(), provs, p, *imported, false, false); err != nil &&
+					ExitCode(err) != CodePartial {
+					return err
+				}
+			}
+			// dropImported retire le certificat importé quand la création n'a pas
+			// laissé de déclaration : resté seul, il nommerait un projet absent.
+			dropImported := func() {
+				if imported == nil {
+					return
+				}
+				if _, err := os.Stat(path); !os.IsNotExist(err) {
+					return
+				}
+				if err := provs.TLS.RemoveUnserved(imported.req.Name); err != nil {
+					app.warnf("⚠ certificat importé %s laissé en place : %v\n", imported.req.Name, err)
+				}
+			}
 			if err := spec.Save(path, p); err != nil {
+				dropImported()
 				return wrap(CodeError, err)
 			}
 			if err := app.openStore(); err == nil {
@@ -121,9 +175,13 @@ func newSiteCreateCommand(app *App) *cobra.Command {
 			app.printf("\n✓ déclaration écrite : %s\n", path)
 			if !opts.apply {
 				app.printf("\nAppliquer :\n  ogs apply %s\n", p.ID())
-				return nil
+				return importCode(imported)
 			}
-			return app.applyProjects(cmd, []*model.Project{p})
+			if err := app.applyProjects(cmd, []*model.Project{p}); err != nil {
+				dropImported()
+				return err
+			}
+			return importCode(imported)
 		},
 	}
 	f := cmd.Flags()
@@ -147,7 +205,19 @@ func newSiteCreateCommand(app *App) *cobra.Command {
 		"tâche à déclarer, sous la forme « expression:commande » (répétable)")
 	f.StringVar(&opts.preset, "preset", "", "dimensionnement du pool PHP")
 	f.BoolVar(&opts.apply, "apply", true, "appliquer immédiatement")
+	f.StringVar(&opts.certFile, "cert", "",
+		"certificat émis ailleurs à importer avant le premier apply, chaîne complète PEM (fullchain.pem)")
+	f.StringVar(&opts.keyFile, "key", "", "clé privée du certificat importé, PEM en clair (privkey.pem)")
 	return cmd
+}
+
+// importCode rend le code 6 d'un import qui a averti : le site est créé, mais
+// l'exploitant doit lire ce qui a été dit du certificat.
+func importCode(c *certImport) error {
+	if c == nil || len(c.warnings()) == 0 {
+		return nil
+	}
+	return exitf(CodePartial, "certificat %s importé avec %d avertissement(s)", c.req.Name, len(c.warnings()))
 }
 
 // buildSite assemble un projet complet à partir des options.
