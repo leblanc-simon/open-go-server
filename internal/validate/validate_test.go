@@ -270,6 +270,34 @@ func TestUniquenessDetectsIdentifierCollision(t *testing.T) {
 	}
 }
 
+// D131 : un domaine d'envoi non servi reste unique dans le parc — la
+// SigningTable n'en admet qu'une clé —, et un projet ne signe pas sous un
+// domaine qu'un voisin sert.
+func TestUniquenessDomaineDEnvoiDKIM(t *testing.T) {
+	signe := func(host string, domains ...string) *model.Project {
+		p := newProject(t, host, naming.EnvProd, model.KindStatic)
+		p.Spec.Mail = &model.Mail{DKIM: &model.DKIM{Enabled: true, Domains: domains}}
+		return p
+	}
+	a := signe("shop.fr", "mail.shop.fr")
+	b := signe("blog.fr", "mail.shop.fr")
+	err := UniquenessFor([]*model.Project{a, b}, "preprod-pp.net", "blogfr")
+	if err == nil || !strings.Contains(err.Error(), "domaine d'envoi") {
+		t.Fatalf("deux projets signant mail.shop.fr : conflit attendu, obtenu %v", err)
+	}
+	voisin := newProject(t, "voisin.fr", naming.EnvProd, model.KindStatic)
+	c := signe("blog.fr", "www.voisin.fr")
+	if err := UniquenessFor([]*model.Project{voisin, c}, "preprod-pp.net", "blogfr"); err == nil {
+		t.Fatal("signer sous le domaine qu'un voisin sert doit être refusé")
+	}
+	// Signer ses propres domaines servis, défaut compris, n'est pas un conflit.
+	d := signe("shop.fr", "shop.fr", "mail.shop.fr")
+	e := signe("blog.fr")
+	if err := Uniqueness([]*model.Project{d, e}, "preprod-pp.net"); err != nil {
+		t.Fatalf("aucun conflit attendu : %v", err)
+	}
+}
+
 func TestUniquenessAllowsProdAndPrep(t *testing.T) {
 	prod := newProject(t, "shop.fr", naming.EnvProd, model.KindStatic)
 	prep := newProject(t, "shop.fr", naming.EnvPrep, model.KindStatic)
@@ -612,12 +640,13 @@ func TestSignatureDKIMRefuseeEnPreproduction(t *testing.T) {
 	}
 }
 
-func TestSignatureDKIMLimiteeAuxDomainesDuProjet(t *testing.T) {
+// D131 : un domaine d'envoi n'a pas à être servi en web — mail.shop.fr ou
+// shop-mail.fr pour le site shop.fr.
+func TestSignatureDKIMAdmetUnDomaineDEnvoiNonServi(t *testing.T) {
 	p := newProject(t, "shop.fr", naming.EnvProd, model.KindStatic)
-	p.Spec.Mail = &model.Mail{DKIM: &model.DKIM{Enabled: true, Domains: []string{"voisin.fr"}}}
-	err := Project(p, "/home")
-	if err == nil || !strings.Contains(err.Error(), "n'appartient pas aux domaines du projet") {
-		t.Fatalf("un domaine étranger au projet doit être refusé, obtenu : %v", err)
+	p.Spec.Mail = &model.Mail{DKIM: &model.DKIM{Enabled: true, Domains: []string{"mail.shop.fr", "shop-mail.fr"}}}
+	if err := Project(p, "/home"); err != nil {
+		t.Fatalf("un domaine d'envoi non servi doit être admis : %v", err)
 	}
 	p.Spec.Mail.DKIM.Domains = []string{"shop.fr", "SHOP.fr."}
 	if err := Project(p, "/home"); err == nil || !strings.Contains(err.Error(), "deux fois") {

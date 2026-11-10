@@ -299,12 +299,9 @@ func validateMail(p *model.Project, add func(string, string, ...any)) {
 			"elle authentifierait des envois de test au nom du domaine de production")
 		return
 	}
-	// Un domaine signé doit appartenir au projet : c'est ce qui rend la signature
-	// unique dans le parc, les domaines l'étant déjà.
-	own := map[string]bool{}
-	for _, d := range p.Spec.Domains {
-		own[model.MailDomain(d.Name)] = true
-	}
+	// Un domaine d'envoi n'a pas à être servi en web : un site shop.fr envoie
+	// sous mail.shop.fr ou shop-mail.fr (D131). Son unicité dans le parc est
+	// tenue par la clé « domaine d'envoi » d'uniquenessConflicts.
 	seen := map[string]bool{}
 	for i, d := range dkim.Domains {
 		f := fmt.Sprintf("spec.mail.dkim.domains[%d]", i)
@@ -317,9 +314,6 @@ func validateMail(p *model.Project, add func(string, string, ...any)) {
 			add(f, "domaine %q déclaré deux fois", d)
 		}
 		seen[name] = true
-		if !own[name] {
-			add(f, "le domaine %q n'appartient pas aux domaines du projet (spec.domains)", d)
-		}
 	}
 	if len(p.DKIMDomains()) == 0 {
 		add("spec.mail.dkim.domains", "aucun domaine à signer : le projet n'a aucun domaine primaire")
@@ -1049,6 +1043,11 @@ func uniquenessConflicts(projects []*model.Project, prepDomain string) []conflic
 		// Le nom d'un certificat est son répertoire : deux projets sous un même
 		// nom écrasent le certificat l'un de l'autre, clé privée comprise (D94).
 		{"certificat", map[string]int{}, certificateNames},
+		// Un domaine d'envoi signé n'a pas à être servi par le projet (D131) : la
+		// SigningTable n'en admet qu'une clé, et un projet ne signe pas sous le
+		// domaine qu'un voisin sert. Les domaines servis entrent donc aussi sous
+		// cette clé — entre eux, la clé « domaine » les tient déjà pour uniques.
+		{"domaine d'envoi", map[string]int{}, mailDomains},
 	}
 	for index, p := range projects {
 		for _, k := range kinds {
@@ -1320,4 +1319,17 @@ func isUnder(path, root string) bool {
 		return false
 	}
 	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+// mailDomains rend les domaines sous lesquels un projet signe ou pourrait
+// signer : ses domaines d'envoi DKIM et ses domaines servis, sous la forme
+// canonique de la clé « domaine » — « www.shop.fr » y vaut « shop.fr ».
+func mailDomains(p *model.Project) []string {
+	out := servedDomains(p)
+	for _, d := range p.DKIMDomains() {
+		if h, err := naming.NormalizeHost(d); err == nil {
+			out = append(out, h)
+		}
+	}
+	return out
 }

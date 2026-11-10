@@ -95,3 +95,28 @@ func TestDKIMActivateSeRejoue(t *testing.T) {
 		t.Errorf("sans clé préparée ni table en retard, code %d attendu, obtenu %d", CodeConflict, code)
 	}
 }
+
+// D131 : un domaine d'envoi n'a pas à être servi par le site — mail.shop.fr,
+// shop-mail.fr —, mais un seul projet du parc signe sous un nom, et jamais sous
+// celui qu'un voisin sert.
+func TestDKIMEnableDomaineDEnvoiNonServi(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("project", "create", "shop.fr", "--kind", "static")
+	h.mustRun("project", "create", "voisin.fr", "--kind", "static")
+
+	h.mustRun("mail", "dkim", "enable", "shopfr", "--domain", "mail.shop.fr", "--domain", "shop-mail.fr")
+	want := []string{"mail.shop.fr", "shop-mail.fr"}
+	if got := h.dkimDomaines(t, "shopfr"); !slices.Equal(got, want) {
+		t.Errorf("%v attendu, obtenu %v", want, got)
+	}
+	h.mustRunPartial("plan", "shopfr")
+
+	// shop-mail.fr est signé par shopfr, shop.fr servi par lui.
+	for _, domaine := range []string{"shop-mail.fr", "shop.fr"} {
+		out, code := h.run("mail", "dkim", "enable", "voisinfr", "--domain", domaine)
+		if code != CodeConflict || !strings.Contains(out, "domaine d'envoi") {
+			t.Errorf("signer %s depuis voisinfr : code %d, attendu %d :\n%s", domaine, code, CodeConflict, out)
+		}
+	}
+}

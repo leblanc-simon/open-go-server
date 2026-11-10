@@ -44,7 +44,9 @@ func newDKIMEnableCommand(app *App) *cobra.Command {
 		Use:   "enable <id>",
 		Short: "Demander la signature DKIM du courrier d'un projet",
 		Long: "Sans --domain, les domaines primaires du projet sont signés. --domain ajoute un\n" +
-			"domaine à ceux déjà signés, sans en retirer aucun. La clé est créée par « ogs apply »,\n" +
+			"domaine à ceux déjà signés, sans en retirer aucun ; il n'a pas à être servi par le\n" +
+			"site (mail.shop.fr, shop-mail.fr), mais un seul projet du parc signe sous un nom, et\n" +
+			"jamais sous celui qu'un autre sert. La clé est créée par « ogs apply »,\n" +
 			"qui signe aussitôt : une signature invérifiable ne vaut pas moins qu'une absence de\n" +
 			"signature. Refusé en préproduction.",
 		Args: cobra.ExactArgs(1),
@@ -56,6 +58,12 @@ func newDKIMEnableCommand(app *App) *cobra.Command {
 			before := p.DKIMDomains()
 			p.Spec.Mail = &model.Mail{DKIM: &model.DKIM{Enabled: true, Domains: enabledDomains(p, domains)}}
 			if err := app.prepare(p); err != nil {
+				return err
+			}
+			// Un domaine d'envoi n'a pas à être servi (D131) : son unicité dans le
+			// parc — un seul projet signe sous un nom, jamais celui qu'un voisin
+			// sert — se juge avant que la déclaration ne soit écrite.
+			if err := app.checkFleetUniqueness(p); err != nil {
 				return err
 			}
 			if lost := missingFrom(before, p.DKIMDomains()); len(lost) > 0 {

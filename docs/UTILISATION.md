@@ -304,6 +304,8 @@ spec:
   mail:
     dkim:
       enabled: true                      # clé DKIM par domaine, à publier dans le DNS
+      domains: [boutique.fr, mail.boutique.fr]  # défaut : les domaines primaires ; un domaine
+                                         # d'envoi n'a pas à être servi par le site
 
   sudo:
     verbs: [start, stop, restart, status]  # « sudo ogs my restart » depuis le compte du projet
