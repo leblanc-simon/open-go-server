@@ -262,13 +262,58 @@ func TestPresetDeclareOuHerite(t *testing.T) {
 		t.Errorf("hérité, machine large : 50 attendu, obtenu %s", got)
 	}
 
-	// En préproduction, le défaut hérité descend d'un cran ; le déclaré jamais.
+	// En préproduction, micro est imposé (D129), au preset déclaré comme à
+	// l'hérité — celui que site clone recopie de la production.
 	prep := model.New("shop.fr", naming.EnvPrep, model.KindSymfony)
 	prep.Spec.App.Version = "6.4"
 	if err := prep.Normalize(t.TempDir(), "preprod-pp.net"); err != nil {
 		t.Fatal(err)
 	}
 	prov.Config = config.Default()
+	if got := children(prep); got != "5" {
+		t.Errorf("préproduction, micro imposé au preset hérité : 5 attendu, obtenu %s", got)
+	}
+	resolve := func() Resolved {
+		t.Helper()
+		at, err := prep.AppType()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return Resolve(prov.Config, prov.Paths, prep, prep.Spec.PHP.Pools[0], at)
+	}
+	prep.Spec.PHP.Pools[0].Preset = "large"
+	if got := children(prep); got != "5" {
+		t.Errorf("préproduction, micro imposé au preset déclaré : 5 attendu, obtenu %s", got)
+	}
+	if got := resolve().DescribePreset(); got !=
+		"micro (imposé par l'environnement, large déclaré)" {
+		t.Errorf("libellé du preset imposé : %q", got)
+	}
+	// Les settings du projet gardent le dernier mot, clé par clé.
+	prep.Spec.PHP.Pools[0].Settings = model.PoolSettings{"pm.max_children": model.Value("8")}
+	if got := children(prep); got != "8" {
+		t.Errorf("préproduction, settings du projet : 8 attendu, obtenu %s", got)
+	}
+	prep.Spec.PHP.Pools[0].Settings = nil
+	// custom échappe à l'imposition : tout y vient des settings.
+	prep.Spec.PHP.Pools[0].Preset = "custom"
+	if got := children(prep); got != "" {
+		t.Errorf("préproduction, custom non imposé : aucun pm.max_children attendu, obtenu %s", got)
+	}
+	// Un preset déclaré inconnu reste refusé : l'imposé ne le masque pas.
+	prep.Spec.PHP.Pools[0].Preset = "géant"
+	if r := resolve(); len(r.Blocking()) == 0 {
+		t.Errorf("preset déclaré inconnu en préproduction : refus attendu")
+	}
+
+	// Sans preset imposé, le défaut hérité descend d'un cran ; le déclaré jamais.
+	sansImpose := func(c *config.Config) {
+		e := c.Environments["prep"]
+		e.Preset = ""
+		c.Environments["prep"] = e
+	}
+	prov.Config = cfgAvec(sansImpose)
+	prep.Spec.PHP.Pools[0].Preset = ""
 	if got := children(prep); got != "5" {
 		t.Errorf("préproduction, ondemand descendu en micro : 5 attendu, obtenu %s", got)
 	}
@@ -278,12 +323,27 @@ func TestPresetDeclareOuHerite(t *testing.T) {
 	}
 	prep.Spec.PHP.Pools[0].Preset = ""
 	prov.Config = cfgAvec(func(c *config.Config) {
+		sansImpose(c)
 		e := c.Environments["prep"]
 		e.PresetDowngrade = false
 		c.Environments["prep"] = e
 	})
 	if got := children(prep); got != "12" {
 		t.Errorf("presetDowngrade: false : 12 attendu, obtenu %s", got)
+	}
+
+	// Un preset imposé inconnu est nommé, et rien n'est imposé.
+	prov.Config = cfgAvec(func(c *config.Config) {
+		e := c.Environments["prep"]
+		e.Preset = "nano"
+		c.Environments["prep"] = e
+	})
+	prep.Spec.PHP.Pools[0].Preset = "medium"
+	if got := children(prep); got != "20" {
+		t.Errorf("preset imposé inconnu : le déclaré reste, 20 attendu, obtenu %s", got)
+	}
+	if pbs := ConfigProblems(prov.Config); len(pbs) != 1 || pbs[0].Field != "config.yaml environments.prep.preset" {
+		t.Errorf("preset imposé inconnu non nommé par ConfigProblems : %v", pbs)
 	}
 }
 

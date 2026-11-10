@@ -456,9 +456,15 @@ type User struct {
 
 // Environment décrit un environnement (prod, prep).
 //
-// PresetDowngrade descend d'un cran le preset **par défaut** des pools de
-// l'environnement (D103) : large → medium → small → micro, ondemand → micro. Un
-// preset déclaré par le projet n'est jamais descendu : il est un choix.
+// Preset impose un preset à tous les pools de l'environnement, déclaré ou hérité
+// (D129) : « micro » en préproduction, où site clone recopie le preset de la
+// production. Seul « custom » y échappe — tout y est fourni par « settings » —,
+// et les « settings » du projet gardent le dernier mot, clé par clé. Vide, rien
+// n'est imposé.
+//
+// PresetDowngrade, à défaut de Preset, descend d'un cran le preset **par
+// défaut** des pools de l'environnement (D103) : large → medium → small → micro,
+// ondemand → micro. Un preset déclaré n'est alors jamais descendu.
 type Environment struct {
 	Domain          string            `yaml:"domain"`
 	HostTemplate    string            `yaml:"hostTemplate"`
@@ -466,6 +472,7 @@ type Environment struct {
 	Certificate     string            `yaml:"certificate"`
 	RobotsNoindex   bool              `yaml:"robotsNoindex"`
 	PHPEnv          map[string]string `yaml:"phpEnv"`
+	Preset          string            `yaml:"preset"`
 	PresetDowngrade bool              `yaml:"presetDowngrade"`
 }
 
@@ -522,6 +529,7 @@ func Default() *Config {
 				IDSuffix:        naming.SuffixPrep,
 				Certificate:     "@wildcard-prep",
 				RobotsNoindex:   true,
+				Preset:          "micro",
 				PresetDowngrade: true,
 			},
 		},

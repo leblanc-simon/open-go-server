@@ -680,8 +680,8 @@ func (p *Project) Normalize(homeRoot, prepDomain string, opts ...NormalizeOption
 	// Un type d'application PHP implique un pool : le déclarer par défaut évite
 	// d'exiger de l'administrateur une saisie qui n'a qu'une réponse sensée.
 	//
-	// Le preset n'y est pas écrit (D103) : le pool suit celui de la machine,
-	// que la préproduction descend d'un cran (environments.prep.presetDowngrade).
+	// Le preset n'y est pas écrit (D103) : le pool suit celui de la machine, ou
+	// celui qu'impose l'environnement — micro en préproduction (D129).
 	if at.NeedsPHP && len(p.Spec.PHP.Pools) == 0 {
 		p.Spec.PHP.Pools = []Pool{{Name: MainPoolName, Version: DefaultPHPVersion}}
 	}

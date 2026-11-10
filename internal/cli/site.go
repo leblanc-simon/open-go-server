@@ -703,8 +703,9 @@ func (a *App) cloneProject(source *model.Project, env naming.Env) (*model.Projec
 		clone.Spec.PHP.Pools[i].Settings = clone.Spec.PHP.Pools[i].Settings.Clone()
 		clone.Spec.PHP.Pools[i].AllowFunctions = slices.Clone(clone.Spec.PHP.Pools[i].AllowFunctions)
 		// Un numéro imposé est celui de la production : la préproduction en
-		// reçoit un à elle (D123). Le preset, lui, est recopié tel quel : seul
-		// le preset hérité descend d'un cran en préproduction (D103).
+		// reçoit un à elle (D123). Le preset, lui, est recopié tel quel : la
+		// préproduction impose le sien au rendu (environments.prep.preset, D129),
+		// et la déclaration garde celui de la production pour une promotion.
 		clone.Spec.PHP.Pools[i].Number = "auto"
 	}
 	// Tâches et services partent désactivés : sur une copie des données de la

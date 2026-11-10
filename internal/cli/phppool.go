@@ -60,8 +60,8 @@ func (a *App) phpWorkers(p *model.Project) int {
 	return total
 }
 
-// poolPreset nomme le preset que le pool reçoit : déclaré, ou celui de la
-// machine, descendu d'un cran en préproduction.
+// poolPreset nomme le preset que le pool reçoit : déclaré, celui de la machine,
+// ou celui qu'impose l'environnement (micro en préproduction, D129).
 func (a *App) poolPreset(p *model.Project, pool model.Pool) string {
 	at, err := p.AppType()
 	if err != nil {

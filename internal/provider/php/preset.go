@@ -161,10 +161,14 @@ func (p Problem) String() string { return p.Field + " : " + p.Message }
 // Resolved est le calcul d'un pool, hors numéro et point d'écoute.
 type Resolved struct {
 	// Preset est le preset retenu ; Inherited dit qu'il vient de la machine (le
-	// pool n'en déclare pas), Downgraded qu'il a été descendu par l'environnement.
+	// pool n'en déclare pas), Downgraded qu'il a été descendu par l'environnement,
+	// Imposed que l'environnement l'a imposé (D129) à la place de Declared — vide
+	// si le pool n'en déclarait pas.
 	Preset     string
 	Inherited  bool
 	Downgraded bool
+	Imposed    bool
+	Declared   string
 	Settings   map[string]string
 	Env        map[string]string
 	Problems   []Problem
@@ -197,15 +201,27 @@ func (r Resolved) Warnings() []Problem {
 }
 
 // DescribePreset rend le preset retenu tel qu'un affichage le nomme : déclaré,
-// hérité de la machine, ou hérité puis descendu par l'environnement.
+// hérité de la machine, hérité puis descendu, ou imposé par l'environnement.
 func (r Resolved) DescribePreset() string {
 	switch {
+	case r.Imposed && r.Declared != "" && r.Declared != r.Preset:
+		return r.Preset + " (imposé par l'environnement, " + r.Declared + " déclaré)"
+	case r.Imposed:
+		return r.Preset + " (imposé par l'environnement)"
 	case r.Downgraded:
 		return r.Preset + " (défaut de la machine, descendu d'un cran)"
 	case r.Inherited:
 		return r.Preset + " (défaut de la machine)"
 	}
 	return r.Preset
+}
+
+// environmentPreset rend le preset qu'impose l'environnement (D129), vide sinon.
+func environmentPreset(cfg *config.Config, env string) string {
+	if cfg == nil {
+		return ""
+	}
+	return cfg.Environments[env].Preset
 }
 
 func poolConfig(cfg *config.Config) config.PHPPool {
@@ -239,8 +255,22 @@ func Resolve(cfg *config.Config, paths config.Paths, proj *model.Project, pool m
 
 	// Preset : déclaré, il doit exister ; hérité de la machine, il est descendu
 	// d'un cran si l'environnement le demande, et un défaut inconnu retombe sur
-	// le preset livré.
+	// le preset livré. L'environnement qui impose le sien l'emporte sur l'un et
+	// l'autre, custom excepté (D129) ; un preset déclaré inconnu reste refusé,
+	// l'imposé ne le masque pas.
 	name := pool.Preset
+	env := string(proj.Env())
+	if imposed := environmentPreset(cfg, env); imposed != "" && name != "custom" &&
+		(name == "" || presetExists(pc, name)) {
+		if presetExists(pc, imposed) {
+			r.Imposed, r.Declared = true, name
+			name = imposed
+		} else {
+			r.Problems = append(r.Problems, Problem{Field: "config.yaml environments." + env + ".preset",
+				Message: fmt.Sprintf("preset %q inconnu (connus : %s) — non imposé",
+					imposed, strings.Join(KnownPresets(cfg), ", "))})
+		}
+	}
 	if name == "" {
 		r.Inherited = true
 		name = pc.PresetName()
@@ -250,7 +280,7 @@ func Resolve(cfg *config.Config, paths config.Paths, proj *model.Project, pool m
 					name, strings.Join(KnownPresets(cfg), ", "), config.DefaultPoolPreset)})
 			name = config.DefaultPoolPreset
 		}
-		if cfg != nil && cfg.Environments[string(proj.Env())].PresetDowngrade {
+		if cfg != nil && cfg.Environments[env].PresetDowngrade {
 			if down, ok := downgrades[name]; ok {
 				name, r.Downgraded = down, true
 			}
@@ -460,6 +490,20 @@ func ConfigProblems(cfg *config.Config) []Problem {
 		out = append(out, Problem{Field: "config.yaml php.pool.defaultPreset",
 			Message: fmt.Sprintf("preset %q inconnu (connus : %s) — %s retenu",
 				name, strings.Join(KnownPresets(cfg), ", "), config.DefaultPoolPreset)})
+	}
+	var envs []string
+	if cfg != nil {
+		for env := range cfg.Environments {
+			envs = append(envs, env)
+		}
+	}
+	sort.Strings(envs)
+	for _, env := range envs {
+		if name := environmentPreset(cfg, env); name != "" && !presetExists(pc, name) {
+			out = append(out, Problem{Field: "config.yaml environments." + env + ".preset",
+				Message: fmt.Sprintf("preset %q inconnu (connus : %s) — non imposé",
+					name, strings.Join(KnownPresets(cfg), ", "))})
+		}
 	}
 	for _, fn := range pc.DisabledFunctions() {
 		if msg := validate.FunctionNameProblem(fn); msg != "" {
