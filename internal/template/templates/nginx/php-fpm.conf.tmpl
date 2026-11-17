@@ -191,7 +191,13 @@ server {
 {{- end }}
     # Répertoires entiers, sauf les exceptions que Prestashop y ouvre (docs/csv_import,
     # mails/themes, translations/cldr ; de tools/, seul profiling est fermé).
-    location ~ ^/(app|bin|cache|classes|config|controllers|download|localization|override|src|templates|tests|travis-scripts|var|vendor{{ if ne .Prestashop "1.7" }}|upload{{ end }})(/|$) {
+    location ~ ^/(app|bin|cache|classes|config|controllers|download|localization|override|src|templates|tests|travis-scripts|vendor{{ if ne .Prestashop "1.7" }}|upload{{ end }})(/|$) {
+        deny all;
+    }
+    # var/ aussi, sauf les feuilles de style que des modules y compilent
+    # (var/modules/<module>/…/*.css) et que leurs pages appellent. Un script suivi
+    # d'un PATH_INFO n'y est pas un point d'entrée : 404 plus bas.
+    location ~ ^/var(/|$)(?!modules/.+\.css$) {
         deny all;
     }
     location ~ ^/docs(/|$)(?!csv_import(/|$)) {

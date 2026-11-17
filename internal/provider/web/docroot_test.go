@@ -995,6 +995,11 @@ func TestApacheReelNeSuitNiLiensEtrangersNiFichiersCaches(t *testing.T) {
 				ecrire("vendor/autoload.txt", "secret\n")
 				ecrire("modules/x/views/templates/t.tpl", "secret smarty\n")
 				ecrire("modules/x/views/css/style.css", "body{}\n")
+				// De var/, seules sortent les feuilles de style que des modules
+				// compilent sous var/modules/.
+				ecrire("var/modules/x/css/compile.css", "body{}\n")
+				ecrire("var/modules/x/donnees.txt", "secret\n")
+				ecrire("var/cache/prod/a.css", "secret\n")
 				// Répertoire d'administration renommé à l'installation, reconnu à son
 				// cron_currency_rates.php.
 				ecrire("admin7x2k/cron_currency_rates.php", "<?php\n")
@@ -1071,11 +1076,13 @@ func TestApacheReelNeSuitNiLiensEtrangersNiFichiersCaches(t *testing.T) {
 				// Répertoires de code et de données refusés par le template (D99),
 				// et modèles de modules jamais servis bruts.
 				for _, uri := range []string{"/app/config/params.txt", "/var/logs/debug.txt",
+					"/var/modules/x/donnees.txt", "/var/cache/prod/a.css",
 					"/config/settings.txt", "/vendor/autoload.txt", "/modules/x/views/templates/t.tpl"} {
 					attendre(uri, 403)
 				}
 				// Un asset de module reste servi.
 				attendre("/modules/x/views/css/style.css", 200)
+				attendre("/var/modules/x/css/compile.css", 200)
 				// Les .htaccess malveillants sont ignorés : le fichier propre du projet
 				// est servi tel quel, jamais l'état du serveur ni le FPM d'un voisin, et
 				// sans 500.

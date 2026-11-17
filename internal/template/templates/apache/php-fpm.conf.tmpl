@@ -189,7 +189,11 @@
     # (docs/csv_import, mails/themes, translations/cldr ; de tools/, seul profiling
     # est fermé). translations/ est ici plus strict que Prestashop : hors cldr, ses
     # catalogues ne servent qu'au PHP.
-    RedirectMatch 403 "^/(app|bin|cache|classes|config|controllers|download|localization|override|src|templates|tests|var|vendor{{ if ne .Prestashop "1.7" }}|upload{{ end }})(/|$)"
+    RedirectMatch 403 "^/(app|bin|cache|classes|config|controllers|download|localization|override|src|templates|tests|vendor{{ if ne .Prestashop "1.7" }}|upload{{ end }})(/|$)"
+    # var/ aussi, sauf les feuilles de style que des modules y compilent
+    # (var/modules/<module>/…/*.css) et que leurs pages appellent. Un segment
+    # caché reste refusé plus bas, un script suivi d'un PATH_INFO aussi.
+    RedirectMatch 403 "^/var(/|$)(?!modules/.+\.css$)"
     RedirectMatch 403 "^/docs(/|$)(?!csv_import(/|$))"
     RedirectMatch 403 "^/mails(/|$)(?!themes(/|$))"
     RedirectMatch 403 "^/translations(/|$)(?!cldr(/|$))"
@@ -221,7 +225,7 @@
 {{- end }}
     # Une liste blanche juge l'URL, non le fichier : « /img/x.php/a.jpg » finit par
     # une extension admise, et Apache exécute x.php avec un PATH_INFO (D119).
-    RedirectMatch 403 "(?i)^/{{ if eq .Prestashop "1.7" }}img{{ else }}(img|themes|js){{ end }}/.*\.php/"
+    RedirectMatch 403 "(?i)^/{{ if eq .Prestashop "1.7" }}(img|var){{ else }}(img|themes|js|var){{ end }}/.*\.php/"
 
     # Types des polices et partage d'origine, repris du .htaccess de Prestashop.
     AddType application/vnd.ms-fontobject .eot

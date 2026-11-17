@@ -273,6 +273,10 @@ func TestLeVhostPrestashopRefuseCeQueSesHtaccessRefusent(t *testing.T) {
 		"/mails/themes/modern/core/order_conf.html.twig", "/bin/console", "/src/Kernel.php",
 		"/controllers/x.php", "/override/x.php", "/localization/fr.xml", "/cache/class_index.php",
 		"/pdf/invoice.tpl", "/templates/index.tpl", "/themes/classic/config/theme.yml",
+		// De var/, seules les feuilles de style de var/modules/ sortent.
+		"/var", "/var/", "/var/modules/", "/var/modules/m/config.php", "/var/modules/m/a.css.map",
+		"/var/modules/m/.cache/a.css", "/var/modules/m/x.php/a.css",
+		"/var/cache/prod/a.css", "/var/modules.css",
 	}
 	servisPartout := []string{
 		"/img/p/1/1-home_default.jpg", "/img/c/3.JPG", "/themes/classic/assets/css/theme.css",
@@ -281,6 +285,7 @@ func TestLeVhostPrestashopRefuseCeQueSesHtaccessRefusent(t *testing.T) {
 		"/tools/foundation/foundation.js", "/mails/themes/modern/assets/logo.png",
 		"/modules/m/views/css/front.css", "/modules/m/logo.png", "/pdf/invoice.css",
 		"/admin634xyz/themes/default/css/admin.css", "/fr/3-vetements",
+		"/var/modules/m/views/css/compile.css", "/var/modules/m/front.css",
 	}
 	// servisApache : ce qu'Apache exécute et que nginx refuse, faute d'être un
 	// point d'entrée de la branche (D119) — un .php de js/ ou de themes/ en 1.7.
