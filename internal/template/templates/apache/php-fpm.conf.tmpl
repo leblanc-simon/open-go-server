@@ -71,6 +71,11 @@
         AllowOverride None
         Require all granted
         Options -Indexes -FollowSymLinks +SymLinksIfOwnerMatch
+        # mod_proxy_fcgi tait l'en-tête Authorization à FPM (ap_add_common_vars) :
+        # sans cela, ni HTTP_AUTHORIZATION ni PHP_AUTH_USER — jeton Bearer d'une
+        # API, Basic géré par l'application, webservice de Prestashop. Le .htaccess
+        # qui le relaie d'ordinaire n'est pas lu (D99), et nginx le transmet déjà.
+        CGIPassAuth On
 {{- if eq .AppKind "php-prestashop" }}
         # {{ .MarquePrestashop }}{{ if .PrestashopIndeterminee }} (version indéterminée){{ end }}.
         # Réécritures reprises des .htaccess que livre cette branche — le .htaccess
@@ -83,9 +88,6 @@
         # boutique en sous-répertoire (REWRITEBASE ≠ /) ni les URI virtuelles du
         # multi-boutique : le plan et doctor les signalent.
         RewriteEngine On
-        # L'en-tête Authorization n'atteint pas PHP-FPM sans cela (webservice, back-office).
-        RewriteCond %{HTTP:Authorization} .
-        RewriteRule .* - [E=HTTP_AUTHORIZATION:%{HTTP:Authorization}]
         # Répertoire d'administration, renommé à l'installation et reconnu à son
         # cron_currency_rates.php (de la 1.6 à la 9), et admin-api/ (9) : un fichier
         # y est servi tel quel, toute autre route va à leur index.php.
