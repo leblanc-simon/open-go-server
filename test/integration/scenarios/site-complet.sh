@@ -381,6 +381,32 @@ fi
 echo "PHP est exécuté sous l'identité du projet, comme prévu."
 
 echo
+echo "--- En-tête Authorization relayé à FPM (D134) ---"
+# mod_proxy_fcgi tait Authorization sans CGIPassAuth, et le .htaccess qui le relaie
+# d'ordinaire n'est pas lu (D99) : un jeton Bearer ou un Basic géré par
+# l'application n'atteignait pas PHP. Script écrit une fois pour toutes (opcache).
+cat > /home/php.test/www/auth.php <<'PHP'
+<?php
+echo "authorization=", $_SERVER['HTTP_AUTHORIZATION'] ?? '-', "\n";
+echo "user=", $_SERVER['PHP_AUTH_USER'] ?? '-', "\n";
+echo "pw=", $_SERVER['PHP_AUTH_PW'] ?? '-', "\n";
+PHP
+chown phptest:phptest /home/php.test/www/auth.php
+reponse=$(curl -s -H 'Host: php.test' -H 'Authorization: Bearer jeton-ogs' http://127.0.0.1/auth.php)
+echo "$reponse" | sed 's/^/  Bearer : /'
+if ! grep -qx "authorization=Bearer jeton-ogs" <<<"$reponse"; then
+    echo "ÉCHEC : le jeton Bearer n'atteint pas PHP"
+    exit 1
+fi
+reponse=$(curl -s -H 'Host: php.test' -u 'alice:s3cret' http://127.0.0.1/auth.php)
+echo "$reponse" | sed 's/^/  Basic : /'
+if ! grep -qx "user=alice" <<<"$reponse" || ! grep -qx "pw=s3cret" <<<"$reponse"; then
+    echo "ÉCHEC : l'authentification Basic n'atteint pas PHP"
+    exit 1
+fi
+echo "Authorization relayé à PHP, Bearer comme Basic."
+
+echo
 echo "--- .htaccess ignoré sous Apache, règles portées par le template (D99) ---"
 # ogs n'active plus les .htaccess (AllowOverride None) : servi par www-data, membre
 # du groupe de tous les projets, un .htaccess du projet pouvait détourner le serveur
@@ -414,7 +440,7 @@ fi
 racineps=/home/boutique.test/www
 poser() { mkdir -p "$(dirname "$racineps/$1")" && printf '%s\n' "$2" > "$racineps/$1"; }
 poser index.php '<?php echo "front boutique: ", ($_GET["controller"] ?? "accueil"), "\n";'
-poser webservice/dispatcher.php '<?php echo "api ok\n";'
+poser webservice/dispatcher.php '<?php echo "api ok clé=", $_SERVER["PHP_AUTH_USER"] ?? "-", "\n";'
 # Répertoire d'administration renommé à l'installation : reconnu à son
 # cron_currency_rates.php ; une route sans fichier va à son index.php.
 poser admin7x2k/cron_currency_rates.php '<?php'
@@ -517,6 +543,13 @@ sleep 1
 attendu / 200 "front boutique"
 attendu /ma-categorie/mon-produit 200 "front boutique"
 attendu /api/products 200 "api ok"
+# Le webservice s'authentifie en Basic, la clé en nom d'utilisateur (D134).
+cle=$(curl -s -u 'CLEWEBSERVICE:' -H 'Host: boutique.test' http://127.0.0.1/api/products)
+echo "  /api/products (Basic)                      $cle"
+if [[ "$cle" != *"clé=CLEWEBSERVICE"* ]]; then
+    echo "ÉCHEC : la clé du webservice n'atteint pas PHP"
+    exit 1
+fi
 attendu /admin7x2k/sell/catalog/products 200 "back-office"
 attendu /admin-api/oauth/token 200 "api admin"
 # Refus des sauvegardes sous un répertoire réel seulement : une URL propre passe.
