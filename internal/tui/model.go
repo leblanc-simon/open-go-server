@@ -7,7 +7,7 @@ import (
 	"strings"
 	"sync"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 
 	"leblanc.io/open-go-server/internal/model"
 )
@@ -64,9 +64,13 @@ const (
 
 // Model est le modèle Bubble Tea de l'inspecteur.
 type Model struct {
-	backend  Backend
-	styles   Styles
-	projects []*model.Project
+	backend Backend
+	styles  Styles
+	// altScreen fait rendre l'interface sur l'écran alternatif. Bubble Tea v2
+	// le porte par la vue, non plus par une option du programme : Run le pose,
+	// les tests rendent sur l'écran ordinaire.
+	altScreen bool
+	projects  []*model.Project
 	// refused nomme les déclarations refusées au chargement : elles ne sont pas
 	// dans l'inventaire, et le bandeau le dit (D120).
 	refused []string
@@ -392,35 +396,38 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.err = msg.err
 		return m, nil
 
-	case tea.KeyMsg:
+	case tea.KeyPressMsg:
 		return m.handleKey(msg)
 	}
 	return m, nil
 }
 
 // handleKey route les touches selon l'écran courant.
-func (m *Model) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (m *Model) handleKey(key tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	if m.filtering {
-		switch key.Type {
-		case tea.KeyCtrlC:
+		switch key.String() {
+		case "ctrl+c":
 			m.filtering = false
 			return m.interrupt(false)
-		case tea.KeyEnter:
+		case "enter":
 			m.filtering = false
 			return m, m.observeCurrent()
-		case tea.KeyEsc:
+		case "esc":
 			m.filtering = false
 			m.filter = ""
 			return m, nil
-		case tea.KeyBackspace:
+		case "backspace":
 			if m.filter != "" {
 				m.filter = m.filter[:len(m.filter)-1]
 			}
 			return m, nil
-		case tea.KeyRunes:
-			m.filter += string(key.Runes)
-			m.cursor = 0
+		case "space":
+			// Un host ne contient pas d'espace : le filtre l'ignore.
 			return m, nil
+		}
+		if key.Text != "" {
+			m.filter += key.Text
+			m.cursor = 0
 		}
 		return m, nil
 	}

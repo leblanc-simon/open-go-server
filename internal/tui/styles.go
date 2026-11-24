@@ -5,7 +5,7 @@ package tui
 import (
 	"os"
 
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/lipgloss/v2"
 )
 
 // Styles regroupe la mise en forme. Elle se dégrade proprement : sans couleur,

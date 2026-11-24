@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"strings"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 )
 
 // WizardAnswers porte les réponses de l'assistant de création.
@@ -121,19 +121,19 @@ func hostHelp(a WizardAnswers, prepDomain string) string {
 }
 
 // wizardKey traite les touches de l'assistant.
-func (m *Model) wizardKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (m *Model) wizardKey(key tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	w := &m.wizard
-	switch key.Type {
-	case tea.KeyCtrlC:
+	switch key.String() {
+	case "ctrl+c":
 		m.mode = modeList
 		return m.interrupt(false)
-	case tea.KeyEsc:
+	case "esc":
 		// Sortir de l'assistant ne perd rien : aucun projet n'est écrit avant la
 		// dernière étape.
 		m.mode = modeList
 		m.status = "création abandonnée"
 		return m, nil
-	case tea.KeyEnter:
+	case "enter":
 		value := strings.TrimSpace(w.input)
 		s := w.current()
 		if value == "" {
@@ -172,18 +172,14 @@ func (m *Model) wizardKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		w.index++
 		return m, nil
-	case tea.KeyBackspace:
+	case "backspace":
 		if w.input != "" {
 			w.input = w.input[:len(w.input)-1]
 		}
 		return m, nil
-	case tea.KeyRunes, tea.KeySpace:
-		w.input += string(key.Runes)
-		if key.Type == tea.KeySpace {
-			w.input += " "
-		}
-		return m, nil
 	}
+	// Le texte de la touche, espace compris : v2 le porte dans Text.
+	w.input += key.Text
 	return m, nil
 }
 

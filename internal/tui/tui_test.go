@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 
 	"leblanc.io/open-go-server/internal/model"
 	"leblanc.io/open-go-server/internal/naming"
@@ -112,29 +112,30 @@ func drive(m *Model, keys ...tea.Msg) string {
 			m = updated.(*Model)
 		}
 	}
-	return m.View()
+	return m.View().Content
 }
 
 func key(s string) tea.Msg {
 	switch s {
 	case "enter":
-		return tea.KeyMsg{Type: tea.KeyEnter}
+		return tea.KeyPressMsg{Code: tea.KeyEnter}
 	case "esc":
-		return tea.KeyMsg{Type: tea.KeyEsc}
+		return tea.KeyPressMsg{Code: tea.KeyEscape}
 	case "down":
-		return tea.KeyMsg{Type: tea.KeyDown}
+		return tea.KeyPressMsg{Code: tea.KeyDown}
 	case "up":
-		return tea.KeyMsg{Type: tea.KeyUp}
+		return tea.KeyPressMsg{Code: tea.KeyUp}
 	case "backspace":
-		return tea.KeyMsg{Type: tea.KeyBackspace}
+		return tea.KeyPressMsg{Code: tea.KeyBackspace}
 	}
-	return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(s)}
+	r := []rune(s)
+	return tea.KeyPressMsg{Code: r[0], Text: s}
 }
 
 func typeText(text string) []tea.Msg {
 	out := make([]tea.Msg, 0, len(text))
 	for _, r := range text {
-		out = append(out, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		out = append(out, tea.KeyPressMsg{Code: r, Text: string(r)})
 	}
 	return out
 }
@@ -395,7 +396,7 @@ func TestQuit(t *testing.T) {
 	if !m.Quitting() {
 		t.Error("q doit demander la sortie")
 	}
-	if m.View() != "" {
+	if m.View().Content != "" {
 		t.Error("la vue doit être vide après la sortie, pour ne pas laisser l'écran sali")
 	}
 }
@@ -463,7 +464,7 @@ func TestLesDeclarationsRefuseesSontNommeesALEcran(t *testing.T) {
 	m := New(backend)
 	m.styles = Styles{Plain: true}
 	m.Update(m.Init()())
-	vue := m.View()
+	vue := m.View().Content
 	for _, attendu := range []string{"1 déclaration(s) refusée(s)", "projet blogfr : spec.user.webAccess", "shopfr"} {
 		if !strings.Contains(vue, attendu) {
 			t.Errorf("l'écran doit montrer %q :\n%s", attendu, vue)
@@ -471,13 +472,13 @@ func TestLesDeclarationsRefuseesSontNommeesALEcran(t *testing.T) {
 	}
 	backend.refused = nil
 	m.Update(m.loadProjects())
-	if strings.Contains(m.View(), "refusée") {
-		t.Errorf("le bandeau doit disparaître une fois la déclaration corrigée :\n%s", m.View())
+	if strings.Contains(m.View().Content, "refusée") {
+		t.Errorf("le bandeau doit disparaître une fois la déclaration corrigée :\n%s", m.View().Content)
 	}
 	// Parc vide hormis la déclaration refusée : le bandeau reste visible.
 	backend.projects, backend.refused = nil, []string{"déclaration illisible : casse.yaml"}
 	m.Update(m.loadProjects())
-	if !strings.Contains(m.View(), "casse.yaml") {
-		t.Errorf("le bandeau doit figurer même sans projet lisible :\n%s", m.View())
+	if !strings.Contains(m.View().Content, "casse.yaml") {
+		t.Errorf("le bandeau doit figurer même sans projet lisible :\n%s", m.View().Content)
 	}
 }

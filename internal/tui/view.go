@@ -4,11 +4,20 @@ import (
 	"fmt"
 	"strings"
 
+	tea "charm.land/bubbletea/v2"
+
 	"leblanc.io/open-go-server/internal/model"
 )
 
-// View rend l'écran courant.
-func (m *Model) View() string {
+// View rend l'écran courant, sur l'écran alternatif quand Run le demande.
+func (m *Model) View() tea.View {
+	v := tea.NewView(m.render())
+	v.AltScreen = m.altScreen
+	return v
+}
+
+// render rend le contenu de l'écran courant.
+func (m *Model) render() string {
 	if m.quitting {
 		return ""
 	}

@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 
 	"leblanc.io/open-go-server/internal/model"
 	"leblanc.io/open-go-server/internal/naming"
@@ -121,7 +121,7 @@ func TestQuitterPendantUneActionAttendSaFin(t *testing.T) {
 
 			var k tea.Msg = key("q")
 			if touche == "ctrl+c" {
-				k = tea.KeyMsg{Type: tea.KeyCtrlC}
+				k = tea.KeyPressMsg{Code: 'c', Mod: tea.ModCtrl}
 			}
 			if _, cmd := m.Update(k); estQuit(cmd) {
 				t.Fatal("la sortie ne doit pas précéder la fin de l'action")
@@ -158,7 +158,7 @@ func TestSIGTERMAttendLaFinDeLAction(t *testing.T) {
 	defer inW.Close()
 	done := make(chan *Model, 1)
 	go func() {
-		m, err := run(ctx, b, tea.WithInput(inR), tea.WithOutput(io.Discard))
+		m, err := run(ctx, b, false, tea.WithInput(inR), tea.WithOutput(io.Discard))
 		if err != nil {
 			t.Error(err)
 		}
@@ -208,7 +208,7 @@ func TestCtrlCEnModeFiltreInterromptLAction(t *testing.T) {
 	if _, cmd := m.Update(key("/")); cmd != nil {
 		t.Fatal("le filtre ne lance rien")
 	}
-	if _, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlC}); estQuit(cmd) {
+	if _, cmd := m.Update(tea.KeyPressMsg{Code: 'c', Mod: tea.ModCtrl}); estQuit(cmd) {
 		t.Fatal("la sortie ne doit pas précéder la fin de l'action")
 	}
 	msg := <-msgs
@@ -232,7 +232,7 @@ func TestCtrlCTardifNeFaitPasRendreLeCode9(t *testing.T) {
 	<-b.démarré
 	close(b.libérer)
 	msg := <-msgs // l'action a abouti, son message n'est pas encore traité
-	if _, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlC}); estQuit(cmd) {
+	if _, cmd := m.Update(tea.KeyPressMsg{Code: 'c', Mod: tea.ModCtrl}); estQuit(cmd) {
 		t.Fatal("la sortie attend le retour de l'action")
 	}
 	if _, cmd := m.Update(msg); !estQuit(cmd) {
@@ -259,7 +259,7 @@ func TestTerminalFerméAttendLaFinDeLAction(t *testing.T) {
 	}
 	done := make(chan fin, 1)
 	go func() {
-		_, err := run(ctx, b, tea.WithInput(inR), tea.WithOutput(io.Discard))
+		_, err := run(ctx, b, false, tea.WithInput(inR), tea.WithOutput(io.Discard))
 		done <- fin{err, b.terminés.Load()}
 	}()
 	time.Sleep(100 * time.Millisecond)

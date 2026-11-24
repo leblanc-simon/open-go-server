@@ -7,7 +7,7 @@ import (
 	"os"
 	"strings"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 )
 
 // ErrInterrupted signale une interface fermée sur une interruption : une action
@@ -18,7 +18,7 @@ var ErrInterrupted = errors.New("interface interrompue")
 // sortie n'est pas un terminal : une TUI dans un pipe ou un cron ne produirait
 // que des séquences d'échappement.
 func Run(ctx context.Context, backend Backend) error {
-	m, err := run(ctx, backend, tea.WithAltScreen())
+	m, err := run(ctx, backend, true)
 	// Une sortie demandée pendant une action en a attendu la fin : son compte
 	// rendu, que l'écran alternatif emporte, est redonné sur la sortie standard.
 	if m != nil && m.quitAfter && len(m.Output()) > 0 {
@@ -36,8 +36,12 @@ func Run(ctx context.Context, backend Backend) error {
 // donc écarté, et l'interruption arrive par le contexte, que main annule sur
 // SIGINT et SIGTERM. Le modèle arrête alors l'action en vol et ne se ferme
 // qu'une fois qu'elle a rendu la main.
-func run(ctx context.Context, backend Backend, opts ...tea.ProgramOption) (*Model, error) {
+//
+// altScreen fait rendre sur l'écran alternatif : Bubble Tea v2 le porte par
+// la vue, non plus par une option du programme.
+func run(ctx context.Context, backend Backend, altScreen bool, opts ...tea.ProgramOption) (*Model, error) {
 	m := NewWithContext(ctx, backend)
+	m.altScreen = altScreen
 	program := tea.NewProgram(m, append(opts, tea.WithoutSignalHandler())...)
 	stop := context.AfterFunc(ctx, func() { program.Send(interruptMsg{}) })
 	defer stop()
