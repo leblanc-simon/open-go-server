@@ -2,6 +2,8 @@ module leblanc.io/open-go-server
 
 go 1.26.5
 
+toolchain go1.27.4
+
 require (
 	github.com/charmbracelet/bubbletea v1.3.10
 	github.com/charmbracelet/lipgloss v1.1.0
