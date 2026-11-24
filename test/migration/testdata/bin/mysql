@@ -4,7 +4,7 @@
 # $FAUX_UTILISATEURS_BASE_CIBLE ; le reste est noté au journal, et un chargement
 # y laisse la première ligne du dump reçu.
 case "${1:-}" in
-    --version) echo "mysql  Ver 15.1 Distrib 10.11.6-MariaDB, for debian-linux-gnu"; exit 0 ;;
+    --version) echo "mysql from 11.8.9-MariaDB, client 15.2 for debian-linux-gnu (x86_64) using  EditLine wrapper"; exit 0 ;;
 esac
 tout="$*"
 existe() { # existe <liste> <motif sed du nom>

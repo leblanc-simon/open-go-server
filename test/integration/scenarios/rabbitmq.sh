@@ -307,7 +307,12 @@ curl -sf -u "$auth" -X PUT "$api/users/atelierfr" -H 'content-type: application/
     { echo "ÉCHEC : compte de l'administrateur non créé"; exit 1; }
 curl -sf -u "$auth" -X PUT "$api/queues/atelierfr/commandes" -H 'content-type: application/json' \
     -d '{"durable":true}' || { echo "ÉCHEC : file de l'administrateur non créée"; exit 1; }
-empreinte() { curl -sf -u "$auth" "$api/users/atelierfr" | grep -o '"password_hash":"[^"]*"'; }
+# RabbitMQ 4.4 ne rend plus l'empreinte dans /api/users/<nom> (« has_password »
+# seulement) : l'export des définitions la porte encore.
+empreinte() {
+    curl -sf -u "$auth" "$api/definitions" | python3 -c \
+        'import json,sys; print(next((u["password_hash"] for u in json.load(sys.stdin)["users"] if u["name"]=="atelierfr"), ""))'
+}
 avant=$(empreinte)
 [ -n "$avant" ] || { echo "ÉCHEC : empreinte du compte de l'administrateur illisible"; exit 1; }
 sortie=$(ogs site create atelier.fr --kind php-symfony --app-version 3.4 --php "$version" \
