@@ -1283,6 +1283,16 @@ func (a *App) removeUser(cmd *cobra.Command, provs *providers, p *model.Project,
 	// L'arborescence part en dernier : tout ce qui précède a pu avoir besoin de la lire.
 	if treeErr == nil {
 		treeErr = os.RemoveAll(p.Spec.Layout.Root)
+		// Le répertoire du groupe part avec son dernier membre (D135) — vide
+		// seulement : il porte sinon les homes des autres membres, et c'est l'état
+		// attendu, sans avertissement.
+		if treeErr == nil {
+			if gone, err := a.removeGroupDir(p); err != nil {
+				warn("répertoire du groupe %s laissé en place : %v", p.Spec.Group, err)
+			} else if gone != "" {
+				*removed = append(*removed, "répertoire du groupe "+gone)
+			}
+		}
 	}
 	// Les journaux vivent sous logs.root (D71), que la validation impose : ils
 	// partent avec le projet, après l'archive qui les a recueillis. Le contrôle est
@@ -1304,6 +1314,32 @@ func (a *App) removeUser(cmd *cobra.Command, provs *providers, p *model.Project,
 		return errors.Join(accountErr, treeErr, logsErr, err)
 	}
 	return errors.Join(accountErr, treeErr, logsErr)
+}
+
+// removeGroupDir retire le répertoire du groupe du projet s'il est vide, atteint
+// depuis la racine des homes sans suivre de lien (D135). Il n'est touché que
+// s'il est bien <racine des homes>/<groupe> : une déclaration retouchée ne fait
+// jamais retirer un autre répertoire. Un répertoire non vide reste en place.
+//
+// Il rend le chemin retiré, vide si rien ne l'a été.
+func (a *App) removeGroupDir(p *model.Project) (string, error) {
+	group := p.Spec.Group
+	if group == "" {
+		return "", nil
+	}
+	homeRoot := filepath.Clean(a.homeRoot())
+	dir := filepath.Join(homeRoot, group)
+	if filepath.Dir(filepath.Clean(p.Spec.Layout.Root)) != dir {
+		return "", nil
+	}
+	if _, err := fs.LstatAt(homeRoot, group); err != nil {
+		return "", nil
+	}
+	remaining, err := fs.RemoveEmptyDirAt(homeRoot, group)
+	if err != nil || len(remaining) > 0 {
+		return "", err
+	}
+	return dir, nil
 }
 
 // removeGroup retire le groupe du projet après son compte, s'il est à ogs et à

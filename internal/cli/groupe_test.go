@@ -108,3 +108,82 @@ func existe(t *testing.T, path string) bool {
 	}
 	return err == nil
 }
+
+// Le répertoire du groupe part avec son dernier membre, jamais avant (D135).
+func TestLeRepertoireDuGroupePartAvecSonDernierMembre(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	h.déclarerGroupé(t, "shop.fr")
+	h.déclarerGroupé(t, "blog.fr")
+	groupe := h.path("home", "acme")
+
+	h.mustRunPartial("project", "delete", "shopfr", "--yes")
+	if existe(t, filepath.Join(groupe, "shop.fr")) || !existe(t, filepath.Join(groupe, "blog.fr")) {
+		t.Fatal("seul le home de shopfr doit partir")
+	}
+	out := h.mustRunPartial("project", "delete", "blogfr", "--yes")
+	if existe(t, groupe) {
+		t.Errorf("le répertoire du groupe doit partir avec son dernier membre :\n%s", out)
+	}
+}
+
+// --keep-data laisse le home, donc le répertoire du groupe.
+func TestKeepDataLaisseLeRepertoireDuGroupe(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	h.déclarerGroupé(t, "shop.fr")
+	h.mustRunPartial("project", "delete", "shopfr", "--keep-data", "--yes")
+	if !existe(t, h.path("home", "acme", "shop.fr")) {
+		t.Error("--keep-data doit laisser le home et son répertoire de groupe")
+	}
+}
+
+// Une restauration recrée le répertoire du groupe, en 0701, d'après la
+// déclaration archivée.
+func TestLaRestaurationRecreeLeRepertoireDuGroupe(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	h.déclarerGroupé(t, "shop.fr")
+	h.mustRunPartial("project", "delete", "shopfr", "--yes")
+	if existe(t, h.path("home", "acme")) {
+		t.Fatal("le répertoire du groupe doit être parti")
+	}
+	h.mustRunPartial("project", "restore", h.derniereArchive(t), "--yes")
+	info, err := os.Lstat(h.path("home", "acme"))
+	if err != nil || info.Mode().Perm() != 0o701 {
+		t.Fatalf("répertoire du groupe après restauration : %v, %v", info, err)
+	}
+	if !existe(t, h.path("home", "acme", "shop.fr")) {
+		t.Error("home absent après restauration")
+	}
+	if decl := h.read(t, filepath.Join("etc", "ogs", "projects", "shopfr.yaml")); !strings.Contains(decl, "group: acme") {
+		t.Errorf("la déclaration restaurée doit garder son groupe :\n%s", decl)
+	}
+}
+
+// Un projet dont la racine est le répertoire d'un groupe emporterait tous ses
+// membres : sa suppression est refusée.
+func TestLaSuppressionRefuseUneRacineEgaleAuRepertoireDUnGroupe(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	h.déclarerGroupé(t, "shop.fr")
+	h.mustRun("project", "create", "blog.fr")
+	rel := filepath.Join("etc", "ogs", "projects", "blogfr.yaml")
+	decl := h.read(t, rel)
+	avant := h.path("home", "blog.fr")
+	if !strings.Contains(decl, "root: "+avant) {
+		t.Fatalf("racine introuvable dans la déclaration :\n%s", decl)
+	}
+	decl = strings.ReplaceAll(decl, avant, h.path("home", "acme"))
+	if err := os.WriteFile(h.path(rel), []byte(decl), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, code := h.run("project", "delete", "blogfr", "--yes")
+	if code != CodeConflict || !strings.Contains(out, "shopfr") {
+		t.Errorf("la suppression doit être refusée en nommant le membre (code %d), obtenu %d :\n%s",
+			CodeConflict, code, out)
+	}
+	if !existe(t, h.path("home", "acme", "shop.fr")) {
+		t.Error("le home d'un membre du groupe a été effacé")
+	}
+}
