@@ -50,12 +50,12 @@ make dev-demo                                   # crée ./dev, deux projets, pla
 
 ### Essais sur système réel
 
-Vingt-deux scénarios conteneurisés éprouvent ce que les tests unitaires ne peuvent pas voir. Ils ont mis au jour
+Vingt-trois scénarios conteneurisés éprouvent ce que les tests unitaires ne peuvent pas voir. Ils ont mis au jour
 plus de trente défauts invisibles autrement (§18 du cahier des charges) : **y recourir avant de déclarer un
 provider fonctionnel**.
 
 ```sh
-make integration-all       # les vingt-deux, à la suite
+make integration-all       # les vingt-trois, à la suite
 make integration-nginx     # un seul (voir SCENARIOS dans le Makefile)
 
 # Hors série : rbenv et pyenv compilent depuis les sources (un quart d'heure).

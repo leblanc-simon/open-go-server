@@ -43,8 +43,9 @@ done
 # règles filtrent l'espace réseau du conteneur — jamais celui de la machine.
 # FPM sans pool enfin : c'est l'activation et l'arrêt de l'unité qu'on éprouve.
 # La restauration supprime d'abord ses projets : même raison que la suppression.
+# Les groupes de projets aussi (D135), qui suppriment et restaurent leurs membres.
 case "$scenario" in
-systemd | runtimes | runtimes-compiles | harden | suppression | web-durci | dkim | journaux | pare-feu | fpm-sans-pool | restauration)
+systemd | runtimes | runtimes-compiles | harden | suppression | web-durci | dkim | journaux | pare-feu | fpm-sans-pool | restauration | groupe)
     # Le répertoire monté doit exister avant « docker run » : sinon Docker le crée
     # au nom de root, et la compilation de l'application du scénario runtimes, qui
     # passe après suppression dans la série, ne peut plus y écrire.

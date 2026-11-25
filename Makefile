@@ -19,7 +19,7 @@ DEBVER  := $(shell git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//' || 
 
 .PHONY: all build test vet fmt cover clean install dev-init dev-demo \
 	doc completion man package integration integration-php integration-package integration-hooks \
-	integration-all integration-import-certificat integration-mysql integration-rabbitmq integration-acme tidy check
+	integration-all integration-groupe integration-import-certificat integration-mysql integration-rabbitmq integration-acme tidy check
 
 all: fmt vet test build
 
@@ -70,7 +70,7 @@ package: doc
 # Ils exigent un système complet — serveur web, PHP, comptes — et s'exécutent
 # donc dans un conteneur. Ils ne font pas partie de « make test ».
 # Tous les scénarios, l'un après l'autre.
-SCENARIOS := reload-group site-complet suppression web-durci nginx hooks mysql postgres rabbitmq pebble systemd runtimes harden paquet supervision dkim journaux pare-feu fpm-sans-pool restauration php-anciennes import-certificat
+SCENARIOS := reload-group site-complet suppression web-durci nginx hooks mysql postgres rabbitmq pebble systemd runtimes harden paquet supervision dkim journaux pare-feu fpm-sans-pool restauration php-anciennes import-certificat groupe
 
 integration-all:
 	@for s in $(SCENARIOS); do \
@@ -98,6 +98,9 @@ integration-php-anciennes:
 
 integration-nginx:
 	./test/integration/run.sh nginx
+
+integration-groupe:
+	./test/integration/run.sh groupe
 
 integration-hooks:
 	./test/integration/run.sh hooks
