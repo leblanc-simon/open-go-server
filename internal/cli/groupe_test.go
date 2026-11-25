@@ -60,3 +60,51 @@ func TestUnGroupeAjouteApresCoupNArretePasLesVoisins(t *testing.T) {
 	}
 	h.mustRunPartial("plan", "shopfr")
 }
+
+// En mode préfixé, l'apply de deux membres d'un groupe crée un seul répertoire
+// de groupe, en 0701, et les deux homes dessous (D135).
+func TestLApplyDeDeuxMembresCreeLeRepertoireDuGroupe(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	for _, host := range []string{"shop.fr", "blog.fr"} {
+		id := strings.ReplaceAll(host, ".", "")
+		decl := h.path(filepath.Join("etc", "ogs", "projects", id+".yaml"))
+		contenu := "apiVersion: ogs/v1\nkind: Project\nmetadata:\n  host: " + host +
+			"\nspec:\n  group: acme\n  app:\n    kind: static\n"
+		if err := os.WriteFile(decl, []byte(contenu), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		h.mustRunPartial("apply", id, "--yes")
+	}
+	info, err := os.Lstat(h.path(filepath.Join("home", "acme")))
+	if err != nil || info.Mode().Perm() != 0o701 {
+		t.Fatalf("répertoire du groupe : %v, %v", info, err)
+	}
+	for _, host := range []string{"shop.fr", "blog.fr"} {
+		if _, err := os.Lstat(h.path(filepath.Join("home", "acme", host))); err != nil {
+			t.Errorf("home de %s : %v", host, err)
+		}
+	}
+}
+
+// déclarerGroupé dépose la déclaration d'un membre du groupe acme et l'applique.
+func (h *harness) déclarerGroupé(t *testing.T, host string) string {
+	t.Helper()
+	id := strings.ReplaceAll(host, ".", "")
+	contenu := "apiVersion: ogs/v1\nkind: Project\nmetadata:\n  host: " + host +
+		"\nspec:\n  group: acme\n  app:\n    kind: static\n"
+	if err := os.WriteFile(h.path("etc", "ogs", "projects", id+".yaml"), []byte(contenu), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h.mustRunPartial("apply", id, "--yes")
+	return id
+}
+
+func existe(t *testing.T, path string) bool {
+	t.Helper()
+	_, err := os.Lstat(path)
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	return err == nil
+}

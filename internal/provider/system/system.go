@@ -80,6 +80,8 @@ type Observed struct {
 	// pas : nginx lui donne ses journaux à chaque réouverture (D116).
 	WebUID int
 	Dirs   map[string]DirState
+	// GroupDir est le répertoire du groupe du projet (D135) ; vide sans groupe.
+	GroupDir DirState
 }
 
 // DirState est l'état d'un répertoire du projet.
@@ -120,6 +122,9 @@ func (p *Provider) Observe(_ context.Context, proj *model.Project) (Observed, er
 				obs.WebMember = true
 			}
 		}
+	}
+	if obs.GroupDir, err = observeGroupDir(proj); err != nil {
+		return obs, err
 	}
 	for _, path := range p.paths(proj) {
 		obs.Dirs[path] = statDir(proj.Spec.Layout.Root, path)
@@ -187,6 +192,10 @@ func (p *Provider) Plan(_ context.Context, proj *model.Project, obs Observed) ([
 	}
 	// Son groupe aussi, s'il existe déjà : à personne d'autre (D107).
 	if err := p.PreexistingGroup(proj, obs); err != nil {
+		return nil, err
+	}
+	// Le répertoire de son groupe de projets, à root seul (D135).
+	if err := p.PreexistingGroupDir(proj, obs); err != nil {
 		return nil, err
 	}
 
@@ -315,7 +324,15 @@ func (p *Provider) Plan(_ context.Context, proj *model.Project, obs Observed) ([
 		}
 	}
 
-	// 4. Arborescence.
+	// 4. Arborescence : le répertoire du groupe d'abord (D135), puis le home qu'il
+	// porte et ses sous-répertoires.
+	gs, err := p.groupDirStep(proj, obs)
+	if err != nil {
+		return nil, err
+	}
+	if gs != nil {
+		steps = append(steps, gs)
+	}
 	dirSteps, err := p.dirSteps(proj, obs)
 	if err != nil {
 		return nil, err
@@ -527,6 +544,15 @@ func (p *Provider) ensureDir(proj *model.Project, rel string, mode os.FileMode, 
 		target = fs.Owner{UID: uid, GID: gid}
 	}
 	if rel == "" {
+		// Le home d'un projet groupé se crée dans le répertoire de son groupe, par
+		// descripteur (D135) : EnsureDir créerait par MkdirAll un répertoire de
+		// groupe manquant, au mode du home et sans le juger.
+		if _, _, ok, err := groupDir(proj); err != nil {
+			return err
+		} else if ok {
+			root := filepath.Clean(proj.Spec.Layout.Root)
+			return fs.EnsureDirAt(filepath.Dir(root), filepath.Base(root), mode, target)
+		}
 		return fs.EnsureDir(proj.Spec.Layout.Root, mode, target)
 	}
 	return fs.EnsureDirAt(proj.Spec.Layout.Root, rel, mode, target)

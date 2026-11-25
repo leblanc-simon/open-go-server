@@ -235,8 +235,20 @@ func newProjectListCommand(app *App) *cobra.Command {
 					fmt.Fprintln(app.Out, "aucun projet déclaré")
 					return
 				}
-				fmt.Fprintln(tw, "IDENTIFIANT\tHOST\tENV\tTYPE\tHOME")
+				// La colonne du groupe (D135) n'apparaît que si un projet en a un : un
+				// parc sans groupe garde sa sortie d'avant.
+				grouped := slices.ContainsFunc(items, func(it projectSummary) bool { return it.Group != "" })
+				if grouped {
+					fmt.Fprintln(tw, "IDENTIFIANT\tHOST\tENV\tTYPE\tGROUPE\tHOME")
+				} else {
+					fmt.Fprintln(tw, "IDENTIFIANT\tHOST\tENV\tTYPE\tHOME")
+				}
 				for _, it := range items {
+					if grouped {
+						fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n", it.ID, it.Host, it.Env, it.Kind,
+							orValue(it.Group, "-"), it.Home)
+						continue
+					}
 					fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", it.ID, it.Host, it.Env, it.Kind, it.Home)
 				}
 			}))
