@@ -927,3 +927,22 @@ func TestNeSuitPasUnLienPoseEntreLeConstatEtLEcriture(t *testing.T) {
 		}
 	})
 }
+
+func TestHardenNeDescendPasSousLaRacineDesHomes(t *testing.T) {
+	// Sous la racine des homes vivent les homes et les répertoires des groupes de
+	// projets (D135), dont l'apply est le seul juge : « ne desserre jamais »
+	// laisserait un répertoire de groupe en 0700 que l'apply rouvrirait en 0701,
+	// et le plan oscillerait. La racine n'est donc ni récursive, ni accompagnée
+	// d'une cible plus profonde.
+	for _, target := range Defaults("/home") {
+		if target.Path == "/home" {
+			if target.Recursive || target.FileMode != 0 {
+				t.Errorf("la racine des homes ne doit être traitée qu'à son niveau : %+v", target)
+			}
+			continue
+		}
+		if strings.HasPrefix(target.Path, "/home/") {
+			t.Errorf("cible sous la racine des homes : %s", target.Path)
+		}
+	}
+}

@@ -982,3 +982,20 @@ func TestAdoptGardeLHoteReelDuCompteMySQL(t *testing.T) {
 		t.Errorf("hôte relu %q, %% attendu :\n%s", got, data)
 	}
 }
+
+func TestAdoptNePoseJamaisDeGroupe(t *testing.T) {
+	// Un projet adopté garde son home et ses bases réels (D78) : il n'entre dans
+	// aucun groupe, que la validation lui refuserait (D135).
+	scanner, _ := legacyServer(t)
+	resources, _ := scanner.Scan(context.Background())
+	candidates, _ := Correlate(resources, "/home", "preprod-pp.net")
+	for _, c := range candidates {
+		p, _, err := Adopt(c, "/home", "preprod-pp.net")
+		if err != nil {
+			continue
+		}
+		if p.Spec.Group != "" {
+			t.Errorf("%s : groupe %q posé à l'adoption", c.Host, p.Spec.Group)
+		}
+	}
+}

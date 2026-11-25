@@ -896,6 +896,7 @@ func (a *App) runChecks(ctx context.Context) []check {
 	for _, p := range a.placementProblems(projects) {
 		add("racines du parc", "échec", p.what, p.fix)
 	}
+	a.groupDirChecks(projects, add)
 	certificateDeclarationChecks(projects, add)
 	fleetUniquenessChecks(projects, a.Cfg.PrepDomain(), add)
 	redirectTargetChecks(projects, add)

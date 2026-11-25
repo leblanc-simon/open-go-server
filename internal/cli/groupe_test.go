@@ -292,3 +292,129 @@ func TestLaCompletionDeGroupProposeLesGroupesExistants(t *testing.T) {
 	}
 }
 
+// ligneDoctor rend les lignes de doctor qui portent name.
+func ligneDoctor(out, name string) string {
+	var lignes []string
+	for _, l := range strings.Split(out, "\n") {
+		if strings.Contains(l, name) {
+			lignes = append(lignes, l)
+		}
+	}
+	return strings.Join(lignes, "\n")
+}
+
+// doctor juge le répertoire du groupe comme l'apply : régime, traversée,
+// contenu (D135).
+func TestDoctorJugeLeRepertoireDuGroupe(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	h.déclarerGroupé(t, "shop.fr")
+	groupe := h.path("home", "acme")
+	out, _ := h.run("doctor")
+	if l := ligneDoctor(out, "répertoire du groupe acme"); !strings.Contains(l, "1 membre(s)") {
+		t.Fatalf("répertoire conforme :\n%s", out)
+	}
+
+	if err := os.Chmod(groupe, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	out, _ = h.run("doctor")
+	if l := ligneDoctor(out, "répertoire du groupe acme"); !strings.Contains(l, "mode 0755") {
+		t.Errorf("mode retouché :\n%s", out)
+	}
+
+	if err := os.Chmod(groupe, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	out, _ = h.run("doctor")
+	if l := ligneDoctor(out, "répertoire du groupe acme"); !strings.Contains(l, "n'est pas traversable") {
+		t.Errorf("répertoire fermé :\n%s", out)
+	}
+	if err := os.Chmod(groupe, 0o701); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.Mkdir(filepath.Join(groupe, "vieux.fr"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	out, _ = h.run("doctor")
+	if l := ligneDoctor(out, "répertoire du groupe acme"); !strings.Contains(l, "vieux.fr") {
+		t.Errorf("entrée étrangère :\n%s", out)
+	}
+}
+
+// Un répertoire au régime d'un groupe que plus aucun projet ne déclare est nommé.
+func TestDoctorNommeUnRepertoireDeGroupeOrphelin(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("project", "create", "solo.fr")
+	h.mustRunPartial("apply", "--yes")
+	zeta := h.path("home", "zeta")
+	if err := os.Mkdir(zeta, 0o701); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(zeta, 0o701); err != nil {
+		t.Fatal(err)
+	}
+	out, _ := h.run("doctor")
+	if l := ligneDoctor(out, "répertoire du groupe zeta"); !strings.Contains(l, "n'est le groupe d'aucun projet") {
+		t.Errorf("répertoire orphelin :\n%s", out)
+	}
+	if strings.Contains(out, "solo.fr, au régime") {
+		t.Errorf("un home ne doit pas passer pour un répertoire de groupe :\n%s", out)
+	}
+}
+
+// doctor dit le groupe ajouté après coup, que le plan du projet refuse.
+func TestDoctorNommeUnGroupeAjouteApresCoup(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("project", "create", "blog.fr")
+	rel := filepath.Join("etc", "ogs", "projects", "blogfr.yaml")
+	decl := strings.Replace(h.read(t, rel), "\nspec:\n", "\nspec:\n  group: acme\n", 1)
+	if err := os.WriteFile(h.path(rel), []byte(decl), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, _ := h.run("doctor")
+	if l := ligneDoctor(out, "groupe acme"); !strings.Contains(l, "blogfr") {
+		t.Errorf("groupe ajouté après coup :\n%s", out)
+	}
+}
+
+// Un site repris dont le home serait le répertoire d'un groupe emporterait ses
+// membres à la suppression, et l'apply le donnerait à son compte : l'adoption est
+// refusée comme un home imbriqué (D94, D135).
+func TestLAdoptionRefuseUnHomeEgalAuRepertoireDUnGroupe(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	h.déclarerGroupé(t, "shop.fr")
+	h.legacyServer(t)
+	vhost := h.path("etc", "apache2", "sites-available", "boutique.conf")
+	data, err := os.ReadFile(vhost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Sous préfixe, une racine adoptée garde le chemin qu'elle lit : le serveur
+	// simulé désigne donc le répertoire du groupe par son chemin préfixé, comme un
+	// vrai serveur le ferait par /home/acme.
+	groupe := h.path("home", "acme")
+	if err := os.WriteFile(vhost, []byte(strings.ReplaceAll(string(data), "/var/www/boutique", groupe)),
+		0o644); err != nil {
+		t.Fatal(err)
+	}
+	passwd := "boutique:x:1001:1001::" + groupe + ":/bin/bash\n"
+	if err := os.WriteFile(h.path("etc", "passwd"), []byte(passwd), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(h.path("home", "acme", "public"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	out, code := h.run("import", "adopt", "boutiquefr", "--yes")
+	if code != CodeConflict || !strings.Contains(out, "shopfr") {
+		t.Errorf("adoption d'un home égal au répertoire du groupe : code %d, attendu %d :\n%s",
+			code, CodeConflict, out)
+	}
+	if existe(t, h.path("etc", "ogs", "projects", "boutiquefr.yaml")) {
+		t.Error("aucune déclaration ne doit être écrite")
+	}
+}
