@@ -1,10 +1,15 @@
 package cli
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"leblanc.io/open-go-server/internal/config"
+	"leblanc.io/open-go-server/internal/naming"
+	"leblanc.io/open-go-server/internal/tui"
 )
 
 // Une déclaration groupée, écrite à la main, se planifie sous le répertoire de
@@ -187,3 +192,103 @@ func TestLaSuppressionRefuseUneRacineEgaleAuRepertoireDUnGroupe(t *testing.T) {
 		t.Error("le home d'un membre du groupe a été effacé")
 	}
 }
+
+// --group sur « project create » et « site create » pose le groupe, le home sous
+// son répertoire et la base préfixée (D135).
+func TestCreateAvecGroupe(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("project", "create", "shop.fr", "--group", "acme", "--db", "mysql")
+	decl := h.read(t, filepath.Join("etc", "ogs", "projects", "shopfr.yaml"))
+	for _, attendu := range []string{"group: acme", "root: " + h.path("home", "acme", "shop.fr"),
+		"name: acme_shopfr", "user: shopfr"} {
+		if !strings.Contains(decl, attendu) {
+			t.Errorf("%q absent de la déclaration :\n%s", attendu, decl)
+		}
+	}
+	h.mustRunPartial("site", "create", "blog.fr", "--kind", "static", "--group", "acme", "--tls=false", "--yes")
+	if !existe(t, h.path("home", "acme", "blog.fr")) {
+		t.Error("site create --group doit poser le home sous le répertoire du groupe")
+	}
+	out := h.mustRun("project", "list")
+	if !strings.Contains(out, "GROUPE") || !strings.Contains(out, "acme") {
+		t.Errorf("project list doit montrer le groupe :\n%s", out)
+	}
+	out = h.mustRun("project", "list", "-o", "json")
+	if !strings.Contains(out, `"group": "acme"`) {
+		t.Errorf("la sortie JSON doit porter le groupe :\n%s", out)
+	}
+}
+
+func TestUnGroupeInvalideEstUneErreurDUsage(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	for _, args := range [][]string{
+		{"project", "create", "shop.fr", "--group", "ac_me"},
+		{"site", "create", "shop.fr", "--group", "..", "--yes"},
+	} {
+		if out, code := h.run(args...); code != CodeUsage {
+			t.Errorf("« ogs %s » : code %d, attendu %d :\n%s", strings.Join(args, " "), code, CodeUsage, out)
+		}
+	}
+	if existe(t, h.path("etc", "ogs", "projects", "shopfr.yaml")) {
+		t.Error("aucune déclaration ne doit être écrite")
+	}
+}
+
+// L'assistant de la TUI produit la même déclaration que « site create --group ».
+func TestLAssistantRangeLeSiteDansSonGroupe(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("site", "create", "shop.fr", "--kind", "static", "--group", "acme", "--apply=false", "--yes")
+	cli := h.read(t, filepath.Join("etc", "ogs", "projects", "shopfr.yaml"))
+	if err := os.Remove(h.path("etc", "ogs", "projects", "shopfr.yaml")); err != nil {
+		t.Fatal(err)
+	}
+	b := &tuiBackend{app: h.ouvrirApp(t, true)}
+	if out, err := b.Create(context.Background(), tui.WizardAnswers{Host: "shop.fr", Kind: "static",
+		Env: "prod", Group: "acme"}); err != nil {
+		t.Fatalf("Create : %v\n%s", err, out)
+	}
+	if got := h.read(t, filepath.Join("etc", "ogs", "projects", "shopfr.yaml")); got != cli {
+		t.Errorf("déclarations différentes :\n--- CLI\n%s\n--- TUI\n%s", cli, got)
+	}
+}
+
+// La préproduction d'un projet groupé rejoint le groupe de la source, base
+// préfixée comprise (D135).
+func TestLeCloneHeriteDuGroupe(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("project", "create", "shop.fr", "--kind", "static", "--group", "acme", "--db", "mysql")
+	h.mustRunPartial("apply", "--yes")
+	out, code := h.run("site", "clone", "shopfr", "--to", "prep", "--yes")
+	if code != CodeOK && code != CodePartial {
+		t.Fatalf("clone en échec (code %d) :\n%s", code, out)
+	}
+	decl := h.read(t, filepath.Join("etc", "ogs", "projects", "shopfrprep.yaml"))
+	for _, attendu := range []string{"group: acme", "root: " + h.path("home", "acme", "shop."+config.Default().Environments[string(naming.EnvPrep)].Domain),
+		"name: acme_shopfrprep"} {
+		if !strings.Contains(decl, attendu) {
+			t.Errorf("%q absent de la déclaration du clone :\n%s", attendu, decl)
+		}
+	}
+}
+
+// --group propose les groupes du parc, une fois chacun.
+func TestLaCompletionDeGroupProposeLesGroupesExistants(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("init")
+	h.mustRun("project", "create", "shop.fr", "--group", "acme")
+	h.mustRun("project", "create", "blog.fr", "--group", "acme")
+	h.mustRun("project", "create", "news.fr", "--group", "zeta")
+	h.mustRun("project", "create", "solo.fr")
+	out, code := h.run("__complete", "site", "create", "x.fr", "--group", "")
+	if code != CodeOK {
+		t.Fatalf("__complete a échoué (code %d) :\n%s", code, out)
+	}
+	if strings.Count(out, "acme\n") != 1 || !strings.Contains(out, "zeta\n") {
+		t.Errorf("groupes proposés :\n%s", out)
+	}
+}
+

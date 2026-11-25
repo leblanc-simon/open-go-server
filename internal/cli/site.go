@@ -47,6 +47,8 @@ type siteOptions struct {
 	phpVersion string
 	env        string
 	id         string
+	// group range le site dans un groupe de projets (D135).
+	group      string
 	aliases    []string
 	redirects  []string
 	database   string
@@ -192,6 +194,7 @@ func newSiteCreateCommand(app *App) *cobra.Command {
 	f.BoolVar(&opts.envFile, "env-file", false, "brancher /etc/ogs/env/<id>.env sur le service applicatif")
 	f.StringVar(&opts.phpVersion, "php", "", "version PHP (défaut "+model.DefaultPHPVersion+")")
 	f.StringVar(&opts.env, "env", "prod", "environnement : prod ou prep")
+	f.StringVar(&opts.group, "group", "", groupFlagUsage)
 	f.StringVar(&opts.id, "id", "", "forcer l'identifiant")
 	f.StringSliceVar(&opts.aliases, "alias", nil, "domaine servi en plus du principal (répétable)")
 	f.StringSliceVar(&opts.redirects, "redirect", nil, "domaine redirigé vers le principal (répétable)")
@@ -247,6 +250,9 @@ func (a *App) buildSite(host string, opts siteOptions) (*model.Project, error) {
 	}
 	if opts.phpVersion != "" {
 		p.Spec.PHP.Pools = []model.Pool{{Name: model.MainPoolName, Version: opts.phpVersion}}
+	}
+	if err := setGroup(p, opts.group); err != nil {
+		return nil, err
 	}
 	a.creationSudo(p)
 	// Première normalisation : l'identifiant et le host effectif en découlent, et
@@ -860,6 +866,7 @@ func (a *App) applyProjects(cmd *cobra.Command, projects []*model.Project) error
 type statusRow struct {
 	Project   string   `json:"project" yaml:"project"`
 	Env       string   `json:"env" yaml:"env"`
+	Group     string   `json:"group,omitempty" yaml:"group,omitempty"`
 	Host      string   `json:"host" yaml:"host"`
 	PHP       string   `json:"php,omitempty" yaml:"php,omitempty"`
 	Drift     int      `json:"drift" yaml:"drift"`
@@ -906,8 +913,8 @@ func newStatusCommand(app *App) *cobra.Command {
 			problems := refused
 			restores := app.unfinishedRestores()
 			for _, p := range projects {
-				row := statusRow{Project: p.ID(), Env: p.Metadata.Env, Host: p.Spec.Domains[0].Name,
-					Health: "sain"}
+				row := statusRow{Project: p.ID(), Env: p.Metadata.Env, Group: p.Spec.Group,
+					Host: p.Spec.Domains[0].Name, Health: "sain"}
 				// Une restauration inachevée (D113) : le projet est déclaré, son
 				// contenu peut-être pas rendu.
 				if s, ok := restores[p.ID()]; ok {

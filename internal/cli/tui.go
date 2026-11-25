@@ -327,7 +327,7 @@ func (b *tuiBackend) Create(ctx context.Context, answers tui.WizardAnswers) (str
 	defer b.mu.Unlock()
 	opts := siteOptions{
 		kind: answers.Kind, appVersion: answers.AppVersion, phpVersion: answers.PHPVersion,
-		env: answers.Env, database: answers.Database, tls: true, apply: false,
+		env: answers.Env, group: answers.Group, database: answers.Database, tls: true, apply: false,
 	}
 	// Les noms sont nettoyés une fois pour toutes : « async, high » nommait sinon
 	// la file « high » précédée d'une espace, que le worker « high » ne consommait pas.

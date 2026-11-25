@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"slices"
 	"text/tabwriter"
 
 	"github.com/spf13/cobra"
@@ -45,6 +46,7 @@ func newProjectCreateCommand(app *App) *cobra.Command {
 		envFile bool
 		phpVer  string
 		withDB  string
+		group   string
 	)
 	cmd := &cobra.Command{
 		Use:   "create <host>",
@@ -78,6 +80,9 @@ func newProjectCreateCommand(app *App) *cobra.Command {
 			}
 			if phpVer != "" {
 				p.Spec.PHP.Pools = []model.Pool{{Name: model.MainPoolName, Version: phpVer}}
+			}
+			if err := setGroup(p, group); err != nil {
+				return err
 			}
 			if hostOpt != "" {
 				// Un host explicite dissocie le nom servi du host canonique.
@@ -168,7 +173,25 @@ func newProjectCreateCommand(app *App) *cobra.Command {
 	f.StringVar(&hostOpt, "host", "", "host servi, s'il diffère du host canonique")
 	f.StringVar(&phpVer, "php", "", "version PHP du pool principal (défaut "+model.DefaultPHPVersion+")")
 	f.StringVar(&withDB, "db", "", "déclarer une base : mysql, mariadb ou postgres")
+	f.StringVar(&group, "group", "", groupFlagUsage)
 	return cmd
+}
+
+// groupFlagUsage décrit --group, commun à « project create » et « site create ».
+const groupFlagUsage = "ranger le projet dans un groupe : home sous <racine des homes>/<groupe>/, bases préfixées " +
+	"« <groupe>_ » ; figé à la création (D135)"
+
+// setGroup pose le groupe d'un projet à créer, après en avoir contrôlé le nom :
+// une faute de frappe est une erreur d'usage, non une déclaration refusée.
+func setGroup(p *model.Project, group string) error {
+	if group == "" {
+		return nil
+	}
+	if err := naming.ValidateGroup(group); err != nil {
+		return exitf(CodeUsage, "--group : %s", err)
+	}
+	p.Spec.Group = group
+	return nil
 }
 
 func kindsList() string {
@@ -197,6 +220,7 @@ type projectSummary struct {
 	Host    string   `json:"host" yaml:"host"`
 	Env     string   `json:"env" yaml:"env"`
 	Kind    string   `json:"kind" yaml:"kind"`
+	Group   string   `json:"group,omitempty" yaml:"group,omitempty"`
 	Home    string   `json:"home" yaml:"home"`
 	Docroot string   `json:"docroot,omitempty" yaml:"docroot,omitempty"`
 	Domains []string `json:"domains" yaml:"domains"`
@@ -209,7 +233,7 @@ func summarize(p *model.Project) projectSummary {
 	}
 	return projectSummary{
 		ID: p.ID(), Host: p.Metadata.Host, Env: p.Metadata.Env,
-		Kind: string(p.Spec.App.Kind), Home: p.Spec.Layout.Root,
+		Kind: string(p.Spec.App.Kind), Group: p.Spec.Group, Home: p.Spec.Layout.Root,
 		Docroot: p.Spec.Layout.Docroot, Domains: domains,
 	}
 }
@@ -275,6 +299,9 @@ func newProjectShowCommand(app *App) *cobra.Command {
 				fmt.Fprintf(tw, "identifiant\t%s\n", p.ID())
 				fmt.Fprintf(tw, "host\t%s\n", p.Metadata.Host)
 				fmt.Fprintf(tw, "environnement\t%s\n", p.Metadata.Env)
+				if p.Spec.Group != "" {
+					fmt.Fprintf(tw, "groupe\t%s\n", p.Spec.Group)
+				}
 				fmt.Fprintf(tw, "type\t%s (version %s)\n", p.Spec.App.Kind, p.Spec.App.Version)
 				fmt.Fprintf(tw, "utilisateur\t%s:%s (shell %s)\n", p.Spec.User.Name, p.Spec.User.Group, p.Spec.User.Shell)
 				fmt.Fprintf(tw, "accès web\t%s\n", p.Spec.User.WebAccess)
@@ -339,6 +366,10 @@ func (a *App) preexistingHome(ctx context.Context, p *model.Project) error {
 	}
 	// Le groupe d'un compte à créer, de même (D107).
 	if err := prov.PreexistingGroup(p, obs); err != nil {
+		return wrap(CodeConflict, err)
+	}
+	// Et le répertoire de son groupe de projets, à root seul (D135).
+	if err := prov.PreexistingGroupDir(p, obs); err != nil {
 		return wrap(CodeConflict, err)
 	}
 	return nil

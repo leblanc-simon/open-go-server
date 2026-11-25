@@ -286,6 +286,8 @@ func TestWizardCollectsAnswers(t *testing.T) {
 	msgs = append(msgs, key("enter")) // environnement : prod
 	msgs = append(msgs, typeText("shop.fr")...)
 	msgs = append(msgs, key("enter"))         // host
+	msgs = append(msgs, typeText("acme")...)  //
+	msgs = append(msgs, key("enter"))         // groupe (D135)
 	msgs = append(msgs, key("enter"))         // type : défaut php-symfony
 	msgs = append(msgs, typeText("6.4")...)   //
 	msgs = append(msgs, key("enter"))         // version applicative
@@ -306,7 +308,8 @@ func TestWizardCollectsAnswers(t *testing.T) {
 	if answers.Host != "shop.fr" || answers.Kind != "php-symfony" || answers.PHPVersion != "8.5" {
 		t.Errorf("réponses collectées : %+v", answers)
 	}
-	if answers.Database != "mysql" || answers.Messenger != "async" || answers.Instances != "2" {
+	if answers.Group != "acme" || answers.Database != "mysql" || answers.Messenger != "async" ||
+		answers.Instances != "2" {
 		t.Errorf("réponses collectées : %+v", answers)
 	}
 	if !strings.Contains(view, "projet créé") {
@@ -340,6 +343,7 @@ func TestWizardRejectsUnknownChoice(t *testing.T) {
 	msgs = append(msgs, key("enter")) // environnement : prod
 	msgs = append(msgs, typeText("shop.fr")...)
 	msgs = append(msgs, key("enter"))
+	msgs = append(msgs, key("enter")) // groupe : aucun
 	msgs = append(msgs, typeText("php-drupal")...)
 	msgs = append(msgs, key("enter"))
 	view := drive(m, msgs...)

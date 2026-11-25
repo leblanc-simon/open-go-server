@@ -46,6 +46,14 @@ func installCompletions(root *cobra.Command, app *App) {
 		if f := cmd.Flags().Lookup("env"); f != nil {
 			_ = cmd.RegisterFlagCompletionFunc("env", staticComplete(envValues()))
 		}
+		// Les groupes existants sont proposés, un groupe neuf restant libre : une
+		// faute de frappe y créerait sinon un second répertoire (D135).
+		if f := cmd.Flags().Lookup("group"); f != nil {
+			_ = cmd.RegisterFlagCompletionFunc("group",
+				func(_ *cobra.Command, _ []string, prefix string) ([]string, cobra.ShellCompDirective) {
+					return filterPrefix(projectGroups(app), prefix), cobra.ShellCompDirectiveNoFileComp
+				})
+		}
 	}
 }
 
@@ -128,6 +136,21 @@ func projectIDs(app *App) []string {
 			continue
 		}
 		out = append(out, strings.TrimSuffix(e.Name(), ".yaml"))
+	}
+	sort.Strings(out)
+	return out
+}
+
+// projectGroups liste les groupes de projets du parc (D135), sans doublon. Comme
+// pour les identifiants, une déclaration illisible est simplement passée.
+func projectGroups(app *App) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, id := range projectIDs(app) {
+		if p := loadForCompletion(app, id); p != nil && p.Spec.Group != "" && !seen[p.Spec.Group] {
+			seen[p.Spec.Group] = true
+			out = append(out, p.Spec.Group)
+		}
 	}
 	sort.Strings(out)
 	return out

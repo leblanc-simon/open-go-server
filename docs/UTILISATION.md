@@ -408,6 +408,37 @@ fichier d'environnement de la production n'est jamais recopié : celui de la pr�
 `ogs site clone shopfr --to prep --dry-run` annonce ce que la copie retiendra, masquera et reprendra, et
 quand le clone rendra le code 6.
 
+La préproduction d'un projet groupé rejoint le groupe de la source (voir ci-dessous) : son home est
+`/home/<groupe>/shop.<domaine>`, ses bases `<groupe>_shopfrprep`.
+
+### 8. Plusieurs sites d'un même client : les groupes
+
+```sh
+sudo ogs site create shop.fr --kind php-symfony --db mysql --group betrancourt
+sudo ogs site create blog.fr --kind php-plain   --db mysql --group betrancourt
+```
+
+Un **groupe** range les sites sous un même répertoire et un même préfixe de base (D135) :
+
+| | sans groupe | `--group betrancourt` |
+|---|---|---|
+| home | `/home/shop.fr` | `/home/betrancourt/shop.fr` |
+| base | `shopfr` | `betrancourt_shopfr` |
+| compte Linux, compte de base, pool, vhost, unités | `shopfr` | `shopfr`, inchangés |
+
+C'est un **rangement, pas un accès partagé** : chaque site garde son compte, son groupe Unix privé et son
+cloisonnement, et un compte de base ne voit toujours que ses bases. Le répertoire du groupe appartient à
+`root:root` en `0701` — le serveur web le traverse, personne d'autre que root ne l'énumère — et l'apply
+rétablit ce régime s'il a été retouché ; un répertoire de ce nom tenu par un autre compte fait refuser la
+création (code 4). Il disparaît avec le dernier site du groupe. `ogs project list` montre le groupe, et
+`--group` se complète avec les groupes existants.
+
+Le nom d'un groupe s'écrit `[a-z][a-z0-9]{1,15}` — ni souligné, ni tiret —, et ne peut pas être
+l'identifiant d'un projet. **Le groupe se choisit à la création et ne change plus** : ogs ne déplace ni un
+home ni une base (MySQL ne sait pas renommer une base). Ajouter ou changer `spec.group` dans la déclaration
+d'un projet existant fait refuser son plan (code 3), sans gêner les autres projets. Un projet repris par
+`ogs import` n'entre jamais dans un groupe.
+
 ## Les services
 
 Un service est un processus long — consommateur de file, worker — que systemd lance, supervise et relance

@@ -15,9 +15,11 @@ type WizardAnswers struct {
 	AppVersion string
 	PHPVersion string
 	Env        string
-	Database   string
-	Messenger  string
-	Instances  string
+	// Group range le site dans un groupe de projets (D135) ; vide pour aucun.
+	Group     string
+	Database  string
+	Messenger string
+	Instances string
 }
 
 // step est une question de l'assistant. L'accès au champ passe par des fonctions
@@ -69,6 +71,10 @@ func newWizard(prepDomain string) wizard {
 		{label: "Host canonique du site", helpOf: hostHelp,
 			get: func(a WizardAnswers) string { return a.Host },
 			set: func(a *WizardAnswers, v string) { a.Host = v }},
+		{label: "Groupe", help: "home sous <racine des homes>/<groupe>/, bases préfixées « <groupe>_ », " +
+			"figé à la création — vide pour aucun",
+			get: func(a WizardAnswers) string { return a.Group },
+			set: func(a *WizardAnswers, v string) { a.Group = v }, optional: true},
 		{label: "Type d'application",
 			get: func(a WizardAnswers) string { return a.Kind },
 			set: func(a *WizardAnswers, v string) { a.Kind = v },
