@@ -772,6 +772,17 @@ func (a *App) checkFleetUniqueness(projects ...*model.Project) error {
 	if err := a.checkPlacement(fleet); err != nil {
 		return err
 	}
+	// Le groupe et la longueur des noms de bases ne se jugent que sur les projets
+	// visés, après les racines : un home hors de la racine des homes est d'abord
+	// une racine changée, et le groupe n'y est pour rien (D135).
+	for _, p := range projects {
+		if err := validate.GroupPlacement(p, a.homeRoot()); err != nil {
+			return exitf(CodeValidation, "projet %s :\n%v", p.ID(), err)
+		}
+		if err := validate.DatabaseNameLengths(p); err != nil {
+			return exitf(CodeValidation, "projet %s :\n%v", p.ID(), err)
+		}
+	}
 	if err := validate.UniquenessFor(fleet, a.Cfg.PrepDomain(), ids...); err != nil {
 		return exitf(CodeConflict, "conflit avec le parc existant :\n%v", err)
 	}

@@ -1391,7 +1391,9 @@ func (p *Provider) Env(ctx context.Context, proj *model.Project) ([]EnvEntry, er
 		}
 		role := ""
 		if i > 0 {
-			role = strings.TrimPrefix(decl.Name, proj.ID()+"_")
+			// Le préfixe du groupe (D135) ne fait pas partie du rôle : sans ce
+			// retrait, ANALYTICS_DATABASE_URL devenait ACME_SHOPFR_ANALYTICS_….
+			role = strings.TrimPrefix(decl.Name, naming.GroupedName(proj.Spec.Group, proj.ID())+"_")
 		}
 		out = append(out, EnvEntry{Name: EnvVarName(role), Value: dsn})
 	}
@@ -1408,10 +1410,11 @@ func (p *Provider) Env(ctx context.Context, proj *model.Project) ([]EnvEntry, er
 }
 
 // DefaultDatabase construit la déclaration de base par défaut d'un projet : tout
-// porte l'identifiant du projet (D23).
+// porte l'identifiant du projet (D23), la base préfixée par son groupe (D135) —
+// le compte jamais, borné à 32 caractères qu'un identifiant peut déjà atteindre.
 func DefaultDatabase(proj *model.Project, engine string) model.Database {
 	return model.Database{
-		Engine: engine, Name: proj.ID(), User: proj.ID(), Host: "localhost",
+		Engine: engine, Name: naming.GroupedName(proj.Spec.Group, proj.ID()), User: proj.ID(), Host: "localhost",
 		Charset: "utf8mb4", Collation: "utf8mb4_unicode_ci", Privileges: string(PrivAll),
 	}
 }
@@ -1420,7 +1423,7 @@ func DefaultDatabase(proj *model.Project, engine string) model.Database {
 func RoleDatabase(proj *model.Project, engine, role string) model.Database {
 	name := naming.RoleName(proj.ID(), role)
 	return model.Database{
-		Engine: engine, Name: name, User: name, Host: "localhost",
+		Engine: engine, Name: naming.GroupedName(proj.Spec.Group, name), User: name, Host: "localhost",
 		Privileges: string(PrivAll),
 	}
 }

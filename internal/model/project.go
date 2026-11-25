@@ -48,6 +48,11 @@ type Metadata struct {
 
 // Spec regroupe l'ensemble des ressources déclarées.
 type Spec struct {
+	// Group range le projet dans un groupe (D135) : son home sous
+	// <racine des homes>/<groupe>/, ses bases préfixées « <groupe>_ ». Ce n'est
+	// ni un groupe Unix — c'est User.Group — ni un accès partagé. Figé à la
+	// création : le home et les noms de bases sont écrits dans la déclaration.
+	Group        string            `yaml:"group,omitempty"`
 	App          App               `yaml:"app"`
 	User         User              `yaml:"user"`
 	Layout       Layout            `yaml:"layout"`
@@ -641,7 +646,17 @@ func (p *Project) Normalize(homeRoot, prepDomain string, opts ...NormalizeOption
 		p.Spec.User.WebAccess = "group"
 	}
 
+	// Un projet groupé vit sous le répertoire de son groupe (D135). Le nom est
+	// éprouvé avant d'entrer dans un chemin : « .. » sortirait de la racine. Le
+	// refus au chargement ne rend invalide aucune déclaration antérieure — la clé
+	// n'existait pas, et le décodage strict la refusait.
 	root := filepath.Join(homeRoot, effective)
+	if p.Spec.Group != "" {
+		if err := naming.ValidateGroup(p.Spec.Group); err != nil {
+			return fmt.Errorf("spec.group : %w", err)
+		}
+		root = filepath.Join(homeRoot, p.Spec.Group, effective)
+	}
 	if p.Spec.Layout.Root == "" {
 		p.Spec.Layout.Root = root
 	}

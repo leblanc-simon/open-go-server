@@ -81,6 +81,7 @@ func envsAttendus() string {
 
 var (
 	reIdentifier = regexp.MustCompile(`^[a-z][a-z0-9_]{1,31}$`)
+	reGroup      = regexp.MustCompile(`^[a-z][a-z0-9]{1,15}$`)
 	reHostLabel  = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`)
 	reNotKept    = regexp.MustCompile(`[^a-z0-9]`)
 )
@@ -294,6 +295,37 @@ var reservedNames = []string{
 	"uucp", "proxy", "www_data", "www-data", "backup", "list", "irc", "nobody",
 	"systemd", "syslog", "messagebus", "sshd", "mysql", "postgres", "redis",
 	"rabbitmq", "ogs",
+}
+
+// MaxGroup borne le nom d'un groupe de projets (D135) : préfixé à un
+// identifiant de préproduction (32) et à un rôle, le nom de base doit tenir
+// dans les 63 caractères de PostgreSQL.
+const MaxGroup = 16
+
+// ValidateGroup contrôle le nom d'un groupe de projets (D135). Il nomme un
+// répertoire sous la racine des homes et préfixe les bases : ni souligné, qui
+// rendrait le préfixe illisible, ni point ni barre, qui le feraient sortir de la
+// racine. Un nom de compte système est refusé comme pour un identifiant :
+// /home/<groupe> serait pris pour le home de ce compte.
+func ValidateGroup(group string) error {
+	if !reGroup.MatchString(group) {
+		return fmt.Errorf("groupe %q invalide : attendu [a-z][a-z0-9]{1,%d}", group, MaxGroup-1)
+	}
+	for _, r := range reservedNames {
+		if group == r {
+			return fmt.Errorf("groupe %q réservé par le système", group)
+		}
+	}
+	return nil
+}
+
+// GroupedName préfixe le nom d'une base par le groupe de son projet (D135). Sans
+// groupe, le nom est rendu tel quel.
+func GroupedName(group, name string) string {
+	if group == "" {
+		return name
+	}
+	return group + "_" + name
 }
 
 // RoleName suffixe un identifiant pour une ressource additionnelle : la ressource

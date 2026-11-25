@@ -120,6 +120,47 @@ func Placement(p *model.Project, homeRoot, logsRoot string) error {
 	return errs
 }
 
+// GroupPlacement contrôle qu'un projet groupé vit bien sous le répertoire de son
+// groupe (D135). Le groupe est figé à la création : un spec.group ajouté ou
+// changé ensuite ne déplace pas le home, et ce contrôle le refuse. Il se juge au
+// plan et à l'apply du projet visé, jamais au chargement ni sur le parc entier
+// comme Placement (D120) : une déclaration retouchée arrêterait ses voisins.
+func GroupPlacement(p *model.Project, homeRoot string) error {
+	if p.Spec.Group == "" || p.Metadata.Labels["adopted"] == "true" {
+		return nil
+	}
+	want := filepath.Join(filepath.Clean(homeRoot), p.Spec.Group)
+	root := filepath.Clean(p.Spec.Layout.Root)
+	if filepath.Dir(root) == want {
+		return nil
+	}
+	return Errors{{Field: "spec.group", Message: fmt.Sprintf("le projet est dans le groupe %q, mais son home %s "+
+		"n'est pas sous %s : le groupe se fixe à la création, et ogs ne déplace pas un home (D135) — rendre à "+
+		"spec.group sa valeur d'origine", p.Spec.Group, root, want)}}
+}
+
+// DatabaseNameLengths refuse un nom de base que le moteur refuserait : 64
+// caractères sous MySQL et MariaDB, 63 sous PostgreSQL. Le préfixe d'un groupe
+// (D135) allonge les noms ; un nom trop long n'est jamais tronqué, la troncature
+// pouvant faire tomber deux bases sur le même nom. Jugé au plan du projet visé :
+// aucune déclaration trop longue n'a jamais pu s'appliquer, mais la refuser au
+// chargement arrêterait le parc.
+func DatabaseNameLengths(p *model.Project) error {
+	var errs Errors
+	for i, db := range p.Spec.Databases {
+		limit := 64
+		if db.Engine == "postgres" {
+			limit = 63
+		}
+		if len(db.Name) > limit {
+			errs = append(errs, Error{Field: fmt.Sprintf("spec.databases[%d].name", i), Message: fmt.Sprintf(
+				"nom de base %q trop long (%d > %d) : raccourcir le rôle, ou le nom du groupe à la création",
+				db.Name, len(db.Name), limit)})
+		}
+	}
+	return errs.OrNil()
+}
+
 // Project valide un projet déjà normalisé.
 func Project(p *model.Project, homeRoot string) error {
 	var errs Errors
@@ -162,6 +203,17 @@ func Project(p *model.Project, homeRoot string) error {
 	} else {
 		if err := naming.ValidateIdentifier(p.Spec.User.Name); err != nil {
 			add("spec.user.name", "%v", err)
+		}
+	}
+	// Un groupe (D135) n'existait pas avant cette clé, que le décodage strict
+	// refusait : le contrôler au chargement ne rend invalide aucune déclaration
+	// antérieure. Un projet adopté garde son home et ses bases réels (D78).
+	if p.Spec.Group != "" {
+		if err := naming.ValidateGroup(p.Spec.Group); err != nil {
+			add("spec.group", "%v", err)
+		}
+		if adopted {
+			add("spec.group", "un projet adopté garde son home et ses bases réels : il n'entre pas dans un groupe (D135)")
 		}
 	}
 	if p.Spec.User.UID != "" && p.Spec.User.UID != "auto" {
@@ -1083,6 +1135,7 @@ func uniquenessConflicts(projects []*model.Project, prepDomain string) []conflic
 		}
 	}
 	errs = append(errs, includeDirConflicts(projects)...)
+	errs = append(errs, groupConflicts(projects)...)
 	// L'égalité des homes ne suffit pas : un home imbriqué dans celui d'un autre
 	// projet est effacé avec lui, et « ogs project delete » du premier emportait
 	// le second, toujours déclaré et servi. L'import en produit sans y penser : un
@@ -1219,6 +1272,52 @@ func DBServer(engine string) string {
 		return "mysql"
 	}
 	return engine
+}
+
+// groupConflicts refuse ce qui brouillerait un groupe de projets (D135) : un
+// groupe qui porte l'identifiant d'un projet — le préfixe de ses bases se lirait
+// comme une base de rôle de ce projet —, et un home posé dans le répertoire d'un
+// groupe par un projet qui n'en est pas — la suppression du dernier membre le
+// trouverait non vide, et le répertoire passerait pour celui du groupe. Un home
+// égal au répertoire d'un groupe est déjà refusé comme home imbriqué.
+func groupConflicts(projects []*model.Project) []conflict {
+	var out []conflict
+	for _, p := range projects {
+		group := p.Spec.Group
+		if group == "" {
+			continue
+		}
+		for _, q := range projects {
+			if q.Metadata.Name == group {
+				out = append(out, conflict{Error{Field: "groupe", Message: fmt.Sprintf(
+					"le groupe %q du projet %q porte l'identifiant du projet %q", group, p.Metadata.Name,
+					q.Metadata.Name)}, q.Metadata.Name, p.Metadata.Name})
+			}
+		}
+	}
+	// Le répertoire d'un groupe se lit sur le home de ses membres : la racine des
+	// homes n'est pas connue ici, et GroupPlacement garantit au projet visé que
+	// son home est bien sous <racine>/<groupe>.
+	signalés := map[string]bool{}
+	for _, p := range projects {
+		dir := filepath.Dir(filepath.Clean(p.Spec.Layout.Root))
+		if p.Spec.Group == "" || filepath.Base(dir) != p.Spec.Group {
+			continue
+		}
+		for _, q := range projects {
+			if q.Spec.Group == p.Spec.Group || filepath.Dir(filepath.Clean(q.Spec.Layout.Root)) != dir {
+				continue
+			}
+			if key := dir + "\x00" + q.Metadata.Name; !signalés[key] {
+				signalés[key] = true
+				out = append(out, conflict{Error{Field: "home", Message: fmt.Sprintf(
+					"%q, home du projet %q, est dans %s, répertoire du groupe %q (projet %q), sans être de ce "+
+						"groupe", q.Spec.Layout.Root, q.Metadata.Name, dir, p.Spec.Group, p.Metadata.Name)},
+					p.Metadata.Name, q.Metadata.Name})
+			}
+		}
+	}
+	return out
 }
 
 // includeDirConflicts refuse deux vhosts de projets distincts qui partagent un
