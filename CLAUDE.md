@@ -1137,11 +1137,12 @@ Ils ont tous coûté un défaut réel ; les tests unitaires ne les voyaient pas.
 - **Un enfant d'`exec.Local` n'est pas au premier plan du terminal** (`Setpgid`) : un pager qu'il lance
   reste arrêté sur sa première lecture. Une commande dont la sortie est branchée sur le terminal
   (`Command.Stdout`) le désactive — `journalctl --no-pager`.
-- **bubbletea interroge le terminal dès l'initialisation** (couleur de fond : OSC 11 puis CSI 6n) : toute
-  commande d'ogs dont la sortie standard est un terminal sans répondant attend jusqu'à cinq secondes et
-  laisse des séquences d'échappement. C'est le pseudo-terminal qu'apt ouvre pour dpkg, même sous
-  unattended-upgrades : un script de maintenance écarte la sortie standard d'ogs (`>/dev/null`) et garde
-  stderr pour les erreurs.
+- **Rien ne doit interroger le terminal hors de la TUI.** Lip Gloss v1 le faisait dès l'initialisation
+  du paquet (couleur de fond : OSC 11 puis CSI 6n) : toute commande d'ogs dont la sortie standard était un
+  terminal sans répondant attendait jusqu'à cinq secondes et laissait des séquences d'échappement — le
+  pseudo-terminal qu'apt ouvre pour dpkg, même sous unattended-upgrades. Bubble Tea et Lip Gloss v2 ne
+  le font plus ; une bibliothèque ajoutée qui détecterait le terminal à l'import ramènerait le défaut. Les
+  scripts de maintenance gardent leur `>/dev/null` sur la sortie standard d'ogs, stderr pour les erreurs.
 - **Un répertoire de travail root rempli depuis une source non fiable n'est pas une chaîne sûre** (D90) :
   les liens qu'il reçoit (`rsync -l`) sont suivis par toute écriture faite ensuite par le nom sous ce
   répertoire. Un `current/public -> ../../../victime` reçu de la source menait root hors du miroir de
