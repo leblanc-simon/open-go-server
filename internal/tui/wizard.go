@@ -179,9 +179,7 @@ func (m *Model) wizardKey(key tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		w.index++
 		return m, nil
 	case "backspace":
-		if w.input != "" {
-			w.input = w.input[:len(w.input)-1]
-		}
+		w.input = dropLastRune(w.input)
 		return m, nil
 	}
 	// Le texte de la touche, espace compris : v2 le porte dans Text.

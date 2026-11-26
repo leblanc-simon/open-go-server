@@ -6,6 +6,8 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"unicode"
+	"unicode/utf8"
 
 	tea "charm.land/bubbletea/v2"
 
@@ -398,8 +400,44 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.KeyPressMsg:
 		return m.handleKey(msg)
+
+	case tea.PasteMsg:
+		return m.handlePaste(msg.Content)
 	}
 	return m, nil
+}
+
+// handlePaste reçoit un collage. Bubble Tea v2 le livre d'un bloc (collage
+// délimité du terminal), jamais en touches : l'ignorer rendait tout collage
+// sans effet. Seuls les champs de saisie le reçoivent, sur une ligne — une fin
+// de ligne collée ne valide rien.
+func (m *Model) handlePaste(text string) (tea.Model, tea.Cmd) {
+	switch {
+	case m.filtering:
+		// Un host ne contient pas d'espace : le filtre l'ignore, comme à la frappe.
+		m.filter += strings.Map(func(r rune) rune {
+			if unicode.IsControl(r) || unicode.IsSpace(r) {
+				return -1
+			}
+			return r
+		}, text)
+		m.cursor = 0
+	case m.mode == modeWizard:
+		m.wizard.input += strings.Map(func(r rune) rune {
+			if unicode.IsControl(r) {
+				return -1
+			}
+			return r
+		}, text)
+	}
+	return m, nil
+}
+
+// dropLastRune retire le dernier caractère, jamais un octet : un accent effacé
+// à moitié laissait une saisie invalide.
+func dropLastRune(s string) string {
+	_, size := utf8.DecodeLastRuneInString(s)
+	return s[:len(s)-size]
 }
 
 // handleKey route les touches selon l'écran courant.
@@ -417,9 +455,7 @@ func (m *Model) handleKey(key tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.filter = ""
 			return m, nil
 		case "backspace":
-			if m.filter != "" {
-				m.filter = m.filter[:len(m.filter)-1]
-			}
+			m.filter = dropLastRune(m.filter)
 			return m, nil
 		case "space":
 			// Un host ne contient pas d'espace : le filtre l'ignore.

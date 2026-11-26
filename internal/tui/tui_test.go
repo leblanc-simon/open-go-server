@@ -486,3 +486,27 @@ func TestLesDeclarationsRefuseesSontNommeesALEcran(t *testing.T) {
 		t.Errorf("le bandeau doit figurer même sans projet lisible :\n%s", m.View().Content)
 	}
 }
+
+// Bubble Tea v2 livre un collage d'un bloc, en PasteMsg : ignoré, il rendait
+// tout collage sans effet dans l'assistant comme dans le filtre.
+func TestLeCollageAtteintLesChampsDeSaisie(t *testing.T) {
+	backend := &fakeBackend{projects: []*model.Project{
+		project(t, "shop.fr", naming.EnvProd), project(t, "autre.fr", naming.EnvProd),
+	}}
+	m := New(backend)
+	_ = drive(m, m.Init()())
+	view := drive(m, key("/"), tea.PasteMsg{Content: "sh op\n"})
+	if strings.Contains(view, "autrefr") || !strings.Contains(view, "shopfr") {
+		t.Errorf("le filtre doit recevoir le collage, sans blancs :\n%s", view)
+	}
+	_ = drive(m, key("esc"), key("n"), key("enter"))
+	view = drive(m, tea.PasteMsg{Content: "boutique.fr\r\n"})
+	if !strings.Contains(view, "> boutique.fr▏") {
+		t.Errorf("l'assistant doit recevoir le collage, sur une ligne :\n%s", view)
+	}
+	// L'effacement retire un caractère, jamais un octet.
+	view = drive(m, key("backspace"), key("backspace"), key("backspace"), tea.PasteMsg{Content: "é"}, key("backspace"))
+	if !strings.Contains(view, "> boutique▏") {
+		t.Errorf("l'effacement doit retirer le caractère entier :\n%s", view)
+	}
+}
