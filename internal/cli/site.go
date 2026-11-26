@@ -504,8 +504,13 @@ func newSiteCloneCommand(app *App) *cobra.Command {
 			if err := app.preexistingHome(cmd.Context(), target); err != nil {
 				return err
 			}
+			emptyDBs := uncopiedDatabases(target, withData)
 			if app.DryRun {
 				app.describeCloneGuard(guard, declared, dropped, withData)
+				if len(emptyDBs) > 0 {
+					app.warnf("⚠ --with-data ne copie que la base %s : %s resteraient vides\n",
+						target.Spec.Databases[0].Name, strings.Join(emptyDBs, ", "))
+				}
 				app.printf("\n--dry-run : rien n'a été écrit.\n")
 				return nil
 			}
@@ -610,6 +615,12 @@ func newSiteCloneCommand(app *App) *cobra.Command {
 				} else {
 					dataCopied = true
 				}
+			}
+			if len(emptyDBs) > 0 {
+				app.warnf("⚠ --with-data ne copie que la base %s : %s restent vides — "+
+					"« ogs db dump %s <base> -O <fichier> » puis « ogs db restore %s <base> -i <fichier> » pour chacune\n",
+					target.Spec.Databases[0].Name, strings.Join(emptyDBs, ", "), source.ID(), target.ID())
+				guarded = append(guarded, fmt.Sprintf("%d base(s) laissée(s) vide(s)", len(emptyDBs)))
 			}
 			if n := declared.review; n > 0 {
 				guarded = append(guarded, fmt.Sprintf("%d champ(s) de la déclaration à revoir", n))
@@ -1069,4 +1080,18 @@ func sourceRole(d model.Database, base, id string) string {
 		}
 		return '_'
 	}, d.Name), "_")
+}
+
+// uncopiedDatabases nomme les bases du clone que --with-data laisse vides :
+// seule la première reçoit les données de la source, les autres sont créées
+// sans contenu, et le clone le dit au lieu de les laisser passer pour copiées.
+func uncopiedDatabases(target *model.Project, withData bool) []string {
+	if !withData || len(target.Spec.Databases) < 2 {
+		return nil
+	}
+	out := make([]string, 0, len(target.Spec.Databases)-1)
+	for _, d := range target.Spec.Databases[1:] {
+		out = append(out, d.Engine+" "+d.Name)
+	}
+	return out
 }
