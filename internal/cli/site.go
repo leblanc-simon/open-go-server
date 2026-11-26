@@ -734,13 +734,7 @@ func (a *App) cloneProject(source *model.Project, env naming.Env) (*model.Projec
 	if err := a.prepare(&clone); err != nil {
 		return nil, err
 	}
-	for _, d := range source.Spec.Databases {
-		decl := db.DefaultDatabase(&clone, d.Engine)
-		decl.Cluster = d.Cluster
-		decl.Extensions = d.Extensions
-		decl.Privileges = d.Privileges
-		clone.Spec.Databases = append(clone.Spec.Databases, decl)
-	}
+	clone.Spec.Databases = cloneDatabases(source, &clone)
 	if source.Spec.AMQP != nil {
 		transports := make([]string, 0, len(source.Spec.AMQP.Queues))
 		failed := false
@@ -1009,3 +1003,70 @@ func newStatusCommand(app *App) *cobra.Command {
 
 // unitTarget expose le nom de cible pour les messages.
 func unitTarget(id string) string { return unit.TargetName(id) }
+
+// cloneDatabases déclare les bases de la préproduction, une par base de la
+// source, chacune sous le rôle qu'elle tient dans la source : la principale
+// redevient la principale du clone, « shopfr_api » devient « shopfrprep_api ».
+// Toutes passaient par la base principale, et deux bases d'un même moteur
+// recevaient le même nom et le même compte : le clone était refusé, ou les
+// deux bases de la production versées dans une seule. Un compte que la source
+// partage entre plusieurs bases reste partagé dans le clone.
+func cloneDatabases(source, clone *model.Project) []model.Database {
+	base := naming.GroupedName(source.Spec.Group, source.ID())
+	type key struct{ engine, name string }
+	taken := map[key]bool{}
+	users := map[key]string{}
+	var out []model.Database
+	for _, d := range source.Spec.Databases {
+		role := sourceRole(d, base, source.ID())
+		decl := db.RoleDatabase(clone, d.Engine, role)
+		if role == "" {
+			decl = db.DefaultDatabase(clone, d.Engine)
+		}
+		// Un nom que la source n'a pas tiré d'ogs (base adoptée) peut retomber
+		// sur un rôle déjà pris : il est numéroté plutôt que fusionné.
+		for n := 2; taken[key{d.Engine, decl.Name}]; n++ {
+			decl = db.RoleDatabase(clone, d.Engine, naming.RoleName(role, strconv.Itoa(n)))
+			if role == "" {
+				decl = db.RoleDatabase(clone, d.Engine, strconv.Itoa(n))
+			}
+		}
+		taken[key{d.Engine, decl.Name}] = true
+		if u, ok := users[key{d.Engine, d.User}]; ok {
+			decl.User = u
+		} else {
+			users[key{d.Engine, d.User}] = decl.User
+		}
+		decl.Cluster = d.Cluster
+		decl.Extensions = slices.Clone(d.Extensions)
+		decl.Privileges = d.Privileges
+		out = append(out, decl)
+	}
+	return out
+}
+
+// sourceRole rend le rôle d'une base de la source : vide pour la principale,
+// le suffixe de son nom (ou, à défaut, de son compte) pour une base de rôle, et
+// pour un nom qu'ogs n'a pas dérivé — base adoptée —, le nom lui-même ramené à
+// [a-z0-9_].
+func sourceRole(d model.Database, base, id string) string {
+	switch {
+	case d.Name == base:
+		return ""
+	case strings.HasPrefix(d.Name, base+"_"):
+		return strings.TrimPrefix(d.Name, base+"_")
+	case d.User == id:
+		return ""
+	case strings.HasPrefix(d.User, id+"_"):
+		return strings.TrimPrefix(d.User, id+"_")
+	}
+	return strings.Trim(strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+			return r
+		case r >= 'A' && r <= 'Z':
+			return r + 'a' - 'A'
+		}
+		return '_'
+	}, d.Name), "_")
+}
