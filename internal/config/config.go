@@ -1048,7 +1048,10 @@ func (p Paths) Dirs() []struct {
 		{p.Etc(), 0o700},
 		{p.ProjectsDir(), 0o700},
 		{p.ArchivedDir(), 0o700},
-		{p.TemplatesDir(), 0o750},
+		// 0700 comme le reste de /etc/ogs : « ogs init » repose ce mode sur un
+		// répertoire existant, et un 0750 rouvrait à chaque init ce que harden
+		// referme.
+		{p.TemplatesDir(), 0o700},
 		// Les hooks s'exécutent en root : leur répertoire n'a pas à être lisible.
 		{p.HooksDir(), 0o700},
 		{p.DNSCredsDir(), 0o700},

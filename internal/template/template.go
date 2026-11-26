@@ -120,10 +120,11 @@ func (s *Set) Extract(name string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("template %q inconnu", name)
 	}
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+	// Le régime de /etc/ogs, qu'« ogs harden » exige : 0700 et 0600.
+	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
 		return "", err
 	}
-	if err := os.WriteFile(dst, src, 0o644); err != nil {
+	if err := os.WriteFile(dst, src, 0o600); err != nil {
 		return "", err
 	}
 	return dst, nil

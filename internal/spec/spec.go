@@ -81,23 +81,57 @@ func LoadAll(dir string) ([]*model.Project, error) {
 	return out, nil
 }
 
+// DeclarationMode est le mode d'une déclaration neuve, DeclarationDirMode celui
+// de son répertoire : le régime qu'« ogs harden » exige sous /etc/ogs (0600,
+// 0700). Une déclaration écrite en 0644 était rouverte à chaque création — et à
+// chaque réécriture, db add ou cron add compris —, et harden la refermait.
+const (
+	DeclarationMode    os.FileMode = 0o600
+	DeclarationDirMode os.FileMode = 0o700
+)
+
 // Save écrit un fichier de projet. Ces fichiers sont destinés à être lus, édités
 // et versionnés par l'administrateur : ils ne portent donc pas l'en-tête de
-// gestion des fichiers générés.
+// gestion des fichiers générés. Une déclaration existante garde son mode et son
+// propriétaire (WriteFileAtomic) : ogs ne desserre jamais ce que l'exploitant ou
+// harden a resserré, et ne referme pas ce qu'il a choisi d'ouvrir.
 func Save(path string, p *model.Project) error {
 	data, err := Encode(p)
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if _, err := os.Lstat(path); err == nil {
+		return WriteFileAtomic(path, data)
+	} else if !errors.Is(err, fs.ErrNotExist) {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, DeclarationDirMode); err != nil {
 		return err
 	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
+	// CreateTemp crée en exclusif et en 0600 : ni un reste d'écriture
+	// interrompue ni le umask ne décident du mode.
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".ogs-*")
+	if err != nil {
+		return err
+	}
+	name := tmp.Name()
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		_ = os.Remove(name)
+		return err
+	}
+	if err := tmp.Chmod(DeclarationMode); err != nil {
+		tmp.Close()
+		_ = os.Remove(name)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(name)
+		return err
+	}
+	if err := os.Rename(name, path); err != nil {
+		_ = os.Remove(name)
 		return err
 	}
 	return nil

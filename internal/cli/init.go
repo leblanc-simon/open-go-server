@@ -51,7 +51,7 @@ func newInitCommand(app *App) *cobra.Command {
 					return wrap(CodeError, err)
 				}
 				header := []byte("# Configuration d'ogs. Voir « ogs doctor » pour vérifier la cohérence.\n")
-				if err := fs.WriteAtomic(cfgPath, append(header, data...), 0o644, fs.KeepOwner); err != nil {
+				if err := fs.WriteAtomic(cfgPath, append(header, data...), 0o600, fs.KeepOwner); err != nil {
 					return wrap(CodeError, err)
 				}
 				app.printf("✓ configuration écrite : %s\n", cfgPath)

@@ -812,6 +812,10 @@ Ils ont tous coûté un défaut réel ; les tests unitaires ne les voyaient pas.
   existant : en désaccord, l'apply rouvrirait à chaque passage ce que harden referme — c'était le cas de
   `/etc/cron.d`, rouvert en 0755 à chaque écriture d'une tâche. Un répertoire de la machine où ogs dépose
   sans en être le juge passe par **`fs.EnsureSharedDir`**, qui crée mais ne desserre jamais (D116).
+  `/etc/ogs` suit la même règle : tout ce qu'ogs y crée naît en 0700 / 0600, le régime d'`ogs harden`. Les
+  déclarations naissaient en 0644 et `spec.Save` les réécrivait en 0644 à chaque `db add` ou `cron add` ;
+  `ogs init` reposait 0750 sur `templates/` : chaque nouveau projet rendait un écart à harden. Une
+  déclaration existante est réécrite par `spec.WriteFileAtomic`, qui garde son mode et son propriétaire.
 - **Une création défaite doit retirer sa déclaration** (D112) : `site create` dont la saga déroulait tout
   laissait `/etc/ogs/projects/<id>.yaml`, que le plan global lisait aussitôt — la ligne tmpfiles d'un compte
   inexistant faisait rendre 65 à `systemd-tmpfiles`, et l'apply suivant d'un voisin 6 (« Failed to resolve

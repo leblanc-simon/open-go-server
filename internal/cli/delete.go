@@ -462,7 +462,7 @@ func newDeleteCommand(app *App) *cobra.Command {
 				}
 			} else {
 				archivedPath := filepath.Join(app.Paths.ArchivedDir(), p.ID()+".yaml")
-				if err := os.MkdirAll(filepath.Dir(archivedPath), 0o755); err != nil {
+				if err := os.MkdirAll(filepath.Dir(archivedPath), spec.DeclarationDirMode); err != nil {
 					return wrap(CodeError, err)
 				}
 				if err := os.Rename(app.Paths.ProjectFile(p.ID()), archivedPath); err != nil && !os.IsNotExist(err) {
