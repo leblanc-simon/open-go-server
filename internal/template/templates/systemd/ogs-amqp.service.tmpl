@@ -1,0 +1,24 @@
+[Unit]
+Description=ogs — consommateurs du broker (Messenger, rabbitmq:consumer)
+Documentation=man:ogs(8)
+# Rattachée au broker local (D137) : son arrêt — ou son redémarrage, ce que fait
+# apt à une mise à jour — arrête d'abord cette unité, donc les consommateurs,
+# pendant que le broker répond encore ; son démarrage la tire (WantedBy), après
+# qu'il est prêt.
+After={{ .Broker }}
+PartOf={{ .Broker }}
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart={{ .Binary }} amqp start --quiet
+ExecStop={{ .Binary }} amqp stop --quiet
+# Une déclaration refusée ailleurs dans le parc rend 6 : l'unité doit rester
+# active, sans quoi l'arrêt suivant du broker ne jouerait pas ExecStop.
+SuccessExitStatus=0 6
+# L'arrêt attend la fin du message en cours de chaque worker.
+TimeoutStartSec=5min
+TimeoutStopSec=5min
+
+[Install]
+WantedBy={{ .Broker }}

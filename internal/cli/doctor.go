@@ -30,6 +30,7 @@ import (
 	"leblanc.io/open-go-server/internal/provider/php"
 	"leblanc.io/open-go-server/internal/provider/system"
 	tlsprov "leblanc.io/open-go-server/internal/provider/tls"
+	"leblanc.io/open-go-server/internal/provider/unit"
 	"leblanc.io/open-go-server/internal/provider/web"
 	"leblanc.io/open-go-server/internal/validate"
 )
@@ -1030,6 +1031,7 @@ func (a *App) runChecks(ctx context.Context) []check {
 		if !a.Exec.Simulated() {
 			fpmUnitChecks(ctx, provs.PHP, projects, add)
 			renewTimerCheck(ctx, provs.TLS, add)
+			brokerHookCheck(ctx, provs.Unit, add)
 		}
 		provs.close()
 	}
@@ -1087,6 +1089,37 @@ func renewTimerCheck(ctx context.Context, prov *tlsprov.Provider, add func(name,
 		add("timer de renouvellement", "échec", "ogs-renew.timer "+etat+" : aucun certificat ne se renouvelle",
 			"ogs apply")
 	}
+}
+
+// brokerHookCheck dit que l'unité qui rattache les consommateurs au broker local
+// ne jouera pas son rôle (D137) : un arrêt du broker — une mise à jour par apt —
+// laisserait les workers sans broker, et son démarrage ne les relancerait pas.
+func brokerHookCheck(ctx context.Context, prov *unit.Provider, add func(name, status, detail, fix string)) {
+	switch {
+	case !prov.BrokerInstalled():
+		return
+	case !regularFile(filepath.Join(prov.Paths.SystemdDir(), unit.BrokerHookName)):
+		add("consommateurs du broker", "avertissement", unit.BrokerHookName+" absente : un arrêt de "+
+			unit.BrokerUnit+" n'arrête pas les consommateurs", "ogs apply")
+		return
+	}
+	switch prov.BrokerHookProblem(ctx) {
+	case "désactivée":
+		add("consommateurs du broker", "avertissement", unit.BrokerHookName+" désactivée : un arrêt de "+
+			unit.BrokerUnit+" n'arrête pas les consommateurs", "systemctl enable --now "+unit.BrokerHookName)
+	case "inactive":
+		add("consommateurs du broker", "avertissement", unit.BrokerHookName+" inactive alors que "+
+			unit.BrokerUnit+" tourne : l'arrêt du broker ne jouera pas « ogs amqp stop » (arrêtée à la main ?)",
+			"systemctl start "+unit.BrokerHookName+" (relance les consommateurs)")
+	default:
+		add("consommateurs du broker", "ok", unit.BrokerHookName+" rattachée à "+unit.BrokerUnit, "")
+	}
+}
+
+// regularFile dit si path désigne un fichier ordinaire.
+func regularFile(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.Mode().IsRegular()
 }
 
 // firewallChecks porte les contrôles du pare-feu (D72). Une déclaration

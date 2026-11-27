@@ -600,6 +600,84 @@ ogs apply shopfr --yes >/dev/null 2>&1
 echo "  worker sorti en erreur sur SIGTERM : « service stop » le laisse arrêté"
 
 echo
+echo "--- consommateurs du broker : ogs amqp stop|start, et l'arrêt du broker (D136, D137) ---"
+# Un faux broker suffit : ce qui est éprouvé, c'est la propagation par systemd,
+# non RabbitMQ. Le « console » de Symfony est un script qui attend.
+install -d -o shopfr -g shopfr -m 0750 /home/shop.fr/www/bin
+printf '<?php sleep(3600);\n' > /home/shop.fr/www/bin/console
+chown shopfr:shopfr /home/shop.fr/www/bin/console
+cat > /lib/systemd/system/rabbitmq-server.service <<'BROKER'
+[Unit]
+Description=faux broker du scénario
+[Service]
+ExecStart=/bin/sleep infinity
+# Témoin de l'ordre : l'état du consommateur au moment où le broker s'arrête.
+ExecStop=/bin/sh -c 'systemctl is-active ogs-shopfr-async@1.service > /run/conso-a-l-arret-du-broker || true'
+BROKER
+systemctl daemon-reload
+systemctl start rabbitmq-server.service
+ogs service add shopfr async >/dev/null
+ogs apply --yes >/dev/null 2>&1
+sleep 2
+etat() { systemctl is-active "$1" 2>/dev/null; }
+verifier() { # verifier <attendu async> <attendu veille> <contexte>
+    local obtenu="$(etat ogs-shopfr-async@1.service) $(etat ogs-shopfr-veille@1.service)"
+    if [ "$obtenu" != "$1 $2" ]; then
+        systemctl list-units --no-pager --all 'ogs-*' 'rabbitmq*'
+        echo "ÉCHEC : $3 — async et veille : $obtenu (attendu : $1 $2)"
+        exit 1
+    fi
+}
+if [ "$(systemctl is-enabled ogs-amqp.service)" != enabled ] || [ "$(etat ogs-amqp.service)" != active ]; then
+    systemctl status --no-pager ogs-amqp.service | tail -8
+    echo "ÉCHEC : ogs-amqp.service doit être posée, activée et active avec un broker local"
+    exit 1
+fi
+verifier active active "après l'apply"
+
+ogs amqp stop shopfr >/dev/null
+verifier inactive active "« ogs amqp stop » n'arrête que le consommateur"
+ogs amqp start >/dev/null
+sleep 1
+verifier active active "« ogs amqp start » le relance"
+
+systemctl stop rabbitmq-server.service
+verifier inactive active "l'arrêt du broker arrête le consommateur, et lui seul"
+if [ "$(cat /run/conso-a-l-arret-du-broker)" != inactive ]; then
+    echo "ÉCHEC : le consommateur doit être arrêté avant le broker (état à son arrêt : $(cat /run/conso-a-l-arret-du-broker))"
+    exit 1
+fi
+if [ "$(systemctl is-failed ogs-shopfr-async@1.service)" = failed ]; then
+    echo "ÉCHEC : l'arrêt doit être acquitté (D121)"
+    exit 1
+fi
+systemctl start rabbitmq-server.service
+sleep 2
+verifier active active "le démarrage du broker relance le consommateur"
+avant=$(systemctl show -p MainPID --value ogs-shopfr-async@1.service)
+systemctl restart rabbitmq-server.service
+sleep 2
+apres=$(systemctl show -p MainPID --value ogs-shopfr-async@1.service)
+verifier active active "après un redémarrage du broker"
+if [ "$avant" = "$apres" ]; then
+    echo "ÉCHEC : un redémarrage du broker — celui d'apt — doit redémarrer le consommateur"
+    exit 1
+fi
+echo "  stop, start et restart du broker atteignent le consommateur, jamais le worker libre"
+
+ogs service remove shopfr async >/dev/null
+rm /lib/systemd/system/rabbitmq-server.service
+systemctl stop rabbitmq-server.service 2>/dev/null
+systemctl daemon-reload
+ogs apply --yes >/dev/null 2>&1
+if [ -e /etc/systemd/system/ogs-amqp.service ] || [ -e /etc/systemd/system/rabbitmq-server.service.wants ]; then
+    ls -l /etc/systemd/system/ | grep -E "amqp|rabbitmq"
+    echo "ÉCHEC : le broker désinstallé, ogs-amqp.service et son lien doivent partir"
+    exit 1
+fi
+echo "  broker désinstallé : ogs-amqp.service retirée"
+
+echo
 echo "--- abandon d'une suppression : seul ce qui tournait repart (D114) ---"
 # Deux instances, la seconde arrêtée par l'exploitant. Une archive impossible fait
 # abandonner la suppression : relancer la cible tirait ses Wants=, et la seconde

@@ -466,6 +466,18 @@ func (a *App) buildGlobalPlanWithout(ctx context.Context, provs *providers, targ
 		plan.Add(s)
 	}
 
+	// Consommateurs du broker rattachés au broker local (D137) : son arrêt les
+	// arrête d'abord, son démarrage les relance — une mise à jour par apt
+	// compris. Non bloquante : elle ne doit pas arrêter le recalcul du parc.
+	hook, err := provs.Unit.BrokerHookPlan(binary)
+	if err != nil {
+		return nil, wrap(CodeError, err)
+	}
+	parcNonBloquante(hook...)
+	for _, s := range hook {
+		plan.Add(s)
+	}
+
 	// Configuration d'ogs restée sous l'autre moteur web, après une bascule de
 	// web.engine (D118) : une information du plan, jamais un écart — la bascule a
 	// pu être voulue —, jamais retirée, et l'ancien moteur jamais arrêté. doctor
