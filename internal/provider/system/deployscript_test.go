@@ -107,6 +107,127 @@ func TestDeployConfSuitLeTypeEtLEnvironnement(t *testing.T) {
 	}
 }
 
+func TestDeployConfSansServiceNArreteNiNeDemarreRien(t *testing.T) {
+	vides := []string{`SERVICE_CMD_STOP=""`, `SERVICE_CMD_START=""`}
+	cases := []struct {
+		name     string
+		kind     model.AppKind
+		services []model.Service
+		vides    bool
+	}{
+		{"symfony sans service", model.KindSymfony, nil, true},
+		{"statique", model.KindStatic, nil, true},
+		{"symfony avec un worker", model.KindSymfony, []model.Service{{Name: "messenger"}}, false},
+		// L'application supervisée est une unité de la cible : « ogs my stop »
+		// l'arrête, même sans service déclaré.
+		{"node supervisé", model.KindNode, nil, false},
+	}
+	for _, c := range cases {
+		p := model.New("shop.fr", naming.EnvProd, c.kind)
+		p.Spec.Services = c.services
+		if err := p.Normalize("/home", "prep.example"); err != nil {
+			t.Fatal(err)
+		}
+		got := string(DeployConfContent(p))
+		for _, want := range vides {
+			if has := strings.Contains(got, want+"\n"); has != c.vides {
+				t.Errorf("%s : %s présent=%v, attendu %v :\n%s", c.name, want, has, c.vides, got)
+			}
+		}
+		if !c.vides && strings.Contains(got, "SERVICE_CMD") {
+			t.Errorf("%s : le défaut du script (sudo ogs my …) doit s'appliquer :\n%s", c.name, got)
+		}
+	}
+}
+
+func TestReconcileDeployConf(t *testing.T) {
+	const tete = "FRAMEWORK=\"symfony\"\nhook_pre_stop() {\n    SERVICE_CMD_STOP=\"\"\n}\n"
+	bloc := deployNoServiceComment + "\nSERVICE_CMD_STOP=\"\"\nSERVICE_CMD_START=\"\"\n"
+	cases := []struct {
+		name     string
+		in       string
+		services bool
+		want     string
+	}{
+		// Sans service : les absentes sont ajoutées, vides ; la ligne en retrait
+		// d'un hook ne compte pas.
+		{"ajout des deux", tete, false, tete + bloc},
+		{"ajout sans fin de ligne", "BRANCH=\"main\"", false, "BRANCH=\"main\"\n" + bloc},
+		{"ajout de la seule absente", "SERVICE_CMD_STOP=\"x\"\n", false,
+			"SERVICE_CMD_STOP=\"x\"\nSERVICE_CMD_START=\"\"\n"},
+		{"déjà vides", tete + bloc, false, tete + bloc},
+		{"valeurs du projet gardées", "SERVICE_CMD_STOP=\"a\"\nSERVICE_CMD_START=\"b\"\n", false,
+			"SERVICE_CMD_STOP=\"a\"\nSERVICE_CMD_START=\"b\"\n"},
+		// Avec un service : les vides partent, commentaire d'ogs compris.
+		{"retrait des deux", tete + bloc, true, tete},
+		{"retrait, formes vides", "export SERVICE_CMD_STOP=''\nSERVICE_CMD_START= # rien\n", true, ""},
+		{"retrait de la seule vide", "SERVICE_CMD_STOP=\"\"\nSERVICE_CMD_START=\"go\"\n", true,
+			"SERVICE_CMD_START=\"go\"\n"},
+		{"absentes, rien à faire", tete, true, tete},
+		{"valeurs gardées", "SERVICE_CMD_STOP=\"a\"\n", true, "SERVICE_CMD_STOP=\"a\"\n"},
+	}
+	for _, c := range cases {
+		got, change := ReconcileDeployConf([]byte(c.in), c.services)
+		if string(got) != c.want {
+			t.Errorf("%s :\n%q\nattendu\n%q", c.name, got, c.want)
+		}
+		if (change != "") != (c.in != c.want) {
+			t.Errorf("%s : changement %q incohérent", c.name, change)
+		}
+	}
+}
+
+func TestDeployConfSuitLesServicesAApply(t *testing.T) {
+	// Posé sans service, deploy.conf perd ses deux lignes vides quand un service
+	// est déclaré, et les retrouve quand il part : il repasse par les deux formes
+	// de DeployConfContent.
+	p, prov, _, _ := fixture(t)
+	declareDeployScript(t, prov)
+	apply(t, prov, p)
+	path := filepath.Join(p.Spec.Layout.Root, DeployConf)
+	sans := string(DeployConfContent(p))
+
+	p.Spec.Services = []model.Service{{Name: "messenger"}}
+	apply(t, prov, p)
+	data, _ := os.ReadFile(path)
+	if avec := string(DeployConfContent(p)); string(data) != avec {
+		t.Errorf("avec service : %q, attendu %q", data, avec)
+	}
+	if info, err := os.Stat(path); err != nil || info.Mode().Perm() != 0o600 {
+		t.Errorf("le mode de deploy.conf doit être gardé : %v, %v", info.Mode(), err)
+	}
+	if got := stepsOf(t, prov, p, "system/deploy-conf/"); got != nil {
+		t.Errorf("étapes inattendues après réconciliation : %v", got)
+	}
+
+	p.Spec.Services = nil
+	apply(t, prov, p)
+	if data, _ := os.ReadFile(path); string(data) != sans {
+		t.Errorf("sans service : %q, attendu %q", data, sans)
+	}
+}
+
+func TestLaReconciliationSeCompense(t *testing.T) {
+	p, prov, _, _ := fixture(t)
+	declareDeployScript(t, prov)
+	apply(t, prov, p)
+	path := filepath.Join(p.Spec.Layout.Root, DeployConf)
+	avant, _ := os.ReadFile(path)
+
+	p.Spec.Services = []model.Service{{Name: "messenger"}}
+	s := prov.deployConfStep(p)
+	if s == nil || s.Compensate == nil || !s.Mutates() {
+		t.Fatal("la réconciliation doit être une étape compensable")
+	}
+	if err := s.Apply(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	_ = s.Compensate(context.Background())
+	if data, _ := os.ReadFile(path); string(data) != string(avant) {
+		t.Errorf("compensation : %q, attendu %q", data, avant)
+	}
+}
+
 func TestDeployConfPorteLeCodeHorsDeHome(t *testing.T) {
 	// Le script compose /home/<nom du répertoire>/www : un home ailleurs
 	// (naming.homeRoot) doit lui donner le bon répertoire.
@@ -139,8 +260,9 @@ func TestSansScriptCommunAucuneEtapeDeDeploiement(t *testing.T) {
 
 func TestCeQueLeProjetTientNEstJamaisRemplace(t *testing.T) {
 	// deploy.conf est au projet dès sa pose, et un deploy.sh qui n'est pas le lien
-	// commun est un choix du projet : ni l'un ni l'autre n'est réécrit, et rien
-	// n'est signalé — il n'y a là aucun accès à protéger.
+	// commun est un choix du projet : ni l'un ni l'autre n'est remplacé, et rien
+	// n'est signalé — il n'y a là aucun accès à protéger. Seules les deux
+	// variables de service de deploy.conf sont réconciliées, le reste gardé.
 	p, prov, _, _ := fixture(t)
 	declareDeployScript(t, prov)
 	root := p.Spec.Layout.Root
@@ -163,8 +285,9 @@ func TestCeQueLeProjetTientNEstJamaisRemplace(t *testing.T) {
 			t.Errorf("%s : %v", o.Step.Resource, o.Err)
 		}
 	}
-	if data, _ := os.ReadFile(filepath.Join(root, DeployConf)); string(data) != conf {
-		t.Errorf("deploy.conf du projet réécrit : %q", data)
+	want := conf + deployNoServiceComment + "\nSERVICE_CMD_STOP=\"\"\nSERVICE_CMD_START=\"\"\n"
+	if data, _ := os.ReadFile(filepath.Join(root, DeployConf)); string(data) != want {
+		t.Errorf("deploy.conf du projet : %q, attendu %q", data, want)
 	}
 	if data, _ := os.ReadFile(filepath.Join(root, DeployLink)); string(data) != script {
 		t.Errorf("deploy.sh du projet réécrit : %q", data)

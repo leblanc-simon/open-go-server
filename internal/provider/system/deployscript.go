@@ -3,11 +3,14 @@ package system
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"golang.org/x/sys/unix"
@@ -57,10 +60,25 @@ func DeployBranch(proj *model.Project) string {
 	return "main"
 }
 
+// DeployHasServices dit si la cible du projet porte au moins une unité : un
+// service déclaré (spec.services) ou l'application supervisée d'un type à
+// runtime. C'est ce qu'arrêtent et démarrent « ogs my stop|start ».
+func DeployHasServices(proj *model.Project) bool {
+	if len(proj.Spec.Services) > 0 {
+		return true
+	}
+	at, err := proj.AppType()
+	return err == nil && at.Runtime != ""
+}
+
 // DeployConfContent rend le deploy.conf qu'ogs pose pour un projet. L'environnement
 // applicatif est toujours prod : la préproduction se distingue par sa branche,
 // non par APP_ENV. PROJECT_DIR n'est écrit que si le script ne le déduirait pas
-// juste — il le compose en /home/<nom du répertoire du lien>/www.
+// juste — il le compose en /home/<nom du répertoire du lien>/www. Sans service,
+// SERVICE_CMD_STOP et SERVICE_CMD_START sont posés vides : le script n'arrête ni
+// ne démarre alors rien, là où « sudo ogs my stop » n'aurait aucune unité à
+// piloter. Ces deux variables sont ensuite réconciliées à chaque apply
+// (ReconcileDeployConf) ; le reste du fichier est au projet.
 func DeployConfContent(proj *model.Project) []byte {
 	var b strings.Builder
 	b.WriteString("# Configuration de ~/" + DeployLink + " (script de déploiement commun).\n")
@@ -72,6 +90,12 @@ func DeployConfContent(proj *model.Project) []byte {
 	root := filepath.Clean(proj.Spec.Layout.Root)
 	if code := filepath.Join(root, "www"); code != filepath.Join("/home", filepath.Base(root), "www") {
 		fmt.Fprintf(&b, "PROJECT_DIR=%q\n", code)
+	}
+	if !DeployHasServices(proj) {
+		b.WriteString(deployNoServiceComment + "\n")
+		for _, name := range deployServiceVars {
+			b.WriteString(name + "=\"\"\n")
+		}
 	}
 	return []byte(b.String())
 }
@@ -142,7 +166,7 @@ func (p *Provider) deployConfStep(proj *model.Project) *engine.Step {
 		s.Apply = func(context.Context) error { return err }
 		return s
 	case kind != fs.EntryAbsent:
-		return engine.NewStep(resource, engine.NoOp, path+" présent, tenu par le projet")
+		return p.deployConfReconcileStep(proj, resource, path)
 	}
 	content := DeployConfContent(proj)
 	s := engine.NewStep(resource, engine.Create, fmt.Sprintf("%s (FRAMEWORK=%s, BRANCH=%s)",
@@ -222,4 +246,249 @@ func deployConfIsOurs(rootFD int, proj *model.Project) bool {
 	}
 	data, err := io.ReadAll(io.LimitReader(f, maxDeployConf+1))
 	return err == nil && bytes.Equal(data, DeployConfContent(proj))
+}
+
+// deployServiceVars sont les deux variables de deploy.conf qu'ogs réconcilie avec
+// les services du projet ; deployNoServiceComment les précède quand ogs les pose.
+var deployServiceVars = []string{"SERVICE_CMD_STOP", "SERVICE_CMD_START"}
+
+const deployNoServiceComment = "# Aucun service déclaré : rien à arrêter ni à démarrer au déploiement."
+
+// deployServiceAssign reconnaît l'affectation de l'une des deux variables au
+// premier niveau du fichier : une ligne en retrait appartient à une fonction
+// hook_<étape> du projet, qu'ogs ne juge pas.
+var deployServiceAssign = regexp.MustCompile(`^(?:export[ \t]+)?(SERVICE_CMD_STOP|SERVICE_CMD_START)=(.*)$`)
+
+// deployEmptyValue reconnaît une valeur vide : rien, ou une paire de guillemets
+// doubles ou simples vide, suivis au plus d'un commentaire.
+var deployEmptyValue = regexp.MustCompile(`^(?:""|'')?[ \t]*(?:#.*)?$`)
+
+// ReconcileDeployConf aligne SERVICE_CMD_STOP et SERVICE_CMD_START de deploy.conf
+// sur les services du projet, sans toucher au reste :
+//
+//   - sans service, une variable absente est ajoutée, vide ;
+//   - avec un service, une variable présente et vide est retirée — le script
+//     reprend alors son défaut, « sudo ogs my stop|start ».
+//
+// Une variable qui porte une valeur est au projet, et n'est jamais touchée ; une
+// variable vide sans service, ou absente avec un service, non plus. Le
+// commentaire qu'ogs pose avant les deux lignes les suit : ajouté avec elles
+// quand les deux manquent, retiré quand plus aucune ne reste — un deploy.conf
+// d'ogs passe ainsi de l'une à l'autre forme de DeployConfContent. Rend le
+// contenu réconcilié, et ce qui a changé (vide : rien).
+func ReconcileDeployConf(data []byte, hasServices bool) ([]byte, string) {
+	text := string(data)
+	lines := strings.SplitAfter(text, "\n")
+	if len(lines) > 0 && lines[len(lines)-1] == "" {
+		lines = lines[:len(lines)-1]
+	}
+	present := map[string]bool{}
+	nonEmpty := map[string]bool{}
+	for _, l := range lines {
+		m := deployServiceAssign.FindStringSubmatch(strings.TrimRight(l, "\n"))
+		if m == nil {
+			continue
+		}
+		present[m[1]] = true
+		if !deployEmptyValue.MatchString(m[2]) {
+			nonEmpty[m[1]] = true
+		}
+	}
+
+	if !hasServices {
+		var missing []string
+		for _, name := range deployServiceVars {
+			if !present[name] {
+				missing = append(missing, name)
+			}
+		}
+		if len(missing) == 0 {
+			return data, ""
+		}
+		var b strings.Builder
+		b.WriteString(text)
+		if text != "" && !strings.HasSuffix(text, "\n") {
+			b.WriteString("\n")
+		}
+		if len(missing) == len(deployServiceVars) {
+			b.WriteString(deployNoServiceComment + "\n")
+		}
+		for _, name := range missing {
+			b.WriteString(name + "=\"\"\n")
+		}
+		return []byte(b.String()), strings.Join(missing, ", ") + " ajouté(s) vide(s) : aucun service"
+	}
+
+	var removed []string
+	for _, name := range deployServiceVars {
+		if present[name] && !nonEmpty[name] {
+			removed = append(removed, name)
+		}
+	}
+	if len(removed) == 0 {
+		return data, ""
+	}
+	gone := map[string]bool{}
+	for _, name := range removed {
+		gone[name] = true
+	}
+	remaining := false
+	kept := make([]string, 0, len(lines))
+	for _, l := range lines {
+		if m := deployServiceAssign.FindStringSubmatch(strings.TrimRight(l, "\n")); m != nil {
+			if gone[m[1]] {
+				continue
+			}
+			remaining = true
+		}
+		kept = append(kept, l)
+	}
+	if !remaining {
+		out := kept[:0]
+		for _, l := range kept {
+			if strings.TrimRight(l, "\n") != deployNoServiceComment {
+				out = append(out, l)
+			}
+		}
+		kept = out
+	}
+	return []byte(strings.Join(kept, "")), strings.Join(removed, ", ") + " retiré(s) : service déclaré"
+}
+
+// readDeployConf relit deploy.conf par le descripteur de la racine du projet,
+// sans suivre de lien, borné. Il rend aussi le mode et le propriétaire constatés.
+func readDeployConf(dir *fs.Dir) ([]byte, unix.Stat_t, error) {
+	var st unix.Stat_t
+	f, err := dir.OpenFile(DeployConf)
+	if err != nil {
+		return nil, st, err
+	}
+	defer f.Close()
+	if err := unix.Fstat(int(f.Fd()), &st); err != nil {
+		return nil, st, err
+	}
+	if st.Size > maxDeployConf {
+		return nil, st, fmt.Errorf("%s dépasse %d octets", f.Name(), maxDeployConf)
+	}
+	data, err := io.ReadAll(io.LimitReader(f, maxDeployConf+1))
+	if err == nil && len(data) > maxDeployConf {
+		err = fmt.Errorf("%s dépasse %d octets", f.Name(), maxDeployConf)
+	}
+	return data, st, err
+}
+
+// writeDeployConf remplace deploy.conf par data, atomiquement : un fichier
+// temporaire créé en exclusivité, sans suivre de lien, au propriétaire et au mode
+// donnés, puis renommé par le descripteur du répertoire.
+func writeDeployConf(dir *fs.Dir, data []byte, mode os.FileMode, owner fs.Owner) error {
+	var r [8]byte
+	if _, err := rand.Read(r[:]); err != nil {
+		return err
+	}
+	tmp := ".deploy.conf.ogs-" + hex.EncodeToString(r[:])
+	f, err := dir.Create(tmp, mode, owner)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		_ = dir.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		_ = dir.Remove(tmp)
+		return err
+	}
+	if err := dir.Rename(tmp, DeployConf); err != nil {
+		_ = dir.Remove(tmp)
+		return err
+	}
+	return nil
+}
+
+// deployConfOwnedByProject dit si le deploy.conf constaté est au compte du
+// projet. Un fichier à un autre compte — root, un ancien titulaire — n'est pas
+// réécrit. Sous préfixe, le compte n'existe pas : le contrôle se tait.
+func (p *Provider) deployConfOwnedByProject(proj *model.Project, st unix.Stat_t) bool {
+	if p.Exec.Simulated() {
+		return true
+	}
+	uid, _, err := p.ResolveOwner(proj, "")
+	return err == nil && int(st.Uid) == uid
+}
+
+// deployConfReconcileStep réconcilie les deux variables de service d'un
+// deploy.conf présent (ReconcileDeployConf). Le fichier est relu à
+// l'application : ce que le projet y a changé depuis le plan est pris en compte,
+// jamais écrasé par le contenu calculé au plan. Non critique, comme la pose.
+func (p *Provider) deployConfReconcileStep(proj *model.Project, resource, path string) *engine.Step {
+	root := proj.Spec.Layout.Root
+	has := DeployHasServices(proj)
+	refused := func(err error) *engine.Step {
+		s := engine.NewStep(resource, engine.Update, path+" — relecture refusée : "+err.Error())
+		s.Critical = false
+		s.Apply = func(context.Context) error { return err }
+		return s
+	}
+	dir, err := fs.OpenDir(root)
+	if err != nil {
+		return refused(err)
+	}
+	data, st, err := readDeployConf(dir)
+	dir.Close()
+	if err != nil {
+		return refused(err)
+	}
+	if !p.deployConfOwnedByProject(proj, st) {
+		return engine.NewStep(resource, engine.NoOp, path+" à un autre compte que le projet, laissé en place")
+	}
+	_, change := ReconcileDeployConf(data, has)
+	if change == "" {
+		return engine.NewStep(resource, engine.NoOp, path+" présent, tenu par le projet")
+	}
+	s := engine.NewStep(resource, engine.Update, path+" : "+change)
+	s.Critical = false
+	var before, written []byte
+	var mode os.FileMode
+	s.Apply = func(context.Context) error {
+		dir, err := fs.OpenDir(root)
+		if err != nil {
+			return err
+		}
+		defer dir.Close()
+		data, st, err := readDeployConf(dir)
+		if err != nil {
+			return err
+		}
+		if !p.deployConfOwnedByProject(proj, st) {
+			return fmt.Errorf("%s n'est plus au compte du projet", path)
+		}
+		out, change := ReconcileDeployConf(data, has)
+		if change == "" {
+			return nil
+		}
+		mode = os.FileMode(st.Mode).Perm()
+		if err := writeDeployConf(dir, out, mode, p.linkOwner(proj)); err != nil {
+			return err
+		}
+		before, written = data, out
+		return nil
+	}
+	// La compensation rend le fichier d'avant, s'il est resté tel qu'ogs l'a
+	// réécrit : retouché entre-temps, il est au projet.
+	s.Compensate = func(context.Context) error {
+		if written == nil {
+			return nil
+		}
+		dir, err := fs.OpenDir(root)
+		if err != nil {
+			return nil
+		}
+		defer dir.Close()
+		if same, _ := sameDeployConf(dir, written); same {
+			return writeDeployConf(dir, before, mode, p.linkOwner(proj))
+		}
+		return nil
+	}
+	return s
 }
