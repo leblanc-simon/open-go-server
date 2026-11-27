@@ -184,6 +184,8 @@ func (a *App) loadConfig() error {
 // d'état ; et ce qui ne fait que démarrer ou arrêter des services, sans rien
 // calculer de la configuration.
 var configTolerant = map[string]bool{
+	"ogs amqp start":      true,
+	"ogs amqp stop":       true,
 	"ogs cert renew":      true,
 	"ogs init":            true,
 	"ogs my restart":      true,

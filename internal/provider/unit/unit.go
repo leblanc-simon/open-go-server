@@ -919,6 +919,96 @@ func (p *Provider) Stop(ctx context.Context, id string) ([]string, error) {
 	return running, nil
 }
 
+// BrokerTemplate dit si un template de service consomme un broker : Messenger
+// (Symfony 4.1 et plus, et tout projet hors Symfony) ou rabbitmq:consumer
+// (Symfony avant 4.1, D128). Un template vide vaut Messenger, comme au rendu.
+func BrokerTemplate(tmpl string) bool {
+	return tmpl == "" || tmpl == TemplateMessenger || tmpl == TemplateConsumer
+}
+
+// BrokerServices nomme les services déclarés du projet qui consomment un broker
+// (BrokerTemplate), dans l'ordre de la déclaration. Le template worker en est
+// exclu : sa commande est libre, et rien ne dit qu'elle lit une file.
+func BrokerServices(proj *model.Project) []string {
+	var out []string
+	for _, s := range proj.Spec.Services {
+		if BrokerTemplate(s.Template) {
+			out = append(out, s.Name)
+		}
+	}
+	return out
+}
+
+// ofServices dit si une unité est une instance de l'un des services nommés du
+// projet. Le « @ » sépare le nom du service du numéro : « a » ne retient pas
+// les instances de « a-b ».
+func ofServices(unit, id string, services []string) bool {
+	for _, s := range services {
+		if strings.HasPrefix(unit, "ogs-"+id+"-"+s+"@") && strings.HasSuffix(unit, ".service") {
+			return true
+		}
+	}
+	return false
+}
+
+// RunningServices énumère, parmi les unités actives du projet (Running), les
+// instances des services nommés. La cible n'en fait jamais partie.
+func (p *Provider) RunningServices(ctx context.Context, id string, services []string) ([]string, error) {
+	running, err := p.Running(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, u := range running {
+		if ofServices(u, id, services) {
+			out = append(out, u)
+		}
+	}
+	return out, nil
+}
+
+// StopServices arrête les instances actives des services nommés, et elles
+// seules : la cible et les autres services du projet — application supervisée
+// comprise — continuent de tourner. Comme Stop, l'arrêt est acquitté
+// (reset-failed) : l'unité redevient « inactive », l'état que l'apply respecte
+// (D121), et un worker qui rend 1 sur SIGTERM n'est pas relancé par lui.
+func (p *Provider) StopServices(ctx context.Context, id string, services []string) ([]string, error) {
+	running, err := p.RunningServices(ctx, id, services)
+	if err != nil || len(running) == 0 {
+		return nil, err
+	}
+	if err := p.systemctl(ctx, append([]string{"stop"}, running...)...); err != nil {
+		return running, err
+	}
+	_ = p.systemctl(ctx, append([]string{"reset-failed"}, running...)...)
+	return running, nil
+}
+
+// EnabledServices énumère les instances activées (.wants) des services nommés.
+func (p *Provider) EnabledServices(id string, services []string) []string {
+	var out []string
+	for _, u := range p.Units(id) {
+		if ofServices(u, id, services) {
+			out = append(out, u)
+		}
+	}
+	return out
+}
+
+// StartServices démarre les instances activées des services nommés, puis la
+// cible sans ses dépendances (startInstances) : une instance démarrée hors de
+// sa cible ne s'arrêterait plus avec elle (D114), et la cible démarrée
+// ordinairement relancerait les autres services que l'exploitant a arrêtés.
+// Le compteur d'échecs est acquitté d'abord, comme pour « service start ».
+func (p *Provider) StartServices(ctx context.Context, id string, services []string) ([]string, error) {
+	units := p.EnabledServices(id, services)
+	if len(units) == 0 {
+		return nil, nil
+	}
+	_ = p.systemctl(ctx, append([]string{"reset-failed"}, units...)...)
+	return units, p.startInstances(ctx, id, units...)
+}
+
 // Start relance les unités d'un projet qu'un Stop a rendues, et elles seules.
 // Les instances sont démarrées par leur nom ; la cible, si elle tournait, sans
 // ses dépendances (--job-mode=ignore-requirements) : démarrée ordinairement,

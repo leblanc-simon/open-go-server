@@ -28,6 +28,8 @@ func newAMQPCommand(app *App) *cobra.Command {
 	cmd.AddCommand(
 		newAMQPStatusCommand(app),
 		newAMQPMessengerCommand(app),
+		newAMQPServicesCommand(app, "stop"),
+		newAMQPServicesCommand(app, "start"),
 		queue,
 		creds,
 	)

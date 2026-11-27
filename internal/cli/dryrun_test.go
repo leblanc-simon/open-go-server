@@ -272,6 +272,8 @@ func casDryRunParCommande(secret, certImport, keyImport string) map[string]casDr
 		// Simulations.
 		"ogs apply":          {[]string{"apply", "--yes"}, "--dry-run : rien n'a été appliqué"},
 		"ogs amqp messenger": {[]string{"amqp", "messenger", "shopfr"}, "vhost: shopfr"},
+		"ogs amqp stop":      {[]string{"amqp", "stop"}, "ogs-shopfr-messenger-async@1.service  serait arrêté"},
+		"ogs amqp start":     {[]string{"amqp", "start"}, "ogs-shopfr-messenger-async@1.service  serait démarré"},
 		"ogs cert issue":     {[]string{"cert", "issue", "certfr"}, "--dry-run : certificat certfr"},
 		"ogs cert import": {[]string{"cert", "import", "certfr", "--cert", certImport, "--key", keyImport, "--force"},
 			"--dry-run : le certificat serait écrit"},
