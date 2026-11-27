@@ -237,7 +237,7 @@ func kinds() []string {
 		string(model.KindPrestashop), string(model.KindSymfony),
 		string(model.KindGo), string(model.KindNode),
 		string(model.KindPython), string(model.KindRuby),
-		string(model.KindCustom),
+		string(model.KindJava), string(model.KindCustom),
 	}
 }
 

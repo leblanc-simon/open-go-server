@@ -79,7 +79,7 @@ func newWizard(prepDomain string) wizard {
 			get: func(a WizardAnswers) string { return a.Kind },
 			set: func(a *WizardAnswers, v string) { a.Kind = v },
 			choices: []string{"php-symfony", "php-prestashop", "php-plain", "static",
-				"go", "node", "python", "ruby"}},
+				"go", "node", "python", "ruby", "java"}},
 		{label: "Version applicative", help: "« auto » lit le composer.json",
 			get: func(a WizardAnswers) string { return a.AppVersion },
 			set: func(a *WizardAnswers, v string) { a.AppVersion = v }, optional: true},

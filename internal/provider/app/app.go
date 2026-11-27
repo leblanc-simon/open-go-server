@@ -152,7 +152,7 @@ func (p *Provider) Endpoint(proj *model.Project) (Endpoint, error) {
 		// Un binaire Go écoute sur un port : il n'a pas de convention de socket, et
 		// l'imposer supposerait une coopération du code applicatif. Une commande
 		// custom est dans le même cas, ogs ne sachant rien de ce qu'elle lance.
-		if at.Runtime == RuntimeGo || at.Runtime == RuntimeCustom {
+		if at.Runtime == RuntimeGo || at.Runtime == RuntimeCustom || at.Runtime == RuntimeJava {
 			listen = "port"
 		} else {
 			listen = "socket"
@@ -366,6 +366,12 @@ func (p *Provider) build(proj *model.Project, endpoint Endpoint, legacyPython bo
 		env["HOST"] = "127.0.0.1"
 		env["PORT"] = strconv.Itoa(endpoint.Port)
 		env["LISTEN_ADDR"] = endpoint.Address
+		if at.Runtime == RuntimeJava {
+			// Spring Boot lit server.port et server.address par ces variables :
+			// l'application écoute là où ogs relaie, sans configuration.
+			env["SERVER_PORT"] = strconv.Itoa(endpoint.Port)
+			env["SERVER_ADDRESS"] = "127.0.0.1"
+		}
 	}
 	body, err := p.Templates.Render("systemd/app.service", map[string]any{
 		"Description": fmt.Sprintf("ogs %s — application %s", proj.ID(), at.Runtime),
@@ -431,6 +437,14 @@ func (p *Provider) command(proj *model.Project, runtime string, endpoint Endpoin
 			python = link
 		}
 		return fmt.Sprintf("%s -m %s --bind %s --workers 2 %s", python, AppModule, bind, entry), nil
+	case RuntimeJava:
+		if entry == "" {
+			entry = "app.jar"
+		}
+		// $JAVA_OPTS est développé par systemd en autant de mots qu'il en porte,
+		// aucun s'il est vide : la mémoire de la JVM (-Xmx) se règle par
+		// spec.app.env ou le fichier d'environnement, sans réécrire l'unité.
+		return link + " $JAVA_OPTS -jar " + entry, nil
 	case RuntimeRuby:
 		bind := "tcp://127.0.0.1:" + strconv.Itoa(endpoint.Port)
 		if endpoint.Unix() {

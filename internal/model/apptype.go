@@ -20,6 +20,9 @@ const (
 	KindNode       AppKind = "node"
 	KindPython     AppKind = "python"
 	KindRuby       AppKind = "ruby"
+	// KindJava est une application JVM lancée par « java -jar » (D138) : un JDK
+	// installé par SDKMAN dans le home, comme nvm, rbenv et pyenv.
+	KindJava AppKind = "java"
 	// KindCustom est un processus supervisé quelconque : ogs n'y installe aucun
 	// runtime, et la commande à lancer est déclarée par spec.app.command (D75).
 	KindCustom AppKind = "custom"
@@ -120,6 +123,12 @@ var appTypes = map[AppKind]AppType{
 	KindRuby: {Kind: KindRuby, VHostTemplate: "proxy", Runtime: "ruby",
 		// master.key et les clés par environnement ouvrent les credentials de Rails.
 		Config: append(slices.Clone(dotenvConfig), "config/master.key", "config/credentials/*.key")},
+	// Spring Boot lit sa configuration externe dans config/ et à côté du jar,
+	// répertoire courant de l'unité : identifiants des bases, secrets.
+	KindJava: {Kind: KindJava, VHostTemplate: "proxy", Runtime: "java",
+		Config: append(slices.Clone(dotenvConfig), "application.properties", "application.yml", "application.yaml",
+			"application-*.properties", "application-*.yml", "application-*.yaml",
+			"config/application*.properties", "config/application*.yml", "config/application*.yaml")},
 	KindCustom: {Kind: KindCustom, VHostTemplate: "proxy", Runtime: "custom", Config: dotenvConfig},
 }
 
@@ -127,7 +136,7 @@ var appTypes = map[AppKind]AppType{
 func Kinds() []AppKind {
 	return []AppKind{
 		KindPrestashop, KindSymfony, KindPHPPlain, KindStatic,
-		KindGo, KindNode, KindPython, KindRuby, KindCustom,
+		KindGo, KindNode, KindPython, KindRuby, KindJava, KindCustom,
 	}
 }
 

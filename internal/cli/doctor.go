@@ -802,7 +802,7 @@ func (a *App) runChecks(ctx context.Context) []check {
 			{"ssl", "aucun site ne peut être servi en HTTPS"},
 			{"proxy", "aucun relais vers PHP-FPM ni vers une application"},
 			{"proxy_fcgi", "PHP ne peut pas être exécuté : le vhost rendra le source"},
-			{"proxy_http", "les applications Go, Node, Ruby et Python ne peuvent pas être relayées"},
+			{"proxy_http", "les applications Go, Node, Ruby, Python et Java ne peuvent pas être relayées"},
 			{"rewrite", "les redirections vers HTTPS et les front controllers ne fonctionnent pas"},
 			{"headers", "les en-têtes de sécurité (HSTS, X-Robots-Tag) sont ignorés"},
 			{"status", "le vhost de supervision ne rend pas l'état du serveur : " +

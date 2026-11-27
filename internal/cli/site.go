@@ -189,7 +189,7 @@ func newSiteCreateCommand(app *App) *cobra.Command {
 	f := cmd.Flags()
 	f.StringVar(&opts.kind, "kind", string(model.KindSymfony), "type d'application ("+kindsList()+")")
 	f.StringVar(&opts.appVersion, "app-version", "auto", "version applicative")
-	f.StringVar(&opts.runtime, "runtime", "", "version du runtime pour Node, Ruby ou Python (exemple 22.14.0)")
+	f.StringVar(&opts.runtime, "runtime", "", "version du runtime pour Node, Ruby, Python ou Java (exemple 22.14.0, 21.0.13.1+2-tem)")
 	f.StringVar(&opts.command, "command", "", "commande lancée par le service d'un projet custom (exemple '/home/x/www/bin/serveur --port ${PORT}')")
 	f.BoolVar(&opts.envFile, "env-file", false, "brancher /etc/ogs/env/<id>.env sur le service applicatif")
 	f.StringVar(&opts.phpVersion, "php", "", "version PHP (défaut "+model.DefaultPHPVersion+")")

@@ -113,7 +113,7 @@ func (p *Provider) PreexistingHome(proj *model.Project, obs Observed) error {
 
 // notSkeleton nomme ce qui, dans la racine, n'est pas de ceux qu'ogs y pose :
 // au premier niveau, les répertoires de spec.layout.dirs, ceux des gestionnaires
-// de runtime (.nvm, .rbenv, .pyenv, et les venvs .venv-<version> de D123 avec
+// de runtime (.nvm, .rbenv, .pyenv, .sdkman, et les venvs .venv-<version> de D123 avec
 // leur lien ~/.venv, qu'une saga déroulée laisse), les anciens
 // .bin et logs et le lien ~/logs (D70, D71), le lien deploy.sh vers le script
 // commun et le deploy.conf qu'ogs pose (D132) ; dans .ssh, la clé de déploiement,
@@ -124,7 +124,7 @@ func (p *Provider) PreexistingHome(proj *model.Project, obs Observed) error {
 // Tout est lu sans suivre de lien.
 func (p *Provider) notSkeleton(proj *model.Project) ([]string, error) {
 	root := proj.Spec.Layout.Root
-	dirs := map[string]bool{".local": true, ".ssh": true, ".nvm": true, ".rbenv": true, ".pyenv": true,
+	dirs := map[string]bool{".local": true, ".ssh": true, ".nvm": true, ".rbenv": true, ".pyenv": true, ".sdkman": true,
 		model.LegacyLinkDir: true, model.LogLink: true}
 	for _, d := range proj.Spec.Layout.Dirs {
 		dirs[strings.SplitN(filepath.Clean(d.Path), string(filepath.Separator), 2)[0]] = true

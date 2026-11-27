@@ -23,6 +23,7 @@ const (
 	RuntimeNode   = "node"
 	RuntimePython = "python"
 	RuntimeRuby   = "ruby"
+	RuntimeJava   = "java"
 	RuntimeCustom = "custom"
 )
 
@@ -30,7 +31,9 @@ const (
 func managed(runtime string) bool { return runtime != RuntimeCustom }
 
 // Runtimes énumère les runtimes connus.
-func Runtimes() []string { return []string{RuntimeGo, RuntimeNode, RuntimePython, RuntimeRuby} }
+func Runtimes() []string {
+	return []string{RuntimeGo, RuntimeNode, RuntimePython, RuntimeRuby, RuntimeJava}
+}
 
 // Installer installe un runtime dans le home d'un projet (D35).
 type Installer struct {
@@ -46,6 +49,8 @@ func managerDir(root, runtime string) string {
 		return filepath.Join(root, ".rbenv")
 	case RuntimePython:
 		return filepath.Join(root, ".pyenv")
+	case RuntimeJava:
+		return filepath.Join(root, ".sdkman")
 	}
 	return ""
 }
@@ -57,6 +62,10 @@ func BinaryPath(root, runtime, version string) string {
 		return filepath.Join(root, ".nvm", "versions", "node", "v"+version, "bin", "node")
 	case RuntimeRuby:
 		return filepath.Join(root, ".rbenv", "versions", version, "bin", "ruby")
+	case RuntimeJava:
+		// La version est l'identifiant de SDKMAN, distribution comprise :
+		// « 21.0.13.1+2-tem » pour Temurin.
+		return filepath.Join(root, ".sdkman", "candidates", "java", version, "bin", "java")
 	case RuntimePython:
 		// Le lien pointe vers le venv du projet, pas vers l'interpréteur nu : les
 		// dépendances doivent suivre. Le venv porte la version (D123).
@@ -399,6 +408,17 @@ func (i *Installer) Install(ctx context.Context, proj *model.Project, runtime, v
 				`"$RBENV_ROOT/bin/rbenv" install -s %s`,
 			managerDir(root, runtime), version)
 		return i.runAs(ctx, proj, script)
+	case RuntimeJava:
+		// SDKMAN pose le JDK sous ~/.sdkman/candidates/java/<version>. ci=true
+		// répond seul à ses questions (version par défaut), rcupdate=false le
+		// garde hors de ~/.bashrc : le lien géré suffit à l'unité (D30).
+		script := fmt.Sprintf(
+			`export SDKMAN_DIR=%q; [ -s "$SDKMAN_DIR/bin/sdkman-init.sh" ] || `+
+				`{ curl -fsSL "https://get.sdkman.io?rcupdate=false&ci=true" | bash; }; `+
+				`. "$SDKMAN_DIR/bin/sdkman-init.sh"; `+
+				`[ -x %q ] || sdk install java %s`,
+			managerDir(root, runtime), BinaryPath(root, runtime, version), version)
+		return i.runAs(ctx, proj, script)
 	case RuntimePython:
 		// pyenv fournit l'interpréteur, ogs crée le venv du projet : c'est lui que
 		// le lien désigne, afin que les dépendances suivent. Un venv par version
@@ -452,5 +472,19 @@ func (i *Installer) Version(ctx context.Context, proj *model.Project, runtime st
 	if err != nil {
 		return "", err
 	}
-	return strings.TrimSpace(strings.TrimPrefix(strings.Fields(res.Stdout + " ")[0], "v")), nil
+	return parseVersion(res.Stdout), nil
+}
+
+// parseVersion lit la version dans la sortie de « --version » : le premier mot
+// qui commence par un chiffre, « v » de tête ôté. Node rend « v22.14.0 », Ruby
+// « ruby 3.3.6 (…) », Java « openjdk 21.0.5 2024-10-15 » — le premier mot n'y
+// est pas toujours la version.
+func parseVersion(out string) string {
+	for _, f := range strings.Fields(out) {
+		f = strings.TrimPrefix(f, "v")
+		if f != "" && f[0] >= '0' && f[0] <= '9' {
+			return f
+		}
+	}
+	return ""
 }

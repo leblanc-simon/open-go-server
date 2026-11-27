@@ -339,6 +339,97 @@ fi
 echo "l'application a redémarré sur la nouvelle version"
 
 echo
+echo "--- Java : un JDK par SDKMAN dans le home, un jar lancé par le lien géré (D138) ---"
+# SDKMAN exige zip et unzip, que l'image ne porte pas : ce sont des prérequis du
+# runtime, comme git pour rbenv et pyenv.
+apt-get update -qq && apt-get install -y -qq --no-install-recommends zip unzip >/dev/null
+# SDKMAN retire de sa liste les versions dépassées : la plus récente Temurin 21
+# est lue chez lui plutôt que figée ici.
+jdk=$(curl -fsSL "https://api.sdkman.io/2/candidates/java/linuxx64/versions/list?current=&installed=" |
+    grep -oE '\b21\.[0-9.+]+-tem\b' | head -1)
+if [ -z "$jdk" ]; then
+    echo "ÉCHEC : aucune version Temurin 21 annoncée par SDKMAN"
+    exit 1
+fi
+echo "version retenue : $jdk"
+ogs site create java.test --kind java --runtime "$jdk" --tls=false --yes 2>&1 |
+    grep -Ei "runtime|unité|⚠|✗" | head -5
+binaire=/home/java.test/.sdkman/candidates/java/$jdk/bin/java
+if [ ! -x "$binaire" ]; then
+    echo "ÉCHEC : le JDK n'est pas là où ogs l'attend"
+    ls /home/java.test/.sdkman/candidates/java 2>&1 | head -5
+    exit 1
+fi
+if [ "$(stat -c %U "$binaire")" != "javatest" ]; then
+    echo "ÉCHEC : le JDK n'appartient pas au projet — il a été installé en root"
+    exit 1
+fi
+if grep -qs sdkman /home/java.test/.bashrc; then
+    echo "ÉCHEC : SDKMAN a modifié le .bashrc du projet"
+    exit 1
+fi
+if [ "$(readlink -f /home/java.test/.local/bin/java)" != "$(readlink -f "$binaire")" ]; then
+    echo "ÉCHEC : .local/bin/java ne désigne pas le JDK installé"
+    ls -l /home/java.test/.local/bin/java
+    exit 1
+fi
+# Un serveur minimal, compilé par le JDK du projet sous son identité : il écoute
+# là où Spring Boot écouterait, SERVER_ADDRESS:SERVER_PORT.
+src=/home/java.test/www/src
+install -d -o javatest -g javatest -m 0750 "$src"
+cat >"$src/Serveur.java" <<'JAVA'
+import com.sun.net.httpserver.HttpServer;
+import java.net.InetSocketAddress;
+public class Serveur {
+    public static void main(String[] a) throws Exception {
+        HttpServer s = HttpServer.create(new InetSocketAddress(System.getenv("SERVER_ADDRESS"),
+            Integer.parseInt(System.getenv("SERVER_PORT"))), 0);
+        s.createContext("/", x -> { byte[] r = ("java " + Runtime.version().feature()).getBytes();
+            x.sendResponseHeaders(200, r.length); x.getResponseBody().write(r); x.close(); });
+        s.start();
+    }
+}
+JAVA
+chown javatest:javatest "$src/Serveur.java"
+jdkbin=$(dirname "$binaire")
+runuser -u javatest -- sh -c "cd $src && $jdkbin/javac Serveur.java && \
+    $jdkbin/jar --create --file ../app.jar --main-class Serveur Serveur.class" || {
+    echo "ÉCHEC : le jar de l'essai n'a pas pu être construit"
+    exit 1
+}
+unite='ogs-javatest-app@1.service'
+systemctl reset-failed "$unite" 2>/dev/null
+systemctl restart "$unite"
+sortie=$(ogs apply javatest --yes 2>&1); code=$?
+echo "$sortie" | grep -Ei "lien|attente|⚠|✗" | head -5
+if [ "$code" != 0 ] || [ "$(systemctl is-active "$unite")" != "active" ]; then
+    echo "ÉCHEC : l'application Java ne tourne pas (code $code)"
+    journalctl -u "$unite" --no-pager -n 10 2>&1
+    exit 1
+fi
+reponse=$(curl -s http://127.0.0.1:26001/)
+echo "réponse sur 127.0.0.1:26001 : $reponse"
+if [ "$reponse" != "java 21" ]; then
+    echo "ÉCHEC : l'application Java ne répond pas là où ogs relaie"
+    exit 1
+fi
+if [ "$(ps -o user= -p "$(systemctl show -p MainPID --value "$unite")")" != "javatest" ]; then
+    echo "ÉCHEC : la JVM ne tourne pas sous l'identité du projet"
+    exit 1
+fi
+# JAVA_OPTS atteint la JVM sans réécrire la commande : la mémoire se règle ainsi.
+sed -i 's/^  app:$/  app:\n    env:\n      JAVA_OPTS: -Xmx64m -Dogs.essai=1/' /etc/ogs/projects/javatest.yaml
+ogs apply javatest --yes >/dev/null 2>&1
+sleep 2
+if ! tr '\0' ' ' </proc/"$(systemctl show -p MainPID --value "$unite")"/cmdline | grep -q -- "-Xmx64m -Dogs.essai=1 -jar app.jar"; then
+    echo "ÉCHEC : JAVA_OPTS n'atteint pas la JVM"
+    tr '\0' ' ' </proc/"$(systemctl show -p MainPID --value "$unite")"/cmdline; echo
+    exit 1
+fi
+echo "JDK $jdk dans le home, jar servi sur 26001 sous javatest, JAVA_OPTS transmis"
+ogs project delete javatest --yes >/dev/null 2>&1
+
+echo
 echo "--- suppression : le runtime part avec le home ---"
 # Sans « --purge » : celui-ci exige une confirmation interactive, car il est sans
 # recours. La suppression ordinaire archive puis démonte.
@@ -363,4 +454,5 @@ echo
 echo "RÉSULTAT : une application Go est supervisée, écoute sur un socket 0660 sous"
 echo "           l'identité du projet et est servie par le vhost ; une application"
 echo "           custom reçoit sa commande et son fichier d'environnement ; nvm"
-echo "           installe Node dans le home du projet, là où ogs l'attend."
+echo "           installe Node dans le home du projet, là où ogs l'attend ; SDKMAN"
+echo "           y installe le JDK d'une application Java, servie par son jar."

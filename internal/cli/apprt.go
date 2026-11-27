@@ -14,7 +14,7 @@ import (
 func newRuntimeCommand(app *App) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "runtime",
-		Short: "Gérer les runtimes applicatifs (Node, Ruby, Python)",
+		Short: "Gérer les runtimes applicatifs (Node, Ruby, Python, Java)",
 		Long: "Les runtimes sont installés dans le home de chaque projet : une copie par site,\n" +
 			"des mises à jour à faire autant de fois qu'il y a de projets, mais une maîtrise\n" +
 			"complète des versions par l'exploitant du site.",
@@ -105,7 +105,7 @@ func newRuntimeInstallCommand(app *App) *cobra.Command {
 			}
 			if at.Runtime == "" {
 				return exitf(CodeUsage, "le projet %s n'a pas de runtime applicatif "+
-					"(types concernés : go, node, python, ruby)", p.ID())
+					"(types concernés : go, node, python, ruby, java)", p.ID())
 			}
 			if at.Runtime != appprov.RuntimeGo && at.Runtime != appprov.RuntimeCustom {
 				if err := appprov.CheckVersion(args[1]); err != nil {
